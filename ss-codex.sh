@@ -618,6 +618,8 @@ show_menu() {
 ========================================
  SS Codex 一键节点管理
 ========================================
+ 提示：输入 sscodex 打开管理面板
+----------------------------------------
  sing-box：$(singbox_install_state)
  状态：$(service_status_short)
  版本：$(singbox_version)
