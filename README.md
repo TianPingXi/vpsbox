@@ -7,4 +7,9 @@
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/QXTianPing/ss-codex/main/ss-codex.sh)
 
-## vps：sscodex
+## 管理命令
+
+安装完成后，可随时输入以下命令打开管理面板：
+
+```bash
+sscodex
