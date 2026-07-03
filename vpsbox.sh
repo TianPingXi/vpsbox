@@ -1108,6 +1108,81 @@ ipv4_dns_lines() {
     echo " 未检测到 IPv4 DNS"
 }
 
+change_ipv4_dns() {
+    local choice
+    local dns1=""
+    local dns2=""
+    local backup
+
+    cat <<EOF
+========================================
+ 修改 IPv4 DNS
+========================================
+当前 IPv4 DNS：
+$(ipv4_dns_lines)
+----------------------------------------
+ 1) 使用默认 DNS：1.1.1.1 + 8.8.8.8
+ 2) 自定义 IPv4 DNS
+ 0) 取消
+========================================
+EOF
+
+    read -r -p "请输入选项: " choice
+    case "$choice" in
+        1)
+            dns1="1.1.1.1"
+            dns2="8.8.8.8"
+            ;;
+        2)
+            while true; do
+                read -r -p "请输入 DNS1 IPv4 地址: " dns1
+                if is_ipv4_address "$dns1"; then
+                    break
+                fi
+                err "DNS1 格式不正确，请输入 IPv4 地址，例如 1.1.1.1。"
+            done
+
+            while true; do
+                read -r -p "请输入 DNS2 IPv4 地址，留空跳过: " dns2
+                [ -z "$dns2" ] && break
+                if is_ipv4_address "$dns2"; then
+                    break
+                fi
+                err "DNS2 格式不正确，请输入 IPv4 地址，例如 8.8.8.8。"
+            done
+            ;;
+        0)
+            info "已取消。"
+            return 0
+            ;;
+        *)
+            warn "无效选项。"
+            return 1
+            ;;
+    esac
+
+    if [ -L /etc/resolv.conf ]; then
+        warn "/etc/resolv.conf 是符号链接，DNS 可能由系统网络服务管理，重启后可能被覆盖。"
+    fi
+
+    backup="/etc/resolv.conf.vpsbox.bak.$(date +%Y%m%d%H%M%S)"
+    if [ -e /etc/resolv.conf ]; then
+        cp /etc/resolv.conf "$backup" 2>/dev/null || warn "备份 /etc/resolv.conf 失败，将继续尝试写入。"
+    fi
+
+    if ! {
+        printf 'nameserver %s\n' "$dns1"
+        [ -n "$dns2" ] && printf 'nameserver %s\n' "$dns2"
+    } > /etc/resolv.conf; then
+        err "写入 /etc/resolv.conf 失败。"
+        return 1
+    fi
+
+    info "IPv4 DNS 已更新："
+    ipv4_dns_lines
+    [ -e "$backup" ] && info "原配置备份：$backup"
+}
+
 update_system_packages() {
     detect_os
     if [ "$OS" != "debian" ]; then
@@ -1523,12 +1598,8 @@ EOF
 EOF
 }
 
-uninstall_all() {
-    echo "此操作会卸载 VPSBox、sing-box，并删除所有节点配置。"
-    read -r -p "确认继续？请输入 YES：" confirm
-    [ "$confirm" = "YES" ] || { info "已取消。"; return 0; }
-
-    info "正在停止并禁用服务..."
+uninstall_singbox_and_nodes() {
+    info "正在停止并禁用 sing-box 服务..."
     service_stop 2>/dev/null || true
     service_disable 2>/dev/null || true
 
@@ -1551,13 +1622,32 @@ uninstall_all() {
         fi
     fi
 
-    info "正在清理文件..."
+    info "正在删除 sing-box 和节点配置..."
     rm -rf "$CONFIG_DIR"
     rm -f /usr/bin/sing-box /usr/local/bin/sing-box
-    rm -f "$CMD_PATH" /usr/bin/vpsbox
-    rm -f /usr/local/bin/sb /usr/bin/sb
     rm -f /var/log/sing-box*
-    rm -f "$BBR_CONF"
+
+    info "sing-box 和节点配置已删除。"
+}
+
+uninstall_all() {
+    local confirm
+    local remove_singbox
+
+    echo "此操作会卸载 VPSBox 管理命令。"
+    echo "默认不会删除 sing-box，也不会删除节点配置。"
+    read -r -p "确认卸载 VPSBox？请输入 YES：" confirm
+    [ "$confirm" = "YES" ] || { info "已取消。"; return 0; }
+
+    read -r -p "是否同时删除 sing-box 和所有节点配置？请输入 YES 确认：" remove_singbox
+    if [ "$remove_singbox" = "YES" ]; then
+        uninstall_singbox_and_nodes
+    else
+        info "已保留 sing-box 和节点配置。"
+    fi
+
+    info "正在删除 VPSBox 命令..."
+    rm -f "$CMD_PATH" /usr/bin/vpsbox
 
     info "卸载完成。"
     info "vpsbox 命令已删除，当前菜单即将退出。"
@@ -1754,12 +1844,13 @@ $(ipv4_dns_lines)
 11) 一键开启 BBR + fq
 12) 安装 Fail2ban
 13) 限制 systemd 日志大小
+14) 修改 IPv4 DNS
 ----------------------------------------
  更新维护
-14) 更新 sing-box
-15) 更新 vpsbox 脚本
+15) 更新 sing-box
+16) 更新 vpsbox 脚本
 ----------------------------------------
-16) 卸载 VPSBox
+17) 卸载 VPSBox
  0) 退出
 ========================================
 EOF
@@ -1785,9 +1876,10 @@ main_loop() {
             11) enable_bbr_fq; pause ;;
             12) install_fail2ban; pause ;;
             13) limit_systemd_journal; pause ;;
-            14) update_singbox; pause ;;
-            15) update_vpsbox; pause ;;
-            16) uninstall_all; pause ;;
+            14) change_ipv4_dns; pause ;;
+            15) update_singbox; pause ;;
+            16) update_vpsbox; pause ;;
+            17) uninstall_all; pause ;;
             0) exit 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
