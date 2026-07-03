@@ -15,6 +15,16 @@ SERVICE_NAME="sing-box"
 METHOD="2022-blake3-aes-128-gcm"
 PORT_MIN=10000
 PORT_MAX=60000
+TRACE_NAMES=(
+    "北京电信" "北京联通" "北京移动"
+    "上海电信" "上海联通" "上海移动"
+    "广州电信" "广州联通" "广州移动"
+)
+TRACE_IPS=(
+    "219.141.140.10" "202.106.195.68" "221.179.155.161"
+    "101.95.120.109" "210.22.70.3" "183.192.160.3"
+    "58.60.188.222" "210.21.196.6" "120.196.165.24"
+)
 
 info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
@@ -1303,6 +1313,121 @@ EOF
 EOF
 }
 
+nexttrace_installed() {
+    command -v nexttrace >/dev/null 2>&1
+}
+
+ensure_nexttrace() {
+    if nexttrace_installed; then
+        return 0
+    fi
+
+    warn "未检测到 nexttrace。"
+    read -r -p "是否自动安装 nexttrace？(y/N): " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消。"; return 1; }
+
+    ensure_curl || return 1
+
+    info "正在安装 nexttrace..."
+    if ! curl -fsSL https://nxtrace.org/nt | bash; then
+        err "nexttrace 安装失败，请检查网络后重试。"
+        return 1
+    fi
+
+    if nexttrace_installed; then
+        info "nexttrace 安装完成。"
+        return 0
+    fi
+
+    err "未找到 nexttrace 命令，安装可能未成功。"
+    return 1
+}
+
+trace_has() {
+    local output="$1"
+    local pattern="$2"
+    printf '%s\n' "$output" | grep -Eiq "$pattern"
+}
+
+detect_trace_line() {
+    local output="$1"
+    local has_4134=0
+    local has_4809=0
+
+    trace_has "$output" 'AS[[:space:]]*4134|AS4134|202\.97\.' && has_4134=1
+    trace_has "$output" 'AS[[:space:]]*4809|AS4809|59\.43\.' && has_4809=1
+
+    if trace_has "$output" 'AS[[:space:]]*23764|AS23764|69\.194\.|203\.22\.'; then
+        echo "CTGNET|AS23764"
+    elif [ "$has_4134" = "1" ] && [ "$has_4809" = "1" ]; then
+        echo "CN2 GT|AS4134/AS4809"
+    elif [ "$has_4809" = "1" ]; then
+        echo "CN2 GIA|AS4809"
+    elif [ "$has_4134" = "1" ]; then
+        echo "163|AS4134"
+    elif trace_has "$output" 'AS[[:space:]]*9929|AS9929|218\.105\.|210\.51\.'; then
+        echo "9929|AS9929"
+    elif trace_has "$output" 'AS[[:space:]]*4837|AS4837|219\.158\.'; then
+        echo "4837|AS4837"
+    elif trace_has "$output" 'AS[[:space:]]*58807|AS58807|223\.120\.(16|17|19|130|131|140|141)\.'; then
+        echo "CMIN2|AS58807"
+    elif trace_has "$output" 'AS[[:space:]]*58453|AS58453|AS[[:space:]]*9808|AS9808|223\.(118|119|120|121)\.'; then
+        echo "CMI|AS58453"
+    else
+        echo "未识别|-"
+    fi
+}
+
+run_nexttrace_target() {
+    local ip="$1"
+
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 45 nexttrace -n -P -C "$ip" 2>&1
+    else
+        nexttrace -n -P -C "$ip" 2>&1
+    fi
+}
+
+show_backtrace_routes() {
+    ensure_nexttrace || return 1
+
+    local i
+    local name
+    local ip
+    local output
+    local detected
+    local result
+    local asn
+
+    cat <<EOF
+========================================
+ 三网回程检测
+========================================
+线路      目标 IP          判断       关键 ASN
+EOF
+
+    for i in "${!TRACE_NAMES[@]}"; do
+        name="${TRACE_NAMES[$i]}"
+        ip="${TRACE_IPS[$i]}"
+
+        if output="$(run_nexttrace_target "$ip")"; then
+            detected="$(detect_trace_line "$output")"
+            result="${detected%%|*}"
+            asn="${detected#*|}"
+        else
+            result="检测失败"
+            asn="-"
+        fi
+
+        printf '%-10s %-15s %-10s %s\n' "$name" "$ip" "$result" "$asn"
+    done
+
+    cat <<EOF
+========================================
+提示：回程判断仅供参考，完整路径可用 nexttrace 手动确认。
+EOF
+}
+
 uninstall_all() {
     echo "此操作会卸载 SS Codex、sing-box，并删除所有节点配置。"
     read -r -p "确认继续？请输入 YES：" confirm
@@ -1410,6 +1535,7 @@ $(ipv4_dns_lines)
 13) 卸载 SS Codex
 14) 一键自检
 15) 查看端口与安全组建议
+16) 查看三网回程
  0) 退出
 ========================================
 EOF
@@ -1437,6 +1563,7 @@ main_loop() {
             13) uninstall_all; pause ;;
             14) run_self_check; pause ;;
             15) show_ports_security_group; pause ;;
+            16) show_backtrace_routes; pause ;;
             0) exit 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
