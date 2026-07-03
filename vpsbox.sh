@@ -354,10 +354,7 @@ show_ports_security_group() {
     local suggest_file
     local proto
     local state
-    local recvq
-    local sendq
     local local_addr
-    local peer_addr
     local proc_info
     local addr
     local port
@@ -368,7 +365,7 @@ show_ports_security_group() {
     local_file="$(mktemp)"
     suggest_file="$(mktemp)"
 
-    while read -r proto state recvq sendq local_addr peer_addr proc_info; do
+    while read -r proto state _recvq _sendq local_addr _peer_addr proc_info; do
         case "$state" in
             LISTEN|UNCONN) ;;
             *) continue ;;
@@ -1280,7 +1277,11 @@ run_self_check() {
 ========================================
 EOF
 
-    [ "$(id -u)" = "0" ] && check_ok "运行用户" "root" || check_fail "运行用户" "不是 root"
+    if [ "$(id -u)" = "0" ]; then
+        check_ok "运行用户" "root"
+    else
+        check_fail "运行用户" "不是 root"
+    fi
 
     if [ -x "$CMD_PATH" ]; then
         check_ok "vpsbox 命令" "$CMD_PATH"
@@ -1720,7 +1721,7 @@ show_menu() {
     clear 2>/dev/null || true
     cat <<EOF
 ========================================
- VPSBox
+ $APP_NAME
 ========================================
  提示：输入 vpsbox 打开管理面板
 ----------------------------------------
