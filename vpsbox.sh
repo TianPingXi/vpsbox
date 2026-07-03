@@ -1123,6 +1123,38 @@ ipv4_dns_lines() {
     echo " 未检测到 IPv4 DNS"
 }
 
+update_system_packages() {
+    detect_os
+    if [ "$OS" != "debian" ]; then
+        err "系统更新当前仅支持 Debian/Ubuntu。"
+        case "$OS" in
+            alpine) warn "Alpine 可手动执行：apk update && apk upgrade" ;;
+            redhat) warn "RedHat 系可手动执行：dnf upgrade -y 或 yum update -y" ;;
+            *) warn "未识别系统类型，已取消。" ;;
+        esac
+        return 1
+    fi
+
+    cat <<EOF
+即将执行系统更新：
+apt update && apt upgrade -y && apt autoremove -y
+EOF
+    read -r -p "确认继续？[y/N]: " confirm
+    case "$confirm" in
+        y|Y|yes|YES) ;;
+        *) info "已取消系统更新。"; return 0 ;;
+    esac
+
+    export DEBIAN_FRONTEND=noninteractive
+    apt update && apt upgrade -y && apt autoremove -y
+
+    if [ "$(reboot_required_state)" = "需要" ]; then
+        warn "系统更新完成，检测到需要重启 VPS。"
+    else
+        info "系统更新完成，当前不需要重启。"
+    fi
+}
+
 enable_bbr_fq() {
     cat > "$BBR_CONF" <<EOF
 net.core.default_qdisc=fq
@@ -1709,15 +1741,16 @@ $(ipv4_dns_lines)
  9) 查看系统优化状态
 ----------------------------------------
  系统优化
-10) 一键开启 BBR + fq
-11) 安装 Fail2ban
-12) 限制 systemd 日志大小
+10) 系统更新
+11) 一键开启 BBR + fq
+12) 安装 Fail2ban
+13) 限制 systemd 日志大小
 ----------------------------------------
  更新维护
-13) 更新 sing-box
-14) 更新 vpsbox 脚本
+14) 更新 sing-box
+15) 更新 vpsbox 脚本
 ----------------------------------------
-15) 卸载 VPSBox
+16) 卸载 VPSBox
  0) 退出
 ========================================
 EOF
@@ -1739,12 +1772,13 @@ main_loop() {
             7) run_self_check; pause ;;
             8) show_backtrace_routes; pause ;;
             9) show_system_maintenance_status; pause ;;
-            10) enable_bbr_fq; pause ;;
-            11) install_fail2ban; pause ;;
-            12) limit_systemd_journal; pause ;;
-            13) update_singbox; pause ;;
-            14) update_vpsbox; pause ;;
-            15) uninstall_all; pause ;;
+            10) update_system_packages; pause ;;
+            11) enable_bbr_fq; pause ;;
+            12) install_fail2ban; pause ;;
+            13) limit_systemd_journal; pause ;;
+            14) update_singbox; pause ;;
+            15) update_vpsbox; pause ;;
+            16) uninstall_all; pause ;;
             0) exit 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
