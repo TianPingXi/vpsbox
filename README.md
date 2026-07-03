@@ -1,11 +1,11 @@
-# SS Codex
+# VPSBox
 
-基于 sing-box 的 SS 2022 一键节点管理脚本。
+VPS 初始化、系统优化与 sing-box 节点管理脚本。
 
 ## VPS 一键安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/QXTianPing/ss-codex/main/ss-codex.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh)
 ```
 
 ## 管理命令
@@ -13,40 +13,56 @@ bash <(curl -fsSL https://raw.githubusercontent.com/QXTianPing/ss-codex/main/ss-
 安装完成后，可随时输入以下命令打开管理面板：
 
 ```bash
-sscodex
+vpsbox
 ```
+
+旧命令 `sscodex` 会作为兼容入口保留。
 
 ## 主界面
 
-输入 `sscodex` 打开管理面板：
+输入 `vpsbox` 打开管理面板：
 
 ```text
 ========================================
- SS Codex 一键节点管理
+ VPSBox
 ========================================
- 提示：输入 sscodex 打开管理面板
+ 提示：输入 vpsbox 打开管理面板，旧命令 sscodex 仍可兼容使用
 ----------------------------------------
  sing-box：已安装 / 未安装
- 状态：运行中 / 未运行
- 版本：1.x.x
- BBR：已启用 / 未启用
- fq：已启用 / 未启用
+ sing-box 状态：运行中 / 未运行
+ sing-box 版本：1.x.x
  当前节点：已创建 / 未创建
+ 节点地址：example.com:49880
 ----------------------------------------
+ IPv4 DNS：
+ nameserver 1.1.1.1
+ nameserver 8.8.8.8
+----------------------------------------
+ 节点管理
  1) 创建/重建 SS 2022 节点
  2) 查看节点链接
  3) 删除当前节点
 ----------------------------------------
+ 服务管理
  4) 启动 sing-box 服务
  5) 停止 sing-box 服务
  6) 重启 sing-box 服务
- 7) 查看 sing-box 状态
- 8) 查看 sing-box 日志
 ----------------------------------------
- 9) 一键开启 BBR + fq
-10) 更新 sing-box
-11) 更新 sscodex 脚本
-12) 卸载 SS Codex
+ 检查工具
+ 7) 一键自检
+ 8) 查看三网回程
+ 9) 查看系统优化状态
+----------------------------------------
+ 系统优化
+10) 一键开启 BBR + fq
+11) 安装 Fail2ban
+12) 限制 systemd 日志大小
+----------------------------------------
+ 更新维护
+13) 更新 sing-box
+14) 更新 vpsbox 脚本
+----------------------------------------
+15) 卸载 VPSBox
  0) 退出
 ========================================
 请输入选项:
@@ -63,8 +79,13 @@ sscodex
 - 查看节点链接
 - 删除当前节点
 - 启动、停止、重启 sing-box
-- 查看状态和日志
+- 一键自检
+- 三网回程检测
+- 查看系统优化状态
+- 查看端口与安全组建议
 - 一键开启 BBR + fq
+- 安装 Fail2ban
+- 限制 systemd 日志大小
 - 更新 sing-box
-- 更新 sscodex 脚本
-- 卸载 SS Codex、sing-box，并删除所有节点配置
+- 更新 vpsbox 脚本
+- 卸载 VPSBox、sing-box，并删除所有节点配置
