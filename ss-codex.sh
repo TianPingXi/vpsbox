@@ -926,6 +926,9 @@ install_fail2ban() {
         return 1
     fi
 
+    info "等待 Fail2ban 服务启动 3 秒..."
+    sleep 3
+
     if [ "$(fail2ban_service_state)" = "运行中" ] && [ "$(fail2ban_sshd_state)" = "已启用" ]; then
         info "Fail2ban 已安装，SSH 防护已启用。"
         return 0
@@ -945,6 +948,9 @@ EOF
     elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
         rc-service fail2ban restart || { err "Fail2ban 重启失败。"; return 1; }
     fi
+
+    info "等待 Fail2ban 服务重启 3 秒..."
+    sleep 3
 
     info "Fail2ban 状态：$(fail2ban_service_state)"
     info "SSH 防护：$(fail2ban_sshd_state)"
