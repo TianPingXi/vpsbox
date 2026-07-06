@@ -13,7 +13,8 @@ BBR_CONF="/etc/sysctl.d/99-vpsbox-bbr.conf"
 GAI_CONF="/etc/gai.conf"
 SSHD_MAIN_CONF="/etc/ssh/sshd_config"
 SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
-SSHD_VPSBOX_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh.conf"
+SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
+SSHD_VPSBOX_HARDENING_CONF="$SSHD_CONFIG_DIR/01-vpsbox-ssh-hardening.conf"
 SSH_TARGET_PORT="23333"
 RUNTIME_DIR="/run/vpsbox"
 LOCK_FILE="$RUNTIME_DIR/vpsbox.lock"
@@ -91,22 +92,149 @@ prepare_runtime_dir() {
     chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
 }
 
+is_pid() {
+    [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+process_alive() {
+    local pid="$1"
+
+    is_pid "$pid" && kill -0 "$pid" 2>/dev/null
+}
+
+lock_pid_from_file() {
+    local path="$1"
+    local pid=""
+
+    [ -f "$path" ] || return 1
+    pid="$(awk -F= '$1 == "pid" { print $2; exit }' "$path" 2>/dev/null || true)"
+    if is_pid "$pid"; then
+        printf '%s\n' "$pid"
+        return 0
+    fi
+    return 1
+}
+
+find_running_vpsbox_pid() {
+    ps -eo pid=,args= 2>/dev/null |
+        awk -v self="$$" -v cmd="$CMD_PATH" '
+            $1 != self && index($0, cmd) { print $1; exit }
+        '
+}
+
+show_process_summary() {
+    local pid="$1"
+
+    if process_alive "$pid"; then
+        ps -p "$pid" -o pid=,tty=,etime=,cmd= 2>/dev/null || true
+    fi
+}
+
+terminate_old_vpsbox_menu() {
+    local pid="${1:-}"
+    local confirm
+    local i
+
+    if ! is_pid "$pid"; then
+        pid="$(find_running_vpsbox_pid || true)"
+    fi
+
+    if ! process_alive "$pid"; then
+        return 1
+    fi
+
+    warn "检测到旧 vpsbox 菜单仍在运行："
+    show_process_summary "$pid"
+    echo ""
+    read -r -p "输入 YES 结束旧菜单并继续，其他任意输入取消: " confirm
+    if [ "$confirm" != "YES" ]; then
+        err "检测到另一个 vpsbox 正在运行，请先退出旧菜单。"
+        exit 1
+    fi
+
+    kill "$pid" 2>/dev/null || true
+    for i in 1 2 3 4 5; do
+        process_alive "$pid" || return 0
+        sleep 1
+    done
+
+    warn "旧菜单未正常退出，正在强制结束。"
+    kill -KILL "$pid" 2>/dev/null || true
+    sleep 1
+    process_alive "$pid" && return 1 || return 0
+}
+
+write_flock_metadata() {
+    : > "$LOCK_FILE"
+    {
+        printf 'pid=%s\n' "$$"
+        printf 'started=%s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+    } >&200
+}
+
+write_lockdir_metadata() {
+    {
+        printf 'pid=%s\n' "$$"
+        printf 'started=%s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+    } > "$LOCK_DIR/pid"
+}
+
 acquire_lock() {
+    local old_pid=""
+
     prepare_runtime_dir
 
     if command -v flock >/dev/null 2>&1; then
         exec 200>"$LOCK_FILE"
-        if ! flock -n 200; then
-            err "检测到另一个 vpsbox 正在运行，请先退出旧菜单。"
+        if flock -n 200; then
+            write_flock_metadata
+            return 0
+        fi
+
+        old_pid="$(lock_pid_from_file "$LOCK_FILE" || true)"
+        if terminate_old_vpsbox_menu "$old_pid"; then
+            if flock -n 200; then
+                write_flock_metadata
+                return 0
+            fi
+            err "旧菜单已处理，但锁仍被占用，请稍后重试。"
             exit 1
         fi
+
+        err "检测到另一个 vpsbox 正在运行，请先退出旧菜单。"
+        exit 1
+    fi
+
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        write_lockdir_metadata
+        trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
         return 0
+    fi
+
+    old_pid="$(lock_pid_from_file "$LOCK_DIR/pid" || true)"
+    [ -z "$old_pid" ] && old_pid="$(find_running_vpsbox_pid || true)"
+    if ! process_alive "$old_pid"; then
+        warn "检测到残留 vpsbox 锁，正在清理。"
+        rm -rf "$LOCK_DIR"
+        if mkdir "$LOCK_DIR" 2>/dev/null; then
+            write_lockdir_metadata
+            trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+            return 0
+        fi
+    elif terminate_old_vpsbox_menu "$old_pid"; then
+        rm -rf "$LOCK_DIR"
+        if mkdir "$LOCK_DIR" 2>/dev/null; then
+            write_lockdir_metadata
+            trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+            return 0
+        fi
     fi
 
     if ! mkdir "$LOCK_DIR" 2>/dev/null; then
         err "检测到另一个 vpsbox 正在运行，请先退出旧菜单。"
         exit 1
     fi
+    write_lockdir_metadata
     trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 }
 
@@ -1702,19 +1830,35 @@ backup_ssh_file() {
 
 restore_ssh_config_backup() {
     local main_backup="$1"
-    local dropin_backup="$2"
+    local dropin_path="$2"
+    local dropin_backup="$3"
 
     if [ -n "$main_backup" ] && [ -e "$main_backup" ]; then
         cp -a "$main_backup" "$SSHD_MAIN_CONF" || warn "恢复 $SSHD_MAIN_CONF 失败。"
     fi
     if [ -n "$dropin_backup" ] && [ -e "$dropin_backup" ]; then
-        cp -a "$dropin_backup" "$SSHD_VPSBOX_CONF" || warn "恢复 $SSHD_VPSBOX_CONF 失败。"
+        cp -a "$dropin_backup" "$dropin_path" || warn "恢复 $dropin_path 失败。"
     else
-        rm -f "$SSHD_VPSBOX_CONF" || warn "删除 $SSHD_VPSBOX_CONF 失败。"
+        rm -f "$dropin_path" || warn "删除 $dropin_path 失败。"
     fi
 }
 
-write_vpsbox_ssh_config() {
+comment_main_ssh_port_directives() {
+    local tmp
+
+    tmp="$(mktemp)" || return 1
+    awk '
+        /^[[:space:]]*Port[[:space:]]+/ {
+            print "# VPSBox disabled: " $0
+            next
+        }
+        { print }
+    ' "$SSHD_MAIN_CONF" > "$tmp" || { rm -f "$tmp"; return 1; }
+    install -m 644 "$tmp" "$SSHD_MAIN_CONF" || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+}
+
+write_vpsbox_ssh_port_config() {
     local tmp
 
     mkdir -p "$SSHD_CONFIG_DIR" || return 1
@@ -1722,6 +1866,18 @@ write_vpsbox_ssh_config() {
     cat > "$tmp" <<EOF || { rm -f "$tmp"; return 1; }
 # Managed by VPSBox
 Port $SSH_TARGET_PORT
+EOF
+    install -m 644 "$tmp" "$SSHD_VPSBOX_PORT_CONF" || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+}
+
+write_vpsbox_ssh_hardening_config() {
+    local tmp
+
+    mkdir -p "$SSHD_CONFIG_DIR" || return 1
+    tmp="$(mktemp)" || return 1
+    cat > "$tmp" <<'EOF' || { rm -f "$tmp"; return 1; }
+# Managed by VPSBox
 LoginGraceTime 1m
 StrictModes yes
 PubkeyAuthentication yes
@@ -1729,11 +1885,11 @@ PermitEmptyPasswords no
 UsePAM yes
 UseDNS no
 EOF
-    install -m 644 "$tmp" "$SSHD_VPSBOX_CONF" || { rm -f "$tmp"; return 1; }
+    install -m 644 "$tmp" "$SSHD_VPSBOX_HARDENING_CONF" || { rm -f "$tmp"; return 1; }
     rm -f "$tmp"
 }
 
-validate_vpsbox_ssh_effective_config() {
+validate_ssh_port_effective_config() {
     local bin
 
     bin="$(sshd_binary)" || { err "未找到 sshd，无法检查 SSH 配置。"; return 1; }
@@ -1746,6 +1902,17 @@ validate_vpsbox_ssh_effective_config() {
     if ! ssh_effective_ports_match_target; then
         err "SSH 当前生效端口不是 $SSH_TARGET_PORT，当前为：$(ssh_port_state)"
         warn "可能还有其他 SSH 配置文件也写了 Port，请先检查 /etc/ssh/sshd_config 和 /etc/ssh/sshd_config.d/。"
+        return 1
+    fi
+}
+
+validate_ssh_hardening_effective_config() {
+    local bin
+
+    bin="$(sshd_binary)" || { err "未找到 sshd，无法检查 SSH 配置。"; return 1; }
+
+    if ! "$bin" -t; then
+        err "sshd -t 检查未通过。"
         return 1
     fi
 
@@ -1784,7 +1951,7 @@ EOF
     fi
 }
 
-apply_ssh_port_hardening() {
+apply_ssh_port_change() {
     local confirm
     local suffix
     local main_backup=""
@@ -1800,12 +1967,12 @@ apply_ssh_port_hardening() {
         return 1
     fi
 
-    if ssh_vpsbox_settings_effective; then
-        info "SSH 端口与基础加固已经生效，无需重复应用。"
+    if ssh_effective_ports_match_target; then
+        info "SSH 端口已经是 $SSH_TARGET_PORT，无需重复修改。"
         read -r -p "仍要重新写入并重启 SSH？[y/N]: " confirm
         case "$confirm" in
             y|Y|yes|YES) ;;
-            *) info "已取消重复应用。"; return 0 ;;
+            *) info "已取消重复修改。"; return 0 ;;
         esac
     fi
 
@@ -1820,26 +1987,26 @@ apply_ssh_port_hardening() {
         err "备份 $SSHD_MAIN_CONF 失败，已取消修改。"
         return 1
     fi
-    if ! dropin_backup="$(backup_ssh_file "$SSHD_VPSBOX_CONF" "$suffix")"; then
-        err "备份 $SSHD_VPSBOX_CONF 失败，已取消修改。"
+    if ! dropin_backup="$(backup_ssh_file "$SSHD_VPSBOX_PORT_CONF" "$suffix")"; then
+        err "备份 $SSHD_VPSBOX_PORT_CONF 失败，已取消修改。"
         return 1
     fi
 
-    if ! write_vpsbox_ssh_config || ! ensure_sshd_dropin_include; then
-        err "写入 SSH 配置失败，正在回滚。"
-        restore_ssh_config_backup "$main_backup" "$dropin_backup"
+    if ! write_vpsbox_ssh_port_config || ! ensure_sshd_dropin_include || ! comment_main_ssh_port_directives; then
+        err "写入 SSH 端口配置失败，正在回滚。"
+        restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_PORT_CONF" "$dropin_backup"
         return 1
     fi
 
-    if ! validate_vpsbox_ssh_effective_config; then
-        err "SSH 配置验证失败，正在回滚。"
-        restore_ssh_config_backup "$main_backup" "$dropin_backup"
+    if ! validate_ssh_port_effective_config; then
+        err "SSH 端口配置验证失败，正在回滚。"
+        restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_PORT_CONF" "$dropin_backup"
         return 1
     fi
 
     if ! restart_ssh_service; then
         err "SSH 服务重启失败，正在回滚配置并尝试恢复服务。"
-        restore_ssh_config_backup "$main_backup" "$dropin_backup"
+        restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_PORT_CONF" "$dropin_backup"
         restart_ssh_service >/dev/null 2>&1 || true
         return 1
     fi
@@ -1850,12 +2017,78 @@ apply_ssh_port_hardening() {
         warn "Fail2ban sshd 端口同步失败，请稍后检查 fail2ban-client status sshd。"
     fi
 
-    info "SSH 端口与基础加固已应用。"
+    info "SSH 端口已修改为 $SSH_TARGET_PORT。"
     [ -n "$main_backup" ] && info "主配置备份：$main_backup"
-    [ -n "$dropin_backup" ] && info "vpsbox SSH 配置备份：$dropin_backup"
+    [ -n "$dropin_backup" ] && info "vpsbox SSH 端口配置备份：$dropin_backup"
     warn "不要关闭当前 SSH 窗口。"
     warn "请另开一个新窗口测试：ssh -p $SSH_TARGET_PORT root@你的服务器IP"
     warn "确认新端口可以登录后，再去商家安全组关闭 TCP 22。"
+}
+
+apply_ssh_basic_hardening() {
+    local confirm
+    local suffix
+    local main_backup=""
+    local dropin_backup=""
+
+    if ! sshd_binary >/dev/null 2>&1; then
+        err "未找到 sshd，无法修改 SSH 配置。"
+        return 1
+    fi
+
+    if [ ! -f "$SSHD_MAIN_CONF" ]; then
+        err "未找到 SSH 主配置：$SSHD_MAIN_CONF"
+        return 1
+    fi
+
+    if ssh_basic_hardening_effective; then
+        info "SSH 基础加固已经生效，无需重复应用。"
+        read -r -p "仍要重新写入并重启 SSH？[y/N]: " confirm
+        case "$confirm" in
+            y|Y|yes|YES) ;;
+            *) info "已取消重复应用。"; return 0 ;;
+        esac
+    fi
+
+    read -r -p "确认应用 SSH 基础加固并重启 SSH？[y/N]: " confirm
+    case "$confirm" in
+        y|Y|yes|YES) ;;
+        *) info "已取消，未修改 SSH 配置。"; return 0 ;;
+    esac
+
+    suffix="$(date +%F-%H%M%S)"
+    if ! main_backup="$(backup_ssh_file "$SSHD_MAIN_CONF" "$suffix")"; then
+        err "备份 $SSHD_MAIN_CONF 失败，已取消修改。"
+        return 1
+    fi
+    if ! dropin_backup="$(backup_ssh_file "$SSHD_VPSBOX_HARDENING_CONF" "$suffix")"; then
+        err "备份 $SSHD_VPSBOX_HARDENING_CONF 失败，已取消修改。"
+        return 1
+    fi
+
+    if ! write_vpsbox_ssh_hardening_config || ! ensure_sshd_dropin_include; then
+        err "写入 SSH 基础加固配置失败，正在回滚。"
+        restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_HARDENING_CONF" "$dropin_backup"
+        return 1
+    fi
+
+    if ! validate_ssh_hardening_effective_config; then
+        err "SSH 基础加固配置验证失败，正在回滚。"
+        restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_HARDENING_CONF" "$dropin_backup"
+        return 1
+    fi
+
+    if ! restart_ssh_service; then
+        err "SSH 服务重启失败，正在回滚配置并尝试恢复服务。"
+        restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_HARDENING_CONF" "$dropin_backup"
+        restart_ssh_service >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    info "SSH 基础加固已应用。"
+    [ -n "$main_backup" ] && info "主配置备份：$main_backup"
+    [ -n "$dropin_backup" ] && info "vpsbox SSH 加固配置备份：$dropin_backup"
+    warn "不要关闭当前 SSH 窗口。建议另开一个新窗口测试 SSH 登录。"
 }
 
 show_current_ssh_config() {
@@ -1921,54 +2154,35 @@ EOF
         echo " 未找到 ss 命令，无法查看监听状态。"
     fi
 
-    cat <<EOF
+cat <<EOF
 ----------------------------------------
 配置来源：
- $SSHD_VPSBOX_CONF $([ -f "$SSHD_VPSBOX_CONF" ] && echo "存在" || echo "不存在")
+ 端口配置：$SSHD_VPSBOX_PORT_CONF $([ -f "$SSHD_VPSBOX_PORT_CONF" ] && echo "存在" || echo "不存在")
+ 加固配置：$SSHD_VPSBOX_HARDENING_CONF $([ -f "$SSHD_VPSBOX_HARDENING_CONF" ] && echo "存在" || echo "不存在")
 ========================================
 EOF
 }
 
-ssh_port_hardening_menu() {
+ssh_port_change_menu() {
     local opt
 
     while true; do
         clear 2>/dev/null || true
         cat <<EOF
 ========================================
- SSH 端口与基础加固
+ 修改 SSH 端口
 ========================================
  当前 SSH 端口：$(ssh_port_state)
  目标 SSH 端口：$SSH_TARGET_PORT
- 加固配置：$(ssh_hardening_state)
 ----------------------------------------
 将写入：
-$SSHD_VPSBOX_CONF
+$SSHD_VPSBOX_PORT_CONF
 
 1. Port $SSH_TARGET_PORT
    修改 SSH 监听端口，减少 22 端口扫描噪音。
    请先在商家安全组放行 TCP $SSH_TARGET_PORT。
-
-2. LoginGraceTime 1m
-   登录认证最多等待 1 分钟，超时断开。
-
-3. StrictModes yes
-   检查用户目录和 ~/.ssh 权限，权限不安全会拒绝登录。
-
-4. PubkeyAuthentication yes
-   允许 SSH 密钥登录；没有密钥也不影响密码登录。
-
-5. PermitEmptyPasswords no
-   禁止空密码账号通过 SSH 登录。
-
-6. UsePAM yes
-   保持 Debian 默认 PAM 登录/会话流程。
-
-7. UseDNS no
-   登录时不做反向 DNS 查询，减少登录卡顿。
 ----------------------------------------
- 1) 应用 SSH 端口与基础加固
- 2) 查看 SSH 当前生效配置
+ 1) 应用 SSH 端口修改
  0) 返回
 ========================================
 EOF
@@ -1976,8 +2190,54 @@ EOF
         echo ""
 
         case "$opt" in
-            1) apply_ssh_port_hardening; pause ;;
-            2) show_current_ssh_config; pause ;;
+            1) apply_ssh_port_change; pause ;;
+            0) return 0 ;;
+            *) warn "无效选项：$opt"; pause ;;
+        esac
+    done
+}
+
+ssh_basic_hardening_menu() {
+    local opt
+
+    while true; do
+        clear 2>/dev/null || true
+        cat <<EOF
+========================================
+ SSH 基础加固
+========================================
+ 加固配置：$(ssh_hardening_state)
+----------------------------------------
+将写入：
+$SSHD_VPSBOX_HARDENING_CONF
+
+1. LoginGraceTime 1m
+   登录认证最多等待 1 分钟，超时断开。
+
+2. StrictModes yes
+   检查用户目录和 ~/.ssh 权限，权限不安全会拒绝登录。
+
+3. PubkeyAuthentication yes
+   允许 SSH 密钥登录；没有密钥也不影响密码登录。
+
+4. PermitEmptyPasswords no
+   禁止空密码账号通过 SSH 登录。
+
+5. UsePAM yes
+   保持 Debian 默认 PAM 登录/会话流程。
+
+6. UseDNS no
+   登录时不做反向 DNS 查询，减少登录卡顿。
+----------------------------------------
+ 1) 应用 SSH 基础加固
+ 0) 返回
+========================================
+EOF
+        read -r -p "请输入选项: " opt
+        echo ""
+
+        case "$opt" in
+            1) apply_ssh_basic_hardening; pause ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
@@ -2793,7 +3053,9 @@ system_menu() {
  4) 限制 systemd 日志大小
  5) 修改系统 IPv4 DNS
  6) 启用系统 IPv4 优先
- 7) SSH 端口与基础加固
+ 7) 修改 SSH 端口
+ 8) SSH 基础加固
+ 9) 查看 SSH 当前生效配置
  0) 返回主菜单
 ========================================
 EOF
@@ -2807,7 +3069,9 @@ EOF
             4) limit_systemd_journal; pause ;;
             5) change_ipv4_dns; pause ;;
             6) enable_ipv4_priority; pause ;;
-            7) ssh_port_hardening_menu ;;
+            7) ssh_port_change_menu ;;
+            8) ssh_basic_hardening_menu ;;
+            9) show_current_ssh_config; pause ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
