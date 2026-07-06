@@ -11,6 +11,10 @@ STATE_FILE="$CONFIG_DIR/vpsbox.env"
 URI_FILE="$CONFIG_DIR/vpsbox-uri.txt"
 BBR_CONF="/etc/sysctl.d/99-vpsbox-bbr.conf"
 GAI_CONF="/etc/gai.conf"
+SSHD_MAIN_CONF="/etc/ssh/sshd_config"
+SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
+SSHD_VPSBOX_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh.conf"
+SSH_TARGET_PORT="23333"
 RUNTIME_DIR="/run/vpsbox"
 LOCK_FILE="$RUNTIME_DIR/vpsbox.lock"
 LOCK_DIR="$RUNTIME_DIR/lockdir"
@@ -1583,6 +1587,403 @@ enable_ipv4_priority() {
     info "可用 curl ip.sb 或 curl -v ip.sb 验证默认出口。"
 }
 
+sshd_binary() {
+    local bin
+
+    bin="$(command -v sshd 2>/dev/null || true)"
+    if [ -n "$bin" ]; then
+        printf '%s\n' "$bin"
+    elif [ -x /usr/sbin/sshd ]; then
+        printf '%s\n' "/usr/sbin/sshd"
+    else
+        return 1
+    fi
+}
+
+sshd_effective_config() {
+    local bin
+
+    bin="$(sshd_binary)" || return 1
+    "$bin" -T 2>/dev/null
+}
+
+sshd_effective_values() {
+    local key="$1"
+
+    sshd_effective_config | awk -v key="$key" '$1 == key {
+        $1 = ""
+        sub(/^ /, "")
+        print
+    }' || true
+}
+
+sshd_effective_value() {
+    local key="$1"
+    local value
+
+    value="$(sshd_effective_values "$key" | head -n 1 || true)"
+    [ -n "$value" ] && printf '%s\n' "$value" || printf '%s\n' "未知"
+}
+
+sshd_effective_value_list() {
+    local key="$1"
+    local values
+
+    values="$(sshd_effective_values "$key" | awk 'BEGIN { sep = "" } { printf "%s%s", sep, $0; sep = ", " } END { printf "\n" }' || true)"
+    [ -n "$values" ] && printf '%s\n' "$values" || printf '%s\n' "未知"
+}
+
+ssh_port_state() {
+    sshd_effective_value_list port
+}
+
+ssh_effective_value_equals() {
+    local key="$1"
+    local expected="$2"
+
+    [ "$(sshd_effective_value "$key")" = "$expected" ]
+}
+
+ssh_effective_ports_match_target() {
+    local ports
+
+    ports="$(sshd_effective_values port | sort -n | awk 'BEGIN { sep = "" } { printf "%s%s", sep, $0; sep = " " } END { printf "\n" }' || true)"
+    [ "$ports" = "$SSH_TARGET_PORT" ]
+}
+
+ssh_basic_hardening_effective() {
+    ssh_effective_value_equals logingracetime 60 &&
+        ssh_effective_value_equals strictmodes yes &&
+        ssh_effective_value_equals pubkeyauthentication yes &&
+        ssh_effective_value_equals permitemptypasswords no &&
+        ssh_effective_value_equals usepam yes &&
+        ssh_effective_value_equals usedns no
+}
+
+ssh_vpsbox_settings_effective() {
+    ssh_effective_ports_match_target && ssh_basic_hardening_effective
+}
+
+ssh_hardening_state() {
+    if ! sshd_binary >/dev/null 2>&1; then
+        echo "无法检测"
+    elif ssh_basic_hardening_effective; then
+        echo "已配置"
+    else
+        echo "未配置"
+    fi
+}
+
+ensure_sshd_dropin_include() {
+    local tmp
+
+    if grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf([[:space:]]|$)' "$SSHD_MAIN_CONF" 2>/dev/null; then
+        return 0
+    fi
+
+    tmp="$(mktemp)" || return 1
+    {
+        echo "Include /etc/ssh/sshd_config.d/*.conf"
+        cat "$SSHD_MAIN_CONF"
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
+    install -m 644 "$tmp" "$SSHD_MAIN_CONF" || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+}
+
+backup_ssh_file() {
+    local path="$1"
+    local suffix="$2"
+
+    if [ -e "$path" ]; then
+        cp -a "$path" "${path}.vpsbox.bak.${suffix}" || return 1
+        printf '%s\n' "${path}.vpsbox.bak.${suffix}"
+    fi
+}
+
+restore_ssh_config_backup() {
+    local main_backup="$1"
+    local dropin_backup="$2"
+
+    if [ -n "$main_backup" ] && [ -e "$main_backup" ]; then
+        cp -a "$main_backup" "$SSHD_MAIN_CONF" || warn "恢复 $SSHD_MAIN_CONF 失败。"
+    fi
+    if [ -n "$dropin_backup" ] && [ -e "$dropin_backup" ]; then
+        cp -a "$dropin_backup" "$SSHD_VPSBOX_CONF" || warn "恢复 $SSHD_VPSBOX_CONF 失败。"
+    else
+        rm -f "$SSHD_VPSBOX_CONF" || warn "删除 $SSHD_VPSBOX_CONF 失败。"
+    fi
+}
+
+write_vpsbox_ssh_config() {
+    local tmp
+
+    mkdir -p "$SSHD_CONFIG_DIR" || return 1
+    tmp="$(mktemp)" || return 1
+    cat > "$tmp" <<EOF || { rm -f "$tmp"; return 1; }
+# Managed by VPSBox
+Port $SSH_TARGET_PORT
+LoginGraceTime 1m
+StrictModes yes
+PubkeyAuthentication yes
+PermitEmptyPasswords no
+UsePAM yes
+UseDNS no
+EOF
+    install -m 644 "$tmp" "$SSHD_VPSBOX_CONF" || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+}
+
+validate_vpsbox_ssh_effective_config() {
+    local bin
+
+    bin="$(sshd_binary)" || { err "未找到 sshd，无法检查 SSH 配置。"; return 1; }
+
+    if ! "$bin" -t; then
+        err "sshd -t 检查未通过。"
+        return 1
+    fi
+
+    if ! ssh_effective_ports_match_target; then
+        err "SSH 当前生效端口不是 $SSH_TARGET_PORT，当前为：$(ssh_port_state)"
+        warn "可能还有其他 SSH 配置文件也写了 Port，请先检查 /etc/ssh/sshd_config 和 /etc/ssh/sshd_config.d/。"
+        return 1
+    fi
+
+    if ! ssh_basic_hardening_effective; then
+        err "SSH 基础加固项未全部生效。"
+        return 1
+    fi
+}
+
+restart_ssh_service() {
+    if is_systemd; then
+        retry 3 2 systemctl restart ssh || retry 3 2 systemctl restart sshd
+    elif command -v service >/dev/null 2>&1; then
+        retry 3 2 service ssh restart || retry 3 2 service sshd restart
+    else
+        err "未找到可用的 SSH 服务重启方式。"
+        return 1
+    fi
+}
+
+sync_fail2ban_sshd_port() {
+    if ! fail2ban_installed; then
+        return 0
+    fi
+
+    mkdir -p /etc/fail2ban/jail.d || return 1
+    cat > /etc/fail2ban/jail.d/99-vpsbox-sshd-port.local <<EOF
+[sshd]
+port = $SSH_TARGET_PORT
+EOF
+
+    if is_systemd; then
+        retry 3 2 systemctl restart fail2ban || return 1
+    elif command -v rc-service >/dev/null 2>&1; then
+        retry 3 2 rc-service fail2ban restart || return 1
+    fi
+}
+
+apply_ssh_port_hardening() {
+    local confirm
+    local suffix
+    local main_backup=""
+    local dropin_backup=""
+
+    if ! sshd_binary >/dev/null 2>&1; then
+        err "未找到 sshd，无法修改 SSH 配置。"
+        return 1
+    fi
+
+    if [ ! -f "$SSHD_MAIN_CONF" ]; then
+        err "未找到 SSH 主配置：$SSHD_MAIN_CONF"
+        return 1
+    fi
+
+    if ssh_vpsbox_settings_effective; then
+        info "SSH 端口与基础加固已经生效，无需重复应用。"
+        read -r -p "仍要重新写入并重启 SSH？[y/N]: " confirm
+        case "$confirm" in
+            y|Y|yes|YES) ;;
+            *) info "已取消重复应用。"; return 0 ;;
+        esac
+    fi
+
+    read -r -p "确认已在商家安全组放行 TCP $SSH_TARGET_PORT？输入 YES 继续: " confirm
+    if [ "$confirm" != "YES" ]; then
+        info "已取消，未修改 SSH 配置。"
+        return 0
+    fi
+
+    suffix="$(date +%F-%H%M%S)"
+    if ! main_backup="$(backup_ssh_file "$SSHD_MAIN_CONF" "$suffix")"; then
+        err "备份 $SSHD_MAIN_CONF 失败，已取消修改。"
+        return 1
+    fi
+    if ! dropin_backup="$(backup_ssh_file "$SSHD_VPSBOX_CONF" "$suffix")"; then
+        err "备份 $SSHD_VPSBOX_CONF 失败，已取消修改。"
+        return 1
+    fi
+
+    if ! write_vpsbox_ssh_config || ! ensure_sshd_dropin_include; then
+        err "写入 SSH 配置失败，正在回滚。"
+        restore_ssh_config_backup "$main_backup" "$dropin_backup"
+        return 1
+    fi
+
+    if ! validate_vpsbox_ssh_effective_config; then
+        err "SSH 配置验证失败，正在回滚。"
+        restore_ssh_config_backup "$main_backup" "$dropin_backup"
+        return 1
+    fi
+
+    if ! restart_ssh_service; then
+        err "SSH 服务重启失败，正在回滚配置并尝试恢复服务。"
+        restore_ssh_config_backup "$main_backup" "$dropin_backup"
+        restart_ssh_service >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    if sync_fail2ban_sshd_port; then
+        fail2ban_installed && info "Fail2ban sshd 端口已同步为 $SSH_TARGET_PORT。"
+    else
+        warn "Fail2ban sshd 端口同步失败，请稍后检查 fail2ban-client status sshd。"
+    fi
+
+    info "SSH 端口与基础加固已应用。"
+    [ -n "$main_backup" ] && info "主配置备份：$main_backup"
+    [ -n "$dropin_backup" ] && info "vpsbox SSH 配置备份：$dropin_backup"
+    warn "不要关闭当前 SSH 窗口。"
+    warn "请另开一个新窗口测试：ssh -p $SSH_TARGET_PORT root@你的服务器IP"
+    warn "确认新端口可以登录后，再去商家安全组关闭 TCP 22。"
+}
+
+show_current_ssh_config() {
+    local port
+    local login_grace
+    local strict_modes
+    local pubkey_auth
+    local empty_passwords
+    local use_pam
+    local use_dns
+
+    if ! sshd_binary >/dev/null 2>&1; then
+        err "未找到 sshd，无法查看 SSH 当前生效配置。"
+        return 1
+    fi
+
+    port="$(ssh_port_state)"
+    login_grace="$(sshd_effective_value logingracetime)"
+    strict_modes="$(sshd_effective_value strictmodes)"
+    pubkey_auth="$(sshd_effective_value pubkeyauthentication)"
+    empty_passwords="$(sshd_effective_value permitemptypasswords)"
+    use_pam="$(sshd_effective_value usepam)"
+    use_dns="$(sshd_effective_value usedns)"
+
+    cat <<EOF
+========================================
+ SSH 当前生效配置
+========================================
+1. Port
+   当前值：$port
+   作用：SSH 实际监听端口。
+
+2. LoginGraceTime
+   当前值：$login_grace
+   作用：登录认证最多等待时间，超时断开。
+
+3. StrictModes
+   当前值：$strict_modes
+   作用：检查用户目录和 ~/.ssh 权限，权限不安全会拒绝登录。
+
+4. PubkeyAuthentication
+   当前值：$pubkey_auth
+   作用：是否允许 SSH 密钥登录。
+
+5. PermitEmptyPasswords
+   当前值：$empty_passwords
+   作用：是否禁止空密码账号登录；no 表示禁止空密码登录。
+
+6. UsePAM
+   当前值：$use_pam
+   作用：是否使用 Debian PAM 登录/会话流程。
+
+7. UseDNS
+   当前值：$use_dns
+   作用：是否进行 DNS 反向解析；no 通常可减少登录卡顿。
+----------------------------------------
+监听状态：
+EOF
+
+    if command -v ss >/dev/null 2>&1; then
+        ss -H -tlnp 2>/dev/null | awk '/sshd/ { print " " $0 }' || true
+    else
+        echo " 未找到 ss 命令，无法查看监听状态。"
+    fi
+
+    cat <<EOF
+----------------------------------------
+配置来源：
+ $SSHD_VPSBOX_CONF $([ -f "$SSHD_VPSBOX_CONF" ] && echo "存在" || echo "不存在")
+========================================
+EOF
+}
+
+ssh_port_hardening_menu() {
+    local opt
+
+    while true; do
+        clear 2>/dev/null || true
+        cat <<EOF
+========================================
+ SSH 端口与基础加固
+========================================
+ 当前 SSH 端口：$(ssh_port_state)
+ 目标 SSH 端口：$SSH_TARGET_PORT
+ 加固配置：$(ssh_hardening_state)
+----------------------------------------
+将写入：
+$SSHD_VPSBOX_CONF
+
+1. Port $SSH_TARGET_PORT
+   修改 SSH 监听端口，减少 22 端口扫描噪音。
+   请先在商家安全组放行 TCP $SSH_TARGET_PORT。
+
+2. LoginGraceTime 1m
+   登录认证最多等待 1 分钟，超时断开。
+
+3. StrictModes yes
+   检查用户目录和 ~/.ssh 权限，权限不安全会拒绝登录。
+
+4. PubkeyAuthentication yes
+   允许 SSH 密钥登录；没有密钥也不影响密码登录。
+
+5. PermitEmptyPasswords no
+   禁止空密码账号通过 SSH 登录。
+
+6. UsePAM yes
+   保持 Debian 默认 PAM 登录/会话流程。
+
+7. UseDNS no
+   登录时不做反向 DNS 查询，减少登录卡顿。
+----------------------------------------
+ 1) 应用 SSH 端口与基础加固
+ 2) 查看 SSH 当前生效配置
+ 0) 返回
+========================================
+EOF
+        read -r -p "请输入选项: " opt
+        echo ""
+
+        case "$opt" in
+            1) apply_ssh_port_hardening; pause ;;
+            2) show_current_ssh_config; pause ;;
+            0) return 0 ;;
+            *) warn "无效选项：$opt"; pause ;;
+        esac
+    done
+}
+
 update_system_packages() {
     detect_os
     if [ "$OS" != "debian" ]; then
@@ -1894,6 +2295,16 @@ EOF
     check_ok "BBR" "$(bbr_state)"
     check_ok "fq" "$(fq_state)"
     check_ok "IPv4 优先" "$(ipv4_priority_state)"
+    if ssh_effective_ports_match_target; then
+        check_ok "SSH 端口" "$(ssh_port_state)"
+    else
+        check_warn "SSH 端口" "$(ssh_port_state)"
+    fi
+    if ssh_basic_hardening_effective; then
+        check_ok "SSH 基础加固" "$(ssh_hardening_state)"
+    else
+        check_warn "SSH 基础加固" "$(ssh_hardening_state)"
+    fi
     check_ok "Fail2ban" "$(fail2ban_install_state)"
     check_ok "Fail2ban 状态" "$(fail2ban_service_state)"
     check_ok "SSH 防护" "$(fail2ban_sshd_state)"
@@ -2370,6 +2781,8 @@ system_menu() {
  BBR：$(bbr_state)
  fq：$(fq_state)
  IPv4 优先：$(ipv4_priority_state)
+ SSH 端口：$(ssh_port_state)
+ SSH 加固：$(ssh_hardening_state)
  Fail2ban：$(fail2ban_service_state)
  SSH 防护：$(fail2ban_sshd_state)
  系统重启：$(reboot_required_state)
@@ -2380,6 +2793,7 @@ system_menu() {
  4) 限制 systemd 日志大小
  5) 修改系统 IPv4 DNS
  6) 启用系统 IPv4 优先
+ 7) SSH 端口与基础加固
  0) 返回主菜单
 ========================================
 EOF
@@ -2393,6 +2807,7 @@ EOF
             4) limit_systemd_journal; pause ;;
             5) change_ipv4_dns; pause ;;
             6) enable_ipv4_priority; pause ;;
+            7) ssh_port_hardening_menu ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac

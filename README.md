@@ -72,6 +72,7 @@ sing-box 管理
 4) 限制 systemd 日志大小
 5) 修改系统 IPv4 DNS
 6) 启用系统 IPv4 优先
+7) SSH 端口与基础加固
 0) 返回主菜单
 ```
 
@@ -94,6 +95,7 @@ sing-box 管理
 - 限制 systemd 日志大小
 - 修改系统 IPv4 DNS
 - 启用系统 IPv4 优先，IPv4 不可用时 IPv6 仍可兜底
+- SSH 端口与基础加固，支持改为 23333、同步 Fail2ban 端口并查看 SSH 当前生效配置
 - 更新 sing-box
 - 更新 vpsbox 脚本
 - 打开管理面板时自动检查并更新 vpsbox
