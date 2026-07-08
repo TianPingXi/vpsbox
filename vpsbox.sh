@@ -1406,11 +1406,12 @@ fail2ban_sshd_state() {
 }
 
 chrony_service_name() {
-    if is_systemd && systemctl list-unit-files chronyd.service 2>/dev/null | grep -q '^chronyd\.service'; then
-        echo "chronyd"
-    else
-        echo "chrony"
-    fi
+    detect_os
+    case "$OS" in
+        debian) echo "chrony" ;;
+        redhat) echo "chronyd" ;;
+        *) echo "chrony" ;;
+    esac
 }
 
 chrony_conf_path() {
