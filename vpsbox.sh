@@ -32,6 +32,7 @@ FAIL2BAN_VPSBOX_SSHD_CONF="$FAIL2BAN_CONFIG_DIR/99-vpsbox-sshd.local"
 RUNTIME_DIR="/run/vpsbox"
 LOCK_FILE="$RUNTIME_DIR/vpsbox.lock"
 LOCK_DIR="$RUNTIME_DIR/lockdir"
+LOCK_USING_FLOCK=0
 LOCK_USING_DIR=0
 SERVICE_NAME="sing-box"
 METHOD="2022-blake3-aes-128-gcm"
@@ -181,8 +182,17 @@ terminate_orphaned_vpsbox_menu() {
 }
 
 cleanup_vpsbox_lock() {
+    if [ "$LOCK_USING_FLOCK" = "1" ]; then
+        flock -u 200 2>/dev/null || true
+        exec 200>&-
+        LOCK_USING_FLOCK=0
+        if [ -f "$LOCK_FILE" ] && [ ! -L "$LOCK_FILE" ]; then
+            : > "$LOCK_FILE"
+        fi
+    fi
     if [ "$LOCK_USING_DIR" = "1" ] && [ -d "$LOCK_DIR" ] && [ ! -L "$LOCK_DIR" ]; then
         rm -rf "$LOCK_DIR"
+        LOCK_USING_DIR=0
     fi
 }
 
@@ -282,6 +292,7 @@ acquire_lock() {
     if command -v flock >/dev/null 2>&1; then
         exec 200>"$LOCK_FILE"
         if flock -n 200; then
+            LOCK_USING_FLOCK=1
             write_flock_metadata
             install_lock_cleanup_traps
             return 0
@@ -290,6 +301,7 @@ acquire_lock() {
         old_pid="$(lock_pid_from_file "$LOCK_FILE" || true)"
         if old_menu_lost_terminal "$LOCK_FILE" "$old_pid" && terminate_orphaned_vpsbox_menu "$old_pid"; then
             if flock -n 200; then
+                LOCK_USING_FLOCK=1
                 write_flock_metadata
                 install_lock_cleanup_traps
                 return 0
@@ -297,6 +309,7 @@ acquire_lock() {
         fi
         if terminate_old_vpsbox_menu "$old_pid"; then
             if flock -n 200; then
+                LOCK_USING_FLOCK=1
                 write_flock_metadata
                 install_lock_cleanup_traps
                 return 0
