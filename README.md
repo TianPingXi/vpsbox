@@ -2,6 +2,8 @@
 
 VPS 初始化、系统优化与 sing-box 节点管理脚本。
 
+当前版本：`v1.0.0`
+
 ## VPS 一键安装
 
 ```bash
@@ -93,17 +95,32 @@ sing-box 管理
 - 一键自检，包含系统优化状态和端口安全组建议
 - 三网回程检测
 - 系统更新
-- 一键开启 BBR + fq
+- 一键开启 BBR + fq（先验证内核能力与运行时生效，再写入持久化配置；失败会恢复运行时参数）
 - 安装 Fail2ban
 - 开启 NTP 时间同步，使用 chrony 自动校准系统时间并设置开机自启
-- 限制 systemd 日志大小
+- 限制 systemd 日志大小（使用独立 drop-in，历史日志清理需单独确认）
 - 修改系统 IPv4 DNS
 - 启用系统 IPv4 优先，IPv4 不可用时 IPv6 仍可兜底
-- 修改 SSH 端口为 23333，并同步 Fail2ban sshd 端口
+- 修改 SSH 端口为 23333，并按 SSH 当前实际生效端口同步 Fail2ban sshd jail
 - SSH 基础加固，启用低风险 SSH 配置项
 - 查看 SSH 当前生效配置
-- 更新 sing-box
+- 更新 sing-box（节点配置检查或服务恢复失败时，自动尝试恢复更新前的二进制）
 - 更新 vpsbox 脚本
-- 打开管理面板时自动检查并更新 vpsbox
+- 打开已安装的管理面板时检查远程版本，只提示更新，不自动覆盖本地脚本
 - 卸载 VPSBox
 - 可单独确认删除 sing-box 和所有节点配置
+
+## 安全与恢复说明
+
+- 节点状态文件按固定字段解析，不作为 Shell 脚本执行；配置目录拒绝符号链接，并要求 root 所有权和限制性权限。
+- 修改普通 `/etc/resolv.conf` 前必须成功备份，写入时保留非 `nameserver` 行，修改后验证域名解析；未知 DNS 符号链接会拒绝直接覆盖。
+- 修改 systemd-resolved 配置失败或解析验证失败时，会恢复原配置并尝试重新启动服务。
+- 配置 chrony 时会先备份配置并确认 chrony 可用，再停用 systemd-timesyncd；后续步骤失败会恢复原 NTP 配置和服务状态。
+- journald 限制写入 `/etc/systemd/journald.conf.d/99-vpsbox.conf`，不会直接改写发行版主配置；重启或生效检查失败会回滚该 drop-in。
+- BBR/fq 仅在内核模块加载和运行时参数验证均通过后才保存到 `/etc/sysctl.d/99-vpsbox-bbr.conf`。
+- sing-box 更新会临时备份当前命令解析到的二进制；若新版不能通过节点配置检查或服务不能恢复，会尝试还原该二进制。通过系统包管理器升级的相关依赖不保证降级。
+- VPSBox 将自己修改前的 DNS、BBR、IPv4 优先、Fail2ban、chrony 和 journald 文件保存到 `/etc/vpsbox/`，可在“系统优化”菜单中查看并输入 `YES` 恢复；恢复成功后会清除对应清单标记。
+- SSH 主配置与 VPSBox drop-in 也会保存到该目录，但只能在“修改 SSH 端口”子菜单中单独恢复。恢复前会提示连接风险，恢复后执行 `sshd -t`、重启 SSH 并确认原端口监听；请先准备控制台或备用连接。
+- 删除节点前会确认 sing-box 已停止、节点端口不再监听，并尝试禁用开机启动。
+- VPSBox 更新必须通过菜单手动触发；新脚本需包含有效版本号并通过 Bash 语法检查，旧脚本保留在 `/usr/local/bin/vpsbox.previous`。
+- 卸载 VPSBox 不会自动恢复已经应用的 SSH、DNS、BBR、IPv4 优先、Fail2ban、NTP 或 journald 系统设置。
