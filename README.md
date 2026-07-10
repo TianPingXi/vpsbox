@@ -121,6 +121,7 @@ sing-box 管理
 - sing-box 更新会临时备份当前命令解析到的二进制；若新版不能通过节点配置检查或服务不能恢复，会尝试还原该二进制。通过系统包管理器升级的相关依赖不保证降级。
 - VPSBox 将自己修改前的 DNS、BBR、IPv4 优先、Fail2ban、chrony 和 journald 文件保存到 `/etc/vpsbox/`，可在“系统优化”菜单中查看并输入 `YES` 恢复；恢复成功后会清除对应清单标记。
 - SSH 主配置与 VPSBox drop-in 也会保存到该目录，但只能在“修改 SSH 端口”子菜单中单独恢复。恢复前会提示连接风险，恢复后执行 `sshd -t`、重启 SSH 并确认原端口监听；请先准备控制台或备用连接。
+- 系统工具提供垃圾清理和主机名修改：垃圾清理先预览并分项确认，只处理包缓存、过期临时文件、VPSBox 过期备份和明确确认的历史日志；主机名修改会备份 `/etc/hostname` 与 `/etc/hosts` 并支持恢复。
 - 删除节点前会确认 sing-box 已停止、节点端口不再监听，并尝试禁用开机启动。
 - VPSBox 更新必须通过菜单手动触发；新脚本需包含有效版本号并通过 Bash 语法检查，旧脚本保留在 `/usr/local/bin/vpsbox.previous`。
 - 卸载 VPSBox 不会自动恢复已经应用的 SSH、DNS、BBR、IPv4 优先、Fail2ban、NTP 或 journald 系统设置。

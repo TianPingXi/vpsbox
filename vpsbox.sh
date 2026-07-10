@@ -19,6 +19,8 @@ CHANGE_BACKUP_DIR="$VPSBOX_STATE_DIR/backups"
 GAI_CONF="/etc/gai.conf"
 NTP_SOURCES_BEGIN="# BEGIN VPSBOX NTP SOURCES"
 NTP_SOURCES_END="# END VPSBOX NTP SOURCES"
+HOSTNAME_BEGIN="# BEGIN VPSBOX HOSTNAME"
+HOSTNAME_END="# END VPSBOX HOSTNAME"
 SSHD_MAIN_CONF="/etc/ssh/sshd_config"
 SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
 SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
@@ -3665,10 +3667,135 @@ uninstall_all() {
     exit 0
 }
 
+is_valid_hostname_value() {
+    local value="$1"
+    [ -n "$value" ] && [ "${#value}" -le 253 ] || return 1
+    [[ "$value" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
+    local label
+    IFS='.' read -ra labels <<< "$value"
+    for label in "${labels[@]}"; do
+        [ -n "$label" ] && [ "${#label}" -le 63 ] || return 1
+        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+    done
+}
+
+hostname_current_value() {
+    hostnamectl --static 2>/dev/null || hostname 2>/dev/null
+}
+
+set_system_hostname() {
+    local value="$1"
+    if command -v hostnamectl >/dev/null 2>&1; then
+        hostnamectl set-hostname "$value"
+    else
+        hostname "$value"
+    fi
+}
+
+change_system_hostname() {
+    local old new tmp
+    old="$(hostname_current_value)"
+    echo "当前主机名：$old"
+    read -r -p "请输入新主机名（留空取消）: " new
+    [ -n "$new" ] || { info "已取消。"; return 0; }
+    is_valid_hostname_value "$new" || { err "主机名格式不正确。"; return 1; }
+    [ "$new" != "$old" ] || { info "新旧主机名相同。"; return 0; }
+    backup_change_file_once HOSTNAME_FILE /etc/hostname || return 1
+    backup_change_file_once HOSTS_FILE /etc/hosts || return 1
+
+    tmp="$(mktemp /etc/.hostname.vpsbox.XXXXXX)" || return 1
+    printf '%s\n' "$new" > "$tmp"
+    if ! chown root:root "$tmp" || ! chmod 644 "$tmp" || ! mv -f "$tmp" /etc/hostname || ! set_system_hostname "$new"; then
+        rm -f "$tmp"
+        restore_change_file HOSTNAME_FILE /etc/hostname || true
+        set_system_hostname "$old" 2>/dev/null || true
+        err "主机名修改失败，已尝试恢复原主机名。"
+        return 1
+    fi
+
+    tmp="$(mktemp /etc/.hosts.vpsbox.XXXXXX)" || {
+        restore_change_file HOSTNAME_FILE /etc/hostname || true
+        set_system_hostname "$old" 2>/dev/null || true
+        return 1
+    }
+    awk -v begin="$HOSTNAME_BEGIN" -v end="$HOSTNAME_END" '
+        $0 == begin { skip=1; next }
+        $0 == end { skip=0; next }
+        !skip { print }
+    ' /etc/hosts > "$tmp"
+    {
+        printf '%s\n' "$HOSTNAME_BEGIN"
+        printf '127.0.1.1 %s\n' "$new"
+        printf '%s\n' "$HOSTNAME_END"
+    } >> "$tmp"
+    if ! chown root:root "$tmp" || ! chmod 644 "$tmp" || ! mv -f "$tmp" /etc/hosts; then
+        rm -f "$tmp"
+        restore_change_file HOSTNAME_FILE /etc/hostname || true
+        restore_change_file HOSTS_FILE /etc/hosts || true
+        hostnamectl set-hostname "$old" 2>/dev/null || true
+        err "更新 /etc/hosts 失败，已恢复原配置。"
+        return 1
+    fi
+    manifest_set HOSTNAME_VALUE "$old" || return 1
+    mark_change_applied HOSTNAME || return 1
+    info "主机名已修改为：$new"
+}
+
+cleanup_size_for() {
+    local path="$1"
+    [ -d "$path" ] || { echo 0; return; }
+    du -sb "$path" 2>/dev/null | awk '{print $1}'
+}
+
+cleanup_preview() {
+    local path size
+    for path in /var/cache/apt /var/cache/dnf /var/cache/yum /var/cache/apk /tmp /var/tmp "$CHANGE_BACKUP_DIR"; do
+        [ -d "$path" ] || continue
+        size="$(cleanup_size_for "$path")"
+        printf '%-30s %s bytes\n' "$path" "$size"
+    done
+    command -v journalctl >/dev/null 2>&1 && journalctl --disk-usage 2>/dev/null || true
+}
+
+cleanup_old_temp_files() {
+    local path="$1"
+    [ -d "$path" ] || return 0
+    find "$path" -xdev -type f -user root -mtime +7 -print -delete 2>/dev/null || true
+}
+
+cleanup_system_garbage() {
+    local confirm journal_confirm
+    echo "将扫描并清理：包管理器缓存、超过 7 天的 root 临时文件、VPSBox 过期备份。"
+    echo "不会清理节点配置、用户主目录、Docker 数据卷或数据库。"
+    cleanup_preview
+    read -r -p "确认执行垃圾清理？请输入 YES：" confirm
+    [ "$confirm" = "YES" ] || { info "已取消清理。"; return 0; }
+
+    if command -v apt-get >/dev/null 2>&1; then apt-get clean || warn "APT 缓存清理失败。"; fi
+    if command -v dnf >/dev/null 2>&1; then dnf clean all || warn "DNF 缓存清理失败。"; fi
+    if command -v yum >/dev/null 2>&1; then yum clean all || warn "YUM 缓存清理失败。"; fi
+    if command -v apk >/dev/null 2>&1; then apk cache clean || warn "APK 缓存清理失败。"; fi
+    cleanup_old_temp_files /tmp
+    cleanup_old_temp_files /var/tmp
+    if [ -d "$CHANGE_BACKUP_DIR" ]; then
+        find "$CHANGE_BACKUP_DIR" -xdev -type f -mtime +30 -delete 2>/dev/null || warn "VPSBox 过期备份清理不完整。"
+    fi
+    if command -v journalctl >/dev/null 2>&1; then
+        read -r -p "是否清理超过 30 天的 systemd 日志？请输入 YES，其他输入跳过：" journal_confirm
+        if [ "$journal_confirm" = "YES" ]; then
+            journalctl --vacuum-time=30d || warn "systemd 历史日志清理失败。"
+        else
+            info "已跳过 systemd 历史日志清理。"
+        fi
+    fi
+    info "垃圾清理完成，当前占用："
+    cleanup_preview
+}
+
 show_vpsbox_changes() {
     local name
     echo "VPSBox 已记录的系统变更："
-    for name in DNS_RESOLV DNS_RESOLVED BBR_CONF GAI_CONF FAIL2BAN_SSHD NTP_CONF JOURNALD_CONF; do
+    for name in HOSTNAME DNS_RESOLV DNS_RESOLVED BBR_CONF GAI_CONF FAIL2BAN_SSHD NTP_CONF JOURNALD_CONF; do
         if [ "$(manifest_value "APPLIED_$name" 2>/dev/null || true)" = "1" ]; then
             printf ' - %s：可恢复\n' "$name"
         fi
@@ -3678,11 +3805,18 @@ show_vpsbox_changes() {
 }
 
 restore_vpsbox_system_changes() {
-    local confirm cc fq chrony timesyncd failed=0
+    local confirm cc fq chrony timesyncd old failed=0
 
     show_vpsbox_changes
     read -r -p "恢复上述 VPSBox 已记录的系统设置？请输入 YES：" confirm
     [ "$confirm" = "YES" ] || { info "已取消恢复。"; return 0; }
+
+    if [ "$(manifest_value APPLIED_HOSTNAME 2>/dev/null || true)" = "1" ]; then
+        restore_change_file HOSTNAME_FILE /etc/hostname || failed=1
+        restore_change_file HOSTS_FILE /etc/hosts || failed=1
+        old="$(manifest_value HOSTNAME_VALUE 2>/dev/null || true)"
+        [ -n "$old" ] && set_system_hostname "$old" 2>/dev/null || failed=1
+    fi
 
     if [ "$(manifest_value APPLIED_DNS_RESOLV 2>/dev/null || true)" = "1" ] && ! restore_change_file DNS_RESOLV /etc/resolv.conf; then failed=1; fi
     if [ "$(manifest_value APPLIED_DNS_RESOLVED 2>/dev/null || true)" = "1" ] && ! restore_change_file DNS_RESOLVED /etc/systemd/resolved.conf.d/vpsbox.conf; then failed=1; fi
@@ -3718,9 +3852,13 @@ restore_vpsbox_system_changes() {
         err "部分文件恢复失败；已保留变更清单和备份，请修复权限或路径后重试。"
         return 1
     fi
-    for name in DNS_RESOLV DNS_RESOLVED BBR_CONF GAI_CONF FAIL2BAN_SSHD JOURNALD_CONF NTP_CONF NTP_SOURCES; do
+    for name in HOSTNAME_FILE HOSTS_FILE DNS_RESOLV DNS_RESOLVED BBR_CONF GAI_CONF FAIL2BAN_SSHD JOURNALD_CONF NTP_CONF NTP_SOURCES; do
         [ "$(manifest_value "APPLIED_$name" 2>/dev/null || true)" = "1" ] && clear_change_tracking "$name" || true
     done
+    clear_change_tracking HOSTNAME_FILE || true
+    clear_change_tracking HOSTS_FILE || true
+    manifest_remove APPLIED_HOSTNAME || true
+    manifest_remove HOSTNAME_VALUE || true
     clear_change_tracking NTP_SOURCES || true
     manifest_remove NTP_CHRONY_ACTIVE || true
     manifest_remove NTP_CHRONY_ENABLED || true
@@ -4005,6 +4143,8 @@ system_menu() {
  9) 查看 SSH 当前生效配置
  10) 开启 NTP 时间同步
  11) 查看/恢复 VPSBox 系统改动
+ 12) 垃圾清理
+ 13) 修改主机名
  0) 返回主菜单
 ========================================
 EOF
@@ -4023,6 +4163,8 @@ EOF
             9) show_current_ssh_config; pause ;;
             10) enable_ntp_sync; pause ;;
             11) restore_vpsbox_system_changes; pause ;;
+            12) cleanup_system_garbage; pause ;;
+            13) change_system_hostname; pause ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
