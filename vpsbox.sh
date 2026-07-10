@@ -1149,6 +1149,8 @@ normalize_host() {
     local no_colons
     local colon_count
 
+    host="${host//$'\033[200~'/}"
+    host="${host//$'\033[201~'/}"
     host="$(echo "$host" | tr -d '[:space:]')"
     host="${host#http://}"
     host="${host#https://}"
@@ -1816,6 +1818,7 @@ create_or_rebuild_node() {
             err "请只输入一次域名或 IP。"
             continue
         fi
+        info "已识别节点连接地址：$domain"
         break
     done
 
@@ -1925,6 +1928,7 @@ create_vless_reality_node() {
             err "请只输入一次域名或 IP。"
             continue
         fi
+        info "已识别节点连接地址：$domain"
         break
     done
 
