@@ -845,6 +845,54 @@ service_is_running() {
     [ "$(service_status_short)" = "运行中" ]
 }
 
+singbox_config_pids() {
+    local proc pid exe
+    local -a args
+
+    for proc in /proc/[0-9]*; do
+        [ -r "$proc/cmdline" ] || continue
+        pid="${proc##*/}"
+        [ "$pid" != "$$" ] || continue
+        exe="$(readlink "$proc/exe" 2>/dev/null || true)"
+        [ "${exe##*/}" = "sing-box" ] || continue
+        mapfile -d '' -t args < "$proc/cmdline" 2>/dev/null || true
+        [ "${#args[@]}" -ge 4 ] || continue
+        if [ "${args[1]}" = "run" ] && [ "${args[2]}" = "-c" ] && [ "${args[3]}" = "$CONFIG_PATH" ]; then
+            printf '%s\n' "$pid"
+        fi
+    done
+}
+
+stop_singbox_config_processes() {
+    local pids pid i
+
+    pids="$(singbox_config_pids)"
+    [ -n "$pids" ] || return 0
+    warn "检测到使用 $CONFIG_PATH 的残留 sing-box 进程，正在停止：$(echo "$pids" | tr '\n' ' ')"
+    while read -r pid; do
+        [ -n "$pid" ] && kill -TERM "$pid" 2>/dev/null || true
+    done <<< "$pids"
+    for i in 1 2 3 4 5; do
+        [ -z "$(singbox_config_pids)" ] && return 0
+        sleep 1
+    done
+    pids="$(singbox_config_pids)"
+    while read -r pid; do
+        [ -n "$pid" ] && kill -KILL "$pid" 2>/dev/null || true
+    done <<< "$pids"
+    sleep 1
+    [ -z "$(singbox_config_pids)" ]
+}
+
+restart_singbox_cleanly() {
+    service_stop 2>/dev/null || true
+    stop_singbox_config_processes || {
+        err "旧 sing-box 进程无法停止，已拒绝启动新实例。"
+        return 1
+    }
+    service_start
+}
+
 show_service_status() {
     if is_systemd; then
         systemctl status "$SERVICE_NAME" --no-pager || true
@@ -1237,6 +1285,17 @@ is_valid_node_host() {
     is_ip_address "$host" || is_domain_name "$host"
 }
 
+is_repeated_node_host() {
+    local host="${1,,}"
+    local length="${#1}"
+    local half
+
+    [ "$length" -ge 8 ] || return 1
+    ((length % 2 == 0)) || return 1
+    half=$((length / 2))
+    [ "${host:0:half}" = "${host:half:half}" ]
+}
+
 uri_host() {
     local host="$1"
     if [[ "$host" == *:* && "$host" != \[*\] ]]; then
@@ -1343,7 +1402,7 @@ restore_node_files() {
     fi
 
     if [ "$was_running" = "1" ] && [ -f "$CONFIG_PATH" ] && singbox_installed; then
-        service_restart 2>/dev/null || true
+        restart_singbox_cleanly 2>/dev/null || true
         info "旧配置已恢复，sing-box 已尝试重启。"
     else
         info "已恢复到创建前状态。"
@@ -1752,6 +1811,11 @@ create_or_rebuild_node() {
             err "格式不正确，请输入类似 sb.637892.xyz、1.2.3.4 或 2001:db8::1。"
             continue
         fi
+        if is_repeated_node_host "$domain"; then
+            err "检测到节点地址可能被重复粘贴：$domain"
+            err "请只输入一次域名或 IP。"
+            continue
+        fi
         break
     done
 
@@ -1765,6 +1829,22 @@ create_or_rebuild_node() {
         return 1
     fi
     info "节点端口：$port"
+
+    cat <<EOF
+----------------------------------------
+ 请确认节点信息
+ 协议：SS 2022
+ 连接地址：$domain
+ 连接端口：$port
+ 节点名称：$name
+----------------------------------------
+EOF
+    read -r -p "确认无误并创建？请输入 YES：" confirm
+    if [ "$confirm" != "YES" ]; then
+        cleanup_node_backup "$backup_dir"
+        info "已取消，未修改当前节点。"
+        return 0
+    fi
 
     info "正在自动生成随机强密码..."
     password="$(random_password)"
@@ -1795,7 +1875,7 @@ create_or_rebuild_node() {
         return 1
     fi
     info "正在启动 sing-box 服务..."
-    if ! service_restart; then
+    if ! restart_singbox_cleanly; then
         restore_node_files "$backup_dir"
         err "sing-box 启动失败，未创建新节点。"
         return 1
@@ -1840,6 +1920,11 @@ create_vless_reality_node() {
             err "格式不正确，请输入类似 sb.example.com、1.2.3.4 或 2001:db8::1。"
             continue
         fi
+        if is_repeated_node_host "$domain"; then
+            err "检测到节点地址可能被重复粘贴：$domain"
+            err "请只输入一次域名或 IP。"
+            continue
+        fi
         break
     done
 
@@ -1869,6 +1954,23 @@ create_vless_reality_node() {
         return 1
     fi
     info "节点端口：$port"
+
+    cat <<EOF
+----------------------------------------
+ 请确认节点信息
+ 协议：VLESS Reality
+ 连接地址：$domain
+ 连接端口：$port
+ Reality 目标：${server_name}:443
+ 节点名称：$name
+----------------------------------------
+EOF
+    read -r -p "确认无误并创建？请输入 YES：" confirm
+    if [ "$confirm" != "YES" ]; then
+        cleanup_node_backup "$backup_dir"
+        info "已取消，未修改当前节点。"
+        return 0
+    fi
 
     uuid="$(sing-box generate uuid 2>/dev/null | tr -d '\r\n')"
     if [[ ! "$uuid" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
@@ -1908,7 +2010,7 @@ create_vless_reality_node() {
         return 1
     fi
     info "正在启动 sing-box 服务..."
-    if ! service_restart || ! service_is_running || ! wait_for_port_listener "$port"; then
+    if ! restart_singbox_cleanly || ! service_is_running || ! wait_for_port_listener "$port"; then
         restore_node_files "$backup_dir"
         err "sing-box 未保持运行或节点端口未监听，未创建新节点。"
         return 1
@@ -1973,8 +2075,9 @@ delete_node() {
     read -r -p "确认删除当前 ${PROTOCOL:-shadowsocks} 节点？sing-box 服务将停止。(y/N): " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消。"; return 0; }
 
-    if service_is_running && ! service_stop; then
-        err "sing-box 服务停止失败，已保留节点配置。"
+    service_stop 2>/dev/null || warn "服务管理器未能正常停止 sing-box，将继续检查 VPSBox 配置对应的进程。"
+    if ! stop_singbox_config_processes; then
+        err "残留 sing-box 进程无法停止，已保留节点配置。"
         return 1
     fi
     sleep 1
@@ -2033,7 +2136,7 @@ update_singbox() {
             rm -rf "$backup_dir"
             return 1
         fi
-        if ! setup_service || ! service_restart || ! service_is_running; then
+        if ! setup_service || ! restart_singbox_cleanly || ! service_is_running; then
             err "新版 sing-box 未能正常启动，正在恢复旧二进制。"
             service_stop 2>/dev/null || true
             if ! run_singbox_installer "$old_version" && ! cp -a "$backup_binary" "$binary_path"; then
@@ -4430,7 +4533,7 @@ restart_service_action() {
     fi
     install_singbox_if_missing || return 1
     setup_service || return 1
-    service_restart || return 1
+    restart_singbox_cleanly || return 1
     info "sing-box 服务已重启。"
 }
 

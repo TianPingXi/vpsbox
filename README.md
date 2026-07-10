@@ -129,5 +129,6 @@ sing-box 管理
 - sing-box 当前固定为 `v1.13.14`，按发行版和架构下载官方 Release 包；Alpine 不再混用 `edge/community` 源，Debian/Ubuntu 同样使用经过 SHA256 校验的官方包。
 - NextTrace 当前固定为 `v1.7.1`，从官方 GitHub Release 下载并校验 SHA256 后安装；不再执行远程安装脚本。
 - 删除节点前会确认 sing-box 已停止、节点端口不再监听，并尝试禁用开机启动。
+- 删除、重建或重启节点时会清理仍使用 `/etc/sing-box/config.json` 的残留 sing-box 进程，防止旧节点继续占用端口或重复启动实例。
 - VPSBox 更新必须通过菜单手动触发；新脚本需包含有效版本号并通过 Bash 语法检查，旧脚本保留在 `/usr/local/bin/vpsbox.previous`。
 - 卸载 VPSBox 不会自动恢复已经应用的 SSH、DNS、BBR、IPv4 优先、Fail2ban、NTP 或 journald 系统设置。
