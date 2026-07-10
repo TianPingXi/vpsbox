@@ -56,6 +56,18 @@ info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 
+confirm_default_yes() {
+    local prompt="$1" answer
+    while true; do
+        read -r -p "$prompt (Y/n): " answer || return 1
+        case "$answer" in
+            ""|Y|y) return 0 ;;
+            N|n) return 1 ;;
+            *) warn "请输入 y 或 n；直接回车默认 y。" ;;
+        esac
+    done
+}
+
 retry() {
     local max="$1"
     local delay="$2"
@@ -1149,8 +1161,7 @@ normalize_host() {
     local no_colons
     local colon_count
 
-    host="${host//$'\033[200~'/}"
-    host="${host//$'\033[201~'/}"
+    host="$(sanitize_paste_input "$host")"
     host="$(echo "$host" | tr -d '[:space:]')"
     host="${host#http://}"
     host="${host#https://}"
@@ -1171,6 +1182,17 @@ normalize_host() {
 
     host="${host%.}"
     echo "$host"
+}
+
+sanitize_paste_input() {
+    local value="$1"
+
+    value="${value//$'\033[200~'/}"
+    value="${value//$'\033[201~'/}"
+    value="$(printf '%s' "$value" | LC_ALL=C tr -d '\000-\037\177')"
+    value="${value#\[200~}"
+    value="${value%\[201~}"
+    printf '%s' "$value"
 }
 
 is_ipv4_address() {
@@ -1823,8 +1845,18 @@ create_or_rebuild_node() {
     done
 
     default_name="$(default_name_for_host "$domain")"
-    read -r -p "请输入节点名称，留空默认 ${default_name}：" input_name
-    name="$(sanitize_name "${input_name:-$default_name}")"
+    while true; do
+        read -r -p "请输入节点名称，留空默认 ${default_name}：" input_name
+        input_name="$(sanitize_paste_input "$input_name")"
+        if [ -n "$input_name" ] && [[ "${input_name,,}" == "${domain,,}"* ]]; then
+            err "检测到节点名称包含连接地址前缀，可能是粘贴残留：$input_name"
+            err "请重新输入节点名称。"
+            continue
+        fi
+        name="$(sanitize_name "${input_name:-$default_name}")"
+        info "已识别节点名称：$name"
+        break
+    done
 
     if ! port="$(choose_node_port "$existing_port")"; then
         cleanup_node_backup "$backup_dir"
@@ -1842,8 +1874,7 @@ create_or_rebuild_node() {
  节点名称：$name
 ----------------------------------------
 EOF
-    read -r -p "确认无误并创建？请输入 YES：" confirm
-    if [ "$confirm" != "YES" ]; then
+    if ! confirm_default_yes "确认无误并创建？"; then
         cleanup_node_backup "$backup_dir"
         info "已取消，未修改当前节点。"
         return 0
@@ -1934,8 +1965,18 @@ create_vless_reality_node() {
 
     default_name="$(default_name_for_host "$domain")"
     default_name="vless-${default_name#ss-}"
-    read -r -p "请输入节点名称，留空默认 ${default_name}：" input_name
-    name="$(sanitize_name "${input_name:-$default_name}")"
+    while true; do
+        read -r -p "请输入节点名称，留空默认 ${default_name}：" input_name
+        input_name="$(sanitize_paste_input "$input_name")"
+        if [ -n "$input_name" ] && [[ "${input_name,,}" == "${domain,,}"* ]]; then
+            err "检测到节点名称包含连接地址前缀，可能是粘贴残留：$input_name"
+            err "请重新输入节点名称。"
+            continue
+        fi
+        name="$(sanitize_name "${input_name:-$default_name}")"
+        info "已识别节点名称：$name"
+        break
+    done
 
     while true; do
         read -r -p "请输入 Reality 目标域名/SNI：" input_sni
@@ -1969,8 +2010,7 @@ create_vless_reality_node() {
  节点名称：$name
 ----------------------------------------
 EOF
-    read -r -p "确认无误并创建？请输入 YES：" confirm
-    if [ "$confirm" != "YES" ]; then
+    if ! confirm_default_yes "确认无误并创建？"; then
         cleanup_node_backup "$backup_dir"
         info "已取消，未修改当前节点。"
         return 0
