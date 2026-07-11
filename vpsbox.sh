@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="VPSBox"
-VPSBOX_VERSION="v1.0.1"
+VPSBOX_VERSION="v1.0.2"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
@@ -34,6 +34,7 @@ LOCK_FILE="$RUNTIME_DIR/vpsbox.lock"
 LOCK_DIR="$RUNTIME_DIR/lockdir"
 LOCK_USING_FLOCK=0
 LOCK_USING_DIR=0
+ACTIVE_NODE_BACKUP=""
 SERVICE_NAME="sing-box"
 METHOD="2022-blake3-aes-128-gcm"
 PORT_MIN=10000
@@ -195,12 +196,12 @@ terminate_orphaned_vpsbox_menu() {
 
 cleanup_vpsbox_lock() {
     if [ "$LOCK_USING_FLOCK" = "1" ]; then
-        flock -u 200 2>/dev/null || true
-        exec 200>&-
-        LOCK_USING_FLOCK=0
         if [ -f "$LOCK_FILE" ] && [ ! -L "$LOCK_FILE" ]; then
             : > "$LOCK_FILE"
         fi
+        flock -u 200 2>/dev/null || true
+        exec 200>&-
+        LOCK_USING_FLOCK=0
     fi
     if [ "$LOCK_USING_DIR" = "1" ] && [ -d "$LOCK_DIR" ] && [ ! -L "$LOCK_DIR" ]; then
         rm -rf "$LOCK_DIR"
@@ -208,8 +209,17 @@ cleanup_vpsbox_lock() {
     fi
 }
 
+cleanup_vpsbox_runtime() {
+    local backup="${ACTIVE_NODE_BACKUP:-}"
+    ACTIVE_NODE_BACKUP=""
+    if [[ "$backup" == /tmp/vpsbox-node-backup.* ]] && [ -d "$backup" ] && declare -F restore_node_files >/dev/null 2>&1; then
+        restore_node_files "$backup" || true
+    fi
+    cleanup_vpsbox_lock
+}
+
 install_lock_cleanup_traps() {
-    trap cleanup_vpsbox_lock EXIT
+    trap cleanup_vpsbox_runtime EXIT
     trap 'exit 0' HUP INT TERM QUIT
 }
 
@@ -302,7 +312,8 @@ acquire_lock() {
     prepare_runtime_dir
 
     if command -v flock >/dev/null 2>&1; then
-        exec 200>"$LOCK_FILE"
+        [ ! -L "$LOCK_FILE" ] || { err "$LOCK_FILE 是符号链接，已拒绝使用。"; exit 1; }
+        exec 200<>"$LOCK_FILE"
         if flock -n 200; then
             LOCK_USING_FLOCK=1
             write_flock_metadata
@@ -427,13 +438,15 @@ ensure_curl() {
 
 download_vpsbox_script() {
     local dest="$1"
+    local require_newer="${2:-0}"
     local tmp
+    local downloaded_version
 
     ensure_curl || return 1
 
-    mkdir -p "$(dirname "$dest")"
+    mkdir -p "$(dirname "$dest")" || return 1
     if command -v mktemp >/dev/null 2>&1; then
-        tmp="$(mktemp "${dest}.tmp.XXXXXX")"
+        tmp="$(mktemp "${dest}.tmp.XXXXXX")" || return 1
     else
         tmp="${dest}.tmp.$$"
         : > "$tmp"
@@ -456,9 +469,15 @@ download_vpsbox_script() {
         err "下载到的脚本缺少有效版本号，已保留当前版本。"
         return 1
     fi
+    downloaded_version="$(sed -n 's/^VPSBOX_VERSION="\([^"]*\)"$/\1/p' "$tmp" | head -n 1)"
+    if [ "$require_newer" = "1" ] && ! version_is_newer "$downloaded_version" "$VPSBOX_VERSION"; then
+        rm -f "$tmp"
+        err "远程版本 $downloaded_version 不高于当前版本 $VPSBOX_VERSION，已取消更新。"
+        return 1
+    fi
 
-    chmod 755 "$tmp" 2>/dev/null || true
-    mv -f "$tmp" "$dest"
+    chmod 755 "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$dest" || { rm -f "$tmp"; return 1; }
 }
 
 version_is_newer() {
@@ -599,7 +618,7 @@ install_self_command() {
     local src
     src="${BASH_SOURCE[0]:-$0}"
 
-    mkdir -p "$(dirname "$CMD_PATH")"
+    mkdir -p "$(dirname "$CMD_PATH")" || { warn "无法创建管理命令目录。"; return 0; }
 
     case "$src" in
         /dev/fd/*|/proc/*)
@@ -615,7 +634,10 @@ install_self_command() {
     [ -f "$src" ] || return 0
 
     if [ "$(readlink -f "$src" 2>/dev/null || echo "$src")" != "$CMD_PATH" ]; then
-        cp "$src" "$CMD_PATH" 2>/dev/null || true
+        if ! cp "$src" "$CMD_PATH" 2>/dev/null; then
+            warn "无法安装管理命令到 $CMD_PATH。"
+            return 0
+        fi
         install_command_alias
     else
         install_command_alias
@@ -904,6 +926,22 @@ restart_singbox_cleanly() {
     service_start
 }
 
+restore_singbox_service_state() {
+    local was_enabled="$1" was_active="$2"
+
+    if [ "$was_enabled" = "1" ]; then
+        service_enable || return 1
+    else
+        service_disable 2>/dev/null || true
+    fi
+    if [ "$was_active" = "1" ]; then
+        restart_singbox_cleanly && service_is_running
+    else
+        service_stop 2>/dev/null || true
+        stop_singbox_config_processes
+    fi
+}
+
 show_service_status() {
     if is_systemd; then
         systemctl status "$SERVICE_NAME" --no-pager || true
@@ -1043,7 +1081,7 @@ state_file_is_secure() {
     mode="$(stat -c '%a' "$STATE_FILE" 2>/dev/null)" || return 1
     [ "$owner" = "0" ] || return 1
     [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
-    (( (8#$mode & 8#022) == 0 ))
+    (( (8#$mode & 8#077) == 0 ))
 }
 
 load_state() {
@@ -1170,7 +1208,7 @@ normalize_host() {
     local colon_count
 
     host="$(sanitize_paste_input "$host")"
-    host="$(echo "$host" | tr -d '[:space:]')"
+    host="$(printf '%s' "$host" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
     host="${host#http://}"
     host="${host#https://}"
     host="${host%%/*}"
@@ -1411,6 +1449,7 @@ restore_node_files() {
     local backup_dir="$1"
     local was_running="0"
     local was_enabled="0"
+    local failed=0
 
     [ -f "$backup_dir/service-running" ] && was_running="$(cat "$backup_dir/service-running")"
     [ -f "$backup_dir/service-enabled" ] && was_enabled="$(cat "$backup_dir/service-enabled")"
@@ -1419,45 +1458,55 @@ restore_node_files() {
     service_stop 2>/dev/null || true
     stop_singbox_config_processes 2>/dev/null || true
 
-    rm -f "$CONFIG_PATH" "$STATE_FILE" "$URI_FILE"
-    [ -f "$backup_dir/config.json" ] && cp -a "$backup_dir/config.json" "$CONFIG_PATH"
-    [ -f "$backup_dir/state.env" ] && cp -a "$backup_dir/state.env" "$STATE_FILE"
-    [ -f "$backup_dir/node-uri.txt" ] && cp -a "$backup_dir/node-uri.txt" "$URI_FILE"
+    rm -f "$CONFIG_PATH" "$STATE_FILE" "$URI_FILE" || failed=1
+    if [ -f "$backup_dir/config.json" ]; then cp -a "$backup_dir/config.json" "$CONFIG_PATH" || failed=1; fi
+    if [ -f "$backup_dir/state.env" ]; then cp -a "$backup_dir/state.env" "$STATE_FILE" || failed=1; fi
+    if [ -f "$backup_dir/node-uri.txt" ]; then cp -a "$backup_dir/node-uri.txt" "$URI_FILE" || failed=1; fi
 
     if is_systemd; then
         if [ -f "$backup_dir/sing-box.service" ]; then
-            cp -a "$backup_dir/sing-box.service" /etc/systemd/system/sing-box.service
+            cp -a "$backup_dir/sing-box.service" /etc/systemd/system/sing-box.service || failed=1
         else
-            rm -f /etc/systemd/system/sing-box.service
+            rm -f /etc/systemd/system/sing-box.service || failed=1
         fi
-        systemctl daemon-reload 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || failed=1
     fi
 
     if [ "$OS" = "alpine" ]; then
         if [ -f "$backup_dir/openrc-sing-box" ]; then
-            cp -a "$backup_dir/openrc-sing-box" /etc/init.d/sing-box
+            cp -a "$backup_dir/openrc-sing-box" /etc/init.d/sing-box || failed=1
         else
-            rm -f /etc/init.d/sing-box
+            rm -f /etc/init.d/sing-box || failed=1
         fi
     fi
 
     if [ "$was_enabled" = "1" ]; then
-        service_enable 2>/dev/null || warn "旧配置已恢复，但 sing-box 开机启动状态恢复失败。"
+        service_enable 2>/dev/null || failed=1
     else
         service_disable 2>/dev/null || true
     fi
 
     if [ "$was_running" = "1" ] && [ -f "$CONFIG_PATH" ] && singbox_installed; then
         if restart_singbox_cleanly 2>/dev/null; then
-            info "旧配置与运行状态已恢复。"
+            :
         else
-            warn "旧配置已恢复，但 sing-box 运行状态恢复失败，请手动检查服务。"
+            failed=1
         fi
-    else
-        info "已恢复到创建前状态。"
     fi
 
+    if [ "$failed" -ne 0 ]; then
+        err "旧节点恢复不完整，备份已保留：$backup_dir"
+        return 1
+    fi
+    info "已恢复到创建前状态。"
     rm -rf "$backup_dir"
+}
+
+rollback_active_node_transaction() {
+    local backup="${ACTIVE_NODE_BACKUP:-}"
+    ACTIVE_NODE_BACKUP=""
+    [ -n "$backup" ] || return 0
+    restore_node_files "$backup"
 }
 
 cleanup_node_backup() {
@@ -1607,12 +1656,6 @@ write_config() {
     local mode
 
     secure_config_dir || return 1
-    if [ -f "$CONFIG_PATH" ]; then
-        cp "$CONFIG_PATH" "${CONFIG_PATH}.bak" || return 1
-        chown root:root "${CONFIG_PATH}.bak" || return 1
-        chmod 600 "${CONFIG_PATH}.bak" || return 1
-    fi
-
     mode="$(listen_mode)"
 
     case "$mode" in
@@ -1701,11 +1744,6 @@ write_vless_reality_config() {
     local port="$1" uuid="$2" server_name="$3" private_key="$4" short_id="$5" mode
 
     secure_config_dir || return 1
-    if [ -f "$CONFIG_PATH" ]; then
-        cp "$CONFIG_PATH" "${CONFIG_PATH}.bak" || return 1
-        chown root:root "${CONFIG_PATH}.bak" || return 1
-        chmod 600 "${CONFIG_PATH}.bak" || return 1
-    fi
     mode="$(listen_mode)"
     case "$mode" in
         ipv6) info "监听地址：::（IPv4/IPv6 双栈）" ;;
@@ -1768,6 +1806,7 @@ setup_service() {
     bin="$(command -v sing-box)"
 
     if is_systemd; then
+        [ ! -L /etc/systemd/system/sing-box.service ] || { err "sing-box systemd 服务文件是符号链接，已拒绝覆盖。"; return 1; }
         cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
 Description=Sing-box Proxy Server
@@ -1796,6 +1835,7 @@ EOF
         service_enable || return 1
         return 0
     elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
+        [ ! -L /etc/init.d/sing-box ] || { err "sing-box OpenRC 服务文件是符号链接，已拒绝覆盖。"; return 1; }
         cat > /etc/init.d/sing-box <<EOF
 #!/sbin/openrc-run
 name="sing-box"
@@ -1854,7 +1894,7 @@ create_or_rebuild_node() {
     local password
 
     while true; do
-        read -r -p "请输入节点域名或 IP：" input_host
+        read -r -p "请输入节点域名或 IP：" input_host || { cleanup_node_backup "$backup_dir"; info "输入已结束，已取消。"; return 1; }
         domain="$(normalize_host "$input_host")"
         if [ -z "$domain" ]; then
             err "节点域名或 IP 不能为空，请重新输入。"
@@ -1875,7 +1915,7 @@ create_or_rebuild_node() {
 
     default_name="$(default_name_for_host "$domain")"
     while true; do
-        read -r -p "请输入节点名称，留空默认 ${default_name}：" input_name
+        read -r -p "请输入节点名称，留空默认 ${default_name}：" input_name || { cleanup_node_backup "$backup_dir"; info "输入已结束，已取消。"; return 1; }
         input_name="$(sanitize_paste_input "$input_name")"
         if [ -n "$input_name" ] && [[ "${input_name,,}" == "${domain,,}"* ]]; then
             err "检测到节点名称包含连接地址前缀，可能是粘贴残留：$input_name"
@@ -1914,41 +1954,44 @@ EOF
 
     info "加密方式：$METHOD"
     info "正在写入配置..."
+    ACTIVE_NODE_BACKUP="$backup_dir"
     if ! write_config "$port" "$password"; then
-        restore_node_files "$backup_dir"
+        rollback_active_node_transaction || true
         err "配置检查失败，未创建新节点。"
         return 1
     fi
 
     if ! save_state "$domain" "$name" "$port" "$password"; then
-        restore_node_files "$backup_dir"
+        rollback_active_node_transaction || true
         err "状态文件写入失败，未创建新节点。"
         return 1
     fi
 
     if ! write_uri_file; then
-        restore_node_files "$backup_dir"
+        rollback_active_node_transaction || true
         err "节点链接写入失败，未创建新节点。"
         return 1
     fi
 
     if ! setup_service; then
-        restore_node_files "$backup_dir"
+        rollback_active_node_transaction || true
         err "服务配置失败，未创建新节点。"
         return 1
     fi
     info "正在启动 sing-box 服务..."
     if ! restart_singbox_cleanly; then
-        restore_node_files "$backup_dir"
+        rollback_active_node_transaction || true
         err "sing-box 启动失败，未创建新节点。"
         return 1
     fi
     if ! service_is_running || ! wait_for_port_listener "$port"; then
-        restore_node_files "$backup_dir"
+        rollback_active_node_transaction || true
         err "sing-box 未保持运行或节点端口未监听，未创建新节点。"
         return 1
     fi
 
+    rm -f "${CONFIG_PATH}.bak"
+    ACTIVE_NODE_BACKUP=""
     cleanup_node_backup "$backup_dir"
 
     info "创建完成，节点链接如下："
@@ -1981,7 +2024,7 @@ create_vless_reality_node() {
     fi
 
     while true; do
-        read -r -p "请输入节点连接地址（域名或 IP）：" input_host
+        read -r -p "请输入节点连接地址（域名或 IP）：" input_host || { cleanup_node_backup "$backup_dir"; info "输入已结束，已取消。"; return 1; }
         domain="$(normalize_host "$input_host")"
         if ! is_valid_node_host "$domain"; then
             err "格式不正确，请输入类似 sb.example.com、1.2.3.4 或 2001:db8::1。"
@@ -1999,7 +2042,7 @@ create_vless_reality_node() {
     default_name="$(default_name_for_host "$domain")"
     default_name="vless-${default_name#ss-}"
     while true; do
-        read -r -p "请输入节点名称，留空默认 ${default_name}：" input_name
+        read -r -p "请输入节点名称，留空默认 ${default_name}：" input_name || { cleanup_node_backup "$backup_dir"; info "输入已结束，已取消。"; return 1; }
         input_name="$(sanitize_paste_input "$input_name")"
         if [ -n "$input_name" ] && [[ "${input_name,,}" == "${domain,,}"* ]]; then
             err "检测到节点名称包含连接地址前缀，可能是粘贴残留：$input_name"
@@ -2012,7 +2055,7 @@ create_vless_reality_node() {
     done
 
     while true; do
-        read -r -p "请输入 Reality 目标域名/SNI：" input_sni
+        read -r -p "请输入 Reality 目标域名/SNI：" input_sni || { cleanup_node_backup "$backup_dir"; info "输入已结束，已取消。"; return 1; }
         server_name="$(normalize_host "$input_sni")"
         if ! is_domain_name "$server_name"; then
             err "Reality 目标必须是有效域名，不能使用 IP 地址。"
@@ -2071,27 +2114,30 @@ EOF
     fi
 
     info "正在写入 VLESS Reality 配置..."
+    ACTIVE_NODE_BACKUP="$backup_dir"
     if ! write_vless_reality_config "$port" "$uuid" "$server_name" "$private_key" "$short_id"; then
-        restore_node_files "$backup_dir"
+        rollback_active_node_transaction || true
         err "配置检查失败，未创建新节点。"
         return 1
     fi
     if ! save_vless_reality_state "$domain" "$name" "$port" "$uuid" "$server_name" "$public_key" "$short_id"; then
-        restore_node_files "$backup_dir"
+        rollback_active_node_transaction || true
         err "状态文件写入失败，未创建新节点。"
         return 1
     fi
     if ! write_uri_file || ! setup_service; then
-        restore_node_files "$backup_dir"
+        rollback_active_node_transaction || true
         err "节点链接或服务配置失败，未创建新节点。"
         return 1
     fi
     info "正在启动 sing-box 服务..."
     if ! restart_singbox_cleanly || ! service_is_running || ! wait_for_port_listener "$port"; then
-        restore_node_files "$backup_dir"
+        rollback_active_node_transaction || true
         err "sing-box 未保持运行或节点端口未监听，未创建新节点。"
         return 1
     fi
+    rm -f "${CONFIG_PATH}.bak"
+    ACTIVE_NODE_BACKUP=""
     cleanup_node_backup "$backup_dir"
     info "创建完成，节点链接如下："
     view_node_link
@@ -2169,7 +2215,7 @@ delete_node() {
     if ! service_disable; then
         warn "无法禁用 sing-box 开机启动，请手动检查服务状态。"
     fi
-    rm -f "$CONFIG_PATH" "$STATE_FILE" "$URI_FILE"
+    rm -f "$CONFIG_PATH" "$STATE_FILE" "$URI_FILE" "${CONFIG_PATH}.bak"
     info "当前节点已删除，sing-box 服务已停止并尝试禁用开机启动。"
 }
 
@@ -2193,11 +2239,14 @@ update_singbox() {
     if service_is_running; then
         was_active=1
     fi
-    if is_systemd && systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+    if service_is_enabled; then
         was_enabled=1
     fi
 
-    install_deps || return 1
+    if ! install_deps; then
+        rm -rf "$backup_dir"
+        return 1
+    fi
     info "正在更新 sing-box..."
     if ! run_singbox_installer; then
         rm -rf "$backup_dir"
@@ -2210,20 +2259,20 @@ update_singbox() {
             if ! run_singbox_installer "$old_version"; then
                 cp -a "$backup_binary" "$binary_path" || err "恢复旧二进制失败：$backup_binary"
             fi
+            restore_singbox_service_state "$was_enabled" "$was_active" 2>/dev/null || warn "旧版 sing-box 已恢复，但原服务状态恢复失败。"
             rm -rf "$backup_dir"
             return 1
         fi
-        if ! setup_service || ! restart_singbox_cleanly || ! service_is_running; then
-            err "新版 sing-box 未能正常启动，正在恢复旧二进制。"
+        if ! setup_service || ! restore_singbox_service_state "$was_enabled" "$was_active"; then
+            err "新版 sing-box 未能恢复原服务状态，正在恢复旧二进制。"
             service_stop 2>/dev/null || true
             if ! run_singbox_installer "$old_version" && ! cp -a "$backup_binary" "$binary_path"; then
                 err "恢复旧版 sing-box 失败：$backup_binary"
                 rm -rf "$backup_dir"
                 return 1
             fi
-            if [ "$was_enabled" -eq 1 ]; then service_enable || true; else service_disable || true; fi
-            if [ "$was_active" -eq 1 ] && ! service_start; then
-                err "旧版 sing-box 已恢复，但服务未能重新启动。"
+            if ! setup_service || ! restore_singbox_service_state "$was_enabled" "$was_active"; then
+                err "旧版 sing-box 已恢复，但原服务状态恢复失败。"
                 rm -rf "$backup_dir"
                 return 1
             fi
@@ -2248,7 +2297,7 @@ update_vpsbox() {
         chmod 700 "$backup" || return 1
     fi
 
-    download_vpsbox_script "$CMD_PATH" || return 1
+    download_vpsbox_script "$CMD_PATH" 1 || return 1
     install_command_alias
 
     info "vpsbox 已更新；旧版本备份：$backup"
@@ -2311,6 +2360,16 @@ fail2ban_service_state() {
         fi
     else
         echo "未知"
+    fi
+}
+
+fail2ban_service_is_enabled() {
+    if is_systemd; then
+        systemctl is-enabled --quiet fail2ban 2>/dev/null
+    elif [ "$OS" = "alpine" ]; then
+        [ -e /etc/runlevels/default/fail2ban ] || [ -L /etc/runlevels/default/fail2ban ]
+    else
+        return 1
     fi
 }
 
@@ -2456,6 +2515,15 @@ enable_ntp_sync() {
         return 1
     fi
 
+    svc="$(chrony_service_name)"
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then chrony_was_active=1; fi
+    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then chrony_was_enabled=1; fi
+    if systemctl list-unit-files systemd-timesyncd.service 2>/dev/null | grep -q '^systemd-timesyncd\.service'; then
+        timesyncd_exists=1
+        if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then timesyncd_was_active=1; fi
+        if systemctl is-enabled --quiet systemd-timesyncd 2>/dev/null; then timesyncd_was_enabled=1; fi
+    fi
+
     info "正在安装 chrony..."
     case "$OS" in
         debian)
@@ -2489,7 +2557,6 @@ enable_ntp_sync() {
             ;;
     esac
 
-    svc="$(chrony_service_name)"
     conf="$(chrony_conf_path)"
     source_file="/etc/chrony/sources.d/vpsbox.sources"
     backup_change_file_once NTP_CONF "$conf" || { err "记录 chrony 原配置失败，已取消修改。"; return 1; }
@@ -2499,13 +2566,6 @@ enable_ntp_sync() {
     if [ -e "$source_file" ] || [ -L "$source_file" ]; then
         cp -a "$source_file" "$backup_dir/vpsbox.sources" || { rm -rf "$backup_dir"; err "备份 NTP 源配置失败，已取消。"; return 1; }
         : > "$backup_dir/source-existed"
-    fi
-    if systemctl is-active --quiet "$svc" 2>/dev/null; then chrony_was_active=1; fi
-    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then chrony_was_enabled=1; fi
-    if systemctl list-unit-files systemd-timesyncd.service 2>/dev/null | grep -q '^systemd-timesyncd\.service'; then
-        timesyncd_exists=1
-        if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then timesyncd_was_active=1; fi
-        if systemctl is-enabled --quiet systemd-timesyncd 2>/dev/null; then timesyncd_was_enabled=1; fi
     fi
     manifest_set_once NTP_CHRONY_ACTIVE "$([ "$chrony_was_active" -eq 1 ] && echo active || echo inactive)" || return 1
     manifest_set_once NTP_CHRONY_ENABLED "$([ "$chrony_was_enabled" -eq 1 ] && echo enabled || echo disabled)" || return 1
@@ -3280,9 +3340,17 @@ sync_fail2ban_sshd_port() {
     local backend="auto"
     local ports
     local tmp
+    local was_running=0
 
     if ! fail2ban_installed; then
         return 0
+    fi
+    [ "$(fail2ban_service_state)" = "运行中" ] && was_running=1
+    manifest_set_once FAIL2BAN_ACTIVE "$([ "$was_running" -eq 1 ] && echo active || echo inactive)" || return 1
+    if fail2ban_service_is_enabled; then
+        manifest_set_once FAIL2BAN_ENABLED enabled || return 1
+    else
+        manifest_set_once FAIL2BAN_ENABLED disabled || return 1
     fi
 
     mkdir -p "$FAIL2BAN_CONFIG_DIR" || return 1
@@ -3319,7 +3387,7 @@ EOF
     fi
 
     if is_systemd; then
-        if ! retry 3 2 systemctl restart fail2ban; then
+        if [ "$was_running" -eq 1 ] && ! retry 3 2 systemctl restart fail2ban; then
             if [ -n "$backup" ]; then
                 cp -a "$backup" "$FAIL2BAN_VPSBOX_SSHD_CONF" || true
             else
@@ -3329,7 +3397,7 @@ EOF
             return 1
         fi
     elif command -v rc-service >/dev/null 2>&1; then
-        if [ "$(fail2ban_service_state)" = "运行中" ]; then
+        if [ "$was_running" -eq 1 ]; then
             retry 3 2 rc-service fail2ban restart || {
                 if [ -n "$backup" ]; then
                     cp -a "$backup" "$FAIL2BAN_VPSBOX_SSHD_CONF" || true
@@ -3339,14 +3407,6 @@ EOF
                 rc-service fail2ban restart >/dev/null 2>&1 || true
                 return 1
             }
-        elif ! retry 3 2 rc-service fail2ban start; then
-            if [ -n "$backup" ]; then
-                cp -a "$backup" "$FAIL2BAN_VPSBOX_SSHD_CONF" || true
-            else
-                rm -f "$FAIL2BAN_VPSBOX_SSHD_CONF"
-            fi
-            rc-service fail2ban start >/dev/null 2>&1 || true
-            return 1
         fi
     else
         err "未找到 Fail2ban 服务重启方式。"
@@ -3354,7 +3414,9 @@ EOF
     fi
 
     rm -f "$FAIL2BAN_CONFIG_DIR/99-vpsbox-sshd-port.local"
-    fail2ban-client status sshd >/dev/null 2>&1 || return 1
+    if [ "$was_running" -eq 1 ]; then
+        fail2ban-client status sshd >/dev/null 2>&1 || return 1
+    fi
     mark_change_applied FAIL2BAN_SSHD || return 1
 }
 
@@ -3594,7 +3656,7 @@ EOF
 }
 
 restore_vpsbox_ssh_config() {
-    local confirm tmp original_ports original_port name path
+    local confirm tmp original_ports original_port name path cleanup_failed=0
 
     [ "$(manifest_value APPLIED_SSH_CONFIG 2>/dev/null || true)" = "1" ] || {
         warn "没有已记录的 VPSBox SSH 配置可恢复。"
@@ -3634,8 +3696,15 @@ restore_vpsbox_ssh_config() {
         return 1
     fi
     rm -rf "$tmp"
-    clear_change_tracking SSHD_MAIN; clear_change_tracking SSHD_PORT; clear_change_tracking SSHD_HARDENING
-    manifest_remove APPLIED_SSH_CONFIG; manifest_remove SSH_PORTS
+    clear_change_tracking SSHD_MAIN || cleanup_failed=1
+    clear_change_tracking SSHD_PORT || cleanup_failed=1
+    clear_change_tracking SSHD_HARDENING || cleanup_failed=1
+    manifest_remove APPLIED_SSH_CONFIG || cleanup_failed=1
+    manifest_remove SSH_PORTS || cleanup_failed=1
+    if [ "$cleanup_failed" -ne 0 ]; then
+        err "SSH 配置已恢复，但变更清单清理失败；已保留剩余记录供人工核验。"
+        return 1
+    fi
     sync_fail2ban_sshd_port || warn "SSH 已恢复，但 Fail2ban 端口同步失败，请手动检查。"
     info "SSH 配置已恢复，请立即用新窗口验证原端口连接。"
 }
@@ -3764,8 +3833,8 @@ enable_bbr_fq() {
     old_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
     old_fq="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
     backup_change_file_once BBR_CONF "$BBR_CONF" || { err "记录 BBR 原配置失败，已取消修改。"; return 1; }
-    manifest_set BBR_CC "${old_cc:-unknown}" || return 1
-    manifest_set BBR_FQ "${old_fq:-unknown}" || return 1
+    manifest_set_once BBR_CC "${old_cc:-unknown}" || return 1
+    manifest_set_once BBR_FQ "${old_fq:-unknown}" || return 1
     backup_dir="$(mktemp -d /tmp/vpsbox-bbr.XXXXXX)" || return 1
     if [ -e "$BBR_CONF" ] || [ -L "$BBR_CONF" ]; then
         [ ! -L "$BBR_CONF" ] || { rm -rf "$backup_dir"; err "$BBR_CONF 是符号链接，已拒绝覆盖。"; return 1; }
@@ -4235,7 +4304,8 @@ show_backtrace_routes() {
     local tmp_dir
     local result_file
 
-    tmp_dir="$(mktemp -d /tmp/vpsbox-trace.XXXXXX)"
+    tmp_dir="$(mktemp -d /tmp/vpsbox-trace.XXXXXX)" || { err "无法创建回程检测临时目录。"; return 1; }
+    [[ "$tmp_dir" == /tmp/vpsbox-trace.* ]] || { err "回程检测临时目录路径异常。"; return 1; }
     trap 'rm -rf "$tmp_dir"' RETURN
 
     cat <<EOF
@@ -4281,8 +4351,9 @@ EOF
 
 uninstall_singbox_and_nodes() {
     info "正在停止并禁用 sing-box 服务..."
-    if service_is_running && ! service_stop; then
-        err "sing-box 服务停止失败，已取消删除。"
+    service_stop 2>/dev/null || warn "服务管理器未能正常停止 sing-box，将继续检查 VPSBox 配置对应的进程。"
+    if ! stop_singbox_config_processes; then
+        err "残留 sing-box 进程无法停止，已取消删除。"
         return 1
     fi
     sleep 1
@@ -4450,7 +4521,7 @@ cleanup_old_temp_files() {
 }
 
 cleanup_orphaned_change_backups() {
-    local backup name state
+    local backup name state old_file
     [ -d "$CHANGE_BACKUP_DIR" ] || return 0
     for backup in "$CHANGE_BACKUP_DIR"/*; do
         [ -f "$backup" ] || continue
@@ -4458,8 +4529,13 @@ cleanup_orphaned_change_backups() {
         [[ "$name" =~ ^[A-Z0-9_]+$ ]] || continue
         state="$(manifest_value "BACKUP_$name" 2>/dev/null || true)"
         [ "$state" = "file" ] && continue
-        if find "$backup" -xdev -type f -mtime +30 -print -delete 2>/dev/null; then
+        old_file="$(find "$backup" -xdev -type f -mtime +30 -print -quit 2>/dev/null || true)"
+        [ -n "$old_file" ] || continue
+        if find "$backup" -xdev -type f -mtime +30 -delete 2>/dev/null; then
             info "已清理未引用的 VPSBox 备份：$name"
+        else
+            warn "清理未引用的 VPSBox 备份失败：$name"
+            return 1
         fi
     done
 }
@@ -4506,6 +4582,7 @@ show_vpsbox_changes() {
 
 restore_vpsbox_system_changes() {
     local confirm cc fq chrony timesyncd old failed=0
+    local fail2ban_active fail2ban_enabled
 
     show_vpsbox_changes
     read -r -p "恢复上述 VPSBox 已记录的系统设置？请输入 YES：" confirm
@@ -4532,12 +4609,15 @@ restore_vpsbox_system_changes() {
     if [ "$(manifest_value APPLIED_FAIL2BAN_SSHD 2>/dev/null || true)" = "1" ]; then
         restore_change_file FAIL2BAN_SSHD "$FAIL2BAN_VPSBOX_SSHD_CONF" || failed=1
         if fail2ban_installed; then
+            fail2ban-client -t -c /etc/fail2ban >/dev/null 2>&1 || failed=1
+            fail2ban_active="$(manifest_value FAIL2BAN_ACTIVE 2>/dev/null || true)"
+            fail2ban_enabled="$(manifest_value FAIL2BAN_ENABLED 2>/dev/null || true)"
             if is_systemd; then
-                systemctl restart fail2ban && systemctl is-active --quiet fail2ban || failed=1
+                if [ "$fail2ban_enabled" = "enabled" ]; then systemctl enable fail2ban || failed=1; elif [ "$fail2ban_enabled" = "disabled" ]; then systemctl disable fail2ban || failed=1; fi
+                if [ "$fail2ban_active" = "active" ]; then systemctl restart fail2ban || failed=1; elif [ "$fail2ban_active" = "inactive" ]; then systemctl stop fail2ban || failed=1; elif systemctl is-active --quiet fail2ban; then systemctl restart fail2ban || failed=1; fi
             elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
-                rc-service fail2ban restart && rc-service fail2ban status >/dev/null || failed=1
-            else
-                failed=1
+                if [ "$fail2ban_enabled" = "enabled" ]; then rc-update add fail2ban default || failed=1; elif [ "$fail2ban_enabled" = "disabled" ]; then rc-update del fail2ban default || failed=1; fi
+                if [ "$fail2ban_active" = "active" ]; then rc-service fail2ban restart || failed=1; elif [ "$fail2ban_active" = "inactive" ]; then rc-service fail2ban stop || failed=1; elif rc-service fail2ban status >/dev/null 2>&1; then rc-service fail2ban restart || failed=1; fi
             fi
         fi
     fi
@@ -4546,16 +4626,20 @@ restore_vpsbox_system_changes() {
         is_systemd && systemctl restart systemd-journald && systemctl is-active --quiet systemd-journald || failed=1
     fi
     if [ "$(manifest_value APPLIED_NTP_CONF 2>/dev/null || true)" = "1" ]; then
-        is_systemd || { err "当前环境无法恢复 systemd 管理的 NTP 状态。"; failed=1; }
-        chrony="$(chrony_service_name)"
-        systemctl stop "$chrony" || failed=1
-        restore_change_file NTP_CONF "$(chrony_conf_path)" || failed=1
-        restore_change_file NTP_SOURCES /etc/chrony/sources.d/vpsbox.sources || failed=1
-        if [ "$(manifest_value NTP_CHRONY_ENABLED 2>/dev/null || true)" = "enabled" ]; then systemctl enable "$chrony" || failed=1; else systemctl disable "$chrony" || failed=1; fi
-        if [ "$(manifest_value NTP_CHRONY_ACTIVE 2>/dev/null || true)" = "active" ]; then systemctl start "$chrony" || failed=1; else systemctl stop "$chrony" || failed=1; fi
-        timesyncd="$(manifest_value NTP_TIMESYNCD_ENABLED 2>/dev/null || true)"
-        if [ "$timesyncd" = "enabled" ]; then systemctl enable systemd-timesyncd || failed=1; else systemctl disable systemd-timesyncd || failed=1; fi
-        if [ "$(manifest_value NTP_TIMESYNCD_ACTIVE 2>/dev/null || true)" = "active" ]; then systemctl start systemd-timesyncd || failed=1; else systemctl stop systemd-timesyncd || failed=1; fi
+        if is_systemd; then
+            chrony="$(chrony_service_name)"
+            systemctl stop "$chrony" || failed=1
+            restore_change_file NTP_CONF "$(chrony_conf_path)" || failed=1
+            restore_change_file NTP_SOURCES /etc/chrony/sources.d/vpsbox.sources || failed=1
+            if [ "$(manifest_value NTP_CHRONY_ENABLED 2>/dev/null || true)" = "enabled" ]; then systemctl enable "$chrony" || failed=1; else systemctl disable "$chrony" || failed=1; fi
+            if [ "$(manifest_value NTP_CHRONY_ACTIVE 2>/dev/null || true)" = "active" ]; then systemctl start "$chrony" || failed=1; else systemctl stop "$chrony" || failed=1; fi
+            timesyncd="$(manifest_value NTP_TIMESYNCD_ENABLED 2>/dev/null || true)"
+            if [ "$timesyncd" = "enabled" ]; then systemctl enable systemd-timesyncd || failed=1; else systemctl disable systemd-timesyncd || failed=1; fi
+            if [ "$(manifest_value NTP_TIMESYNCD_ACTIVE 2>/dev/null || true)" = "active" ]; then systemctl start systemd-timesyncd || failed=1; else systemctl stop systemd-timesyncd || failed=1; fi
+        else
+            err "当前环境无法恢复 systemd 管理的 NTP 状态。"
+            failed=1
+        fi
     fi
     if [ "$failed" -eq 1 ]; then
         err "部分文件恢复失败；已保留变更清单和备份，请修复权限或路径后重试。"
@@ -4585,6 +4669,8 @@ restore_vpsbox_system_changes() {
             clear_change_tracking "$name" || failed=1
         fi
     done
+    manifest_remove FAIL2BAN_ACTIVE || failed=1
+    manifest_remove FAIL2BAN_ENABLED || failed=1
     if [ "$failed" -eq 1 ]; then
         err "恢复已完成部分步骤，但清单或备份清理失败，已保留剩余状态供人工核验。"
         return 1
@@ -4745,8 +4831,12 @@ EOF
     info "单文件：50M"
     read -r -p "是否立即清理历史日志至 500M？此操作不可恢复。请输入 YES 确认：" confirm
     if [ "$confirm" = "YES" ]; then
-        retry 3 2 journalctl --vacuum-size=500M
-        info "清理完成，当前日志占用：$(journal_disk_usage)"
+        if retry 3 2 journalctl --vacuum-size=500M; then
+            info "清理完成，当前日志占用：$(journal_disk_usage)"
+        else
+            err "历史日志清理失败，日志大小限制仍已生效。"
+            return 1
+        fi
     else
         info "已跳过清理历史日志；新限制会在后续日志轮转中生效。"
     fi
