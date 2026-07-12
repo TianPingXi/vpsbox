@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="VPSBox"
-VPSBOX_VERSION="v1.0.2"
+VPSBOX_VERSION="v1.0.3"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
@@ -43,11 +43,15 @@ TRACE_NAMES=(
     "北京电信" "北京联通" "北京移动"
     "上海电信" "上海联通" "上海移动"
     "广州电信" "广州联通" "广州移动"
+    "安徽电信" "安徽联通" "安徽移动"
+    "江苏电信" "江苏联通" "江苏移动"
 )
 TRACE_IPS=(
     "219.141.140.10" "202.106.195.68" "221.179.155.161"
     "101.95.120.109" "210.22.70.3" "183.192.160.3"
     "58.60.188.222" "210.21.196.6" "120.196.165.24"
+    "117.68.25.70" "112.132.39.158" "39.145.24.48"
+    "180.102.191.98" "112.80.130.226" "36.155.201.93"
 )
 TRACE_MAX_JOBS=3
 REMOTE_VERSION=""
@@ -4235,30 +4239,51 @@ trace_has() {
     printf '%s\n' "$output" | grep -Eiq "$pattern"
 }
 
+trace_count() {
+    local output="$1"
+    local pattern="$2"
+    local count
+
+    count="$(printf '%s\n' "$output" | grep -Eo "$pattern" | wc -l || true)"
+    printf '%s\n' "${count//[[:space:]]/}"
+}
+
 detect_trace_line() {
     local output="$1"
     local has_4134=0
     local has_4809=0
+    local count_20297=0
+    local count_5943=0
 
     trace_has "$output" 'AS[[:space:]]*4134|AS4134|202\.97\.' && has_4134=1
     trace_has "$output" 'AS[[:space:]]*4809|AS4809|59\.43\.' && has_4809=1
+    count_20297="$(trace_count "$output" '202\.97\.')"
+    count_5943="$(trace_count "$output" '59\.43\.')"
 
     if trace_has "$output" 'AS[[:space:]]*23764|AS23764|69\.194\.|203\.22\.'; then
-        echo "CTGNET|AS23764"
-    elif [ "$has_4134" = "1" ] && [ "$has_4809" = "1" ]; then
-        echo "CN2 GT|AS4134/AS4809"
-    elif [ "$has_4809" = "1" ]; then
-        echo "CN2 GIA|AS4809"
-    elif [ "$has_4134" = "1" ]; then
-        echo "163|AS4134"
-    elif trace_has "$output" 'AS[[:space:]]*9929|AS9929|218\.105\.|210\.51\.'; then
-        echo "9929|AS9929"
-    elif trace_has "$output" 'AS[[:space:]]*4837|AS4837|219\.158\.'; then
-        echo "4837|AS4837"
+        echo "CTGNet|AS23764"
+    elif trace_has "$output" 'AS[[:space:]]*10099|AS10099'; then
+        echo "10099|AS10099"
     elif trace_has "$output" 'AS[[:space:]]*58807|AS58807|223\.120\.(16|17|19|130|131|140|141)\.'; then
         echo "CMIN2|AS58807"
-    elif trace_has "$output" 'AS[[:space:]]*58453|AS58453|AS[[:space:]]*9808|AS9808|223\.(118|119|120|121)\.'; then
+    elif trace_has "$output" 'AS[[:space:]]*9929|AS9929|218\.105\.|210\.51\.'; then
+        echo "9929|AS9929"
+    elif [ "$has_4134" = "1" ] && [ "$has_4809" = "1" ] && [ "$count_20297" -gt 1 ]; then
+        echo "CN2 GT|AS4134/AS4809"
+    elif [ "$has_4809" = "1" ] && [ "$count_5943" -gt 0 ]; then
+        echo "CN2 GIA|AS4809"
+    elif [ "$has_4809" = "1" ]; then
+        echo "CN2（待确认）|AS4809"
+    elif [ "$has_4134" = "1" ]; then
+        echo "163|AS4134"
+    elif trace_has "$output" 'AS[[:space:]]*4837|AS4837|219\.158\.'; then
+        echo "4837|AS4837"
+    elif trace_has "$output" 'AS[[:space:]]*58453|AS58453|223\.(118|119|120|121)\.'; then
         echo "CMI|AS58453"
+    elif trace_has "$output" 'AS[[:space:]]*9808|AS9808|221\.(176|183)\.'; then
+        echo "CMNET|AS9808"
+    elif trace_has "$output" 'AS[[:space:]]*3356|AS3356'; then
+        echo "Lumen|AS3356"
     else
         echo "未识别|-"
     fi
@@ -4266,11 +4291,18 @@ detect_trace_line() {
 
 run_nexttrace_target() {
     local ip="$1"
+    local mode="$2"
+    local -a args=(-n -P -C)
+
+    if [ "$mode" = "tcp" ]; then
+        args+=(-T -p 443)
+    fi
+    args+=("$ip")
 
     if command -v timeout >/dev/null 2>&1; then
-        timeout 30 nexttrace -n -P -C "$ip" 2>&1
+        timeout 30 nexttrace "${args[@]}" 2>&1
     else
-        nexttrace -n -P -C "$ip" 2>&1
+        nexttrace "${args[@]}" 2>&1
     fi
 }
 
@@ -4278,12 +4310,13 @@ check_route_target() {
     local name="$1"
     local ip="$2"
     local result_file="$3"
+    local mode="$4"
     local output
     local detected
     local result
     local asn
 
-    if output="$(run_nexttrace_target "$ip")"; then
+    if output="$(run_nexttrace_target "$ip" "$mode")"; then
         detected="$(detect_trace_line "$output")"
         result="${detected%%|*}"
         asn="${detected#*|}"
@@ -4298,11 +4331,24 @@ check_route_target() {
 show_backtrace_routes() {
     ensure_nexttrace || return 1
 
+    local mode
+    local mode_name
     local i
     local name
     local ip
     local tmp_dir
     local result_file
+    local job_count=0
+    local completed=0
+
+    while true; do
+        read -r -p "检测模式：ICMP 快速检测 / TCP 443 复核 (I/t，默认 I): " mode || return 1
+        case "$mode" in
+            ""|I|i) mode="icmp"; mode_name="ICMP 快速检测"; break ;;
+            T|t) mode="tcp"; mode_name="TCP 443 复核"; break ;;
+            *) warn "请输入 i 或 t；直接回车默认 ICMP 快速检测。" ;;
+        esac
+    done
 
     tmp_dir="$(mktemp -d /tmp/vpsbox-trace.XXXXXX)" || { err "无法创建回程检测临时目录。"; return 1; }
     [[ "$tmp_dir" == /tmp/vpsbox-trace.* ]] || { err "回程检测临时目录路径异常。"; return 1; }
@@ -4312,24 +4358,31 @@ show_backtrace_routes() {
 ========================================
  三网回程检测
 ========================================
+模式：$mode_name
 正在分批检测 ${#TRACE_NAMES[@]} 个目标，每批最多 ${TRACE_MAX_JOBS} 个，每个最多 30 秒，请稍等...
 ----------------------------------------
 线路      目标 IP          判断       关键 ASN
 EOF
 
-    local job_count=0
     for i in "${!TRACE_NAMES[@]}"; do
         name="${TRACE_NAMES[$i]}"
         ip="${TRACE_IPS[$i]}"
-        check_route_target "$name" "$ip" "$tmp_dir/$i" &
+        check_route_target "$name" "$ip" "$tmp_dir/$i" "$mode" &
         job_count=$((job_count + 1))
         if [ "$job_count" -ge "$TRACE_MAX_JOBS" ]; then
             wait
+            completed=$((completed + job_count))
+            printf '\r进度：%d/%d' "$completed" "${#TRACE_NAMES[@]}"
             job_count=0
         fi
     done
 
-    wait
+    if [ "$job_count" -gt 0 ]; then
+        wait
+        completed=$((completed + job_count))
+        printf '\r进度：%d/%d' "$completed" "${#TRACE_NAMES[@]}"
+    fi
+    printf '\n'
 
     for i in "${!TRACE_NAMES[@]}"; do
         result_file="$tmp_dir/$i"
@@ -4345,7 +4398,7 @@ EOF
 
     cat <<EOF
 ========================================
-提示：回程判断仅供参考，完整路径可用 nexttrace 手动确认。
+提示：线路判断仅供参考；CN2 GT/GIA 以完整路径的 ASN 与跳数为准，可用 nexttrace 手动复核。
 EOF
 }
 
