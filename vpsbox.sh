@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="VPSBox"
-VPSBOX_VERSION="v1.0.7"
+VPSBOX_VERSION="v1.0.8"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
@@ -3091,7 +3091,7 @@ sshd_effective_values() {
         $1 = ""
         sub(/^ /, "")
         print
-    }' || true
+    }'
 }
 
 sshd_effective_value() {
@@ -3132,7 +3132,7 @@ ssh_effective_value_equals() {
 ssh_effective_ports_match_target() {
     local ports
 
-    ports="$(sshd_effective_values port | sort -n | awk 'BEGIN { sep = "" } { printf "%s%s", sep, $0; sep = " " } END { printf "\n" }' || true)"
+    ports="$(ssh_effective_ports_csv)" || return 1
     [ "$ports" = "$SSH_TARGET_PORT" ]
 }
 
@@ -3159,20 +3159,12 @@ ssh_hardening_state() {
     fi
 }
 
-ensure_sshd_dropin_include() {
-    local tmp
+sshd_main_has_active_port_directive() {
+    grep -Eq '^[[:space:]]*Port[[:space:]]+[0-9]+' "$SSHD_MAIN_CONF" 2>/dev/null
+}
 
-    if grep -Eq '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf([[:space:]]|$)' "$SSHD_MAIN_CONF" 2>/dev/null; then
-        return 0
-    fi
-
-    tmp="$(mktemp)" || return 1
-    {
-        echo "Include /etc/ssh/sshd_config.d/*.conf"
-        cat "$SSHD_MAIN_CONF"
-    } > "$tmp" || { rm -f "$tmp"; return 1; }
-    install -m 644 "$tmp" "$SSHD_MAIN_CONF" || { rm -f "$tmp"; return 1; }
-    rm -f "$tmp"
+sshd_dropin_include_available() {
+    grep -Eiq '^[[:space:]]*Include[[:space:]]+.*sshd_config\.d/.*\.conf' "$SSHD_MAIN_CONF" 2>/dev/null
 }
 
 backup_ssh_file() {
@@ -3200,16 +3192,20 @@ restore_ssh_config_backup() {
     fi
 }
 
-comment_main_ssh_port_directives() {
+set_main_ssh_port_directives() {
     local tmp
 
     tmp="$(mktemp)" || return 1
-    awk '
+    awk -v port="$SSH_TARGET_PORT" '
         /^[[:space:]]*Port[[:space:]]+/ {
-            print "# VPSBox disabled: " $0
+            print "Port " port
+            changed=1
             next
         }
         { print }
+        END {
+            if (!changed) print "Port " port
+        }
     ' "$SSHD_MAIN_CONF" > "$tmp" || { rm -f "$tmp"; return 1; }
     install -m 644 "$tmp" "$SSHD_MAIN_CONF" || { rm -f "$tmp"; return 1; }
     rm -f "$tmp"
@@ -3322,6 +3318,60 @@ wait_for_ssh_listener() {
     return 1
 }
 
+wait_for_any_ssh_listener_csv() {
+    local ports="$1" port
+    local IFS=,
+
+    for port in $ports; do
+        wait_for_ssh_listener "$port" && return 0
+    done
+    return 1
+}
+
+ssh_socket_activation_active() {
+    is_systemd && { systemctl is-active --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet sshd.socket 2>/dev/null; }
+}
+
+choose_ssh_target_port() {
+    local input confirm
+
+    while true; do
+        read -r -p "请输入新 SSH 端口（1-65535，留空默认 23333）: " input || return 1
+        input="${input:-23333}"
+        is_valid_port "$input" || { err "端口必须是 1-65535 的整数。"; continue; }
+        if ! port_is_effective_ssh_port "$input" && port_in_use "$input"; then
+            err "端口 $input 已被占用，请更换。"
+            continue
+        fi
+        if [ "$input" -lt 1024 ]; then
+            read -r -p "端口 $input 属于特权端口，输入 YES 确认使用: " confirm
+            [ "$confirm" = "YES" ] || continue
+        fi
+        printf '%s\n' "$input"
+        return 0
+    done
+}
+
+rollback_ssh_port_change() {
+    local main_backup="$1" dropin_backup="$2" original_ports="$3" bin
+
+    restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_PORT_CONF" "$dropin_backup"
+    bin="$(sshd_binary)" || { err "SSH 回滚后未找到 sshd，请通过控制台恢复。"; return 1; }
+    if ! "$bin" -t; then
+        err "SSH 回滚后的配置校验失败，请通过控制台恢复。"
+        return 1
+    fi
+    if ! restart_ssh_service; then
+        err "SSH 回滚后服务无法重启，请通过控制台恢复。"
+        return 1
+    fi
+    if [ -n "$original_ports" ] && ! wait_for_any_ssh_listener_csv "$original_ports"; then
+        err "SSH 回滚后未恢复原端口监听（$original_ports），请通过控制台恢复。"
+        return 1
+    fi
+    return 0
+}
+
 warn_ssh_access_controls() {
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
         ufw status 2>/dev/null | grep -Eq "^${SSH_TARGET_PORT}/tcp[[:space:]]+ALLOW" ||
@@ -3428,7 +3478,7 @@ EOF
 }
 
 apply_ssh_port_change() {
-    local confirm
+    local confirm new_port original_ports write_action
     local suffix
     local main_backup=""
     local dropin_backup=""
@@ -3442,6 +3492,15 @@ apply_ssh_port_change() {
         err "未找到 SSH 主配置：$SSHD_MAIN_CONF"
         return 1
     fi
+
+    if ssh_socket_activation_active; then
+        err "检测到 SSH socket activation 正在运行；为避免误改监听端口，当前不自动修改。"
+        err "请先通过控制台处理 ssh.socket/sshd.socket，或关闭 socket activation 后重试。"
+        return 1
+    fi
+
+    new_port="$(choose_ssh_target_port)" || { info "已取消。"; return 0; }
+    SSH_TARGET_PORT="$new_port"
 
     if ssh_effective_ports_match_target; then
         info "SSH 端口已经是 $SSH_TARGET_PORT，无需重复修改。"
@@ -3461,7 +3520,8 @@ apply_ssh_port_change() {
     backup_change_file_once SSHD_MAIN "$SSHD_MAIN_CONF" || return 1
     backup_change_file_once SSHD_PORT "$SSHD_VPSBOX_PORT_CONF" || return 1
     backup_change_file_once SSHD_HARDENING "$SSHD_VPSBOX_HARDENING_CONF" || return 1
-    manifest_set_once SSH_PORTS "$(ssh_effective_ports_csv)" || return 1
+    original_ports="$(ssh_effective_ports_csv)" || { err "无法读取 SSH 当前生效端口，已取消修改。"; return 1; }
+    manifest_set_once SSH_PORTS "$original_ports" || return 1
 
     suffix="$(date +%F-%H%M%S)"
     if ! main_backup="$(backup_ssh_file "$SSHD_MAIN_CONF" "$suffix")"; then
@@ -3473,31 +3533,41 @@ apply_ssh_port_change() {
         return 1
     fi
 
-    if ! write_vpsbox_ssh_port_config || ! ensure_sshd_dropin_include || ! comment_main_ssh_port_directives; then
-        err "写入 SSH 端口配置失败，正在回滚。"
-        restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_PORT_CONF" "$dropin_backup"
-        return 1
+    if { [ -e "$SSHD_VPSBOX_PORT_CONF" ] && sshd_dropin_include_available; } || { ! ssh_main_has_active_port_directive && sshd_dropin_include_available; }; then
+        write_action="VPSBox drop-in"
+        write_vpsbox_ssh_port_config || {
+            err "写入 SSH drop-in 失败，正在回滚。"
+            rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" || true
+            return 1
+        }
+    else
+        write_action="主配置"
+        set_main_ssh_port_directives || {
+            err "写入 SSH 主配置失败，正在回滚。"
+            rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" || true
+            return 1
+        }
     fi
 
     if ! validate_ssh_port_effective_config; then
         err "SSH 端口配置验证失败，正在回滚。"
-        restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_PORT_CONF" "$dropin_backup"
+        rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" || true
         return 1
     fi
 
     if ! restart_ssh_service; then
-        err "SSH 服务重启失败，正在回滚配置并尝试恢复服务。"
-        restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_PORT_CONF" "$dropin_backup"
-        restart_ssh_service >/dev/null 2>&1 || true
+        err "SSH 服务重启失败，正在回滚配置。"
+        rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" || true
         return 1
     fi
 
     if ! wait_for_ssh_listener "$SSH_TARGET_PORT"; then
         err "SSH 重启后未检测到 sshd 监听端口 $SSH_TARGET_PORT，正在回滚。"
-        restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_PORT_CONF" "$dropin_backup"
-        restart_ssh_service >/dev/null 2>&1 || true
+        rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" || true
         return 1
     fi
+
+    info "SSH 配置写入位置：$write_action"
 
     warn_ssh_access_controls
 
@@ -3726,14 +3796,10 @@ ssh_port_change_menu() {
  修改 SSH 端口
 ========================================
  当前 SSH 端口：$(ssh_port_state)
- 目标 SSH 端口：$SSH_TARGET_PORT
+ 新端口：创建时输入，留空默认 23333
 ----------------------------------------
-将写入：
-$SSHD_VPSBOX_PORT_CONF
-
-1. Port $SSH_TARGET_PORT
-   修改 SSH 监听端口，减少 22 端口扫描噪音。
-   请先在商家安全组放行 TCP $SSH_TARGET_PORT。
+将根据当前 SSH 配置，最小化修改主配置或 VPSBox drop-in。
+请先在商家安全组放行即将输入的 TCP 端口。
 ----------------------------------------
  1) 应用 SSH 端口修改
  2) 恢复 VPSBox SSH 配置（高风险）
@@ -4566,7 +4632,7 @@ uninstall_all() {
 
 is_valid_hostname_value() {
     local value="$1"
-    [ -n "$value" ] && [ "${#value}" -le 253 ] || return 1
+    [ -n "$value" ] && [ "${#value}" -le 64 ] || return 1
     [[ "$value" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
     local label
     IFS='.' read -ra labels <<< "$value"
@@ -4577,64 +4643,113 @@ is_valid_hostname_value() {
 }
 
 hostname_current_value() {
-    hostnamectl --static 2>/dev/null || hostname 2>/dev/null
+    if is_systemd && command -v hostnamectl >/dev/null 2>&1; then
+        hostnamectl --static 2>/dev/null || hostname 2>/dev/null
+    else
+        hostname 2>/dev/null
+    fi
 }
 
 set_system_hostname() {
     local value="$1"
-    if command -v hostnamectl >/dev/null 2>&1; then
+    if is_systemd && command -v hostnamectl >/dev/null 2>&1; then
         hostnamectl set-hostname "$value"
     else
         hostname "$value"
     fi
 }
 
+hostname_hosts_markers_valid() {
+    local begin_count end_count begin_line end_line
+
+    [ -f /etc/hosts ] && [ ! -L /etc/hosts ] || return 1
+    begin_count="$(grep -Fxc "$HOSTNAME_BEGIN" /etc/hosts 2>/dev/null || true)"
+    end_count="$(grep -Fxc "$HOSTNAME_END" /etc/hosts 2>/dev/null || true)"
+    if [ "$begin_count" = "0" ] && [ "$end_count" = "0" ]; then
+        return 0
+    fi
+    [ "$begin_count" = "1" ] && [ "$end_count" = "1" ] || return 1
+    begin_line="$(grep -Fnx "$HOSTNAME_BEGIN" /etc/hosts | cut -d: -f1)"
+    end_line="$(grep -Fnx "$HOSTNAME_END" /etc/hosts | cut -d: -f1)"
+    [ "$begin_line" -lt "$end_line" ]
+}
+
+hostname_short_name() {
+    printf '%s\n' "${1%%.*}"
+}
+
+rollback_hostname_change() {
+    local original="$1"
+
+    restore_change_file HOSTNAME_FILE /etc/hostname >/dev/null 2>&1 || true
+    restore_change_file HOSTS_FILE /etc/hosts >/dev/null 2>&1 || true
+    set_system_hostname "$original" >/dev/null 2>&1 || true
+}
+
 change_system_hostname() {
-    local old new tmp
+    local old original new short_name hosts_entry tmp
     old="$(hostname_current_value)"
     echo "当前主机名：$old"
     read -r -p "请输入新主机名（留空取消）: " new
+    new="$(sanitize_paste_input "$new")"
     [ -n "$new" ] || { info "已取消。"; return 0; }
-    is_valid_hostname_value "$new" || { err "主机名格式不正确。"; return 1; }
+    is_valid_hostname_value "$new" || { err "主机名格式不正确：仅允许字母、数字、点和连字符，长度不超过 64。"; return 1; }
     [ "$new" != "$old" ] || { info "新旧主机名相同。"; return 0; }
+    [ ! -L /etc/hostname ] || { err "/etc/hostname 是符号链接，已拒绝修改。"; return 1; }
+    hostname_hosts_markers_valid || { err "/etc/hosts 是符号链接或 VPSBox 主机名标记异常，已拒绝修改。"; return 1; }
     backup_change_file_once HOSTNAME_FILE /etc/hostname || return 1
     backup_change_file_once HOSTS_FILE /etc/hosts || return 1
+    manifest_set_once HOSTNAME_VALUE "$old" || return 1
+    original="$(manifest_value HOSTNAME_VALUE 2>/dev/null || true)"
+    [ -n "$original" ] || { err "无法记录原始主机名，已取消修改。"; return 1; }
+    short_name="$(hostname_short_name "$new")"
+    hosts_entry="127.0.1.1 $new"
+    [ "$short_name" = "$new" ] || hosts_entry+=" $short_name"
 
     tmp="$(mktemp /etc/.hostname.vpsbox.XXXXXX)" || return 1
     printf '%s\n' "$new" > "$tmp"
     if ! chown root:root "$tmp" || ! chmod 644 "$tmp" || ! mv -f "$tmp" /etc/hostname || ! set_system_hostname "$new"; then
         rm -f "$tmp"
-        restore_change_file HOSTNAME_FILE /etc/hostname || true
-        set_system_hostname "$old" 2>/dev/null || true
+        rollback_hostname_change "$original"
         err "主机名修改失败，已尝试恢复原主机名。"
         return 1
     fi
 
     tmp="$(mktemp /etc/.hosts.vpsbox.XXXXXX)" || {
-        restore_change_file HOSTNAME_FILE /etc/hostname || true
-        set_system_hostname "$old" 2>/dev/null || true
+        rollback_hostname_change "$original"
         return 1
     }
-    awk -v begin="$HOSTNAME_BEGIN" -v end="$HOSTNAME_END" '
+    if ! awk -v begin="$HOSTNAME_BEGIN" -v end="$HOSTNAME_END" '
         $0 == begin { skip=1; next }
         $0 == end { skip=0; next }
         !skip { print }
-    ' /etc/hosts > "$tmp"
+    ' /etc/hosts > "$tmp"; then
+        rm -f "$tmp"
+        rollback_hostname_change "$original"
+        err "读取 /etc/hosts 失败，已恢复原配置。"
+        return 1
+    fi
     {
         printf '%s\n' "$HOSTNAME_BEGIN"
-        printf '127.0.1.1 %s\n' "$new"
+        printf '%s\n' "$hosts_entry"
         printf '%s\n' "$HOSTNAME_END"
     } >> "$tmp"
     if ! chown root:root "$tmp" || ! chmod 644 "$tmp" || ! mv -f "$tmp" /etc/hosts; then
         rm -f "$tmp"
-        restore_change_file HOSTNAME_FILE /etc/hostname || true
-        restore_change_file HOSTS_FILE /etc/hosts || true
-        set_system_hostname "$old" 2>/dev/null || true
+        rollback_hostname_change "$original"
         err "更新 /etc/hosts 失败，已恢复原配置。"
         return 1
     fi
-    manifest_set HOSTNAME_VALUE "$old" || return 1
-    mark_change_applied HOSTNAME || return 1
+    if [ "$(tr -d '\r\n' </etc/hostname)" != "$new" ] || [ "$(hostname_current_value)" != "$new" ] || ! grep -Fqx "$hosts_entry" /etc/hosts; then
+        rollback_hostname_change "$original"
+        err "主机名验证失败，已恢复原配置。"
+        return 1
+    fi
+    if ! mark_change_applied HOSTNAME; then
+        rollback_hostname_change "$original"
+        err "无法记录主机名变更，已恢复原配置。"
+        return 1
+    fi
     info "主机名已修改为：$new"
 }
 

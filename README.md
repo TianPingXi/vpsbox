@@ -2,7 +2,7 @@
 
 VPS 初始化、系统优化与 sing-box 节点管理脚本。
 
-当前版本：`v1.0.7`
+当前版本：`v1.0.8`
 
 ## VPS 一键安装
 
@@ -106,7 +106,7 @@ sing-box 管理
 - 限制 systemd 日志大小（使用独立 drop-in，历史日志清理需单独确认）
 - 修改系统 IPv4 DNS
 - 启用系统 IPv4 优先，IPv4 不可用时 IPv6 仍可兜底
-- 修改 SSH 端口为 23333，并按 SSH 当前实际生效端口同步 Fail2ban sshd jail
+- 修改 SSH 端口（留空默认 23333），并按 SSH 当前实际生效端口同步 Fail2ban sshd jail
 - SSH 基础加固，启用低风险 SSH 配置项
 - 查看 SSH 当前生效配置
 - 更新 sing-box（节点配置检查或服务恢复失败时，自动尝试恢复更新前的二进制）
