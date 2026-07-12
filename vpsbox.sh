@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="VPSBox"
-VPSBOX_VERSION="v1.0.8"
+VPSBOX_VERSION="v1.0.9"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"

@@ -2,7 +2,7 @@
 
 VPS 初始化、系统优化与 sing-box 节点管理脚本。
 
-当前版本：`v1.0.8`
+当前版本：`v1.0.9`
 
 ## VPS 一键安装
 
@@ -114,27 +114,3 @@ sing-box 管理
 - 打开已安装的管理面板时检查远程版本，只提示更新，不自动覆盖本地脚本
 - 卸载 VPSBox
 - 可单独确认删除 sing-box 和所有节点配置
-
-## 安全与恢复说明
-
-- 节点状态文件按固定字段解析，不作为 Shell 脚本执行；配置目录拒绝符号链接，并要求 root 所有权和限制性权限。
-- VLESS Reality 会分别保存客户端连接地址和 Reality 目标域名；创建前检查目标 DNS 与 TLS 443 可达性，私钥只写入权限为 `600` 的服务端配置，不写入节点链接或状态文件。
-- VPSBox 锁会记录进程身份与终端；异常断开后失去有效终端的旧菜单会在下次启动时自动回收，仍在有效终端中的会话须明确确认后才会结束。
-- 修改普通 `/etc/resolv.conf` 前必须成功备份，写入时保留非 `nameserver` 行，修改后验证域名解析；未知 DNS 符号链接会拒绝直接覆盖。
-- 修改 systemd-resolved 配置失败或解析验证失败时，会恢复原配置并尝试重新启动服务。
-- 配置 chrony 时会先备份配置并确认 chrony 可用，再停用 systemd-timesyncd；后续步骤失败会恢复原 NTP 配置和服务状态。
-- journald 限制写入 `/etc/systemd/journald.conf.d/99-vpsbox.conf`，不会直接改写发行版主配置；重启或生效检查失败会回滚该 drop-in。
-- BBR/fq 仅在内核模块加载和运行时参数验证均通过后才保存到 `/etc/sysctl.d/99-vpsbox-bbr.conf`。
-- sing-box 安装与更新使用固定的官方 GitHub Release 版本，并校验 Release 提供的 SHA256；更新失败时会尝试重新安装原版本，再以旧二进制作为最后恢复手段。
-- VPSBox 将自己修改前的 DNS、BBR、IPv4 优先、Fail2ban、chrony 和 journald 文件保存到 `/etc/vpsbox/`，可在“系统优化”菜单中查看并输入 `YES` 恢复；恢复成功后会清除对应清单标记。
-- SSH 主配置与 VPSBox drop-in 也会保存到该目录，但只能在“修改 SSH 端口”子菜单中单独恢复。恢复前会提示连接风险，恢复后执行 `sshd -t`、重启 SSH 并确认原端口监听；请先准备控制台或备用连接。
-- 系统工具提供垃圾清理和主机名修改：垃圾清理先预览并分项确认，只处理包缓存、过期临时文件、VPSBox 过期备份和明确确认的历史日志；主机名修改会备份 `/etc/hostname` 与 `/etc/hosts` 并支持恢复。
-- sing-box 当前固定为 `v1.13.14`，按发行版和架构下载官方 Release 包；Alpine 不再混用 `edge/community` 源，Debian/Ubuntu 同样使用经过 SHA256 校验的官方包。
-- NextTrace 当前固定为 `v1.7.1`，从官方 GitHub Release 下载并校验 SHA256 后安装；不再执行远程安装脚本。
-- 删除节点前会确认 sing-box 已停止、节点端口不再监听，并尝试禁用开机启动。
-- 删除、重建或重启节点时会清理仍使用 `/etc/sing-box/config.json` 的残留 sing-box 进程，防止旧节点继续占用端口或重复启动实例。
-- 重建节点前必须完整备份配置、状态、链接和服务文件；失败时同时恢复服务运行状态与开机启动状态，备份不完整则拒绝重建。
-- 节点写入期间收到中断或异常退出时会触发事务回滚；回滚不完整时保留临时备份并报告位置。
-- 节点状态文件仅接受 root 私有权限，删除或重建节点时不会持久保留包含旧凭据的配置副本。
-- VPSBox 更新必须通过菜单手动触发；新脚本需包含有效版本号并通过 Bash 语法检查，旧脚本保留在 `/usr/local/bin/vpsbox.previous`。
-- 卸载 VPSBox 不会自动恢复已经应用的 SSH、DNS、BBR、IPv4 优先、Fail2ban、NTP 或 journald 系统设置。
