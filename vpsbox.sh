@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="VPSBox"
-VPSBOX_VERSION="v1.0.3"
+VPSBOX_VERSION="v1.0.4"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
@@ -4264,7 +4264,7 @@ detect_trace_line() {
         echo "CTGNet|AS23764"
     elif trace_has "$output" 'AS[[:space:]]*10099|AS10099'; then
         echo "10099|AS10099"
-    elif trace_has "$output" 'AS[[:space:]]*58807|AS58807|223\.120\.(16|17|19|130|131|140|141)\.'; then
+    elif trace_has "$output" 'AS[[:space:]]*58807|AS58807|223\.120\.(1(2[89]|[3-9][0-9])|2([0-4][0-9]|5[0-5]))\.'; then
         echo "CMIN2|AS58807"
     elif trace_has "$output" 'AS[[:space:]]*9929|AS9929|218\.105\.|210\.51\.'; then
         echo "9929|AS9929"
@@ -4278,7 +4278,7 @@ detect_trace_line() {
         echo "163|AS4134"
     elif trace_has "$output" 'AS[[:space:]]*4837|AS4837|219\.158\.'; then
         echo "4837|AS4837"
-    elif trace_has "$output" 'AS[[:space:]]*58453|AS58453|223\.(118|119|120|121)\.'; then
+    elif trace_has "$output" 'AS[[:space:]]*58453|AS58453|223\.(118|119|121)\.|223\.120\.(0|[1-9][0-9]|1[01][0-9]|12[0-7])\.'; then
         echo "CMI|AS58453"
     elif trace_has "$output" 'AS[[:space:]]*9808|AS9808|221\.(176|183)\.'; then
         echo "CMNET|AS9808"
