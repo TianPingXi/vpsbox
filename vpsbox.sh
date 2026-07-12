@@ -2,8 +2,8 @@
 set -euo pipefail
 umask 077
 
-APP_NAME="VPSBox"
-VPSBOX_VERSION="v1.0.10"
+APP_NAME="vpsbox"
+VPSBOX_VERSION="v1.0.11"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
@@ -685,7 +685,7 @@ secure_config_dir() {
 
 ensure_change_store() {
     [ ! -L "$VPSBOX_STATE_DIR" ] && [ ! -L "$CHANGE_BACKUP_DIR" ] && [ ! -L "$CHANGE_MANIFEST" ] || {
-        err "VPSBox 变更清单路径包含符号链接，已拒绝使用。"
+        err "vpsbox 变更清单路径包含符号链接，已拒绝使用。"
         return 1
     }
     mkdir -p "$CHANGE_BACKUP_DIR" || return 1
@@ -2217,7 +2217,7 @@ delete_node() {
     read -r -p "确认删除当前 ${PROTOCOL:-shadowsocks} 节点？sing-box 服务将停止。(y/N): " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消。"; return 0; }
 
-    service_stop 2>/dev/null || warn "服务管理器未能正常停止 sing-box，将继续检查 VPSBox 配置对应的进程。"
+    service_stop 2>/dev/null || warn "服务管理器未能正常停止 sing-box，将继续检查 vpsbox 配置对应的进程。"
     if ! stop_singbox_config_processes; then
         err "残留 sing-box 进程无法停止，已保留节点配置。"
         return 1
@@ -2995,9 +2995,9 @@ change_ipv4_dns() {
 当前 IPv4 DNS：
 $(ipv4_dns_lines)
 ----------------------------------------
- 1) 使用默认 DNS：1.1.1.1 + 8.8.8.8
- 2) 自定义 IPv4 DNS
- 0) 取消
+ [1] 使用默认 DNS：1.1.1.1 + 8.8.8.8
+ [2] 自定义 IPv4 DNS
+ [0] 取消
 ========================================
 EOF
 
@@ -3236,7 +3236,7 @@ write_vpsbox_ssh_port_config() {
     mkdir -p "$SSHD_CONFIG_DIR" || return 1
     tmp="$(mktemp)" || return 1
     cat > "$tmp" <<EOF || { rm -f "$tmp"; return 1; }
-# Managed by VPSBox
+# Managed by vpsbox
 Port $SSH_TARGET_PORT
 EOF
     install -m 644 "$tmp" "$SSHD_VPSBOX_PORT_CONF" || { rm -f "$tmp"; return 1; }
@@ -3249,7 +3249,7 @@ write_vpsbox_ssh_hardening_config() {
     mkdir -p "$SSHD_CONFIG_DIR" || return 1
     tmp="$(mktemp)" || return 1
     cat > "$tmp" <<'EOF' || { rm -f "$tmp"; return 1; }
-# Managed by VPSBox
+# Managed by vpsbox
 LoginGraceTime 1m
 StrictModes yes
 PubkeyAuthentication yes
@@ -3553,7 +3553,7 @@ apply_ssh_port_change() {
     fi
 
     if { [ -e "$SSHD_VPSBOX_PORT_CONF" ] && sshd_dropin_include_available; } || { ! ssh_main_has_active_port_directive && sshd_dropin_include_available; }; then
-        write_action="VPSBox drop-in"
+        write_action="vpsbox drop-in"
         write_vpsbox_ssh_port_config || {
             err "写入 SSH drop-in 失败，正在回滚。"
             rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" || true
@@ -3755,12 +3755,12 @@ restore_vpsbox_ssh_config() {
     local confirm tmp original_ports original_port name path cleanup_failed=0
 
     [ "$(manifest_value APPLIED_SSH_CONFIG 2>/dev/null || true)" = "1" ] || {
-        warn "没有已记录的 VPSBox SSH 配置可恢复。"
+        warn "没有已记录的 vpsbox SSH 配置可恢复。"
         return 0
     }
     original_ports="$(manifest_value SSH_PORTS 2>/dev/null || true)"
     original_port="${original_ports%%,*}"
-    echo "将恢复 SSH 主配置及 VPSBox 端口/加固 drop-in。"
+    echo "将恢复 SSH 主配置及 vpsbox 端口/加固 drop-in。"
     echo "预期恢复端口：${original_ports:-未知}；当前连接可能断开。"
     read -r -p "请确认已有控制台或备用连接。输入 YES 执行 SSH 恢复：" confirm
     [ "$confirm" = "YES" ] || { info "已取消 SSH 恢复。"; return 0; }
@@ -3817,12 +3817,12 @@ ssh_port_change_menu() {
  当前 SSH 端口：$(ssh_port_state)
  新端口：创建时输入，留空默认 23333
 ----------------------------------------
-将根据当前 SSH 配置，最小化修改主配置或 VPSBox drop-in。
+将根据当前 SSH 配置，最小化修改主配置或 vpsbox drop-in。
 请先在商家安全组放行即将输入的 TCP 端口。
 ----------------------------------------
- 1) 应用 SSH 端口修改
- 2) 恢复 VPSBox SSH 配置（高风险）
- 0) 返回
+ [1] 应用 SSH 端口修改
+ [2] 恢复 vpsbox SSH 配置（高风险）
+ [0] 返回
 ========================================
 EOF
         read -r -p "请输入选项: " opt || exit 0
@@ -3869,8 +3869,8 @@ $SSHD_VPSBOX_HARDENING_CONF
  6. UseDNS no
    登录时不做反向 DNS 查询，减少登录卡顿。
 ----------------------------------------
- 1) 应用 SSH 基础加固
- 0) 返回
+ [1] 应用 SSH 基础加固
+ [0] 返回
 ========================================
 EOF
         read -r -p "请输入选项: " opt || exit 0
@@ -4572,7 +4572,7 @@ EOF
 
 uninstall_singbox_and_nodes() {
     info "正在停止并禁用 sing-box 服务..."
-    service_stop 2>/dev/null || warn "服务管理器未能正常停止 sing-box，将继续检查 VPSBox 配置对应的进程。"
+    service_stop 2>/dev/null || warn "服务管理器未能正常停止 sing-box，将继续检查 vpsbox 配置对应的进程。"
     if ! stop_singbox_config_processes; then
         err "残留 sing-box 进程无法停止，已取消删除。"
         return 1
@@ -4621,10 +4621,10 @@ uninstall_all() {
     local confirm
     local remove_singbox
 
-    echo "此操作会卸载 VPSBox 管理命令。"
+    echo "此操作会卸载 vpsbox 管理命令。"
     echo "默认不会删除 sing-box，也不会删除节点配置。"
-    echo "可在确认后恢复 VPSBox 已记录的 DNS、BBR、Fail2ban、NTP、journald 与 IPv4 优先设置。"
-    read -r -p "确认卸载 VPSBox？请输入 YES：" confirm
+    echo "可在确认后恢复 vpsbox 已记录的 DNS、BBR、Fail2ban、NTP、journald 与 IPv4 优先设置。"
+    read -r -p "确认卸载 vpsbox？请输入 YES：" confirm
     [ "$confirm" = "YES" ] || { info "已取消。"; return 0; }
 
     if ! singbox_installed; then
@@ -4633,7 +4633,7 @@ uninstall_all() {
         read -r -p "是否同时删除 sing-box 和所有节点配置？请输入 YES 确认：" remove_singbox
         if [ "$remove_singbox" = "YES" ]; then
             uninstall_singbox_and_nodes || {
-                err "sing-box 卸载未完成，已保留 VPSBox 管理命令便于重试。"
+                err "sing-box 卸载未完成，已保留 vpsbox 管理命令便于重试。"
                 return 1
             }
         else
@@ -4641,7 +4641,7 @@ uninstall_all() {
         fi
     fi
 
-    info "正在删除 VPSBox 命令..."
+    info "正在删除 vpsbox 命令..."
     rm -f "$CMD_PATH" /usr/bin/vpsbox
 
     info "卸载完成。"
@@ -4715,7 +4715,7 @@ change_system_hostname() {
     is_valid_hostname_value "$new" || { err "主机名格式不正确：仅允许字母、数字、点和连字符，长度不超过 64。"; return 1; }
     [ "$new" != "$old" ] || { info "新旧主机名相同。"; return 0; }
     [ ! -L /etc/hostname ] || { err "/etc/hostname 是符号链接，已拒绝修改。"; return 1; }
-    hostname_hosts_markers_valid || { err "/etc/hosts 是符号链接或 VPSBox 主机名标记异常，已拒绝修改。"; return 1; }
+    hostname_hosts_markers_valid || { err "/etc/hosts 是符号链接或 vpsbox 主机名标记异常，已拒绝修改。"; return 1; }
     backup_change_file_once HOSTNAME_FILE /etc/hostname || return 1
     backup_change_file_once HOSTS_FILE /etc/hosts || return 1
     manifest_set_once HOSTNAME_VALUE "$old" || return 1
@@ -4806,9 +4806,9 @@ cleanup_orphaned_change_backups() {
         old_file="$(find "$backup" -xdev -type f -mtime +30 -print -quit 2>/dev/null || true)"
         [ -n "$old_file" ] || continue
         if find "$backup" -xdev -type f -mtime +30 -delete 2>/dev/null; then
-            info "已清理未引用的 VPSBox 备份：$name"
+            info "已清理未引用的 vpsbox 备份：$name"
         else
-            warn "清理未引用的 VPSBox 备份失败：$name"
+            warn "清理未引用的 vpsbox 备份失败：$name"
             return 1
         fi
     done
@@ -4816,7 +4816,7 @@ cleanup_orphaned_change_backups() {
 
 cleanup_system_garbage() {
     local confirm journal_confirm
-    echo "将扫描并清理：包管理器缓存、超过 7 天的 VPSBox 临时文件、未引用的 VPSBox 过期备份。"
+    echo "将扫描并清理：包管理器缓存、超过 7 天的 vpsbox 临时文件、未引用的 vpsbox 过期备份。"
     echo "不会清理节点配置、用户主目录、Docker 数据卷或数据库。"
     cleanup_preview
     read -r -p "确认执行垃圾清理？请输入 YES：" confirm
@@ -4828,7 +4828,7 @@ cleanup_system_garbage() {
     if command -v apk >/dev/null 2>&1; then apk cache clean || warn "APK 缓存清理失败。"; fi
     cleanup_old_temp_files /tmp
     cleanup_old_temp_files /var/tmp
-    cleanup_orphaned_change_backups || warn "VPSBox 未引用备份清理不完整。"
+    cleanup_orphaned_change_backups || warn "vpsbox 未引用备份清理不完整。"
     if command -v journalctl >/dev/null 2>&1; then
         read -r -p "是否清理超过 30 天的 systemd 日志？请输入 YES，其他输入跳过：" journal_confirm
         if [ "$journal_confirm" = "YES" ]; then
@@ -4843,7 +4843,7 @@ cleanup_system_garbage() {
 
 show_vpsbox_changes() {
     local name found=0
-    echo "VPSBox 已记录的系统变更："
+    echo "vpsbox 已记录的系统变更："
     for name in HOSTNAME DNS_RESOLV DNS_RESOLVED BBR_CONF GAI_CONF FAIL2BAN_SSHD NTP_CONF JOURNALD_CONF; do
         if [ "$(manifest_value "APPLIED_$name" 2>/dev/null || true)" = "1" ]; then
             printf ' - %s：可恢复\n' "$name"
@@ -4859,7 +4859,7 @@ restore_vpsbox_system_changes() {
     local fail2ban_active fail2ban_enabled
 
     show_vpsbox_changes
-    read -r -p "恢复上述 VPSBox 已记录的系统设置？请输入 YES：" confirm
+    read -r -p "恢复上述 vpsbox 已记录的系统设置？请输入 YES：" confirm
     [ "$confirm" = "YES" ] || { info "已取消恢复。"; return 0; }
 
     if [ "$(manifest_value APPLIED_HOSTNAME 2>/dev/null || true)" = "1" ]; then
@@ -5135,16 +5135,16 @@ $(vpsbox_update_notice)
  IPv4 DNS：
 $(ipv4_dns_lines)
 ----------------------------------------
- 1) 节点管理
- 2) sing-box 管理
- 3) 系统优化
- 4) 一键自检
- 5) 查看三网回程
- 6) 其他脚本
+ [1] 节点管理
+ [2] sing-box 管理
+ [3] 系统优化
+ [4] 一键自检
+ [5] 查看三网回程
+ [6] 其他脚本
 ----------------------------------------
- 8) 更新 vpsbox 脚本
- 9) 卸载 VPSBox
- 0) 退出
+ [8] 更新 vpsbox 脚本
+ [9] 卸载 vpsbox
+ [0] 退出
 ========================================
 EOF
 }
@@ -5162,11 +5162,11 @@ node_menu() {
  节点地址：$(node_address)
  sing-box 状态：$(service_status_short)
 ----------------------------------------
- 1) 创建/重建 SS 2022 节点
- 2) 创建/重建 VLESS Reality 节点
- 3) 查看节点链接
- 4) 删除当前节点
- 0) 返回主菜单
+ [1] 创建/重建 SS 2022 节点
+ [2] 创建/重建 VLESS Reality 节点
+ [3] 查看节点链接
+ [4] 删除当前节点
+ [0] 返回主菜单
 ========================================
 EOF
         read -r -p "请输入选项: " opt || exit 0
@@ -5196,11 +5196,11 @@ singbox_menu() {
  sing-box 状态：$(service_status_short)
  sing-box 版本：$(singbox_version)
 ----------------------------------------
- 1) 启动 sing-box 服务
- 2) 停止 sing-box 服务
- 3) 重启 sing-box 服务
- 4) 更新 sing-box
- 0) 返回主菜单
+ [1] 启动 sing-box 服务
+ [2] 停止 sing-box 服务
+ [3] 重启 sing-box 服务
+ [4] 更新 sing-box
+ [0] 返回主菜单
 ========================================
 EOF
         read -r -p "请输入选项: " opt || exit 0
@@ -5236,20 +5236,20 @@ system_menu() {
  NTP 同步：$(ntp_sync_state)
  系统重启：$(reboot_required_state)
 ----------------------------------------
- 1) 系统更新
- 2) 垃圾清理
- 3) 限制 systemd 日志大小
- 4) 一键开启 BBR + fq
- 5) 修改系统 IPv4 DNS
- 6) 启用系统 IPv4 优先
- 7) 修改 SSH 端口
- 8) SSH 基础加固
- 9) 安装 Fail2ban
- 10) 开启 NTP 时间同步
- 11) 查看 SSH 当前生效配置
- 12) 修改主机名
- 13) 查看/恢复 VPSBox 系统改动
- 0) 返回主菜单
+ [1] 系统更新
+ [2] 垃圾清理
+ [3] 限制 systemd 日志大小
+ [4] 一键开启 BBR + fq
+ [5] 修改系统 IPv4 DNS
+ [6] 启用系统 IPv4 优先
+ [7] 修改 SSH 端口
+ [8] SSH 基础加固
+ [9] 安装 Fail2ban
+ [10] 开启 NTP 时间同步
+ [11] 查看 SSH 当前生效配置
+ [12] 修改主机名
+ [13] 查看/恢复 vpsbox 系统改动
+ [0] 返回主菜单
 ========================================
 EOF
         read -r -p "请输入选项: " opt || exit 0
@@ -5287,7 +5287,7 @@ show_ip_quality_script_info() {
  上游命令：
  bash <(curl -Ls https://Check.Place) -I
 
- 说明：VPSBox 仅提供第三方脚本链接和命令提示，
+ 说明：vpsbox 仅提供第三方脚本链接和命令提示，
  不会自动执行。
 ========================================
 EOF
@@ -5302,8 +5302,8 @@ other_scripts_menu() {
 ========================================
  其他脚本
 ========================================
- 1) IP 质量体检脚本
- 0) 返回主菜单
+ [1] IP 质量体检脚本
+ [0] 返回主菜单
 ========================================
 EOF
         read -r -p "请输入选项: " opt || exit 0
