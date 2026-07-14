@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.14"
+VPSBOX_VERSION="v1.0.15"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
@@ -3199,6 +3199,27 @@ sshd_dropin_include_available() {
     grep -Eiq '^[[:space:]]*Include[[:space:]]+.*sshd_config\.d/.*\.conf' "$SSHD_MAIN_CONF" 2>/dev/null
 }
 
+ensure_sshd_dropin_include() {
+    local tmp
+
+    sshd_dropin_include_available && return 0
+    mkdir -p "$SSHD_CONFIG_DIR" || return 1
+    tmp="$(mktemp)" || return 1
+
+    # OpenSSH 对多数全局指令采用首个匹配值，因此 Include 必须位于主配置前部。
+    {
+        printf 'Include %s/*.conf\n' "$SSHD_CONFIG_DIR"
+        cat "$SSHD_MAIN_CONF"
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
+
+    if ! cat "$tmp" > "$SSHD_MAIN_CONF"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    rm -f "$tmp"
+    sshd_dropin_include_available
+}
+
 backup_ssh_file() {
     local path="$1"
     local suffix="$2"
@@ -3428,6 +3449,7 @@ sync_fail2ban_sshd_port() {
     local backup=""
     local backend="auto"
     local ports
+    local service_action
     local tmp
     local was_running=0
 
@@ -3476,26 +3498,42 @@ EOF
     fi
 
     if is_systemd; then
-        if [ "$was_running" -eq 1 ] && ! retry 3 2 systemctl restart fail2ban; then
+        if [ "$was_running" -eq 1 ]; then
+            service_action="restart"
+        else
+            service_action="start"
+        fi
+        if ! retry 3 2 systemctl "$service_action" fail2ban; then
             if [ -n "$backup" ]; then
                 cp -a "$backup" "$FAIL2BAN_VPSBOX_SSHD_CONF" || true
             else
                 rm -f "$FAIL2BAN_VPSBOX_SSHD_CONF"
             fi
-            systemctl restart fail2ban >/dev/null 2>&1 || true
+            if [ "$was_running" -eq 1 ]; then
+                systemctl restart fail2ban >/dev/null 2>&1 || true
+            else
+                systemctl stop fail2ban >/dev/null 2>&1 || true
+            fi
             return 1
         fi
     elif command -v rc-service >/dev/null 2>&1; then
         if [ "$was_running" -eq 1 ]; then
-            retry 3 2 rc-service fail2ban restart || {
-                if [ -n "$backup" ]; then
-                    cp -a "$backup" "$FAIL2BAN_VPSBOX_SSHD_CONF" || true
-                else
-                    rm -f "$FAIL2BAN_VPSBOX_SSHD_CONF"
-                fi
+            service_action="restart"
+        else
+            service_action="start"
+        fi
+        if ! retry 3 2 rc-service fail2ban "$service_action"; then
+            if [ -n "$backup" ]; then
+                cp -a "$backup" "$FAIL2BAN_VPSBOX_SSHD_CONF" || true
+            else
+                rm -f "$FAIL2BAN_VPSBOX_SSHD_CONF"
+            fi
+            if [ "$was_running" -eq 1 ]; then
                 rc-service fail2ban restart >/dev/null 2>&1 || true
-                return 1
-            }
+            else
+                rc-service fail2ban stop >/dev/null 2>&1 || true
+            fi
+            return 1
         fi
     else
         err "未找到 Fail2ban 服务重启方式。"
@@ -3503,8 +3541,27 @@ EOF
     fi
 
     rm -f "$FAIL2BAN_CONFIG_DIR/99-vpsbox-sshd-port.local"
-    if [ "$was_running" -eq 1 ]; then
-        fail2ban-client status sshd >/dev/null 2>&1 || return 1
+    if ! retry 5 1 fail2ban-client status sshd >/dev/null 2>&1; then
+        if [ -n "$backup" ]; then
+            cp -a "$backup" "$FAIL2BAN_VPSBOX_SSHD_CONF" || true
+        else
+            rm -f "$FAIL2BAN_VPSBOX_SSHD_CONF"
+        fi
+        if is_systemd; then
+            if [ "$was_running" -eq 1 ]; then
+                systemctl restart fail2ban >/dev/null 2>&1 || true
+            else
+                systemctl stop fail2ban >/dev/null 2>&1 || true
+            fi
+        elif command -v rc-service >/dev/null 2>&1; then
+            if [ "$was_running" -eq 1 ]; then
+                rc-service fail2ban restart >/dev/null 2>&1 || true
+            else
+                rc-service fail2ban stop >/dev/null 2>&1 || true
+            fi
+        fi
+        err "Fail2ban 服务已启动，但 sshd jail 未在预期时间内就绪。"
+        return 1
     fi
     mark_change_applied FAIL2BAN_SSHD || return 1
 }
