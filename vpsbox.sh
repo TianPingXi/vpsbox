@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.15"
+VPSBOX_VERSION="v1.0.16"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
@@ -30,12 +30,21 @@ SSHD_VPSBOX_HARDENING_CONF="$SSHD_CONFIG_DIR/01-vpsbox-ssh-hardening.conf"
 SSH_TARGET_PORT="23333"
 FAIL2BAN_CONFIG_DIR="/etc/fail2ban/jail.d"
 FAIL2BAN_VPSBOX_SSHD_CONF="$FAIL2BAN_CONFIG_DIR/99-vpsbox-sshd.local"
+FIREWALL_CONFIG="$VPSBOX_STATE_DIR/firewall.nft"
+FIREWALL_STATE_FILE="$VPSBOX_STATE_DIR/firewall.env"
+FIREWALL_SYSTEMD_UNIT="/etc/systemd/system/vpsbox-firewall.service"
+FIREWALL_OPENRC_SERVICE="/etc/init.d/vpsbox-firewall"
+FIREWALL_SERVICE_NAME="vpsbox-firewall"
+FIREWALL_ROLLBACK_SECONDS=90
 RUNTIME_DIR="/run/vpsbox"
 LOCK_FILE="$RUNTIME_DIR/vpsbox.lock"
 LOCK_DIR="$RUNTIME_DIR/lockdir"
 LOCK_USING_FLOCK=0
 LOCK_USING_DIR=0
 ACTIVE_NODE_BACKUP=""
+ACTIVE_FIREWALL_TRANSITION_DIR=""
+ACTIVE_SSH_FIREWALL_TRANSITION=0
+ACTIVE_FIREWALL_ROLLBACK_DIR=""
 ACTIVE_TRACE_TMP=""
 SERVICE_NAME="sing-box"
 METHOD="2022-blake3-aes-128-gcm"
@@ -62,6 +71,32 @@ TRACE_SIZE_LARGE=1400
 TRACE_SIZE_QUERIES=3
 REMOTE_VERSION=""
 UPDATE_AVAILABLE=0
+FW_EXTRA_TCP=""
+FW_EXTRA_UDP=""
+FW_SSH_PORTS=""
+FW_NODE_TCP=""
+FW_NODE_UDP=""
+FW_DOCKER_TCP=""
+FW_DOCKER_UDP=""
+FW_DOCKER_PUBLIC_TCP=""
+FW_DOCKER_PUBLIC_UDP=""
+FW_DOCKER_PUBLIC4_TCP=""
+FW_DOCKER_PUBLIC4_UDP=""
+FW_DOCKER_PUBLIC6_TCP=""
+FW_DOCKER_PUBLIC6_UDP=""
+FW_DOCKER_PROXY4_TCP=""
+FW_DOCKER_PROXY4_UDP=""
+FW_DOCKER_PROXY6_TCP=""
+FW_DOCKER_PROXY6_UDP=""
+FW_DOCKER_BRIDGES=""
+FW_DOCKER_DAEMON_PID=""
+FW_DOCKER_DAEMON_START_TICKS=""
+FW_DOCKER_HOST_NETWORK=0
+FW_DOCKER_DYNAMIC_PORT=0
+FW_DOCKER_DIRECT_NETWORK=0
+FW_DOCKER_CUSTOM_BRIDGE=0
+FW_ALLOWED_TCP=""
+FW_ALLOWED_UDP=""
 
 info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
@@ -230,9 +265,38 @@ cleanup_active_trace_tmp() {
 
 cleanup_vpsbox_runtime() {
     local backup="${ACTIVE_NODE_BACKUP:-}"
-    ACTIVE_NODE_BACKUP=""
-    if [[ "$backup" == /tmp/vpsbox-node-backup.* ]] && [ -d "$backup" ] && declare -F restore_node_files >/dev/null 2>&1; then
-        restore_node_files "$backup" || true
+    local firewall_rollback="${ACTIVE_FIREWALL_ROLLBACK_DIR:-}"
+    if [[ "$backup" == /tmp/vpsbox-node-backup.* ]] && [ -d "$backup" ]; then
+        if declare -F rollback_active_node_transaction >/dev/null 2>&1; then
+            rollback_active_node_transaction || true
+        elif declare -F restore_node_files >/dev/null 2>&1; then
+            ACTIVE_NODE_BACKUP=""
+            restore_node_files "$backup" || true
+        fi
+    fi
+    if [ "${ACTIVE_SSH_FIREWALL_TRANSITION:-0}" = "1" ] &&
+        declare -F ssh_firewall_transition_reconcile >/dev/null 2>&1; then
+        ssh_firewall_transition_reconcile ||
+            warn "SSH 端口切换被中断，无法自动对账；临时放行规则已保留，请重新进入防火墙菜单更新。"
+    fi
+    if [ "${ACTIVE_SSH_FIREWALL_TRANSITION:-0}" != "1" ] &&
+        declare -F firewall_abort_port_transition >/dev/null 2>&1; then
+        firewall_abort_port_transition ||
+            warn "端口切换被中断，防火墙临时规则恢复失败，请重新进入防火墙菜单更新。"
+    fi
+    if [[ "$firewall_rollback" == "$RUNTIME_DIR"/firewall-rollback.* ]] &&
+        [ -d "$firewall_rollback" ] && [ ! -L "$firewall_rollback" ] &&
+        declare -F firewall_restore_snapshot_now >/dev/null 2>&1; then
+        if [ -e "$firewall_rollback/completed" ]; then
+            ACTIVE_FIREWALL_ROLLBACK_DIR=""
+            rm -rf "$firewall_rollback"
+        elif [ "$(cat "$firewall_rollback/decision" 2>/dev/null || true)" = "commit" ]; then
+            firewall_restore_snapshot_now "$firewall_rollback" 1 ||
+                warn "防火墙操作被中断，自动恢复失败；快照已保留：$firewall_rollback"
+        else
+            firewall_restore_snapshot_now "$firewall_rollback" 0 ||
+                warn "防火墙操作被中断，自动恢复失败；快照已保留：$firewall_rollback"
+        fi
     fi
     cleanup_active_trace_tmp
     cleanup_vpsbox_lock
@@ -568,13 +632,13 @@ auto_update_vpsbox_on_start() {
         return 0
     fi
 
-    warn "自动更新失败，继续使用当前版本；可稍后使用菜单 8 重试。"
+    warn "自动更新失败，继续使用当前版本；可稍后使用菜单 00 重试。"
     return 0
 }
 
 vpsbox_update_notice() {
     if [ "$UPDATE_AVAILABLE" -eq 1 ]; then
-        printf ' 新版本：%s（自动更新失败，请使用菜单 8 重试）\n' "$REMOTE_VERSION"
+        printf ' 新版本：%s（自动更新失败，请使用菜单 00 重试）\n' "$REMOTE_VERSION"
     fi
 }
 
@@ -803,6 +867,34 @@ singbox_installed() {
     command -v sing-box >/dev/null 2>&1
 }
 
+singbox_package_installed() {
+    case "$OS" in
+        alpine)
+            command -v apk >/dev/null 2>&1 && apk info -e sing-box >/dev/null 2>&1
+            ;;
+        debian)
+            command -v dpkg-query >/dev/null 2>&1 &&
+                [ "$(dpkg-query -W -f='${Status}' sing-box 2>/dev/null || true)" = "install ok installed" ]
+            ;;
+        redhat)
+            command -v rpm >/dev/null 2>&1 && rpm -q sing-box >/dev/null 2>&1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+singbox_artifacts_present() {
+    singbox_installed || singbox_package_installed ||
+        [ -e "$CONFIG_DIR" ] ||
+        [ -e /etc/systemd/system/sing-box.service ] ||
+        [ -e /usr/lib/systemd/system/sing-box.service ] ||
+        [ -e /lib/systemd/system/sing-box.service ] ||
+        [ -e /etc/init.d/sing-box ] ||
+        [ -e /usr/bin/sing-box ] ||
+        [ -e /usr/local/bin/sing-box ] ||
+        pgrep -x sing-box >/dev/null 2>&1
+}
+
 singbox_version() {
     if singbox_installed; then
         sing-box version 2>/dev/null | head -n1 | sed 's/^sing-box version //'
@@ -997,8 +1089,9 @@ show_logs() {
 is_loopback_listen_addr() {
     local addr="$1"
 
+    addr="${addr,,}"
     case "$addr" in
-        127.*|::1|localhost|ip6-localhost)
+        127.*|::1|0:0:0:0:0:0:0:1|::ffff:127.*|::ffff:7f*|0:0:0:0:0:ffff:7f*|localhost|ip6-localhost)
             return 0
             ;;
         *)
@@ -1101,6 +1194,18 @@ EOF
 
 node_exists() {
     [ -f "$CONFIG_PATH" ] && [ ! -L "$CONFIG_PATH" ] && load_state >/dev/null 2>&1
+}
+
+node_artifacts_present() {
+    [ -e "$CONFIG_PATH" ] || [ -e "$STATE_FILE" ] || [ -e "$URI_FILE" ]
+}
+
+require_valid_node_state_if_present() {
+    if node_artifacts_present && ! node_exists; then
+        err "检测到残缺或不安全的节点配置，已拒绝继续以免覆盖配置或遗漏端口。"
+        err "请先检查 $CONFIG_PATH 与 $STATE_FILE。"
+        return 1
+    fi
 }
 
 state_file_is_secure() {
@@ -1486,7 +1591,7 @@ restore_node_files() {
     [ -f "$backup_dir/service-running" ] && was_running="$(cat "$backup_dir/service-running")"
     [ -f "$backup_dir/service-enabled" ] && was_enabled="$(cat "$backup_dir/service-enabled")"
 
-    warn "创建失败，正在恢复旧配置..."
+    warn "操作未完成，正在恢复旧节点配置..."
     service_stop 2>/dev/null || true
     stop_singbox_config_processes 2>/dev/null || true
 
@@ -1534,11 +1639,30 @@ restore_node_files() {
     rm -rf "$backup_dir"
 }
 
-rollback_active_node_transaction() {
+rollback_node_files_transaction() {
     local backup="${ACTIVE_NODE_BACKUP:-}"
     ACTIVE_NODE_BACKUP=""
     [ -n "$backup" ] || return 0
     restore_node_files "$backup"
+}
+
+rollback_active_node_transaction() {
+    local failed=0 had_firewall_transition=0
+    [ -n "${ACTIVE_FIREWALL_TRANSITION_DIR:-}" ] && had_firewall_transition=1
+    rollback_node_files_transaction || failed=1
+    if [ "$had_firewall_transition" -eq 1 ] &&
+        declare -F firewall_abort_port_transition >/dev/null 2>&1; then
+        firewall_abort_port_transition || {
+            warn "节点已回滚，但主机防火墙临时规则恢复失败，请手动更新。"
+            failed=1
+        }
+    elif declare -F firewall_refresh_if_enabled >/dev/null 2>&1; then
+        firewall_refresh_if_enabled || {
+            warn "节点已回滚，但主机防火墙端口重新同步失败，请手动更新。"
+            failed=1
+        }
+    fi
+    [ "$failed" -eq 0 ]
 }
 
 cleanup_node_backup() {
@@ -1593,16 +1717,41 @@ listen_mode() {
 }
 
 random_port() {
-    local port
+    local port docker_ports
     local i
+    if [ "$#" -ge 1 ]; then
+        docker_ports="$1"
+    else
+        docker_ports="$(docker_reserved_ports_csv)" || {
+            err "无法可靠读取 Docker 已发布端口，已取消随机端口选择。"
+            return 1
+        }
+    fi
     for i in $(seq 1 100); do
         port="$(shuf -i "${PORT_MIN}-${PORT_MAX}" -n 1 2>/dev/null || echo $((RANDOM % (PORT_MAX - PORT_MIN + 1) + PORT_MIN)))"
-        if ! port_in_use "$port" && ! port_is_effective_ssh_port "$port"; then
+        if ! port_in_use "$port" &&
+            ! port_is_effective_ssh_port "$port" &&
+            ! csv_contains_port "$docker_ports" "$port"; then
             echo "$port"
             return 0
         fi
     done
     err "连续 100 次未找到可用随机端口。"
+    return 1
+}
+
+random_trace_source_port() {
+    local port i
+
+    # 探测源端口不是入站服务端口，不应依赖 Docker daemon 的保留端口清单。
+    for i in $(seq 1 100); do
+        port="$(shuf -i "${PORT_MIN}-${PORT_MAX}" -n 1 2>/dev/null || echo $((RANDOM % (PORT_MAX - PORT_MIN + 1) + PORT_MIN)))"
+        if ! port_in_use "$port"; then
+            echo "$port"
+            return 0
+        fi
+    done
+    err "连续 100 次未找到可用的 TCP 探测源端口。"
     return 1
 }
 
@@ -1620,7 +1769,12 @@ port_is_effective_ssh_port() {
 }
 
 choose_node_port() {
-    local existing_port="${1:-}" input confirm
+    local existing_port="${1:-}" input confirm docker_ports
+
+    docker_ports="$(docker_reserved_ports_csv)" || {
+        err "无法可靠读取 Docker 已发布端口，已取消节点端口选择。"
+        return 1
+    }
 
     while true; do
         if [ -n "$existing_port" ]; then
@@ -1630,7 +1784,7 @@ choose_node_port() {
         fi
         read -r input || return 1
         if [ -z "$input" ]; then
-            random_port
+            random_port "$docker_ports"
             return $?
         fi
         if ! is_valid_port "$input"; then
@@ -1643,6 +1797,10 @@ choose_node_port() {
         fi
         if [ "$input" != "$existing_port" ] && port_in_use "$input"; then
             err "端口 $input 已被占用，请更换。"
+            continue
+        fi
+        if [ "$input" != "$existing_port" ] && csv_contains_port "$docker_ports" "$input"; then
+            err "端口 $input 已被 Docker 发布规则占用，请更换。"
             continue
         fi
         if [ "$input" -lt 1024 ]; then
@@ -1897,6 +2055,7 @@ EOF
 create_or_rebuild_node() {
     local backup_dir
     local existing_port=""
+    require_valid_node_state_if_present || return 1
     backup_dir="$(mktemp -d /tmp/vpsbox-node-backup.XXXXXX)" || return 1
     if ! backup_node_files "$backup_dir"; then
         cleanup_node_backup "$backup_dir"
@@ -1933,7 +2092,7 @@ create_or_rebuild_node() {
             continue
         fi
         if ! is_valid_node_host "$domain"; then
-            err "格式不正确，请输入类似 sb.637892.xyz、1.2.3.4 或 2001:db8::1。"
+            err "格式不正确，请输入类似 sb.example.com、1.2.3.4 或 2001:db8::1。"
             continue
         fi
         if is_repeated_node_host "$domain"; then
@@ -1980,13 +2139,18 @@ EOF
         info "已取消，未修改当前节点。"
         return 0
     fi
-
     info "正在自动生成随机强密码..."
     password="$(random_password)"
 
     info "加密方式：$METHOD"
     info "正在写入配置..."
     ACTIVE_NODE_BACKUP="$backup_dir"
+    if ! firewall_prepare_port_transition "$port" "$port"; then
+        ACTIVE_NODE_BACKUP=""
+        cleanup_node_backup "$backup_dir"
+        err "主机防火墙无法临时放行新节点端口，未创建节点。"
+        return 1
+    fi
     if ! write_config "$port" "$password"; then
         rollback_active_node_transaction || true
         err "配置检查失败，未创建新节点。"
@@ -2021,6 +2185,11 @@ EOF
         err "sing-box 未保持运行或节点端口未监听，未创建新节点。"
         return 1
     fi
+    if ! firewall_complete_port_transition; then
+        rollback_active_node_transaction || true
+        err "主机防火墙未能同步新节点端口，已恢复创建前状态。"
+        return 1
+    fi
 
     rm -f "${CONFIG_PATH}.bak"
     ACTIVE_NODE_BACKUP=""
@@ -2035,6 +2204,7 @@ create_vless_reality_node() {
     local input_sni server_name uuid short_id private_key public_key
     local -a keypair
 
+    require_valid_node_state_if_present || return 1
     backup_dir="$(mktemp -d /tmp/vpsbox-node-backup.XXXXXX)" || return 1
     if ! backup_node_files "$backup_dir"; then
         cleanup_node_backup "$backup_dir"
@@ -2123,7 +2293,6 @@ EOF
         info "已取消，未修改当前节点。"
         return 0
     fi
-
     uuid="$(sing-box generate uuid 2>/dev/null | tr -d '\r\n')"
     if [[ ! "$uuid" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
         cleanup_node_backup "$backup_dir"
@@ -2147,6 +2316,12 @@ EOF
 
     info "正在写入 VLESS Reality 配置..."
     ACTIVE_NODE_BACKUP="$backup_dir"
+    if ! firewall_prepare_port_transition "$port" ""; then
+        ACTIVE_NODE_BACKUP=""
+        cleanup_node_backup "$backup_dir"
+        err "主机防火墙无法临时放行新节点端口，未创建节点。"
+        return 1
+    fi
     if ! write_vless_reality_config "$port" "$uuid" "$server_name" "$private_key" "$short_id"; then
         rollback_active_node_transaction || true
         err "配置检查失败，未创建新节点。"
@@ -2168,6 +2343,11 @@ EOF
         err "sing-box 未保持运行或节点端口未监听，未创建新节点。"
         return 1
     fi
+    if ! firewall_complete_port_transition; then
+        rollback_active_node_transaction || true
+        err "主机防火墙未能同步新节点端口，已恢复创建前状态。"
+        return 1
+    fi
     rm -f "${CONFIG_PATH}.bak"
     ACTIVE_NODE_BACKUP=""
     cleanup_node_backup "$backup_dir"
@@ -2176,6 +2356,7 @@ EOF
 }
 
 view_node_link() {
+    require_valid_node_state_if_present || return 1
     if ! node_exists; then
         warn "当前没有已创建的节点。"
         return 0
@@ -2215,8 +2396,9 @@ EOF
 }
 
 delete_node() {
-    local node_port
+    local node_port backup_dir
 
+    require_valid_node_state_if_present || return 1
     if ! node_exists; then
         warn "当前没有已创建的节点。"
         return 0
@@ -2230,25 +2412,56 @@ delete_node() {
     read -r -p "确认删除当前 ${PROTOCOL:-shadowsocks} 节点？sing-box 服务将停止。(y/N): " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消。"; return 0; }
 
+    backup_dir="$(mktemp -d /tmp/vpsbox-node-backup.XXXXXX)" || return 1
+    if ! backup_node_files "$backup_dir"; then
+        cleanup_node_backup "$backup_dir"
+        err "备份当前节点失败，已取消删除。"
+        return 1
+    fi
+    ACTIVE_NODE_BACKUP="$backup_dir"
+    if ! firewall_prepare_port_transition "" ""; then
+        rollback_active_node_transaction || true
+        err "主机防火墙无法开始节点删除事务，已取消删除。"
+        return 1
+    fi
+
     service_stop 2>/dev/null || warn "服务管理器未能正常停止 sing-box，将继续检查 vpsbox 配置对应的进程。"
     if ! stop_singbox_config_processes; then
+        rollback_active_node_transaction || true
         err "残留 sing-box 进程无法停止，已保留节点配置。"
         return 1
     fi
     sleep 1
     if service_is_running; then
+        rollback_active_node_transaction || true
         err "sing-box 服务仍在运行，已保留节点配置。"
         return 1
     fi
     if port_in_use "$node_port"; then
+        rollback_active_node_transaction || true
         err "节点端口 $node_port 仍在监听，已保留节点配置。"
         return 1
     fi
-    if ! service_disable; then
-        warn "无法禁用 sing-box 开机启动，请手动检查服务状态。"
+    if ! service_disable || service_is_enabled; then
+        if ! rollback_active_node_transaction; then
+            err "节点服务恢复不完整，备份已保留：$backup_dir"
+        fi
+        err "无法禁用 sing-box 开机启动，已取消删除并尝试恢复服务。"
+        return 1
     fi
-    rm -f "$CONFIG_PATH" "$STATE_FILE" "$URI_FILE" "${CONFIG_PATH}.bak"
-    info "当前节点已删除，sing-box 服务已停止并尝试禁用开机启动。"
+    if ! rm -f "$CONFIG_PATH" "$STATE_FILE" "$URI_FILE" "${CONFIG_PATH}.bak"; then
+        rollback_active_node_transaction || true
+        err "节点文件删除失败，已尝试恢复删除前状态。"
+        return 1
+    fi
+    if ! firewall_complete_port_transition; then
+        rollback_active_node_transaction || true
+        err "主机防火墙端口同步失败，已尝试恢复删除前状态。"
+        return 1
+    fi
+    ACTIVE_NODE_BACKUP=""
+    cleanup_node_backup "$backup_dir"
+    info "当前节点已删除，sing-box 服务已停止并禁用开机启动。"
 }
 
 update_singbox() {
@@ -3340,7 +3553,7 @@ restart_ssh_service() {
 }
 
 ssh_listener_on_port() {
-    local port="$1"
+    local port="$1" socket_ports
 
     command -v ss >/dev/null 2>&1 || return 1
     if ss -H -tlnp 2>/dev/null | awk -v port="$port" '
@@ -3350,7 +3563,9 @@ ssh_listener_on_port() {
         return 0
     fi
 
-    if is_systemd && systemctl is-active --quiet ssh.socket 2>/dev/null; then
+    if ssh_socket_activation_active; then
+        socket_ports="$(ssh_socket_activation_ports_csv)" || return 1
+        csv_contains_port "$socket_ports" "$port" || return 1
         ss -H -tln 2>/dev/null | awk -v port="$port" '
             $4 ~ (":" port "$") { found=1 }
             END { exit(found ? 0 : 1) }
@@ -3358,6 +3573,16 @@ ssh_listener_on_port() {
         return $?
     fi
     return 1
+}
+
+ssh_effective_ports_listening() {
+    local ports port
+    local IFS=,
+
+    ports="$(ssh_effective_ports_csv)" || return 1
+    for port in $ports; do
+        ssh_listener_on_port "$port" || return 1
+    done
 }
 
 wait_for_ssh_listener() {
@@ -3381,12 +3606,143 @@ wait_for_any_ssh_listener_csv() {
     return 1
 }
 
+ssh_connection_server_port() {
+    local client_ip client_port server_ip server_port extra
+
+    [ -n "${SSH_CONNECTION:-}" ] || return 1
+    read -r client_ip client_port server_ip server_port extra <<< "$SSH_CONNECTION"
+    [ -n "$client_ip" ] && [ -n "$client_port" ] && [ -n "$server_ip" ] &&
+        [ -z "${extra:-}" ] && is_valid_port "$server_port" || return 1
+    printf '%s\n' "$server_port"
+}
+
+ssh_socket_activation_ports_csv() {
+    local unit output ports="" parsed active=0
+
+    is_systemd || return 1
+    for unit in ssh.socket sshd.socket; do
+        systemctl is-active --quiet "$unit" 2>/dev/null || continue
+        active=1
+        output="$(systemctl show "$unit" --property=Listen --value 2>/dev/null)" || return 1
+        parsed="$(printf '%s\n' "$output" | awk '
+            {
+                for (i = 1; i < NF; i++) {
+                    token = $i
+                    sub(/^Listen=/, "", token)
+                    if ($(i + 1) != "(Stream)") continue
+                    if (token ~ /^[0-9]+$/ ||
+                        token ~ /^\[[^][]+\]:[0-9]+$/ ||
+                        token ~ /^[*A-Za-z0-9_.-]+:[0-9]+$/) {
+                        sub(/^.*:/, "", token)
+                        print token
+                    }
+                }
+            }
+        ')" || return 1
+        [ -n "$parsed" ] || return 1
+        ports="$(merge_port_csv "$ports" "$(printf '%s\n' "$parsed" | paste -sd, -)")" || return 1
+    done
+    [ "$active" -eq 1 ] && [ -n "$ports" ] || return 1
+    printf '%s\n' "$ports"
+}
+
+ssh_listening_ports_csv() {
+    local output ports socket_ports connection_port
+
+    command -v ss >/dev/null 2>&1 || return 1
+    output="$(ss -H -tlnp 2>/dev/null)" || return 1
+    ports="$(printf '%s\n' "$output" | awk '
+        /"sshd"/ {
+            address=$4
+            sub(/^.*:/, "", address)
+            if (address ~ /^[0-9]+$/) print address
+        }
+    ' | paste -sd, -)" || return 1
+    connection_port="$(ssh_connection_server_port 2>/dev/null || true)"
+    if ssh_socket_activation_active; then
+        socket_ports="$(ssh_socket_activation_ports_csv)" || return 1
+    else
+        socket_ports=""
+    fi
+    ports="$(merge_port_csv "$ports" "$socket_ports" "$connection_port")" || return 1
+    [ -n "$ports" ] || return 1
+    printf '%s\n' "$ports"
+}
+
+ssh_firewall_transition_begin() {
+    local tcp_ports="$1"
+
+    [ "${ACTIVE_SSH_FIREWALL_TRANSITION:-0}" = "0" ] || {
+        err "已有未完成的 SSH 防火墙端口切换。"
+        return 1
+    }
+    ACTIVE_SSH_FIREWALL_TRANSITION=1
+    if ! firewall_prepare_port_transition "$tcp_ports" ""; then
+        ACTIVE_SSH_FIREWALL_TRANSITION=0
+        return 1
+    fi
+}
+
+ssh_firewall_transition_abort() {
+    # SSH 的事务前防火墙快照可能早已落后于 sshd；按配置与实际监听并集重算更安全。
+    ssh_firewall_transition_reconcile
+}
+
+ssh_firewall_transition_finish() {
+    firewall_complete_port_transition || return 1
+    ACTIVE_SSH_FIREWALL_TRANSITION=0
+}
+
+ssh_firewall_transition_reconcile() {
+    local configured_ports listening_ports safe_ports transition_dir
+
+    [ "${ACTIVE_SSH_FIREWALL_TRANSITION:-0}" = "1" ] || return 0
+    configured_ports="$(ssh_effective_ports_csv 2>/dev/null)" || return 1
+    listening_ports="$(ssh_listening_ports_csv 2>/dev/null)" || return 1
+    safe_ports="$(merge_port_csv "$configured_ports" "$listening_ports")" || return 1
+    [ -n "$safe_ports" ] || return 1
+    firewall_sync_active_config "$safe_ports" "" 1 || return 1
+    transition_dir="${ACTIVE_FIREWALL_TRANSITION_DIR:-}"
+    if [ -n "$transition_dir" ]; then
+        firewall_discard_port_transition || return 1
+    fi
+    ACTIVE_SSH_FIREWALL_TRANSITION=0
+}
+
+firewall_settle_pending_port_transition() {
+    if [ -n "${ACTIVE_NODE_BACKUP:-}" ]; then
+        warn "检测到未完成的节点端口事务，正在先恢复节点与防火墙状态。"
+        rollback_active_node_transaction || return 1
+    fi
+    if [ "${ACTIVE_SSH_FIREWALL_TRANSITION:-0}" = "1" ]; then
+        warn "检测到未完成的 SSH 端口事务，正在保留配置端口与实际监听端口的安全并集。"
+        ssh_firewall_transition_reconcile || {
+            err "SSH 端口事务无法安全对账，已拒绝继续修改主机防火墙。"
+            return 1
+        }
+    elif [ -n "${ACTIVE_FIREWALL_TRANSITION_DIR:-}" ]; then
+        warn "检测到未完成的端口事务，正在恢复事务前的防火墙配置。"
+        firewall_abort_port_transition || {
+            err "未完成的端口事务无法恢复，已拒绝继续修改主机防火墙。"
+            return 1
+        }
+    fi
+    [ -z "${ACTIVE_NODE_BACKUP:-}" ] &&
+        [ "${ACTIVE_SSH_FIREWALL_TRANSITION:-0}" = "0" ] &&
+        [ -z "${ACTIVE_FIREWALL_TRANSITION_DIR:-}" ]
+}
+
 ssh_socket_activation_active() {
     is_systemd && { systemctl is-active --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet sshd.socket 2>/dev/null; }
 }
 
 choose_ssh_target_port() {
-    local input confirm
+    local input confirm docker_ports
+
+    docker_ports="$(docker_reserved_ports_csv)" || {
+        err "无法可靠读取 Docker 已发布端口，已取消 SSH 端口选择。"
+        return 1
+    }
 
     while true; do
         read -r -p "请输入新 SSH 端口（1-65535，留空默认 23333）: " input || return 1
@@ -3394,6 +3750,10 @@ choose_ssh_target_port() {
         is_valid_port "$input" || { err "端口必须是 1-65535 的整数。"; continue; }
         if ! port_is_effective_ssh_port "$input" && port_in_use "$input"; then
             err "端口 $input 已被占用，请更换。"
+            continue
+        fi
+        if ! port_is_effective_ssh_port "$input" && csv_contains_port "$docker_ports" "$input"; then
+            err "端口 $input 已被 Docker 发布规则占用，请更换。"
             continue
         fi
         if [ "$input" -lt 1024 ]; then
@@ -3408,18 +3768,33 @@ choose_ssh_target_port() {
 rollback_ssh_port_change() {
     local main_backup="$1" dropin_backup="$2" original_ports="$3" bin
 
-    restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_PORT_CONF" "$dropin_backup"
+    if ! restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_PORT_CONF" "$dropin_backup"; then
+        err "SSH 配置文件回滚失败，请通过控制台恢复。"
+        ssh_firewall_transition_reconcile ||
+            warn "无法自动对账 SSH 端口；临时防火墙规则已保留，请勿关闭当前连接。"
+        return 1
+    fi
     bin="$(sshd_binary)" || { err "SSH 回滚后未找到 sshd，请通过控制台恢复。"; return 1; }
     if ! "$bin" -t; then
         err "SSH 回滚后的配置校验失败，请通过控制台恢复。"
+        ssh_firewall_transition_reconcile ||
+            warn "无法自动对账 SSH 端口；临时防火墙规则已保留，请勿关闭当前连接。"
         return 1
     fi
     if ! restart_ssh_service; then
         err "SSH 回滚后服务无法重启，请通过控制台恢复。"
+        ssh_firewall_transition_reconcile ||
+            warn "无法自动对账 SSH 端口；临时防火墙规则已保留，请勿关闭当前连接。"
         return 1
     fi
     if [ -n "$original_ports" ] && ! wait_for_any_ssh_listener_csv "$original_ports"; then
         err "SSH 回滚后未恢复原端口监听（$original_ports），请通过控制台恢复。"
+        ssh_firewall_transition_reconcile ||
+            warn "无法自动对账 SSH 端口；临时防火墙规则已保留，请勿关闭当前连接。"
+        return 1
+    fi
+    if declare -F ssh_firewall_transition_abort >/dev/null 2>&1 && ! ssh_firewall_transition_abort; then
+        err "SSH 已回滚，但主机防火墙未能恢复修改前的端口规则。"
         return 1
     fi
     return 0
@@ -3621,6 +3996,10 @@ apply_ssh_port_change() {
         err "备份 $SSHD_VPSBOX_PORT_CONF 失败，已取消修改。"
         return 1
     fi
+    if ! ssh_firewall_transition_begin "$SSH_TARGET_PORT"; then
+        err "主机防火墙无法临时放行 SSH 新端口，已取消修改。"
+        return 1
+    fi
 
     if { [ -e "$SSHD_VPSBOX_PORT_CONF" ] && sshd_dropin_include_available; } || { ! ssh_main_has_active_port_directive && sshd_dropin_include_available; }; then
         write_action="vpsbox drop-in"
@@ -3652,6 +4031,11 @@ apply_ssh_port_change() {
 
     if ! wait_for_ssh_listener "$SSH_TARGET_PORT"; then
         err "SSH 重启后未检测到 sshd 监听端口 $SSH_TARGET_PORT，正在回滚。"
+        rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" || true
+        return 1
+    fi
+    if ! ssh_firewall_transition_finish; then
+        err "主机防火墙无法同步 SSH 新端口，正在回滚配置。"
         rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" || true
         return 1
     fi
@@ -3821,21 +4205,83 @@ cat <<EOF
 EOF
 }
 
+restore_ssh_runtime_snapshot() {
+    local snapshot_dir="$1" expected_ports="$2" name path bin
+
+    [[ "$snapshot_dir" == /tmp/vpsbox-ssh-restore.* ]] &&
+        [ -d "$snapshot_dir" ] && [ ! -L "$snapshot_dir" ] || return 1
+    for name in main port hardening; do
+        case "$name" in
+            main) path="$SSHD_MAIN_CONF" ;;
+            port) path="$SSHD_VPSBOX_PORT_CONF" ;;
+            hardening) path="$SSHD_VPSBOX_HARDENING_CONF" ;;
+        esac
+        if [ -e "$snapshot_dir/$name" ] || [ -L "$snapshot_dir/$name" ]; then
+            rm -f "$path" && cp -a "$snapshot_dir/$name" "$path" || return 1
+        elif [ -f "$snapshot_dir/$name.absent" ]; then
+            rm -f "$path" || return 1
+        else
+            return 1
+        fi
+    done
+    bin="$(sshd_binary)" || return 1
+    "$bin" -t || return 1
+    restart_ssh_service || return 1
+    [ -z "$expected_ports" ] || wait_for_any_ssh_listener_csv "$expected_ports"
+}
+
+settle_failed_ssh_restore() {
+    local snapshot_dir="$1" expected_ports="$2"
+
+    if restore_ssh_runtime_snapshot "$snapshot_dir" "$expected_ports"; then
+        if ssh_firewall_transition_abort; then
+            return 0
+        fi
+        warn "SSH 配置与监听已回滚，但防火墙快照未能直接恢复，正在安全对账。"
+    else
+        warn "SSH 运行状态未完整回滚，正在保留配置端口与实际监听端口的安全并集。"
+    fi
+    if ssh_firewall_transition_reconcile; then
+        warn "已按 SSH 配置端口与实际监听端口的并集保留防火墙放行。"
+        return 0
+    fi
+    warn "无法自动对账 SSH 端口；临时防火墙规则已保留，请勿关闭当前连接。"
+    return 1
+}
+
 restore_vpsbox_ssh_config() {
-    local confirm tmp original_ports original_port name path cleanup_failed=0
+    local confirm tmp original_ports current_ports name path cleanup_failed=0
 
     [ "$(manifest_value APPLIED_SSH_CONFIG 2>/dev/null || true)" = "1" ] || {
         warn "没有已记录的 vpsbox SSH 配置可恢复。"
         return 0
     }
     original_ports="$(manifest_value SSH_PORTS 2>/dev/null || true)"
-    original_port="${original_ports%%,*}"
+    original_ports="$(normalize_port_csv "$original_ports")" || {
+        err "记录的 SSH 原端口无效，已拒绝自动恢复。"
+        return 1
+    }
+    [ -n "$original_ports" ] || {
+        err "未记录可恢复的 SSH 原端口，已拒绝自动恢复。"
+        return 1
+    }
+    current_ports="$(ssh_effective_ports_csv)" || {
+        err "无法读取 SSH 当前生效端口，已拒绝自动恢复。"
+        return 1
+    }
     echo "将恢复 SSH 主配置及 vpsbox 端口/加固 drop-in。"
     echo "预期恢复端口：${original_ports:-未知}；当前连接可能断开。"
     read -r -p "请确认已有控制台或备用连接。输入 YES 执行 SSH 恢复：" confirm
     [ "$confirm" = "YES" ] || { info "已取消 SSH 恢复。"; return 0; }
+    if ! ssh_firewall_transition_begin "$original_ports"; then
+        err "主机防火墙无法临时放行待恢复的 SSH 端口，已取消恢复。"
+        return 1
+    fi
 
-    tmp="$(mktemp -d /tmp/vpsbox-ssh-restore.XXXXXX)" || return 1
+    tmp="$(mktemp -d /tmp/vpsbox-ssh-restore.XXXXXX)" || {
+        ssh_firewall_transition_abort || true
+        return 1
+    }
     for name in main port hardening; do
         case "$name" in
             main) path="$SSHD_MAIN_CONF" ;;
@@ -3846,18 +4292,19 @@ restore_vpsbox_ssh_config() {
     done
     if ! restore_change_file SSHD_MAIN "$SSHD_MAIN_CONF" || ! restore_change_file SSHD_PORT "$SSHD_VPSBOX_PORT_CONF" || ! restore_change_file SSHD_HARDENING "$SSHD_VPSBOX_HARDENING_CONF" || ! "$(sshd_binary)" -t; then
         err "SSH 恢复配置校验失败，正在回滚当前配置。"
-        [ -f "$tmp/main" ] && cp -a "$tmp/main" "$SSHD_MAIN_CONF"
-        if [ -f "$tmp/port" ]; then cp -a "$tmp/port" "$SSHD_VPSBOX_PORT_CONF"; else rm -f "$SSHD_VPSBOX_PORT_CONF"; fi
-        if [ -f "$tmp/hardening" ]; then cp -a "$tmp/hardening" "$SSHD_VPSBOX_HARDENING_CONF"; else rm -f "$SSHD_VPSBOX_HARDENING_CONF"; fi
+        settle_failed_ssh_restore "$tmp" "$current_ports" || true
         rm -rf "$tmp"
         return 1
     fi
-    if ! restart_ssh_service || { [ -n "$original_port" ] && ! wait_for_ssh_listener "$original_port"; }; then
+    if ! restart_ssh_service || ! wait_for_any_ssh_listener_csv "$original_ports"; then
         err "SSH 服务未能在原端口恢复监听，正在回滚当前配置。"
-        [ -f "$tmp/main" ] && cp -a "$tmp/main" "$SSHD_MAIN_CONF"
-        if [ -f "$tmp/port" ]; then cp -a "$tmp/port" "$SSHD_VPSBOX_PORT_CONF"; else rm -f "$SSHD_VPSBOX_PORT_CONF"; fi
-        if [ -f "$tmp/hardening" ]; then cp -a "$tmp/hardening" "$SSHD_VPSBOX_HARDENING_CONF"; else rm -f "$SSHD_VPSBOX_HARDENING_CONF"; fi
-        restart_ssh_service >/dev/null 2>&1 || true
+        settle_failed_ssh_restore "$tmp" "$current_ports" || true
+        rm -rf "$tmp"
+        return 1
+    fi
+    if ! ssh_firewall_transition_finish; then
+        err "主机防火墙无法同步恢复后的 SSH 端口，正在回滚当前配置。"
+        settle_failed_ssh_restore "$tmp" "$current_ports" || true
         rm -rf "$tmp"
         return 1
     fi
@@ -4110,6 +4557,2402 @@ install_fail2ban() {
     info "Fail2ban 已安装，SSH 防护已启用，端口：$(ssh_effective_ports_csv)"
 }
 
+normalize_port_csv() {
+    local input="${1:-}" item
+    local -a items
+
+    [ -n "$input" ] || return 0
+    IFS=',' read -ra items <<< "$input"
+    for item in "${items[@]}"; do
+        is_valid_port "$item" || return 1
+    done
+    printf '%s\n' "${items[@]}" | sort -n -u | paste -sd, -
+}
+
+csv_contains_port() {
+    local csv="${1:-}" port="$2"
+    case ",$csv," in
+        *",$port,"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+csv_add_port() {
+    local csv="${1:-}" port="$2"
+    if [ -n "$csv" ]; then
+        normalize_port_csv "$csv,$port"
+    else
+        normalize_port_csv "$port"
+    fi
+}
+
+csv_remove_port() {
+    local csv="${1:-}" port="$2" item
+    local result=""
+    local -a items
+
+    [ -n "$csv" ] || return 0
+    IFS=',' read -ra items <<< "$csv"
+    for item in "${items[@]}"; do
+        [ "$item" = "$port" ] && continue
+        if [ -n "$result" ]; then result="$result,$item"; else result="$item"; fi
+    done
+    normalize_port_csv "$result"
+}
+
+merge_port_csv() {
+    local result="" csv
+    for csv in "$@"; do
+        [ -n "$csv" ] || continue
+        if [ -n "$result" ]; then result="$result,$csv"; else result="$csv"; fi
+    done
+    normalize_port_csv "$result"
+}
+
+port_csv_is_subset() {
+    local required="${1:-}" available="${2:-}" port
+    local IFS=,
+
+    [ -n "$required" ] || return 0
+    for port in $required; do
+        csv_contains_port "$available" "$port" || return 1
+    done
+}
+
+firewall_write_ssh_safe_snapshot() {
+    local source="$1" dest="$2" ssh_ports="$3" existing_tcp formatted tmp
+
+    [ -f "$source" ] && [ ! -L "$source" ] || return 1
+    ssh_ports="$(normalize_port_csv "$ssh_ports")" || return 1
+    [ -n "$ssh_ports" ] || return 1
+    existing_tcp="$(awk '
+        /^[[:space:]]*chain[[:space:]]+input[[:space:]]*\{/ { in_input=1; next }
+        in_input && /^[[:space:]]*\}/ { exit }
+        in_input && $0 !~ /meta nfproto/ { print }
+    ' "$source" | firewall_ports_from_nft_chain tcp)" || return 1
+    if port_csv_is_subset "$ssh_ports" "$existing_tcp"; then
+        [ "$source" = "$dest" ] || cp -a "$source" "$dest"
+        return $?
+    fi
+
+    formatted="$(printf '%s' "$ssh_ports" | sed 's/,/, /g')"
+    tmp="$(mktemp "$(dirname "$dest")/.firewall-ssh-safe.XXXXXX")" || return 1
+    if ! awk -v ports="$formatted" '
+        /^[[:space:]]*chain[[:space:]]+input[[:space:]]*\{/ { in_input=1 }
+        in_input && /^[[:space:]]*\}/ {
+            print "        tcp dport { " ports " } accept"
+            inserted=1
+            in_input=0
+        }
+        { print }
+        END { if (!inserted) exit 1 }
+    ' "$source" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$dest"
+}
+
+firewall_state_file_is_secure() {
+    local owner mode
+
+    [ -f "$FIREWALL_STATE_FILE" ] && [ ! -L "$FIREWALL_STATE_FILE" ] || return 1
+    owner="$(stat -c '%u' "$FIREWALL_STATE_FILE" 2>/dev/null)" || return 1
+    mode="$(stat -c '%a' "$FIREWALL_STATE_FILE" 2>/dev/null)" || return 1
+    [ "$owner" = "0" ] || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$mode & 8#077) == 0 ))
+}
+
+firewall_managed_file_is_secure() {
+    local path="$1" owner mode
+    [ -f "$path" ] && [ ! -L "$path" ] || return 1
+    owner="$(stat -c '%u' "$path" 2>/dev/null)" || return 1
+    mode="$(stat -c '%a' "$path" 2>/dev/null)" || return 1
+    [ "$owner" = "0" ] || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    (( (8#$mode & 8#077) == 0 ))
+}
+
+firewall_load_state() {
+    local key value tcp="" udp=""
+
+    FW_EXTRA_TCP=""
+    FW_EXTRA_UDP=""
+    [ -e "$FIREWALL_STATE_FILE" ] || return 0
+    firewall_state_file_is_secure || {
+        err "防火墙状态文件不安全，已拒绝读取：$FIREWALL_STATE_FILE"
+        return 1
+    }
+
+    while IFS='=' read -r key value || [ -n "$key" ]; do
+        case "$key" in
+            EXTRA_TCP_PORTS) tcp="$value" ;;
+            EXTRA_UDP_PORTS) udp="$value" ;;
+            "") ;;
+            *)
+                err "防火墙状态文件包含未知字段：$key"
+                return 1
+                ;;
+        esac
+    done < "$FIREWALL_STATE_FILE"
+
+    [[ "$tcp" =~ ^$|^[0-9]+(,[0-9]+)*$ ]] || return 1
+    [[ "$udp" =~ ^$|^[0-9]+(,[0-9]+)*$ ]] || return 1
+    FW_EXTRA_TCP="$(normalize_port_csv "$tcp")" || return 1
+    FW_EXTRA_UDP="$(normalize_port_csv "$udp")" || return 1
+}
+
+firewall_write_state_file() {
+    local dest="$1"
+    {
+        printf 'EXTRA_TCP_PORTS=%s\n' "$FW_EXTRA_TCP"
+        printf 'EXTRA_UDP_PORTS=%s\n' "$FW_EXTRA_UDP"
+    } > "$dest"
+}
+
+firewall_install_managed_file() {
+    local source="$1" target="$2" mode="$3" target_dir tmp
+
+    [ ! -L "$target" ] || {
+        err "目标文件是符号链接，已拒绝覆盖：$target"
+        return 1
+    }
+    target_dir="$(dirname "$target")"
+    mkdir -p "$target_dir" || return 1
+    tmp="$(mktemp "$target_dir/.vpsbox-firewall.XXXXXX")" || return 1
+    if ! cp "$source" "$tmp" ||
+        ! chown root:root "$tmp" ||
+        ! chmod "$mode" "$tmp" ||
+        ! mv -f "$tmp" "$target"; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+firewall_runtime_enabled() {
+    command -v nft >/dev/null 2>&1 &&
+        nft list table inet vpsbox >/dev/null 2>&1 &&
+        nft list chain inet vpsbox input >/dev/null 2>&1
+}
+
+firewall_persistence_enabled() {
+    if is_systemd; then
+        systemctl is-enabled --quiet "$FIREWALL_SERVICE_NAME" 2>/dev/null
+    elif [ "$OS" = "alpine" ]; then
+        [ -e "/etc/runlevels/default/$FIREWALL_SERVICE_NAME" ] ||
+            [ -L "/etc/runlevels/default/$FIREWALL_SERVICE_NAME" ]
+    else
+        return 1
+    fi
+}
+
+firewall_service_active() {
+    if is_systemd; then
+        systemctl is-active --quiet "$FIREWALL_SERVICE_NAME" 2>/dev/null
+    elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
+        rc-service "$FIREWALL_SERVICE_NAME" status >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+firewall_control_plane_present() {
+    firewall_runtime_enabled ||
+        [ -e "$FIREWALL_CONFIG" ] ||
+        [ -e "$FIREWALL_SYSTEMD_UNIT" ] ||
+        [ -e "$FIREWALL_OPENRC_SERVICE" ] ||
+        firewall_persistence_enabled ||
+        firewall_service_active
+}
+
+firewall_artifacts_present() {
+    firewall_control_plane_present || [ -e "$FIREWALL_STATE_FILE" ]
+}
+
+firewall_install_state() {
+    command -v nft >/dev/null 2>&1 && echo "已安装" || echo "未安装"
+}
+
+firewall_runtime_state() {
+    if firewall_runtime_enabled; then
+        echo "运行中"
+    elif [ -f "$FIREWALL_CONFIG" ]; then
+        echo "配置存在但未运行"
+    elif [ -e "$FIREWALL_SYSTEMD_UNIT" ] ||
+        [ -e "$FIREWALL_OPENRC_SERVICE" ] ||
+        firewall_persistence_enabled || firewall_service_active; then
+        echo "状态不完整"
+    else
+        echo "未启用"
+    fi
+}
+
+firewall_persistence_state() {
+    firewall_persistence_enabled && echo "已启用" || echo "未启用"
+}
+
+firewall_native_service_enabled() {
+    if is_systemd; then
+        systemctl is-enabled --quiet nftables 2>/dev/null ||
+            systemctl is-active --quiet nftables 2>/dev/null
+    elif [ "$OS" = "alpine" ]; then
+        [ -e /etc/runlevels/default/nftables ] ||
+            [ -L /etc/runlevels/default/nftables ] ||
+            { command -v rc-service >/dev/null 2>&1 && rc-service nftables status >/dev/null 2>&1; }
+    else
+        return 1
+    fi
+}
+
+firewall_check_conflicts() {
+    if command -v ufw >/dev/null 2>&1 &&
+        ufw status 2>/dev/null | grep -Eqi '^Status:[[:space:]]*active'; then
+        err "检测到 UFW 正在运行。为避免规则链冲突，请先停用 UFW 后再启用主机防火墙。"
+        return 1
+    fi
+    if { is_systemd && systemctl is-active --quiet firewalld 2>/dev/null; } ||
+        { [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1 &&
+            rc-service firewalld status >/dev/null 2>&1; }; then
+        err "检测到 firewalld 正在运行。为避免规则链冲突，请先停用 firewalld。"
+        return 1
+    fi
+    if firewall_native_service_enabled; then
+        err "检测到系统 nftables 服务已启用或正在运行。"
+        err "vpsbox 不会覆盖现有 /etc/nftables.conf；请先迁移或停用原服务。"
+        return 1
+    fi
+    if command -v nft >/dev/null 2>&1 &&
+        nft list table inet vpsbox >/dev/null 2>&1 &&
+        { [ ! -f "$FIREWALL_CONFIG" ] || [ ! -f "$FIREWALL_STATE_FILE" ]; }; then
+        err "检测到非完整 vpsbox 状态的 inet vpsbox 表，已拒绝覆盖。"
+        return 1
+    fi
+}
+
+ensure_nftables() {
+    if command -v nft >/dev/null 2>&1 &&
+        command -v jq >/dev/null 2>&1 &&
+        command -v ss >/dev/null 2>&1 &&
+        command -v timeout >/dev/null 2>&1; then
+        return 0
+    fi
+    detect_os
+    info "正在安装主机防火墙所需的 nftables、jq、iproute2 与 coreutils..."
+    case "$OS" in
+        debian)
+            export DEBIAN_FRONTEND=noninteractive
+            retry 3 2 apt-get update -y || return 1
+            retry 3 2 apt-get install -y nftables jq iproute2 coreutils || return 1
+            ;;
+        alpine)
+            retry 3 2 apk update || return 1
+            retry 3 2 apk add --no-cache nftables jq iproute2 coreutils || return 1
+            ;;
+        *)
+            err "主机防火墙目前仅支持 Debian/Ubuntu 与 Alpine。"
+            return 1
+            ;;
+    esac
+    command -v nft >/dev/null 2>&1 &&
+        command -v jq >/dev/null 2>&1 &&
+        command -v ss >/dev/null 2>&1 &&
+        command -v timeout >/dev/null 2>&1 || {
+            err "主机防火墙依赖安装后仍不完整。"
+            return 1
+        }
+}
+
+is_valid_interface_name() {
+    local name="${1:-}"
+    [ -n "$name" ] && [ "${#name}" -le 15 ] &&
+        [[ "$name" =~ ^[A-Za-z0-9_.:-]+$ ]]
+}
+
+normalize_interface_csv() {
+    local input="${1:-}" item
+    local -a items
+
+    [ -n "$input" ] || return 0
+    IFS=',' read -ra items <<< "$input"
+    for item in "${items[@]}"; do
+        is_valid_interface_name "$item" || return 1
+    done
+    printf '%s\n' "${items[@]}" | sort -u | paste -sd, -
+}
+
+interface_csv_add() {
+    local csv="${1:-}" name="$2"
+    if [ -n "$csv" ]; then
+        normalize_interface_csv "$csv,$name"
+    else
+        normalize_interface_csv "$name"
+    fi
+}
+
+firewall_docker_available() {
+    command -v docker >/dev/null 2>&1 &&
+        docker_with_timeout info >/dev/null 2>&1
+}
+
+docker_with_timeout() {
+    command -v docker >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1 || return 1
+    timeout 15 docker "$@"
+}
+
+docker_daemon_process_present() {
+    local comm_file comm_name
+
+    for comm_file in /proc/[0-9]*/comm; do
+        [ -r "$comm_file" ] || continue
+        read -r comm_name < "$comm_file" || continue
+        [ "$comm_name" = "dockerd" ] && return 0
+    done
+    return 1
+}
+
+docker_single_daemon_pid() {
+    local comm_file comm_name pid="" count=0
+
+    for comm_file in /proc/[0-9]*/comm; do
+        [ -r "$comm_file" ] || continue
+        read -r comm_name < "$comm_file" || continue
+        [ "$comm_name" = "dockerd" ] || continue
+        pid="${comm_file%/comm}"
+        pid="${pid##*/}"
+        count=$((count + 1))
+    done
+    [ "$count" -eq 1 ] || return 1
+    printf '%s\n' "$pid"
+}
+
+firewall_docker_config_has_unsafe_mode() {
+    local config_file="$1"
+
+    jq -e '
+        (.["allow-direct-routing"] == true) or
+        (.iptables == false) or
+        (.ip6tables == false) or
+        ([.["default-network-opts"] // {} | .. | objects | to_entries[]? |
+            select(
+                (
+                    ((.key | endswith("gateway_mode_ipv4")) or (.key | endswith("gateway_mode_ipv6"))) and
+                    ((.value == "routed") or (.value == "nat-unprotected"))
+                ) or
+                ((.key | endswith("trusted_host_interfaces")) and ((.value // "") != ""))
+            )
+        ] | length > 0)
+    ' "$config_file" >/dev/null 2>&1
+}
+
+docker_go_bool_value() {
+    local value="${1,,}"
+
+    case "$value" in
+        1|t|true) printf '%s\n' true ;;
+        0|f|false) printf '%s\n' false ;;
+        *) return 1 ;;
+    esac
+}
+
+firewall_validate_docker_daemon_mode() {
+    local comm_file comm_name cmdline_file="" config_file="/etc/docker/daemon.json"
+    local config_view config_parent arg value parsed_bool i daemon_found=0 config_explicit=0
+    local daemon_pid="" clock_ticks boot_epoch start_ticks daemon_start_epoch config_mtime config_ctime
+    local -a daemon_argv
+
+    for comm_file in /proc/[0-9]*/comm; do
+        [ -r "$comm_file" ] || continue
+        read -r comm_name < "$comm_file" || continue
+        [ "$comm_name" = "dockerd" ] || continue
+        cmdline_file="${comm_file%/comm}/cmdline"
+        [ -r "$cmdline_file" ] || continue
+        [ "$daemon_found" -eq 0 ] || {
+            err "检测到多个 dockerd 进程，无法确认当前 socket 对应的 daemon 参数。"
+            return 1
+        }
+        mapfile -d '' -t daemon_argv < "$cmdline_file"
+        daemon_pid="${comm_file%/comm}"
+        daemon_pid="${daemon_pid##*/}"
+        daemon_found=1
+    done
+    [ "$daemon_found" -eq 1 ] || {
+        err "无法确认本机 dockerd 进程参数，已拒绝更新防火墙。"
+        return 1
+    }
+
+    for ((i = 0; i < ${#daemon_argv[@]}; i++)); do
+        arg="${daemon_argv[$i]}"
+        case "$arg" in
+            --config-file=*) config_file="${arg#*=}"; config_explicit=1 ;;
+            --config-file)
+                i=$((i + 1))
+                [ "$i" -lt "${#daemon_argv[@]}" ] || {
+                    err "dockerd --config-file 缺少路径。"
+                    return 1
+                }
+                config_file="${daemon_argv[$i]}"
+                config_explicit=1
+                ;;
+            --allow-direct-routing)
+                err "检测到 Docker direct routing，已拒绝更新防火墙。"
+                return 1
+                ;;
+            --allow-direct-routing=*)
+                value="${arg#*=}"
+                parsed_bool="$(docker_go_bool_value "$value")" || {
+                    err "dockerd 返回了无法识别的 allow-direct-routing 布尔值：$value"
+                    return 1
+                }
+                if [ "$parsed_bool" = "true" ]; then
+                    err "检测到 Docker direct routing，已拒绝更新防火墙。"
+                    return 1
+                fi
+                ;;
+            --iptables=*|--ip6tables=*)
+                value="${arg#*=}"
+                parsed_bool="$(docker_go_bool_value "$value")" || {
+                    err "dockerd 返回了无法识别的防火墙布尔值：$value"
+                    return 1
+                }
+                if [ "$parsed_bool" = "false" ]; then
+                    err "检测到 Docker 已关闭 iptables/ip6tables 管理，无法可靠守卫发布端口。"
+                    return 1
+                fi
+                ;;
+            --default-network-opt=*)
+                value="${arg#*=}"
+                case "$value" in
+                    *gateway_mode_ipv4=routed*|*gateway_mode_ipv6=routed*|\
+                    *gateway_mode_ipv4=nat-unprotected*|*gateway_mode_ipv6=nat-unprotected*|\
+                    *trusted_host_interfaces=*)
+                        err "dockerd 默认网络参数启用了直连/非保护模式，已拒绝更新防火墙。"
+                        return 1
+                        ;;
+                esac
+                ;;
+            --default-network-opt)
+                i=$((i + 1))
+                [ "$i" -lt "${#daemon_argv[@]}" ] || {
+                    err "dockerd --default-network-opt 缺少参数。"
+                    return 1
+                }
+                value="${daemon_argv[$i]}"
+                case "$value" in
+                    *gateway_mode_ipv4=routed*|*gateway_mode_ipv6=routed*|\
+                    *gateway_mode_ipv4=nat-unprotected*|*gateway_mode_ipv6=nat-unprotected*|\
+                    *trusted_host_interfaces=*)
+                        err "dockerd 默认网络参数启用了直连/非保护模式，已拒绝更新防火墙。"
+                        return 1
+                        ;;
+                esac
+                ;;
+        esac
+    done
+
+    case "$config_file" in
+        /*) ;;
+        *)
+            err "dockerd 配置文件不是绝对路径，无法安全检查：$config_file"
+            return 1
+            ;;
+    esac
+    start_ticks="$(awk '{ print $22; exit }' "/proc/$daemon_pid/stat" 2>/dev/null || true)"
+    [[ "$start_ticks" =~ ^[0-9]+$ ]] || {
+        err "无法读取 dockerd 进程启动标识，已拒绝更新防火墙。"
+        return 1
+    }
+    FW_DOCKER_DAEMON_PID="$daemon_pid"
+    FW_DOCKER_DAEMON_START_TICKS="$start_ticks"
+    clock_ticks="$(getconf CLK_TCK 2>/dev/null)" || clock_ticks=""
+    [[ "$clock_ticks" =~ ^[1-9][0-9]*$ ]] || clock_ticks=100
+    boot_epoch="$(awk '$1 == "btime" { print $2; exit }' /proc/stat 2>/dev/null)"
+    if ! [[ "$boot_epoch" =~ ^[0-9]+$ ]]; then
+        err "无法确认 dockerd 启动时间，已拒绝根据磁盘配置更新防火墙。"
+        return 1
+    fi
+    daemon_start_epoch=$((boot_epoch + start_ticks / clock_ticks))
+
+    config_view="/proc/$daemon_pid/root$config_file"
+    if [ ! -e "$config_view" ]; then
+        if [ "$config_explicit" -eq 1 ]; then
+            err "dockerd 显式配置文件在当前 daemon 视图中不存在：$config_file"
+            return 1
+        fi
+        config_parent="${config_view%/*}"
+        if [ -e "$config_parent" ]; then
+            [ -d "$config_parent" ] && [ ! -L "$config_parent" ] || {
+                err "dockerd 默认配置目录状态异常，无法确认启动时配置：${config_file%/*}"
+                return 1
+            }
+            config_mtime="$(stat -c '%Y' "$config_parent" 2>/dev/null)" || return 1
+            config_ctime="$(stat -c '%Z' "$config_parent" 2>/dev/null)" || return 1
+            if [ "$config_mtime" -ge "$daemon_start_epoch" ] ||
+                [ "$config_ctime" -ge "$daemon_start_epoch" ]; then
+                err "dockerd 默认配置文件当前不存在，但配置目录在 daemon 启动后发生过变化。"
+                err "无法排除配置已被删除；请重启 Docker 后再更新 vpsbox 防火墙。"
+                return 1
+            fi
+        fi
+        return 0
+    fi
+    [ ! -L "$config_view" ] || {
+        err "dockerd 配置文件是符号链接，无法确认运行时加载的文件版本：$config_file"
+        return 1
+    }
+    command -v jq >/dev/null 2>&1 || {
+        err "dockerd 使用了配置文件，但缺少 jq，无法安全检查：$config_file"
+        return 1
+    }
+    [ -r "$config_view" ] && [ -f "$config_view" ] || {
+        err "无法安全读取 dockerd 配置文件：$config_file"
+        return 1
+    }
+    config_mtime="$(stat -c '%Y' "$config_view" 2>/dev/null)" || return 1
+    config_ctime="$(stat -c '%Z' "$config_view" 2>/dev/null)" || return 1
+    if ! [[ "$config_mtime" =~ ^[0-9]+$ ]] || ! [[ "$config_ctime" =~ ^[0-9]+$ ]]; then
+        err "无法确认 dockerd 配置文件时间，已拒绝更新防火墙。"
+        return 1
+    fi
+    if [ "$config_mtime" -ge "$daemon_start_epoch" ] || [ "$config_ctime" -ge "$daemon_start_epoch" ]; then
+        err "dockerd 配置文件在 daemon 启动后发生过变化，当前运行态可能尚未加载。"
+        err "请重启 Docker 并确认容器正常后，再更新 vpsbox 防火墙。"
+        return 1
+    fi
+    jq empty "$config_view" >/dev/null 2>&1 || {
+        err "dockerd 配置文件不是有效 JSON：$config_file"
+        return 1
+    }
+    if firewall_docker_config_has_unsafe_mode "$config_view"; then
+        err "dockerd 配置启用了 direct routing、非保护网关或关闭了防火墙管理。"
+        return 1
+    fi
+}
+
+firewall_docker_daemon_identity_unchanged() {
+    local expected_pid="${FW_DOCKER_DAEMON_PID:-}" expected_ticks="${FW_DOCKER_DAEMON_START_TICKS:-}"
+    local comm_file comm_name pid="" count=0 current_ticks
+
+    [[ "$expected_pid" =~ ^[0-9]+$ ]] && [[ "$expected_ticks" =~ ^[0-9]+$ ]] || return 1
+    for comm_file in /proc/[0-9]*/comm; do
+        [ -r "$comm_file" ] || continue
+        read -r comm_name < "$comm_file" || continue
+        [ "$comm_name" = "dockerd" ] || continue
+        pid="${comm_file%/comm}"
+        pid="${pid##*/}"
+        count=$((count + 1))
+    done
+    [ "$count" -eq 1 ] && [ "$pid" = "$expected_pid" ] || return 1
+    current_ticks="$(awk '{ print $22; exit }' "/proc/$pid/stat" 2>/dev/null)" || return 1
+    [ "$current_ticks" = "$expected_ticks" ]
+}
+
+is_wildcard_listen_addr() {
+    local addr="${1,,}"
+
+    case "$addr" in
+        ""|'*'|0.0.0.0|::|0:0:0:0:0:0:0:0) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+firewall_record_docker_public_binding() {
+    local protocol="$1" host_ip="${2,,}" port="$3"
+
+    is_valid_port "$port" || return 1
+    is_loopback_listen_addr "$host_ip" && return 0
+    case "$host_ip" in
+        "")
+            err "Docker 发布地址尚未确定，已拒绝把端口 $port 视为公网端口。"
+            return 1
+            ;;
+        0.0.0.0|'*')
+            case "$protocol" in
+                tcp) FW_DOCKER_PUBLIC4_TCP="$(csv_add_port "$FW_DOCKER_PUBLIC4_TCP" "$port")" ;;
+                udp) FW_DOCKER_PUBLIC4_UDP="$(csv_add_port "$FW_DOCKER_PUBLIC4_UDP" "$port")" ;;
+                *) return 1 ;;
+            esac
+            ;;
+        ::|0:0:0:0:0:0:0:0)
+            case "$protocol" in
+                tcp) FW_DOCKER_PUBLIC6_TCP="$(csv_add_port "$FW_DOCKER_PUBLIC6_TCP" "$port")" ;;
+                udp) FW_DOCKER_PUBLIC6_UDP="$(csv_add_port "$FW_DOCKER_PUBLIC6_UDP" "$port")" ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *)
+            err "Docker 发布到特定非回环地址 $host_ip:$port，当前无法保留地址级访问边界。"
+            err "请改用通配地址/回环地址，或关闭 vpsbox 防火墙后自行管理规则。"
+            return 1
+            ;;
+    esac
+    FW_DOCKER_PUBLIC_TCP="$(merge_port_csv "$FW_DOCKER_PUBLIC4_TCP" "$FW_DOCKER_PUBLIC6_TCP")" || return 1
+    FW_DOCKER_PUBLIC_UDP="$(merge_port_csv "$FW_DOCKER_PUBLIC4_UDP" "$FW_DOCKER_PUBLIC6_UDP")" || return 1
+}
+
+firewall_detect_docker_proxy_ports() {
+    local family output mapping protocol listen_address host port
+
+    FW_DOCKER_PROXY4_TCP=""
+    FW_DOCKER_PROXY4_UDP=""
+    FW_DOCKER_PROXY6_TCP=""
+    FW_DOCKER_PROXY6_UDP=""
+    command -v ss >/dev/null 2>&1 || {
+        err "缺少 ss，无法检查 docker-proxy 监听。"
+        return 1
+    }
+    for family in 4 6; do
+        output="$(ss -H "-$family" -lntup 2>/dev/null)" || {
+            err "无法读取 IPv$family docker-proxy 监听状态。"
+            return 1
+        }
+        while IFS='|' read -r protocol listen_address; do
+            [ -n "$protocol" ] || continue
+            port="${listen_address##*:}"
+            host="${listen_address%:*}"
+            host="${host#[}"
+            host="${host%]}"
+            is_valid_port "$port" || {
+                err "docker-proxy 返回了无效监听端口：$listen_address"
+                return 1
+            }
+            is_loopback_listen_addr "$host" && continue
+            is_wildcard_listen_addr "$host" || {
+                err "docker-proxy 监听特定地址 $listen_address，无法用端口级规则保持地址边界。"
+                return 1
+            }
+            case "$protocol:$family" in
+                tcp:4)
+                    csv_contains_port "$FW_DOCKER_PUBLIC4_TCP" "$port" || return 1
+                    FW_DOCKER_PROXY4_TCP="$(csv_add_port "$FW_DOCKER_PROXY4_TCP" "$port")"
+                    ;;
+                udp:4)
+                    csv_contains_port "$FW_DOCKER_PUBLIC4_UDP" "$port" || return 1
+                    FW_DOCKER_PROXY4_UDP="$(csv_add_port "$FW_DOCKER_PROXY4_UDP" "$port")"
+                    ;;
+                tcp:6)
+                    csv_contains_port "$FW_DOCKER_PUBLIC6_TCP" "$port" || return 1
+                    FW_DOCKER_PROXY6_TCP="$(csv_add_port "$FW_DOCKER_PROXY6_TCP" "$port")"
+                    ;;
+                udp:6)
+                    csv_contains_port "$FW_DOCKER_PUBLIC6_UDP" "$port" || return 1
+                    FW_DOCKER_PROXY6_UDP="$(csv_add_port "$FW_DOCKER_PROXY6_UDP" "$port")"
+                    ;;
+            esac
+        done < <(printf '%s\n' "$output" | awk '/docker-proxy/ {
+            address=$5
+            if ($1 == "tcp" || $1 == "udp") print $1 "|" address
+        }')
+    done
+}
+
+firewall_detect_docker_ports() {
+    local container mode mapping container_port protocol binding host_ip host_port remainder
+    local network_id network_name network_driver bridge_name swarm_state
+    local docker_host context endpoint effective_endpoint security_options container_list network_list
+    local bindings running publish_all port_mappings network_data gateway_v4 gateway_v6 trusted_interfaces
+    local container_dynamic
+    local connected_count
+
+    FW_DOCKER_TCP=""
+    FW_DOCKER_UDP=""
+    FW_DOCKER_PUBLIC_TCP=""
+    FW_DOCKER_PUBLIC_UDP=""
+    FW_DOCKER_PUBLIC4_TCP=""
+    FW_DOCKER_PUBLIC4_UDP=""
+    FW_DOCKER_PUBLIC6_TCP=""
+    FW_DOCKER_PUBLIC6_UDP=""
+    FW_DOCKER_PROXY4_TCP=""
+    FW_DOCKER_PROXY4_UDP=""
+    FW_DOCKER_PROXY6_TCP=""
+    FW_DOCKER_PROXY6_UDP=""
+    FW_DOCKER_BRIDGES=""
+    FW_DOCKER_DAEMON_PID=""
+    FW_DOCKER_DAEMON_START_TICKS=""
+    FW_DOCKER_HOST_NETWORK=0
+    FW_DOCKER_DYNAMIC_PORT=0
+    FW_DOCKER_DIRECT_NETWORK=0
+    FW_DOCKER_CUSTOM_BRIDGE=0
+
+    if ! command -v docker >/dev/null 2>&1; then
+        docker_daemon_process_present || return 0
+        err "检测到 dockerd 进程但缺少 docker CLI，无法可靠检查发布端口。"
+        return 1
+    fi
+
+    docker_host="${DOCKER_HOST:-}"
+    case "$docker_host" in
+        ""|unix:///*) ;;
+        *)
+            err "检测到远程 DOCKER_HOST，已拒绝用远端容器信息配置本机防火墙。"
+            return 1
+            ;;
+    esac
+    context="$(docker_with_timeout context show 2>/dev/null)" || {
+        err "无法确认 Docker 当前 context，已拒绝更新防火墙。"
+        return 1
+    }
+    endpoint="$(docker_with_timeout context inspect --format '{{.Endpoints.docker.Host}}' "$context" 2>/dev/null)" || {
+        err "无法读取 Docker context 连接地址，已拒绝更新防火墙。"
+        return 1
+    }
+    effective_endpoint="${docker_host:-$endpoint}"
+    case "$effective_endpoint" in
+        unix:///var/run/docker.sock|unix:///run/docker.sock) ;;
+        *)
+            err "Docker 当前连接不是受支持的本机 rootful socket：$effective_endpoint"
+            return 1
+            ;;
+    esac
+
+    if ! firewall_docker_available; then
+        err "检测到 Docker 命令，但无法连接 Docker daemon。"
+        err "请先启动 Docker 或移除无效客户端，再更新主机防火墙。"
+        return 1
+    fi
+
+    security_options="$(docker_with_timeout info --format '{{json .SecurityOptions}}' 2>/dev/null)" || {
+        err "无法读取 Docker 安全模式，已拒绝更新防火墙。"
+        return 1
+    }
+    if [[ "$security_options" == *rootless* ]]; then
+        err "检测到 rootless Docker；当前防火墙仅支持本机 rootful Docker。"
+        return 1
+    fi
+
+    swarm_state="$(docker_with_timeout info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null)" || {
+        err "无法读取 Docker Swarm 状态，已拒绝更新防火墙。"
+        return 1
+    }
+    if [ "$swarm_state" != "inactive" ]; then
+        err "Docker Swarm 状态不是 inactive（当前：$swarm_state），已拒绝更新防火墙。"
+        return 1
+    fi
+
+    firewall_validate_docker_daemon_mode || return 1
+
+    container_list="$(docker_with_timeout ps -aq 2>/dev/null)" || {
+        err "Docker 容器枚举失败，已拒绝生成不完整的防火墙规则。"
+        return 1
+    }
+
+    while IFS= read -r container; do
+        [ -n "$container" ] || continue
+        container_dynamic=0
+        mode="$(docker_with_timeout inspect --format '{{.HostConfig.NetworkMode}}' "$container" 2>/dev/null)" || {
+            err "无法读取 Docker 容器网络模式：$container"
+            return 1
+        }
+        if [ "$mode" = "host" ]; then
+            FW_DOCKER_HOST_NETWORK=1
+            continue
+        fi
+        publish_all="$(docker_with_timeout inspect --format '{{.HostConfig.PublishAllPorts}}' "$container" 2>/dev/null)" || {
+            err "无法读取 Docker 容器随机发布设置：$container"
+            return 1
+        }
+        case "$publish_all" in
+            true) container_dynamic=1 ;;
+            false) ;;
+            *)
+                err "Docker 返回了无效的随机发布状态：$publish_all"
+                return 1
+                ;;
+        esac
+        bindings="$(docker_with_timeout inspect --format \
+            '{{range $port, $bindings := .HostConfig.PortBindings}}{{range $bindings}}{{printf "%s|%s|%s\n" $port .HostIp .HostPort}}{{end}}{{end}}' \
+            "$container" 2>/dev/null)" || {
+            err "无法读取 Docker 容器端口映射：$container"
+            return 1
+        }
+        while IFS= read -r mapping; do
+            [ -n "$mapping" ] || continue
+            container_port="${mapping%%|*}"
+            remainder="${mapping#*|}"
+            host_ip="${remainder%%|*}"
+            host_port="${remainder##*|}"
+            protocol="${container_port##*/}"
+            if [ -z "$host_port" ] || [ "$host_port" = "0" ]; then
+                container_dynamic=1
+                continue
+            fi
+            is_valid_port "$host_port" || {
+                err "Docker 返回了无效宿主机端口：$host_port"
+                return 1
+            }
+            case "$protocol" in
+                tcp)
+                    FW_DOCKER_TCP="$(csv_add_port "$FW_DOCKER_TCP" "$host_port")"
+                    [ -n "$host_ip" ] || container_dynamic=1
+                    ;;
+                udp)
+                    FW_DOCKER_UDP="$(csv_add_port "$FW_DOCKER_UDP" "$host_port")"
+                    [ -n "$host_ip" ] || container_dynamic=1
+                    ;;
+                *)
+                    err "检测到不受支持的 Docker 发布协议：$protocol"
+                    return 1
+                    ;;
+            esac
+        done <<< "$bindings"
+
+        running="$(docker_with_timeout inspect --format '{{.State.Running}}' "$container" 2>/dev/null)" || {
+            err "无法读取 Docker 容器运行状态：$container"
+            return 1
+        }
+        if [ "$running" != "true" ]; then
+            [ "$container_dynamic" = "0" ] || FW_DOCKER_DYNAMIC_PORT=1
+            continue
+        fi
+        port_mappings="$(docker_with_timeout port "$container" 2>/dev/null)" || {
+            err "无法读取运行中 Docker 容器的实际发布端口：$container"
+            return 1
+        }
+        [ -z "$port_mappings" ] || container_dynamic=0
+        while IFS= read -r mapping; do
+            [ -n "$mapping" ] || continue
+            container_port="${mapping%% -> *}"
+            protocol="${container_port##*/}"
+            binding="${mapping#* -> }"
+            host_port="${binding##*:}"
+            host_ip="${binding%:*}"
+            host_ip="${host_ip#[}"
+            host_ip="${host_ip%]}"
+            is_valid_port "$host_port" || {
+                err "Docker 返回了无效运行端口：$host_port"
+                return 1
+            }
+            case "$protocol" in
+                tcp)
+                    FW_DOCKER_TCP="$(csv_add_port "$FW_DOCKER_TCP" "$host_port")"
+                    firewall_record_docker_public_binding tcp "$host_ip" "$host_port" || return 1
+                    ;;
+                udp)
+                    FW_DOCKER_UDP="$(csv_add_port "$FW_DOCKER_UDP" "$host_port")"
+                    firewall_record_docker_public_binding udp "$host_ip" "$host_port" || return 1
+                    ;;
+                *)
+                    err "检测到不受支持的 Docker 运行协议：$protocol"
+                    return 1
+                    ;;
+            esac
+        done <<< "$port_mappings"
+        [ "$container_dynamic" = "0" ] || FW_DOCKER_DYNAMIC_PORT=1
+    done <<< "$container_list"
+
+    network_list="$(docker_with_timeout network ls --format '{{.ID}}|{{.Name}}|{{.Driver}}' 2>/dev/null)" || {
+        err "Docker 网络枚举失败，已拒绝生成不完整的防火墙规则。"
+        return 1
+    }
+    while IFS='|' read -r network_id network_name network_driver; do
+        [ -n "$network_id" ] || continue
+        network_data="$(docker_with_timeout network inspect --format \
+            '{{index .Options "com.docker.network.bridge.name"}}|{{index .Options "com.docker.network.bridge.gateway_mode_ipv4"}}|{{index .Options "com.docker.network.bridge.gateway_mode_ipv6"}}|{{index .Options "com.docker.network.bridge.trusted_host_interfaces"}}|{{len .Containers}}' \
+            "$network_id" 2>/dev/null)" || {
+            err "无法读取 Docker 网络配置：$network_name"
+            return 1
+        }
+        IFS='|' read -r bridge_name gateway_v4 gateway_v6 trusted_interfaces connected_count <<< "$network_data"
+        case "$network_driver" in
+            bridge)
+                case "$gateway_v4,$gateway_v6" in
+                    *routed*|*nat-unprotected*)
+                        err "Docker 网络 $network_name 使用 $gateway_v4/$gateway_v6 直连模式，已拒绝更新。"
+                        return 1
+                        ;;
+                esac
+                if [ -n "$trusted_interfaces" ] && [ "$trusted_interfaces" != "<no value>" ]; then
+                    err "Docker 网络 $network_name 允许可信接口直连，已拒绝更新。"
+                    return 1
+                fi
+                if [ -z "$bridge_name" ] || [ "$bridge_name" = "<no value>" ]; then
+                    if [ "$network_name" = "bridge" ]; then
+                        bridge_name="docker0"
+                    else
+                        bridge_name="br-${network_id:0:12}"
+                    fi
+                fi
+                is_valid_interface_name "$bridge_name" || {
+                    err "Docker 返回了无效 bridge 接口名：$bridge_name"
+                    return 1
+                }
+                [ -d "/sys/class/net/$bridge_name/bridge" ] || {
+                    err "Docker 返回的接口不是可用 Linux bridge：$bridge_name"
+                    return 1
+                }
+                case "$bridge_name" in
+                    docker0|br-*) ;;
+                    *) FW_DOCKER_CUSTOM_BRIDGE=1 ;;
+                esac
+                FW_DOCKER_BRIDGES="$(interface_csv_add "$FW_DOCKER_BRIDGES" "$bridge_name")"
+                ;;
+            host|none|null) ;;
+            *)
+                if [[ "$connected_count" =~ ^[1-9][0-9]*$ ]]; then
+                    FW_DOCKER_DIRECT_NETWORK=1
+                    err "Docker 网络 $network_name 使用 $network_driver 且连接了容器，当前无法安全接管。"
+                    return 1
+                fi
+                ;;
+        esac
+    done <<< "$network_list"
+
+    firewall_detect_docker_proxy_ports || {
+        err "docker-proxy 监听与 Docker 发布端口不一致，已拒绝更新防火墙。"
+        return 1
+    }
+    firewall_docker_daemon_identity_unchanged || {
+        err "Docker daemon 在检查期间发生变化，已拒绝使用可能不一致的端口结果。"
+        return 1
+    }
+
+}
+
+docker_reserved_ports_csv() {
+    local docker_host context endpoint effective_endpoint container container_list
+    local bindings mapping host_port running port_mappings swarm_state control_available
+    local service service_list published_ports port reserved=""
+    local daemon_pid daemon_start_ticks current_pid current_start_ticks
+
+    if ! command -v docker >/dev/null 2>&1; then
+        docker_daemon_process_present || return 0
+        err "检测到 dockerd 进程但缺少 docker CLI，无法可靠检查保留端口。"
+        return 1
+    fi
+    docker_host="${DOCKER_HOST:-}"
+    case "$docker_host" in
+        ""|unix:///*) ;;
+        *)
+            err "检测到远程 DOCKER_HOST，无法据此判断本机 Docker 保留端口。"
+            return 1
+            ;;
+    esac
+    context="$(docker_with_timeout context show 2>/dev/null)" || return 1
+    endpoint="$(docker_with_timeout context inspect --format '{{.Endpoints.docker.Host}}' "$context" 2>/dev/null)" || return 1
+    effective_endpoint="${docker_host:-$endpoint}"
+    case "$effective_endpoint" in
+        unix:///*) ;;
+        *)
+            err "Docker 当前连接不是本机 Unix socket，无法可靠检查保留端口。"
+            return 1
+            ;;
+    esac
+    docker_with_timeout info >/dev/null 2>&1 || {
+        err "检测到 Docker 命令，但无法连接本机 Docker daemon。"
+        return 1
+    }
+    daemon_pid="$(docker_single_daemon_pid)" || {
+        err "无法确认唯一的本机 dockerd 进程，已拒绝使用不完整的保留端口结果。"
+        return 1
+    }
+    daemon_start_ticks="$(awk '{ print $22; exit }' "/proc/$daemon_pid/stat" 2>/dev/null || true)"
+    [[ "$daemon_start_ticks" =~ ^[0-9]+$ ]] || return 1
+
+    container_list="$(docker_with_timeout ps -aq 2>/dev/null)" || return 1
+    while IFS= read -r container; do
+        [ -n "$container" ] || continue
+        bindings="$(docker_with_timeout inspect --format \
+            '{{range $port, $bindings := .HostConfig.PortBindings}}{{range $bindings}}{{printf "%s|%s|%s\n" $port .HostIp .HostPort}}{{end}}{{end}}' \
+            "$container" 2>/dev/null)" || return 1
+        while IFS= read -r mapping; do
+            [ -n "$mapping" ] || continue
+            host_port="${mapping##*|}"
+            [ -z "$host_port" ] || [ "$host_port" = "0" ] || {
+                is_valid_port "$host_port" || return 1
+                reserved="$(csv_add_port "$reserved" "$host_port")" || return 1
+            }
+        done <<< "$bindings"
+
+        running="$(docker_with_timeout inspect --format '{{.State.Running}}' "$container" 2>/dev/null)" || return 1
+        [ "$running" = "true" ] || continue
+        port_mappings="$(docker_with_timeout port "$container" 2>/dev/null)" || return 1
+        while IFS= read -r mapping; do
+            [ -n "$mapping" ] || continue
+            host_port="${mapping##*:}"
+            is_valid_port "$host_port" || return 1
+            reserved="$(csv_add_port "$reserved" "$host_port")" || return 1
+        done <<< "$port_mappings"
+    done <<< "$container_list"
+
+    swarm_state="$(docker_with_timeout info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null)" || return 1
+    if [ "$swarm_state" != "inactive" ]; then
+        [ "$swarm_state" = "active" ] || {
+            err "Docker Swarm 状态为 $swarm_state，无法可靠枚举保留端口。"
+            return 1
+        }
+        control_available="$(docker_with_timeout info --format '{{.Swarm.ControlAvailable}}' 2>/dev/null)" || return 1
+        [ "$control_available" = "true" ] || {
+            err "当前 Swarm 节点不是 manager，无法可靠枚举服务发布端口。"
+            return 1
+        }
+        service_list="$(docker_with_timeout service ls -q 2>/dev/null)" || return 1
+        while IFS= read -r service; do
+            [ -n "$service" ] || continue
+            published_ports="$(docker_with_timeout service inspect --format \
+                '{{range .Endpoint.Spec.Ports}}{{printf "%d\n" .PublishedPort}}{{end}}' \
+                "$service" 2>/dev/null)" || return 1
+            while IFS= read -r port; do
+                [ -n "$port" ] || continue
+                is_valid_port "$port" || return 1
+                reserved="$(csv_add_port "$reserved" "$port")" || return 1
+            done <<< "$published_ports"
+        done <<< "$service_list"
+    fi
+    current_pid="$(docker_single_daemon_pid)" || return 1
+    current_start_ticks="$(awk '{ print $22; exit }' "/proc/$current_pid/stat" 2>/dev/null || true)"
+    [ "$current_pid" = "$daemon_pid" ] && [ "$current_start_ticks" = "$daemon_start_ticks" ] || {
+        err "Docker daemon 在端口枚举期间发生变化，已拒绝使用结果。"
+        return 1
+    }
+    printf '%s\n' "$reserved"
+}
+
+firewall_detect_allowed_ports() {
+    local ssh_configured_ports ssh_listening_ports
+
+    ssh_configured_ports="$(ssh_effective_ports_csv 2>/dev/null || true)"
+    [ -n "$ssh_configured_ports" ] || {
+        err "无法读取 SSH 当前实际生效端口，已拒绝启用防火墙。"
+        return 1
+    }
+    ssh_listening_ports="$(ssh_listening_ports_csv 2>/dev/null)" || {
+        err "无法可靠读取 SSH 实际监听端口，已拒绝更新防火墙。"
+        return 1
+    }
+    FW_SSH_PORTS="$(merge_port_csv "$ssh_configured_ports" "$ssh_listening_ports")" || return 1
+
+    FW_NODE_TCP=""
+    FW_NODE_UDP=""
+    require_valid_node_state_if_present || return 1
+    if node_exists; then
+        load_state || return 1
+        is_valid_port "${PORT:-}" || {
+            err "当前节点端口无效，已拒绝生成防火墙规则。"
+            return 1
+        }
+        FW_NODE_TCP="$PORT"
+        [ "${PROTOCOL:-shadowsocks}" = "shadowsocks" ] && FW_NODE_UDP="$PORT"
+    fi
+
+    firewall_detect_docker_ports || return 1
+    FW_ALLOWED_TCP="$(merge_port_csv "$FW_SSH_PORTS" "$FW_NODE_TCP" "$FW_EXTRA_TCP")" || return 1
+    FW_ALLOWED_UDP="$(merge_port_csv "$FW_NODE_UDP" "$FW_EXTRA_UDP")" || return 1
+}
+
+firewall_write_config() {
+    local dest="$1" tcp_ports udp_ports
+    local docker4_tcp docker4_udp docker6_tcp docker6_udp
+    local docker_bridges docker_bridge_elements extra_tcp extra_udp
+    local proxy4_tcp proxy4_udp proxy6_tcp proxy6_udp
+
+    tcp_ports="$(printf '%s' "$FW_ALLOWED_TCP" | sed 's/,/, /g')"
+    udp_ports="$(printf '%s' "$FW_ALLOWED_UDP" | sed 's/,/, /g')"
+    docker4_tcp="$(normalize_port_csv "$FW_DOCKER_PUBLIC4_TCP")" || return 1
+    docker4_udp="$(normalize_port_csv "$FW_DOCKER_PUBLIC4_UDP")" || return 1
+    docker6_tcp="$(normalize_port_csv "$FW_DOCKER_PUBLIC6_TCP")" || return 1
+    docker6_udp="$(normalize_port_csv "$FW_DOCKER_PUBLIC6_UDP")" || return 1
+    extra_tcp="$(normalize_port_csv "$FW_EXTRA_TCP")" || return 1
+    extra_udp="$(normalize_port_csv "$FW_EXTRA_UDP")" || return 1
+    docker_bridges="$(normalize_interface_csv "$FW_DOCKER_BRIDGES")" || return 1
+    if [ -n "$docker4_tcp$docker4_udp$docker6_tcp$docker6_udp" ] && [ -z "$docker_bridges" ]; then
+        err "检测到 Docker 公开端口，但没有可验证的 Docker bridge。"
+        return 1
+    fi
+    if [ -n "$docker_bridges" ]; then
+        docker_bridge_elements="$(printf '%s\n' "$docker_bridges" | awk -F, '{
+            for (i = 1; i <= NF; i++) printf "%s\"%s\"", (i == 1 ? "" : ", "), $i
+        }')"
+    else
+        docker_bridge_elements=""
+    fi
+    proxy4_tcp="$(printf '%s' "$FW_DOCKER_PROXY4_TCP" | sed 's/,/, /g')"
+    proxy4_udp="$(printf '%s' "$FW_DOCKER_PROXY4_UDP" | sed 's/,/, /g')"
+    proxy6_tcp="$(printf '%s' "$FW_DOCKER_PROXY6_TCP" | sed 's/,/, /g')"
+    proxy6_udp="$(printf '%s' "$FW_DOCKER_PROXY6_UDP" | sed 's/,/, /g')"
+    cat > "$dest" <<'EOF'
+# Managed by vpsbox. Replace only the dedicated table; never flush the global ruleset.
+delete table inet vpsbox
+
+table inet vpsbox {
+EOF
+    if [ -n "$docker_bridge_elements" ]; then
+        printf '    set docker_bridge_ifaces {\n        type ifname\n        elements = { %s }\n    }\n\n' \
+            "$docker_bridge_elements" >> "$dest"
+    fi
+    if [ -n "$docker4_tcp" ]; then
+        printf '    set docker4_tcp_ports {\n        type inet_service\n        elements = { %s }\n    }\n\n' \
+            "$(printf '%s' "$docker4_tcp" | sed 's/,/, /g')" >> "$dest"
+    fi
+    if [ -n "$docker4_udp" ]; then
+        printf '    set docker4_udp_ports {\n        type inet_service\n        elements = { %s }\n    }\n\n' \
+            "$(printf '%s' "$docker4_udp" | sed 's/,/, /g')" >> "$dest"
+    fi
+    if [ -n "$docker6_tcp" ]; then
+        printf '    set docker6_tcp_ports {\n        type inet_service\n        elements = { %s }\n    }\n\n' \
+            "$(printf '%s' "$docker6_tcp" | sed 's/,/, /g')" >> "$dest"
+    fi
+    if [ -n "$docker6_udp" ]; then
+        printf '    set docker6_udp_ports {\n        type inet_service\n        elements = { %s }\n    }\n\n' \
+            "$(printf '%s' "$docker6_udp" | sed 's/,/, /g')" >> "$dest"
+    fi
+    if [ -n "$extra_tcp" ]; then
+        printf '    set extra_tcp_dnat_ports {\n        type inet_service\n        elements = { %s }\n    }\n\n' \
+            "$(printf '%s' "$extra_tcp" | sed 's/,/, /g')" >> "$dest"
+    fi
+    if [ -n "$extra_udp" ]; then
+        printf '    set extra_udp_dnat_ports {\n        type inet_service\n        elements = { %s }\n    }\n\n' \
+            "$(printf '%s' "$extra_udp" | sed 's/,/, /g')" >> "$dest"
+    fi
+
+    cat >> "$dest" <<'EOF'
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        ct state invalid drop
+        ct state established,related accept
+        iifname "lo" accept
+
+        ip protocol icmp accept
+        meta l4proto ipv6-icmp accept
+
+        meta nfproto ipv4 udp sport 67 udp dport 68 accept
+        meta nfproto ipv6 udp sport 547 udp dport 546 accept
+EOF
+    [ -n "$tcp_ports" ] && printf '        tcp dport { %s } accept\n' "$tcp_ports" >> "$dest"
+    [ -n "$udp_ports" ] && printf '        udp dport { %s } accept\n' "$udp_ports" >> "$dest"
+    [ -n "$proxy4_tcp" ] && printf '        meta nfproto ipv4 tcp dport { %s } accept\n' "$proxy4_tcp" >> "$dest"
+    [ -n "$proxy4_udp" ] && printf '        meta nfproto ipv4 udp dport { %s } accept\n' "$proxy4_udp" >> "$dest"
+    [ -n "$proxy6_tcp" ] && printf '        meta nfproto ipv6 tcp dport { %s } accept\n' "$proxy6_tcp" >> "$dest"
+    [ -n "$proxy6_udp" ] && printf '        meta nfproto ipv6 udp dport { %s } accept\n' "$proxy6_udp" >> "$dest"
+    cat >> "$dest" <<'EOF'
+    }
+EOF
+    cat >> "$dest" <<'EOF'
+
+    chain docker_port_guard {
+EOF
+    if [ -n "$extra_tcp" ]; then
+        printf '        meta l4proto tcp ct original proto-dst @extra_tcp_dnat_ports accept\n' >> "$dest"
+    fi
+    if [ -n "$docker4_tcp" ]; then
+        printf '        meta nfproto ipv4 meta l4proto tcp oifname @docker_bridge_ifaces ct original proto-dst @docker4_tcp_ports accept\n' >> "$dest"
+    fi
+    if [ -n "$docker6_tcp" ]; then
+        printf '        meta nfproto ipv6 meta l4proto tcp oifname @docker_bridge_ifaces ct original proto-dst @docker6_tcp_ports accept\n' >> "$dest"
+    fi
+    printf '        meta l4proto tcp drop\n' >> "$dest"
+    if [ -n "$extra_udp" ]; then
+        printf '        meta l4proto udp ct original proto-dst @extra_udp_dnat_ports accept\n' >> "$dest"
+    fi
+    if [ -n "$docker4_udp" ]; then
+        printf '        meta nfproto ipv4 meta l4proto udp oifname @docker_bridge_ifaces ct original proto-dst @docker4_udp_ports accept\n' >> "$dest"
+    fi
+    if [ -n "$docker6_udp" ]; then
+        printf '        meta nfproto ipv6 meta l4proto udp oifname @docker_bridge_ifaces ct original proto-dst @docker6_udp_ports accept\n' >> "$dest"
+    fi
+    printf '        meta l4proto udp drop\n' >> "$dest"
+    printf '        drop\n' >> "$dest"
+    cat >> "$dest" <<'EOF'
+    }
+
+    chain docker_forward {
+        type filter hook forward priority -1; policy accept;
+
+        ct state established,related accept
+EOF
+    if [ -n "$docker_bridge_elements" ]; then
+        printf '        iifname @docker_bridge_ifaces accept\n' >> "$dest"
+    fi
+    printf '        ct direction original ct status dnat jump docker_port_guard\n' >> "$dest"
+    if [ -n "$docker_bridge_elements" ]; then
+        printf '        oifname @docker_bridge_ifaces drop\n' >> "$dest"
+    fi
+    cat >> "$dest" <<'EOF'
+    }
+EOF
+    cat >> "$dest" <<'EOF'
+}
+EOF
+}
+
+firewall_write_service_definition() {
+    local dest="$1" nft_path
+    nft_path="$(command -v nft)" || return 1
+
+    if is_systemd; then
+        cat > "$dest" <<EOF
+[Unit]
+Description=vpsbox host firewall
+DefaultDependencies=no
+Wants=network-pre.target
+Before=network-pre.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=-$nft_path add table inet vpsbox
+ExecStart=$nft_path -f $FIREWALL_CONFIG
+ExecStop=-$nft_path delete table inet vpsbox
+
+[Install]
+WantedBy=sysinit.target
+EOF
+    elif [ "$OS" = "alpine" ] && command -v rc-update >/dev/null 2>&1; then
+        cat > "$dest" <<EOF
+#!/sbin/openrc-run
+description="vpsbox host firewall"
+
+depend() {
+    need localmount
+    before net
+}
+
+start() {
+    ebegin "Loading vpsbox host firewall"
+    $nft_path add table inet vpsbox >/dev/null 2>&1 || true
+    $nft_path -f $FIREWALL_CONFIG
+    eend \$?
+}
+
+stop() {
+    ebegin "Removing vpsbox host firewall"
+    $nft_path delete table inet vpsbox >/dev/null 2>&1 || true
+    eend 0
+}
+EOF
+    else
+        err "未检测到受支持的 systemd/OpenRC 服务管理器。"
+        return 1
+    fi
+}
+
+firewall_snapshot_file() {
+    local dir="$1" name="$2" path="$3"
+    if [ -e "$path" ]; then
+        [ ! -L "$path" ] || return 1
+        cp -a "$path" "$dir/$name" || return 1
+        : > "$dir/$name.present"
+    fi
+}
+
+firewall_recover_pending_rollbacks() {
+    local dir decision owner
+
+    prepare_runtime_dir
+    for dir in "$RUNTIME_DIR"/.firewall-rollback-build.*; do
+        [ -e "$dir" ] || continue
+        if [ ! -d "$dir" ] || [ -L "$dir" ]; then
+            err "检测到不安全的防火墙回滚构建目录：$dir"
+            return 1
+        fi
+        rm -rf "$dir" || return 1
+    done
+    for dir in "$RUNTIME_DIR"/firewall-rollback.*; do
+        [ -d "$dir" ] || continue
+        if [ -L "$dir" ]; then
+            err "检测到不安全的防火墙回滚目录：$dir"
+            return 1
+        fi
+        if [ -e "$dir/completed" ] || [ -e "$dir/rolled-back" ]; then
+            [ "${ACTIVE_FIREWALL_ROLLBACK_DIR:-}" = "$dir" ] && ACTIVE_FIREWALL_ROLLBACK_DIR=""
+            rm -rf "$dir"
+            continue
+        fi
+        decision="$(cat "$dir/decision" 2>/dev/null || true)"
+        owner=0
+        [ "$decision" = "commit" ] && owner=1
+        warn "检测到未完成的防火墙操作，正在先恢复快照：$dir"
+        if ! firewall_restore_snapshot_now "$dir" "$owner"; then
+            err "旧防火墙快照尚未恢复，已拒绝开始新的防火墙操作。"
+            return 1
+        fi
+    done
+}
+
+firewall_create_rollback_snapshot() {
+    local output_var="$1" ssh_ports="$2" dir build_dir final_dir suffix nft_path
+
+    if [ -n "${ACTIVE_FIREWALL_ROLLBACK_DIR:-}" ]; then
+        err "已有未完成的防火墙回滚快照，已拒绝创建新快照。"
+        return 1
+    fi
+    prepare_runtime_dir
+    for dir in "$RUNTIME_DIR"/firewall-rollback.*; do
+        [ -d "$dir" ] || continue
+        err "检测到尚未处理的防火墙回滚目录：$dir"
+        return 1
+    done
+
+    build_dir="$(mktemp -d "$RUNTIME_DIR/.firewall-rollback-build.XXXXXX")" || return 1
+    suffix="${build_dir##*.firewall-rollback-build.}"
+    final_dir="$RUNTIME_DIR/firewall-rollback.$suffix"
+    if [ -e "$final_dir" ] || [ -L "$final_dir" ]; then
+        rm -rf "$build_dir"
+        err "防火墙回滚目录发生冲突，已拒绝继续。"
+        return 1
+    fi
+    nft_path="$(command -v nft)" || { rm -rf "$build_dir"; return 1; }
+    firewall_snapshot_file "$build_dir" config "$FIREWALL_CONFIG" &&
+        firewall_snapshot_file "$build_dir" state "$FIREWALL_STATE_FILE" &&
+        firewall_snapshot_file "$build_dir" systemd-unit "$FIREWALL_SYSTEMD_UNIT" &&
+        firewall_snapshot_file "$build_dir" openrc-service "$FIREWALL_OPENRC_SERVICE" || {
+            rm -rf "$build_dir"
+            return 1
+        }
+    if firewall_runtime_enabled; then
+        nft list table inet vpsbox > "$build_dir/table.nft" || { rm -rf "$build_dir"; return 1; }
+        : > "$build_dir/table.present"
+    fi
+    if [ -e "$build_dir/config.present" ] &&
+        ! firewall_write_ssh_safe_snapshot "$build_dir/config" "$build_dir/config" "$ssh_ports"; then
+        rm -rf "$build_dir"
+        return 1
+    fi
+    if [ -e "$build_dir/table.present" ] &&
+        ! firewall_write_ssh_safe_snapshot "$build_dir/table.nft" "$build_dir/table.nft" "$ssh_ports"; then
+        rm -rf "$build_dir"
+        return 1
+    fi
+    firewall_persistence_enabled && : > "$build_dir/service.enabled"
+    firewall_service_active && : > "$build_dir/service.active"
+
+    printf '%s\n' commit > "$build_dir/commit.token" || { rm -rf "$build_dir"; return 1; }
+    printf '%s\n' rollback > "$build_dir/rollback.token" || { rm -rf "$build_dir"; return 1; }
+
+    if ! cat > "$build_dir/rollback.sh" <<EOF
+#!/bin/sh
+set -u
+dir='$final_dir'
+nft='$nft_path'
+failed=0
+mode="\${1:-}"
+
+if [ "\$mode" != "--now" ] && [ "\$mode" != "--commit-owner" ]; then
+    sleep $FIREWALL_ROLLBACK_SECONDS
+fi
+[ -d "\$dir" ] || exit 0
+[ ! -e "\$dir/completed" ] || exit 0
+[ ! -e "\$dir/rolled-back" ] || exit 0
+
+if [ "\$mode" = "--commit-owner" ]; then
+    [ "\$(cat "\$dir/decision" 2>/dev/null)" = "commit" ] || exit 1
+else
+    if ! ln "\$dir/rollback.token" "\$dir/decision" 2>/dev/null; then
+        case "\$(cat "\$dir/decision" 2>/dev/null)" in
+            commit) exit 0 ;;
+            rollback) ;;
+            *) exit 1 ;;
+        esac
+    fi
+fi
+
+mkdir "\$dir/restore.lock" 2>/dev/null || exit 0
+trap 'rmdir "\$dir/restore.lock" >/dev/null 2>&1 || true' EXIT
+trap 'exit 1' HUP INT TERM
+[ ! -e "\$dir/completed" ] || exit 0
+[ ! -e "\$dir/rolled-back" ] || exit 0
+rm -f "\$dir/rollback-failed"
+: > "\$dir/restoring"
+
+run_limited() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 20 "\$@"
+    else
+        "\$@"
+    fi
+}
+
+restore_file() {
+    name="\$1"
+    target="\$2"
+    if [ -e "\$dir/\$name.present" ]; then
+        cp -a "\$dir/\$name" "\$target" || return 1
+    else
+        rm -f "\$target" || return 1
+    fi
+}
+
+restore_file config '$FIREWALL_CONFIG' || failed=1
+restore_file state '$FIREWALL_STATE_FILE' || failed=1
+restore_file systemd-unit '$FIREWALL_SYSTEMD_UNIT' || failed=1
+restore_file openrc-service '$FIREWALL_OPENRC_SERVICE' || failed=1
+
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    run_limited systemctl daemon-reload || failed=1
+    if [ -e "\$dir/service.enabled" ]; then
+        run_limited systemctl enable '$FIREWALL_SERVICE_NAME' || failed=1
+        systemctl is-enabled --quiet '$FIREWALL_SERVICE_NAME' 2>/dev/null || failed=1
+    else
+        run_limited systemctl disable '$FIREWALL_SERVICE_NAME' >/dev/null 2>&1 || true
+        systemctl is-enabled --quiet '$FIREWALL_SERVICE_NAME' 2>/dev/null && failed=1
+    fi
+    if [ -e "\$dir/service.active" ]; then
+        run_limited systemctl restart '$FIREWALL_SERVICE_NAME' || failed=1
+        systemctl is-active --quiet '$FIREWALL_SERVICE_NAME' 2>/dev/null || failed=1
+    else
+        run_limited systemctl stop '$FIREWALL_SERVICE_NAME' >/dev/null 2>&1 || true
+        systemctl is-active --quiet '$FIREWALL_SERVICE_NAME' 2>/dev/null && failed=1
+    fi
+elif command -v rc-update >/dev/null 2>&1; then
+    if [ -e "\$dir/service.enabled" ]; then
+        run_limited rc-update add '$FIREWALL_SERVICE_NAME' default || failed=1
+        [ -e '/etc/runlevels/default/$FIREWALL_SERVICE_NAME' ] || failed=1
+    else
+        run_limited rc-update del '$FIREWALL_SERVICE_NAME' default >/dev/null 2>&1 || true
+        [ ! -e '/etc/runlevels/default/$FIREWALL_SERVICE_NAME' ] || failed=1
+    fi
+    if [ -e "\$dir/service.active" ]; then
+        run_limited rc-service '$FIREWALL_SERVICE_NAME' restart || failed=1
+        rc-service '$FIREWALL_SERVICE_NAME' status >/dev/null 2>&1 || failed=1
+    else
+        run_limited rc-service '$FIREWALL_SERVICE_NAME' stop >/dev/null 2>&1 || true
+        rc-service '$FIREWALL_SERVICE_NAME' status >/dev/null 2>&1 && failed=1
+    fi
+else
+    failed=1
+fi
+
+"\$nft" delete table inet vpsbox >/dev/null 2>&1 || true
+if [ -e "\$dir/table.present" ]; then
+    "\$nft" -f "\$dir/table.nft" || failed=1
+    "\$nft" list table inet vpsbox >/dev/null 2>&1 || failed=1
+elif "\$nft" list table inet vpsbox >/dev/null 2>&1; then
+    failed=1
+fi
+
+if [ "\$failed" -eq 0 ]; then
+    rm -f "\$dir/restoring"
+    : > "\$dir/rolled-back"
+    exit 0
+fi
+: > "\$dir/rollback-failed"
+exit 1
+EOF
+    then
+        rm -rf "$build_dir"
+        return 1
+    fi
+    chmod 700 "$build_dir/rollback.sh" || { rm -rf "$build_dir"; return 1; }
+    sh -n "$build_dir/rollback.sh" || { rm -rf "$build_dir"; return 1; }
+
+    # 仅完整快照使用正式前缀；中断时隐藏构建目录不会被当作待恢复操作。
+    ACTIVE_FIREWALL_ROLLBACK_DIR="$final_dir"
+    if ! mv "$build_dir" "$final_dir"; then
+        ACTIVE_FIREWALL_ROLLBACK_DIR=""
+        rm -rf "$build_dir"
+        return 1
+    fi
+    printf -v "$output_var" '%s' "$final_dir"
+}
+
+firewall_start_rollback_watchdog() {
+    local dir="$1" pid
+    [[ "$dir" == "$RUNTIME_DIR"/firewall-rollback.* ]] &&
+        [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    : > "$dir/armed"
+    nohup sh "$dir/rollback.sh" >> "$dir/rollback.log" 2>&1 &
+    pid=$!
+    process_alive "$pid" || return 1
+    printf '%s\n' "$pid" > "$dir/watchdog.pid"
+}
+
+firewall_restore_snapshot_now() {
+    local dir="$1" commit_owner="${2:-0}" i mode="--now"
+
+    if [[ "$dir" != "$RUNTIME_DIR"/firewall-rollback.* ]] ||
+        [ ! -d "$dir" ] || [ -L "$dir" ]; then
+        return 1
+    fi
+    if [ -e "$dir/completed" ]; then
+        [ "${ACTIVE_FIREWALL_ROLLBACK_DIR:-}" = "$dir" ] && ACTIVE_FIREWALL_ROLLBACK_DIR=""
+        rm -rf "$dir"
+        return 0
+    fi
+    [ -x "$dir/rollback.sh" ] || return 1
+    [ "$commit_owner" = "1" ] && mode="--commit-owner"
+    sh "$dir/rollback.sh" "$mode" >> "$dir/rollback.log" 2>&1 || true
+    for i in {1..90}; do
+        if [ -e "$dir/rolled-back" ]; then
+            [ "${ACTIVE_FIREWALL_ROLLBACK_DIR:-}" = "$dir" ] && ACTIVE_FIREWALL_ROLLBACK_DIR=""
+            rm -rf "$dir"
+            return 0
+        fi
+        [ -e "$dir/rollback-failed" ] && {
+            err "防火墙自动恢复失败，快照保留在：$dir"
+            return 1
+        }
+        sleep 1
+    done
+    err "防火墙恢复结果无法确认，快照保留在：$dir"
+    return 1
+}
+
+firewall_begin_commit() {
+    local dir="$1"
+    [[ "$dir" == "$RUNTIME_DIR"/firewall-rollback.* ]] &&
+        [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    : > "$dir/committing" || return 1
+    if ! ln "$dir/commit.token" "$dir/decision" 2>/dev/null; then
+        rm -f "$dir/committing"
+        return 1
+    fi
+}
+
+firewall_finish_commit() {
+    local dir="$1"
+
+    [[ "$dir" == "$RUNTIME_DIR"/firewall-rollback.* ]] &&
+        [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    [ "$(cat "$dir/decision" 2>/dev/null || true)" = "commit" ] || return 1
+    : > "$dir/completed" || return 1
+    ACTIVE_FIREWALL_ROLLBACK_DIR=""
+    rm -rf "$dir" || true
+    return 0
+}
+
+firewall_apply_config_file() {
+    local config="$1" table_existed=0
+
+    firewall_runtime_enabled && table_existed=1
+    if [ "$table_existed" -eq 0 ]; then
+        nft add table inet vpsbox || return 1
+    fi
+    if ! nft -c -f "$config"; then
+        [ "$table_existed" -eq 1 ] || nft delete table inet vpsbox >/dev/null 2>&1 || true
+        return 1
+    fi
+    if ! nft -f "$config"; then
+        [ "$table_existed" -eq 1 ] || nft delete table inet vpsbox >/dev/null 2>&1 || true
+        return 1
+    fi
+}
+
+firewall_enable_persistence() {
+    command -v timeout >/dev/null 2>&1 || {
+        err "缺少 timeout 命令，无法为防火墙持久化设置执行上限。"
+        return 1
+    }
+    if is_systemd; then
+        timeout 20 systemctl daemon-reload &&
+            timeout 20 systemctl enable --now "$FIREWALL_SERVICE_NAME"
+    elif [ "$OS" = "alpine" ] && command -v rc-update >/dev/null 2>&1; then
+        timeout 20 rc-update add "$FIREWALL_SERVICE_NAME" default >/dev/null &&
+            { timeout 20 rc-service "$FIREWALL_SERVICE_NAME" restart >/dev/null 2>&1 ||
+                timeout 20 rc-service "$FIREWALL_SERVICE_NAME" start; }
+    else
+        return 1
+    fi
+}
+
+firewall_show_port_summary() {
+    cat <<EOF
+----------------------------------------
+ 即将应用主机防火墙
+ SSH TCP：${FW_SSH_PORTS:--}
+ 节点 TCP：${FW_NODE_TCP:--}
+ 节点 UDP：${FW_NODE_UDP:--}
+ 额外 TCP：${FW_EXTRA_TCP:--}
+ 额外 UDP：${FW_EXTRA_UDP:--}
+ Docker TCP：${FW_DOCKER_PUBLIC_TCP:--}
+ Docker UDP：${FW_DOCKER_PUBLIC_UDP:--}
+ 默认入站策略：拒绝
+ 出站：不创建规则
+ Docker 转发：仅检查已发布端口，不限制容器出站
+----------------------------------------
+EOF
+    if [ "$FW_DOCKER_HOST_NETWORK" = "1" ]; then
+        warn "检测到 host 网络模式容器，其监听端口需通过额外放行端口菜单手动添加。"
+    fi
+    if [ "$FW_DOCKER_DYNAMIC_PORT" = "1" ]; then
+        warn "检测到尚未确定的 Docker 随机发布端口；容器启动后请重新更新防火墙。"
+    fi
+    if [ "$FW_DOCKER_DIRECT_NETWORK" = "1" ]; then
+        warn "检测到 Docker 直连网络；该模式不会由当前端口守卫自动放行。"
+    fi
+    if [ "$FW_DOCKER_CUSTOM_BRIDGE" = "1" ]; then
+        warn "检测到自定义 Docker bridge 接口名；新增或变更该网络后必须重新更新防火墙。"
+    fi
+}
+
+firewall_apply_desired_state() {
+    local work_dir rollback_dir answer service_file service_target service_mode
+
+    firewall_settle_pending_port_transition || return 1
+    detect_os
+    case "$OS" in
+        debian|alpine) ;;
+        *) err "主机防火墙目前仅支持 Debian/Ubuntu 与 Alpine。"; return 1 ;;
+    esac
+    firewall_recover_pending_rollbacks || return 1
+    firewall_check_conflicts || return 1
+    ensure_nftables || return 1
+    firewall_check_conflicts || return 1
+    firewall_detect_allowed_ports || return 1
+
+    firewall_show_port_summary
+    read -r -p "确认应用以上规则？请输入 YES：" answer || return 1
+    [ "$answer" = "YES" ] || { info "已取消，未修改防火墙。"; return 0; }
+
+    # 用户确认期间 ssh.socket、sshd 或 Docker 可能变化；落盘前重新取一次实时状态。
+    firewall_detect_allowed_ports || {
+        err "确认后端口状态发生异常，未修改防火墙。"
+        return 1
+    }
+
+    ensure_change_store || return 1
+    work_dir="$(mktemp -d "$RUNTIME_DIR/firewall-work.XXXXXX")" || return 1
+    firewall_write_state_file "$work_dir/firewall.env" || { rm -rf "$work_dir"; return 1; }
+    firewall_write_config "$work_dir/firewall.nft" || { rm -rf "$work_dir"; return 1; }
+    if is_systemd; then
+        service_file="$work_dir/vpsbox-firewall.service"
+        service_target="$FIREWALL_SYSTEMD_UNIT"
+        service_mode=644
+    else
+        service_file="$work_dir/vpsbox-firewall"
+        service_target="$FIREWALL_OPENRC_SERVICE"
+        service_mode=755
+    fi
+    firewall_write_service_definition "$service_file" || { rm -rf "$work_dir"; return 1; }
+
+    if ! firewall_create_rollback_snapshot rollback_dir "$FW_SSH_PORTS"; then
+        rm -rf "$work_dir"
+        err "无法创建防火墙回滚快照。"
+        return 1
+    fi
+    if ! firewall_start_rollback_watchdog "$rollback_dir"; then
+        err "无法启动自动回滚保护，正在恢复原状态。"
+        if ! firewall_restore_snapshot_now "$rollback_dir"; then
+            err "原状态恢复失败，必须先处理保留的回滚快照。"
+        fi
+        rm -rf "$work_dir"
+        return 1
+    fi
+    if ! firewall_install_managed_file "$work_dir/firewall.env" "$FIREWALL_STATE_FILE" 600 ||
+        ! firewall_install_managed_file "$work_dir/firewall.nft" "$FIREWALL_CONFIG" 600 ||
+        ! firewall_install_managed_file "$service_file" "$service_target" "$service_mode" ||
+        ! firewall_apply_config_file "$FIREWALL_CONFIG"; then
+        err "防火墙配置写入或校验失败，正在恢复原状态。"
+        if ! firewall_restore_snapshot_now "$rollback_dir"; then
+            err "原状态恢复失败，必须先处理保留的回滚快照。"
+        fi
+        rm -rf "$work_dir"
+        return 1
+    fi
+
+    info "规则已临时应用，$FIREWALL_ROLLBACK_SECONDS 秒内未确认将自动恢复。"
+    warn "请保持当前 SSH 会话，并立即另开一个 SSH 窗口测试登录。"
+    read -r -p "确认新 SSH 会话可以登录后，输入 YES 保存规则：" answer || answer=""
+    if [ "$answer" != "YES" ]; then
+        warn "未收到有效确认，正在恢复应用前的防火墙状态。"
+        if ! firewall_restore_snapshot_now "$rollback_dir"; then
+            err "原状态恢复失败，必须先处理保留的回滚快照。"
+        fi
+        rm -rf "$work_dir"
+        return 1
+    fi
+
+    if ! firewall_begin_commit "$rollback_dir"; then
+        err "确认前规则已经开始自动恢复，本次设置未保存。"
+        if ! firewall_restore_snapshot_now "$rollback_dir"; then
+            err "自动恢复尚未完成，已保留回滚快照。"
+        fi
+        rm -rf "$work_dir"
+        return 1
+    fi
+    if ! firewall_enable_persistence ||
+        ! firewall_runtime_enabled ||
+        ! firewall_persistence_enabled ||
+        ! firewall_service_active; then
+        err "防火墙持久化验证失败，正在恢复应用前状态。"
+        if ! firewall_restore_snapshot_now "$rollback_dir" 1; then
+            err "原状态恢复失败，必须先处理保留的回滚快照。"
+        fi
+        rm -rf "$work_dir"
+        return 1
+    fi
+    if ! firewall_finish_commit "$rollback_dir"; then
+        err "防火墙提交状态写入失败，正在恢复应用前状态。"
+        if ! firewall_restore_snapshot_now "$rollback_dir" 1; then
+            err "原状态恢复失败，必须先处理保留的回滚快照。"
+        fi
+        rm -rf "$work_dir"
+        return 1
+    fi
+    rm -rf "$work_dir"
+    info "主机防火墙已启用并设置为开机自动加载。"
+}
+
+firewall_sync_active_config() {
+    local temporary_tcp="${1:-}" temporary_udp="${2:-}" quiet="${3:-0}"
+    local tmp backup
+
+    firewall_recover_pending_rollbacks || return 1
+
+    if [ ! -f "$FIREWALL_CONFIG" ]; then
+        if firewall_runtime_enabled ||
+            [ -e "$FIREWALL_SYSTEMD_UNIT" ] ||
+            [ -e "$FIREWALL_OPENRC_SERVICE" ] ||
+            firewall_persistence_enabled ||
+            firewall_service_active; then
+            err "主机防火墙运行状态不完整且配置文件缺失，请先在防火墙菜单关闭或修复。"
+            return 1
+        fi
+        return 0
+    fi
+    [ -f "$FIREWALL_STATE_FILE" ] || {
+        err "主机防火墙配置不完整，请先在防火墙菜单执行更新或关闭。"
+        return 1
+    }
+    firewall_runtime_enabled || {
+        err "主机防火墙配置存在但规则表未运行，无法同步端口。"
+        return 1
+    }
+    firewall_load_state || return 1
+    firewall_detect_allowed_ports || return 1
+    FW_ALLOWED_TCP="$(merge_port_csv "$FW_ALLOWED_TCP" "$temporary_tcp")" || return 1
+    FW_ALLOWED_UDP="$(merge_port_csv "$FW_ALLOWED_UDP" "$temporary_udp")" || return 1
+    tmp="$(mktemp "$RUNTIME_DIR/firewall-refresh.XXXXXX")" || return 1
+    backup="$(mktemp "$RUNTIME_DIR/firewall-config-backup.XXXXXX")" || { rm -f "$tmp"; return 1; }
+    cp "$FIREWALL_CONFIG" "$backup" || { rm -f "$tmp" "$backup"; return 1; }
+    if ! firewall_write_config "$tmp" ||
+        ! nft -c -f "$tmp" ||
+        ! firewall_install_managed_file "$tmp" "$FIREWALL_CONFIG" 600 ||
+        ! nft -f "$FIREWALL_CONFIG"; then
+        firewall_install_managed_file "$backup" "$FIREWALL_CONFIG" 600 || true
+        rm -f "$tmp" "$backup"
+        return 1
+    fi
+    rm -f "$tmp" "$backup"
+    [ "$quiet" = "1" ] || info "主机防火墙已同步当前 SSH、节点和 Docker 端口。"
+}
+
+firewall_prepare_port_transition() {
+    local tcp_ports="${1:-}" udp_ports="${2:-}" transition_dir
+    local ssh_configured_ports ssh_listening_ports ssh_safe_ports
+
+    if [ -n "${ACTIVE_FIREWALL_TRANSITION_DIR:-}" ]; then
+        err "已有未完成的防火墙端口切换，已拒绝开始新的切换。"
+        return 1
+    fi
+    if [ ! -f "$FIREWALL_CONFIG" ]; then
+        firewall_sync_active_config "$tcp_ports" "$udp_ports" 1
+        return $?
+    fi
+
+    prepare_runtime_dir
+    transition_dir="$(mktemp -d "$RUNTIME_DIR/firewall-transition.XXXXXX")" || return 1
+    ssh_configured_ports="$(ssh_effective_ports_csv 2>/dev/null)" || {
+        rm -rf "$transition_dir"
+        return 1
+    }
+    ssh_listening_ports="$(ssh_listening_ports_csv 2>/dev/null)" || {
+        rm -rf "$transition_dir"
+        return 1
+    }
+    ssh_safe_ports="$(merge_port_csv "$ssh_configured_ports" "$ssh_listening_ports")" || {
+        rm -rf "$transition_dir"
+        return 1
+    }
+    # 事务前文件可能落后于 sshd；快照只增补安全 SSH 端口，不提前收窄其他服务。
+    if ! firewall_write_ssh_safe_snapshot \
+        "$FIREWALL_CONFIG" "$transition_dir/firewall.nft" "$ssh_safe_ports"; then
+        rm -rf "$transition_dir"
+        return 1
+    fi
+    ACTIVE_FIREWALL_TRANSITION_DIR="$transition_dir"
+    if ! firewall_sync_active_config "$tcp_ports" "$udp_ports" 1; then
+        firewall_abort_port_transition || true
+        return 1
+    fi
+}
+
+firewall_abort_port_transition() {
+    local transition_dir="${ACTIVE_FIREWALL_TRANSITION_DIR:-}"
+
+    [ -n "$transition_dir" ] || return 0
+    if [[ "$transition_dir" != "$RUNTIME_DIR"/firewall-transition.* ]] ||
+        [ ! -d "$transition_dir" ] || [ -L "$transition_dir" ] ||
+        [ ! -f "$transition_dir/firewall.nft" ]; then
+        err "防火墙端口切换备份无效，已拒绝自动恢复：$transition_dir"
+        return 1
+    fi
+    if ! firewall_install_managed_file "$transition_dir/firewall.nft" "$FIREWALL_CONFIG" 600 ||
+        ! firewall_apply_config_file "$FIREWALL_CONFIG"; then
+        err "防火墙端口切换恢复失败，备份已保留：$transition_dir"
+        return 1
+    fi
+    ACTIVE_FIREWALL_TRANSITION_DIR=""
+    rm -rf "$transition_dir"
+}
+
+firewall_discard_port_transition() {
+    local transition_dir="${ACTIVE_FIREWALL_TRANSITION_DIR:-}"
+
+    [ -n "$transition_dir" ] || return 0
+    if [[ "$transition_dir" != "$RUNTIME_DIR"/firewall-transition.* ]] ||
+        [ ! -d "$transition_dir" ] || [ -L "$transition_dir" ]; then
+        err "防火墙端口切换目录无效，已拒绝清理：$transition_dir"
+        return 1
+    fi
+    ACTIVE_FIREWALL_TRANSITION_DIR=""
+    rm -rf "$transition_dir"
+}
+
+firewall_complete_port_transition() {
+    local transition_dir="${ACTIVE_FIREWALL_TRANSITION_DIR:-}"
+
+    firewall_sync_active_config "" "" 0 || return 1
+    [ -n "$transition_dir" ] || return 0
+    if [[ "$transition_dir" != "$RUNTIME_DIR"/firewall-transition.* ]] ||
+        [ ! -d "$transition_dir" ] || [ -L "$transition_dir" ]; then
+        err "防火墙端口切换目录无效，无法完成清理：$transition_dir"
+        return 1
+    fi
+    firewall_discard_port_transition
+}
+
+firewall_refresh_if_enabled() {
+    firewall_sync_active_config "" "" 0
+}
+
+firewall_ports_from_nft_chain() {
+    local protocol="$1"
+
+    awk -v protocol="$protocol" '
+        {
+            line=$0
+            if (index(line, protocol " sport ") > 0) next
+            marker=protocol " dport "
+            start=index(line, marker)
+            if (start == 0) next
+            tail=substr(line, start + length(marker))
+            stop=index(tail, " accept")
+            if (stop == 0) next
+            values=substr(tail, 1, stop - 1)
+            gsub(/[{},]/, " ", values)
+            count=split(values, parts, /[[:space:]]+/)
+            for (i=1; i<=count; i++) {
+                if (parts[i] ~ /^[0-9]+$/) print parts[i]
+            }
+        }
+    ' | sort -n -u | paste -sd, -
+}
+
+firewall_live_port_set_matches() {
+    local set_name="$1" expected="$2" set_rules live_body live_set
+
+    if [ -n "$expected" ]; then
+        expected="$(normalize_port_csv "$expected")" || return 1
+        set_rules="$(nft -nn list set inet vpsbox "$set_name" 2>/dev/null)" || return 1
+        live_body="$(printf '%s\n' "$set_rules" | firewall_set_body_lines "$set_name")" || return 1
+        live_set="$(printf '%s\n' "$live_body" | firewall_discrete_port_set_values)" || return 1
+        [ "$live_set" = "$expected" ]
+    else
+        ! nft list set inet vpsbox "$set_name" >/dev/null 2>&1
+    fi
+}
+
+firewall_live_interface_set_matches() {
+    local set_name="$1" expected="$2" set_rules live_body live_set
+
+    if [ -n "$expected" ]; then
+        expected="$(normalize_interface_csv "$expected")" || return 1
+        set_rules="$(nft -nn list set inet vpsbox "$set_name" 2>/dev/null)" || return 1
+        live_body="$(printf '%s\n' "$set_rules" | firewall_set_body_lines "$set_name")" || return 1
+        live_set="$(printf '%s\n' "$live_body" | firewall_discrete_interface_set_values)" || return 1
+        [ "$live_set" = "$expected" ]
+    else
+        ! nft list set inet vpsbox "$set_name" >/dev/null 2>&1
+    fi
+}
+
+firewall_set_body_lines() {
+    local set_name="$1"
+
+    awk -v target="$set_name" '
+        $1 == "set" && $2 == target && $3 == "{" { inside=1; next }
+        inside && /^[[:space:]]*}[[:space:]]*$/ { exit }
+        inside {
+            line=$0
+            sub(/^[[:space:]]*/, "", line)
+            sub(/[[:space:]]*;?[[:space:]]*$/, "", line)
+            gsub(/[[:space:]]+/, " ", line)
+            if (line != "") print line
+        }
+    '
+}
+
+firewall_discrete_port_set_values() {
+    awk '
+        NR == 1 { if ($0 != "type inet_service") exit 1; next }
+        { text = text (text == "" ? "" : " ") $0 }
+        END {
+            gsub(/[[:space:]]+/, " ", text)
+            if (text !~ /^elements = \{ [0-9]+(, [0-9]+)* \}$/) exit 1
+            sub(/^elements = \{ /, "", text)
+            sub(/ \}$/, "", text)
+            count=split(text, values, /, /)
+            for (i=1; i<=count; i++) print values[i]
+        }
+    ' | sort -n -u | paste -sd, -
+}
+
+firewall_discrete_interface_set_values() {
+    awk '
+        NR == 1 { if ($0 != "type ifname") exit 1; next }
+        { text = text (text == "" ? "" : " ") $0 }
+        END {
+            gsub(/[[:space:]]+/, " ", text)
+            if (text !~ /^elements = \{ "[A-Za-z0-9_.:-]+"(, "[A-Za-z0-9_.:-]+")* \}$/) exit 1
+            sub(/^elements = \{ /, "", text)
+            sub(/ \}$/, "", text)
+            count=split(text, values, /, /)
+            for (i=1; i<=count; i++) {
+                sub(/^"/, "", values[i])
+                sub(/"$/, "", values[i])
+                print values[i]
+            }
+        }
+    ' | sort -u | paste -sd, -
+}
+
+firewall_nft_port_expression() {
+    local csv
+
+    csv="$(normalize_port_csv "${1:-}")" || return 1
+    [ -n "$csv" ] || return 1
+    if [[ "$csv" == *,* ]]; then
+        printf '{ %s }\n' "$(printf '%s' "$csv" | sed 's/,/, /g')"
+    else
+        printf '%s\n' "$csv"
+    fi
+}
+
+firewall_chain_rule_lines() {
+    local chain="$1"
+
+    awk -v target="$chain" '
+        $1 == "chain" && $2 == target && $3 == "{" { inside=1; next }
+        inside && /^[[:space:]]*}[[:space:]]*$/ { exit }
+        inside {
+            line=$0
+            sub(/^[[:space:]]*/, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            gsub(/[[:space:]]+/, " ", line)
+            if (line == "" || line ~ /^type filter hook /) next
+            print line
+        }
+    '
+}
+
+firewall_expected_input_rule_lines() {
+    local expression
+
+    printf '%s\n' \
+        'ct state 0x1 drop' \
+        'ct state 0x2,0x4 accept' \
+        'iifname "lo" accept' \
+        'ip protocol 1 accept' \
+        'meta l4proto 58 accept' \
+        'meta nfproto 2 udp sport 67 udp dport 68 accept' \
+        'meta nfproto 10 udp sport 547 udp dport 546 accept'
+    if [ -n "$FW_ALLOWED_TCP" ]; then
+        expression="$(firewall_nft_port_expression "$FW_ALLOWED_TCP")" || return 1
+        printf 'tcp dport %s accept\n' "$expression"
+    fi
+    if [ -n "$FW_ALLOWED_UDP" ]; then
+        expression="$(firewall_nft_port_expression "$FW_ALLOWED_UDP")" || return 1
+        printf 'udp dport %s accept\n' "$expression"
+    fi
+    if [ -n "$FW_DOCKER_PROXY4_TCP" ]; then
+        expression="$(firewall_nft_port_expression "$FW_DOCKER_PROXY4_TCP")" || return 1
+        printf 'meta nfproto 2 tcp dport %s accept\n' "$expression"
+    fi
+    if [ -n "$FW_DOCKER_PROXY4_UDP" ]; then
+        expression="$(firewall_nft_port_expression "$FW_DOCKER_PROXY4_UDP")" || return 1
+        printf 'meta nfproto 2 udp dport %s accept\n' "$expression"
+    fi
+    if [ -n "$FW_DOCKER_PROXY6_TCP" ]; then
+        expression="$(firewall_nft_port_expression "$FW_DOCKER_PROXY6_TCP")" || return 1
+        printf 'meta nfproto 10 tcp dport %s accept\n' "$expression"
+    fi
+    if [ -n "$FW_DOCKER_PROXY6_UDP" ]; then
+        expression="$(firewall_nft_port_expression "$FW_DOCKER_PROXY6_UDP")" || return 1
+        printf 'meta nfproto 10 udp dport %s accept\n' "$expression"
+    fi
+}
+
+firewall_expected_guard_rule_lines() {
+    [ -z "$FW_EXTRA_TCP" ] || printf '%s\n' \
+        'meta l4proto 6 ct original proto-dst @extra_tcp_dnat_ports accept'
+    [ -z "$FW_DOCKER_PUBLIC4_TCP" ] || printf '%s\n' \
+        'meta nfproto 2 meta l4proto 6 oifname @docker_bridge_ifaces ct original proto-dst @docker4_tcp_ports accept'
+    [ -z "$FW_DOCKER_PUBLIC6_TCP" ] || printf '%s\n' \
+        'meta nfproto 10 meta l4proto 6 oifname @docker_bridge_ifaces ct original proto-dst @docker6_tcp_ports accept'
+    printf '%s\n' 'meta l4proto 6 drop'
+    [ -z "$FW_EXTRA_UDP" ] || printf '%s\n' \
+        'meta l4proto 17 ct original proto-dst @extra_udp_dnat_ports accept'
+    [ -z "$FW_DOCKER_PUBLIC4_UDP" ] || printf '%s\n' \
+        'meta nfproto 2 meta l4proto 17 oifname @docker_bridge_ifaces ct original proto-dst @docker4_udp_ports accept'
+    [ -z "$FW_DOCKER_PUBLIC6_UDP" ] || printf '%s\n' \
+        'meta nfproto 10 meta l4proto 17 oifname @docker_bridge_ifaces ct original proto-dst @docker6_udp_ports accept'
+    printf '%s\n' 'meta l4proto 17 drop' 'drop'
+}
+
+firewall_expected_forward_rule_lines() {
+    printf '%s\n' 'ct state 0x2,0x4 accept'
+    [ -z "$FW_DOCKER_BRIDGES" ] || printf '%s\n' 'iifname @docker_bridge_ifaces accept'
+    printf '%s\n' 'ct direction 0 ct status 0x20 jump docker_port_guard'
+    [ -z "$FW_DOCKER_BRIDGES" ] || printf '%s\n' 'oifname @docker_bridge_ifaces drop'
+}
+
+firewall_expected_set_names() {
+    [ -z "$FW_DOCKER_BRIDGES" ] || printf '%s\n' docker_bridge_ifaces
+    [ -z "$FW_DOCKER_PUBLIC4_TCP" ] || printf '%s\n' docker4_tcp_ports
+    [ -z "$FW_DOCKER_PUBLIC4_UDP" ] || printf '%s\n' docker4_udp_ports
+    [ -z "$FW_DOCKER_PUBLIC6_TCP" ] || printf '%s\n' docker6_tcp_ports
+    [ -z "$FW_DOCKER_PUBLIC6_UDP" ] || printf '%s\n' docker6_udp_ports
+    [ -z "$FW_EXTRA_TCP" ] || printf '%s\n' extra_tcp_dnat_ports
+    [ -z "$FW_EXTRA_UDP" ] || printf '%s\n' extra_udp_dnat_ports
+}
+
+firewall_table_object_names() {
+    local object_type="$1"
+
+    awk -v object_type="$object_type" '
+        $1 == object_type && $3 == "{" { print $2 }
+    ' | sort -u | paste -sd, -
+}
+
+firewall_live_config_matches_expected() {
+    local table_rules input_rules live_tcp live_udp guard_rules forward_rules
+    local live_rule_lines expected_rule_lines
+    local live_chain_names live_set_names expected_set_names
+    local expected_input_tcp expected_input_udp
+    local expected_docker4_tcp expected_docker4_udp expected_docker6_tcp expected_docker6_udp
+    local expected_docker_bridges
+
+    firewall_runtime_enabled || return 1
+    table_rules="$(nft -nn list table inet vpsbox 2>/dev/null)" || return 1
+    live_chain_names="$(printf '%s\n' "$table_rules" | firewall_table_object_names chain)" || return 1
+    [ "$live_chain_names" = "docker_forward,docker_port_guard,input" ] || return 1
+    live_set_names="$(printf '%s\n' "$table_rules" | firewall_table_object_names set)" || return 1
+    expected_set_names="$(firewall_expected_set_names | sort -u | paste -sd, -)" || return 1
+    [ "$live_set_names" = "$expected_set_names" ] || return 1
+    if printf '%s\n' "$table_rules" |
+        grep -Eq '^[[:space:]]*(map|flowtable|counter|quota|limit|synproxy)[[:space:]]+[^[:space:]]+[[:space:]]*\{'; then
+        return 1
+    fi
+    input_rules="$(nft -nn list chain inet vpsbox input 2>/dev/null)" || return 1
+    printf '%s\n' "$input_rules" |
+        grep -Eq 'hook input priority (filter|0); policy drop;' || return 1
+    live_rule_lines="$(printf '%s\n' "$input_rules" | firewall_chain_rule_lines input)" || return 1
+    expected_rule_lines="$(firewall_expected_input_rule_lines)" || return 1
+    [ "$live_rule_lines" = "$expected_rule_lines" ] || return 1
+    live_tcp="$(printf '%s\n' "$input_rules" | firewall_ports_from_nft_chain tcp)" || return 1
+    live_udp="$(printf '%s\n' "$input_rules" | firewall_ports_from_nft_chain udp)" || return 1
+    expected_input_tcp="$(merge_port_csv "$FW_ALLOWED_TCP" "$FW_DOCKER_PROXY4_TCP" "$FW_DOCKER_PROXY6_TCP")" || return 1
+    expected_input_udp="$(merge_port_csv "$FW_ALLOWED_UDP" "$FW_DOCKER_PROXY4_UDP" "$FW_DOCKER_PROXY6_UDP")" || return 1
+    [ "$live_tcp" = "$expected_input_tcp" ] || return 1
+    [ "$live_udp" = "$expected_input_udp" ] || return 1
+    guard_rules="$(nft -nn list chain inet vpsbox docker_port_guard 2>/dev/null)" || return 1
+    forward_rules="$(nft -nn list chain inet vpsbox docker_forward 2>/dev/null)" || return 1
+    live_rule_lines="$(printf '%s\n' "$guard_rules" | firewall_chain_rule_lines docker_port_guard)" || return 1
+    expected_rule_lines="$(firewall_expected_guard_rule_lines)" || return 1
+    [ "$live_rule_lines" = "$expected_rule_lines" ] || return 1
+    live_rule_lines="$(printf '%s\n' "$forward_rules" | firewall_chain_rule_lines docker_forward)" || return 1
+    expected_rule_lines="$(firewall_expected_forward_rule_lines)" || return 1
+    [ "$live_rule_lines" = "$expected_rule_lines" ] || return 1
+    printf '%s\n' "$forward_rules" |
+        grep -Eq 'hook forward priority (-1|filter[[:space:]]*-[[:space:]]*1); policy accept;' || return 1
+    if nft list chain inet vpsbox output >/dev/null 2>&1; then return 1; fi
+
+    expected_docker4_tcp="$(normalize_port_csv "$FW_DOCKER_PUBLIC4_TCP")" || return 1
+    expected_docker4_udp="$(normalize_port_csv "$FW_DOCKER_PUBLIC4_UDP")" || return 1
+    expected_docker6_tcp="$(normalize_port_csv "$FW_DOCKER_PUBLIC6_TCP")" || return 1
+    expected_docker6_udp="$(normalize_port_csv "$FW_DOCKER_PUBLIC6_UDP")" || return 1
+    expected_docker_bridges="$(normalize_interface_csv "$FW_DOCKER_BRIDGES")" || return 1
+    if [ -n "$expected_docker4_tcp$expected_docker4_udp$expected_docker6_tcp$expected_docker6_udp" ] &&
+        [ -z "$expected_docker_bridges" ]; then return 1; fi
+    firewall_live_port_set_matches docker4_tcp_ports "$expected_docker4_tcp" || return 1
+    firewall_live_port_set_matches docker4_udp_ports "$expected_docker4_udp" || return 1
+    firewall_live_port_set_matches docker6_tcp_ports "$expected_docker6_tcp" || return 1
+    firewall_live_port_set_matches docker6_udp_ports "$expected_docker6_udp" || return 1
+    firewall_live_port_set_matches extra_tcp_dnat_ports "$FW_EXTRA_TCP" || return 1
+    firewall_live_port_set_matches extra_udp_dnat_ports "$FW_EXTRA_UDP" || return 1
+    firewall_live_interface_set_matches docker_bridge_ifaces "$expected_docker_bridges" || return 1
+    ! nft list set inet vpsbox docker_tcp_ports >/dev/null 2>&1 || return 1
+    ! nft list set inet vpsbox docker_udp_ports >/dev/null 2>&1 || return 1
+}
+
+firewall_config_matches_expected() {
+    local tmp status=0
+    [ -f "$FIREWALL_CONFIG" ] && [ -f "$FIREWALL_STATE_FILE" ] || return 1
+    firewall_load_state || return 1
+    firewall_detect_allowed_ports || return 1
+    tmp="$(mktemp "$RUNTIME_DIR/firewall-check.XXXXXX")" || return 1
+    firewall_write_config "$tmp" || status=1
+    if [ "$status" -eq 0 ] && ! cmp -s "$tmp" "$FIREWALL_CONFIG"; then status=1; fi
+    if [ "$status" -eq 0 ] && ! nft -c -f "$FIREWALL_CONFIG" >/dev/null 2>&1; then status=1; fi
+    if [ "$status" -eq 0 ] && ! firewall_live_config_matches_expected; then status=1; fi
+    rm -f "$tmp"
+    [ "$status" -eq 0 ]
+}
+
+firewall_view_rules() {
+    firewall_load_state || return 1
+    firewall_detect_allowed_ports || return 1
+    cat <<EOF
+========================================
+ 当前放行端口
+========================================
+ 来源       协议       端口
+----------------------------------------
+ SSH        TCP        ${FW_SSH_PORTS:--}
+ 节点       TCP        ${FW_NODE_TCP:--}
+ 节点       UDP        ${FW_NODE_UDP:--}
+ Docker     TCP        ${FW_DOCKER_PUBLIC_TCP:--}
+ Docker     UDP        ${FW_DOCKER_PUBLIC_UDP:--}
+ 额外端口   TCP        ${FW_EXTRA_TCP:--}
+ 额外端口   UDP        ${FW_EXTRA_UDP:--}
+----------------------------------------
+ 防火墙：$(firewall_runtime_state)
+ 开机加载：$(firewall_persistence_state)
+ 出站规则：不创建
+========================================
+EOF
+    echo "说明：这里只显示 VPS 内部规则；NAT 端口映射和商家安全组需单独设置。"
+}
+
+firewall_save_inactive_state() {
+    local tmp
+    ensure_change_store || return 1
+    tmp="$(mktemp "$RUNTIME_DIR/firewall-state.XXXXXX")" || return 1
+    firewall_write_state_file "$tmp" &&
+        firewall_install_managed_file "$tmp" "$FIREWALL_STATE_FILE" 600 || {
+            rm -f "$tmp"
+            return 1
+        }
+    rm -f "$tmp"
+}
+
+firewall_commit_port_state() {
+    if firewall_control_plane_present; then
+        firewall_apply_desired_state
+    else
+        firewall_save_inactive_state
+        info "额外端口已保存；启用主机防火墙时会自动使用。"
+    fi
+}
+
+firewall_prompt_port() {
+    local port
+    read -r -p "请输入端口（1-65535）：" port || return 1
+    is_valid_port "$port" || {
+        err "端口必须是 1-65535 的整数。"
+        return 1
+    }
+    printf '%s\n' "$port"
+}
+
+firewall_add_extra_port() {
+    local protocol="$1" port
+    firewall_settle_pending_port_transition || return 1
+    firewall_load_state || return 1
+    port="$(firewall_prompt_port)" || return 1
+    case "$protocol" in
+        tcp) FW_EXTRA_TCP="$(csv_add_port "$FW_EXTRA_TCP" "$port")" ;;
+        udp) FW_EXTRA_UDP="$(csv_add_port "$FW_EXTRA_UDP" "$port")" ;;
+        both)
+            FW_EXTRA_TCP="$(csv_add_port "$FW_EXTRA_TCP" "$port")"
+            FW_EXTRA_UDP="$(csv_add_port "$FW_EXTRA_UDP" "$port")"
+            ;;
+        *) return 1 ;;
+    esac
+    firewall_commit_port_state
+}
+
+firewall_remove_extra_port() {
+    local protocol="$1" port
+    firewall_settle_pending_port_transition || return 1
+    firewall_load_state || return 1
+    port="$(firewall_prompt_port)" || return 1
+    case "$protocol" in
+        tcp)
+            csv_contains_port "$FW_EXTRA_TCP" "$port" || { warn "额外 TCP 列表中没有端口 $port。"; return 0; }
+            FW_EXTRA_TCP="$(csv_remove_port "$FW_EXTRA_TCP" "$port")"
+            ;;
+        udp)
+            csv_contains_port "$FW_EXTRA_UDP" "$port" || { warn "额外 UDP 列表中没有端口 $port。"; return 0; }
+            FW_EXTRA_UDP="$(csv_remove_port "$FW_EXTRA_UDP" "$port")"
+            ;;
+        *) return 1 ;;
+    esac
+    firewall_commit_port_state
+}
+
+firewall_clear_extra_ports() {
+    local answer
+    firewall_settle_pending_port_transition || return 1
+    firewall_load_state || return 1
+    read -r -p "清空所有额外 TCP/UDP 放行端口？请输入 YES：" answer || return 1
+    [ "$answer" = "YES" ] || { info "已取消。"; return 0; }
+    FW_EXTRA_TCP=""
+    FW_EXTRA_UDP=""
+    firewall_commit_port_state
+}
+
+firewall_extra_ports_menu() {
+    local opt
+    while true; do
+        firewall_load_state || return 1
+        clear 2>/dev/null || true
+        cat <<EOF
+========================================
+ 额外放行端口
+========================================
+ TCP：${FW_EXTRA_TCP:--}
+ UDP：${FW_EXTRA_UDP:--}
+----------------------------------------
+ [1] 添加 TCP 端口
+ [2] 添加 UDP 端口
+ [3] 同时添加 TCP/UDP 端口
+ [4] 删除 TCP 端口
+ [5] 删除 UDP 端口
+ [6] 清空额外端口
+ [0] 返回主机防火墙
+========================================
+EOF
+        read -r -p "请输入选项: " opt || return 0
+        echo ""
+        case "$opt" in
+            1) run_menu_action firewall_add_extra_port tcp; pause ;;
+            2) run_menu_action firewall_add_extra_port udp; pause ;;
+            3) run_menu_action firewall_add_extra_port both; pause ;;
+            4) run_menu_action firewall_remove_extra_port tcp; pause ;;
+            5) run_menu_action firewall_remove_extra_port udp; pause ;;
+            6) run_menu_action firewall_clear_extra_ports; pause ;;
+            0) return 0 ;;
+            *) warn "无效选项：$opt"; pause ;;
+        esac
+    done
+}
+
+firewall_disable_internal() {
+    local failed=0
+
+    firewall_settle_pending_port_transition || return 1
+    firewall_recover_pending_rollbacks || return 1
+    if firewall_control_plane_present && ! command -v nft >/dev/null 2>&1; then
+        err "缺少 nft 命令，无法确认并删除当前 vpsbox 规则表。"
+        return 1
+    fi
+    if is_systemd; then
+        systemctl disable --now "$FIREWALL_SERVICE_NAME" >/dev/null 2>&1 || true
+        systemctl is-active --quiet "$FIREWALL_SERVICE_NAME" 2>/dev/null && failed=1
+        systemctl is-enabled --quiet "$FIREWALL_SERVICE_NAME" 2>/dev/null && failed=1
+    elif [ "$OS" = "alpine" ]; then
+        rc-service "$FIREWALL_SERVICE_NAME" stop >/dev/null 2>&1 || true
+        rc-update del "$FIREWALL_SERVICE_NAME" default >/dev/null 2>&1 || true
+        rc-service "$FIREWALL_SERVICE_NAME" status >/dev/null 2>&1 && failed=1
+        { [ -e "/etc/runlevels/default/$FIREWALL_SERVICE_NAME" ] ||
+            [ -L "/etc/runlevels/default/$FIREWALL_SERVICE_NAME" ]; } && failed=1
+    fi
+    if command -v nft >/dev/null 2>&1; then
+        nft delete table inet vpsbox >/dev/null 2>&1 || true
+        nft list table inet vpsbox >/dev/null 2>&1 && failed=1
+    fi
+    [ "$failed" -eq 0 ] || {
+        err "无法完整停止防火墙服务或删除 inet vpsbox 规则表，已保留管理文件便于重试。"
+        return 1
+    }
+    if ! rm -f "$FIREWALL_CONFIG" "$FIREWALL_STATE_FILE" \
+        "$FIREWALL_SYSTEMD_UNIT" "$FIREWALL_OPENRC_SERVICE"; then
+        err "防火墙已停止，但管理文件删除失败。"
+        return 1
+    fi
+    is_systemd && systemctl daemon-reload >/dev/null 2>&1 || true
+    info "vpsbox 主机防火墙已关闭；其他程序的规则未被修改。"
+}
+
+firewall_disable() {
+    local answer
+    firewall_recover_pending_rollbacks || return 1
+    if ! firewall_artifacts_present; then
+        info "主机防火墙未启用，无需关闭。"
+        return 0
+    fi
+    read -r -p "关闭后将不再由 vpsbox 限制入站连接，输入 YES 确认：" answer || return 1
+    [ "$answer" = "YES" ] || { info "已取消。"; return 0; }
+    firewall_disable_internal
+}
+
+firewall_menu() {
+    local opt ssh_ports node_tcp node_udp docker_tcp docker_udp
+
+    firewall_settle_pending_port_transition || return 1
+    while true; do
+        firewall_load_state || return 1
+        ssh_ports="$(ssh_effective_ports_csv 2>/dev/null || echo "-")"
+        node_tcp="-"
+        node_udp="-"
+        if node_exists && load_state; then
+            node_tcp="$PORT"
+            [ "${PROTOCOL:-shadowsocks}" = "shadowsocks" ] && node_udp="$PORT"
+        fi
+        docker_tcp="-"
+        docker_udp="-"
+        if firewall_docker_available; then
+            if firewall_detect_docker_ports; then
+                docker_tcp="${FW_DOCKER_PUBLIC_TCP:--}"
+                docker_udp="${FW_DOCKER_PUBLIC_UDP:--}"
+            fi
+        elif command -v docker >/dev/null 2>&1; then
+            docker_tcp="daemon 不可用"
+            docker_udp="daemon 不可用"
+        fi
+
+        clear 2>/dev/null || true
+        cat <<EOF
+========================================
+ 主机防火墙
+========================================
+ nftables：$(firewall_install_state)
+ 防火墙：$(firewall_runtime_state)
+ 开机加载：$(firewall_persistence_state)
+----------------------------------------
+ SSH TCP：$ssh_ports
+ 节点 TCP：$node_tcp
+ 节点 UDP：$node_udp
+ Docker TCP：$docker_tcp
+ Docker UDP：$docker_udp
+ 额外 TCP：${FW_EXTRA_TCP:--}
+ 额外 UDP：${FW_EXTRA_UDP:--}
+ 默认入站：拒绝未放行的连接
+ 出站规则：不创建
+----------------------------------------
+ [1] 一键开启/更新防火墙
+ [2] 查看当前放行端口
+ [3] 管理额外放行端口
+ [4] 关闭并移除 vpsbox 防火墙
+ [0] 返回主菜单
+========================================
+EOF
+        read -r -p "请输入选项: " opt || return 0
+        echo ""
+        case "$opt" in
+            1) run_menu_action firewall_apply_desired_state; pause ;;
+            2) run_menu_action firewall_view_rules; pause ;;
+            3) firewall_extra_ports_menu ;;
+            4) run_menu_action firewall_disable; pause ;;
+            0) return 0 ;;
+            *) warn "无效选项：$opt"; pause ;;
+        esac
+    done
+}
+
 check_table_header() {
     cat <<'EOF'
 ----------------------------------------
@@ -4218,8 +7061,8 @@ EOF
         check_warn "sing-box" "未安装"
     fi
 
-    if [ -f "$STATE_FILE" ] && ! load_state; then
-        check_fail "节点状态" "文件不安全或内容无效"
+    if node_artifacts_present && ! node_exists; then
+        check_fail "节点状态" "配置残缺、不安全或内容无效"
     elif node_exists; then
         load_state
         has_node="1"
@@ -4304,7 +7147,7 @@ EOF
     if [ "$state" = "已启用" ]; then check_ok "fq" "$state"; else check_warn "fq" "$state"; fi
     state="$(ipv4_priority_state)"
     if [ "$state" = "已启用" ]; then check_ok "IPv4 优先" "$state"; else check_warn "IPv4 优先" "$state"; fi
-    if ssh_effective_ports_match_target; then
+    if ssh_effective_ports_listening; then
         check_ok "SSH 端口" "$(ssh_port_state)"
     else
         check_warn "SSH 端口" "$(ssh_port_state)"
@@ -4320,6 +7163,31 @@ EOF
     if [ "$state" = "运行中" ]; then check_ok "Fail2ban 状态" "$state"; else check_warn "Fail2ban 状态" "$state"; fi
     state="$(fail2ban_sshd_state)"
     if [ "$state" = "已启用" ]; then check_ok "SSH 防护" "$state"; else check_warn "SSH 防护" "$state"; fi
+
+    if ! firewall_control_plane_present; then
+        if [ -e "$FIREWALL_STATE_FILE" ]; then
+            check_warn "主机防火墙" "未启用，已保存额外端口"
+        else
+            check_warn "主机防火墙" "未启用"
+        fi
+    elif ! firewall_managed_file_is_secure "$FIREWALL_CONFIG" ||
+        ! firewall_state_file_is_secure; then
+        check_fail "主机防火墙" "配置文件不完整或不安全"
+    elif ! firewall_runtime_enabled; then
+        check_fail "主机防火墙" "配置存在但规则未运行"
+    else
+        check_ok "主机防火墙" "运行中"
+        if firewall_persistence_enabled && firewall_service_active; then
+            check_ok "防火墙自启" "已启用"
+        else
+            check_fail "防火墙自启" "未正常启用"
+        fi
+        if firewall_config_matches_expected >/dev/null 2>&1; then
+            check_ok "防火墙端口" "与 SSH/节点/Docker 状态一致"
+        else
+            check_fail "防火墙端口" "配置已过期，请执行防火墙更新"
+        fi
+    fi
 
     if [ "$(reboot_required_state)" = "需要" ]; then
         check_warn "系统重启" "需要重启"
@@ -4851,7 +7719,7 @@ show_backtrace_routes() {
     local total="${#TRACE_NAMES[@]}"
 
     # 固定源端口并严格串行，避免五元组变化或并发 TCP 探测造成路径误判。
-    source_port="$(random_port)" || return 1
+    source_port="$(random_trace_source_port)" || return 1
     tmp_dir="$(mktemp -d /tmp/vpsbox-trace.XXXXXX)" || { err "无法创建回程检测临时目录。"; return 1; }
     [[ "$tmp_dir" == /tmp/vpsbox-trace.* ]] || { err "回程检测临时目录路径异常。"; return 1; }
     ACTIVE_TRACE_TMP="$tmp_dir"
@@ -4901,6 +7769,8 @@ EOF
 }
 
 uninstall_singbox_and_nodes() {
+    local failed=0
+
     info "正在停止并禁用 sing-box 服务..."
     service_stop 2>/dev/null || warn "服务管理器未能正常停止 sing-box，将继续检查 vpsbox 配置对应的进程。"
     if ! stop_singbox_config_processes; then
@@ -4912,35 +7782,49 @@ uninstall_singbox_and_nodes() {
         err "sing-box 服务仍在运行，已取消删除。"
         return 1
     fi
-    service_disable 2>/dev/null || warn "无法禁用 sing-box 开机启动，将继续卸载已停止的服务。"
+    service_disable 2>/dev/null ||
+        warn "无法通过服务管理器禁用 sing-box，将继续清理并在最后复核。"
 
     if is_systemd; then
-        rm -f /etc/systemd/system/sing-box.service
-        systemctl daemon-reload 2>/dev/null || true
+        rm -f /etc/systemd/system/sing-box.service \
+            /etc/systemd/system/multi-user.target.wants/sing-box.service \
+            /usr/lib/systemd/system/sing-box.service \
+            /lib/systemd/system/sing-box.service || failed=1
+        systemctl daemon-reload 2>/dev/null || failed=1
         systemctl reset-failed sing-box 2>/dev/null || true
     fi
 
     if [ "$OS" = "alpine" ]; then
-        rm -f /etc/init.d/sing-box
-        apk del sing-box 2>/dev/null || true
+        rm -f /etc/init.d/sing-box /etc/runlevels/default/sing-box || failed=1
+        if singbox_package_installed && ! apk del sing-box; then failed=1; fi
     elif [ "$OS" = "debian" ]; then
-        apt-get purge -y sing-box >/dev/null 2>&1 || true
+        if singbox_package_installed && ! apt-get purge -y sing-box; then failed=1; fi
     elif [ "$OS" = "redhat" ]; then
-        if command -v dnf >/dev/null 2>&1; then
-            dnf remove -y sing-box >/dev/null 2>&1 || true
-        else
-            yum remove -y sing-box >/dev/null 2>&1 || true
+        if singbox_package_installed; then
+            if command -v dnf >/dev/null 2>&1; then
+                dnf remove -y sing-box || failed=1
+            else
+                yum remove -y sing-box || failed=1
+            fi
         fi
     fi
 
     info "正在删除 sing-box 和节点配置..."
-    rm -rf "$CONFIG_DIR"
-    rm -f /usr/bin/sing-box /usr/local/bin/sing-box
-    rm -f /var/log/sing-box*
+    [ "$CONFIG_DIR" = "/etc/sing-box" ] || {
+        err "sing-box 配置目录异常，已拒绝递归删除：$CONFIG_DIR"
+        return 1
+    }
+    rm -rf -- "$CONFIG_DIR" || failed=1
+    rm -f /usr/bin/sing-box /usr/local/bin/sing-box || failed=1
+    rm -f /var/log/sing-box* || failed=1
     hash -r
 
-    if singbox_installed; then
-        err "仍检测到 sing-box 命令，卸载未完全完成：$(command -v sing-box)"
+    if service_is_running || service_is_enabled || singbox_artifacts_present; then
+        err "仍检测到 sing-box 的进程、软件包、服务或配置残留。"
+        failed=1
+    fi
+    if [ "$failed" -ne 0 ]; then
+        err "sing-box 卸载未完整通过验收，已保留 vpsbox 管理命令便于重试。"
         return 1
     fi
 
@@ -4950,6 +7834,7 @@ uninstall_singbox_and_nodes() {
 uninstall_all() {
     local confirm
     local remove_singbox
+    local remove_firewall
 
     echo "此操作会卸载 vpsbox 管理命令。"
     echo "默认不会删除 sing-box，也不会删除节点配置。"
@@ -4957,7 +7842,20 @@ uninstall_all() {
     read -r -p "确认卸载 vpsbox？请输入 YES：" confirm
     [ "$confirm" = "YES" ] || { info "已取消。"; return 0; }
 
-    if ! singbox_installed; then
+    if firewall_artifacts_present; then
+        echo "检测到由 vpsbox 管理的主机防火墙。"
+        read -r -p "卸载前必须关闭并移除该防火墙，输入 YES 继续：" remove_firewall
+        if [ "$remove_firewall" != "YES" ]; then
+            info "已取消卸载，主机防火墙和 vpsbox 命令均已保留。"
+            return 0
+        fi
+        firewall_disable_internal || {
+            err "主机防火墙未能完整移除，已取消卸载 vpsbox。"
+            return 1
+        }
+    fi
+
+    if ! singbox_artifacts_present; then
         info "未安装 sing-box，无需删除节点配置。"
     else
         read -r -p "是否同时删除 sing-box 和所有节点配置？请输入 YES 确认：" remove_singbox
@@ -4972,7 +7870,12 @@ uninstall_all() {
     fi
 
     info "正在删除 vpsbox 命令..."
-    rm -f "$CMD_PATH" /usr/bin/vpsbox
+    if ! rm -f "$CMD_PATH" /usr/bin/vpsbox ||
+        [ -e "$CMD_PATH" ] || [ -L "$CMD_PATH" ] ||
+        [ -e /usr/bin/vpsbox ] || [ -L /usr/bin/vpsbox ]; then
+        err "vpsbox 管理命令删除失败，请检查 $CMD_PATH 与 /usr/bin/vpsbox。"
+        return 1
+    fi
 
     info "卸载完成。"
     info "vpsbox 命令已删除，当前菜单即将退出。"
@@ -5283,6 +8186,7 @@ restore_vpsbox_system_changes() {
 }
 
 start_service_action() {
+    require_valid_node_state_if_present || return 1
     if ! node_exists; then
         warn "当前没有节点配置，请先创建节点。"
         return 0
@@ -5294,6 +8198,7 @@ start_service_action() {
 }
 
 restart_service_action() {
+    require_valid_node_state_if_present || return 1
     if ! node_exists; then
         warn "当前没有节点配置，请先创建节点。"
         return 0
@@ -5490,12 +8395,13 @@ $(ipv4_dns_lines)
  [1] 节点管理
  [2] sing-box 管理
  [3] 系统优化
- [4] 一键自检
- [5] 查看三网回程
- [6] 其他脚本
+ [4] 主机防火墙
+ [5] 一键自检
+ [6] 查看三网回程
+ [7] 其他脚本
 ----------------------------------------
- [8] 更新 vpsbox 脚本
- [9] 卸载 vpsbox
+ [00] 更新 vpsbox 脚本
+ [88] 卸载 vpsbox
  [0] 退出
 ========================================
 EOF
@@ -5589,16 +8495,16 @@ system_menu() {
 ----------------------------------------
  [1] 系统更新
  [2] 垃圾清理
- [3] 限制 systemd 日志大小
- [4] 一键开启 BBR + fq
+ [3] 修改主机名
+ [4] 开启 NTP 时间同步
  [5] 修改系统 IPv4 DNS
  [6] 启用系统 IPv4 优先
- [7] 修改 SSH 端口
- [8] SSH 基础加固
- [9] 安装 Fail2ban
- [10] 开启 NTP 时间同步
- [11] 查看 SSH 当前生效配置
- [12] 修改主机名
+ [7] 一键开启 BBR + fq
+ [8] 修改 SSH 端口
+ [9] SSH 基础加固
+ [10] 查看 SSH 当前生效配置
+ [11] 安装 Fail2ban
+ [12] 限制 systemd 日志大小
  [13] 查看/恢复 vpsbox 系统改动
  [0] 返回主菜单
 ========================================
@@ -5609,16 +8515,16 @@ EOF
         case "$opt" in
             1) run_menu_action update_system_packages; pause ;;
             2) run_menu_action cleanup_system_garbage; pause ;;
-            3) run_menu_action limit_systemd_journal; pause ;;
-            4) run_menu_action enable_bbr_fq; pause ;;
+            3) run_menu_action change_system_hostname; pause ;;
+            4) run_menu_action enable_ntp_sync; pause ;;
             5) run_menu_action change_ipv4_dns; pause ;;
             6) run_menu_action enable_ipv4_priority; pause ;;
-            7) ssh_port_change_menu ;;
-            8) ssh_basic_hardening_menu ;;
-            9) run_menu_action install_fail2ban; pause ;;
-            10) run_menu_action enable_ntp_sync; pause ;;
-            11) run_menu_action show_current_ssh_config; pause ;;
-            12) run_menu_action change_system_hostname; pause ;;
+            7) run_menu_action enable_bbr_fq; pause ;;
+            8) ssh_port_change_menu ;;
+            9) ssh_basic_hardening_menu ;;
+            10) run_menu_action show_current_ssh_config; pause ;;
+            11) run_menu_action install_fail2ban; pause ;;
+            12) run_menu_action limit_systemd_journal; pause ;;
             13) run_menu_action restore_vpsbox_system_changes; pause ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
@@ -5774,11 +8680,12 @@ main_loop() {
             1) run_menu_action node_menu ;;
             2) run_menu_action singbox_menu ;;
             3) run_menu_action system_menu ;;
-            4) run_menu_action run_self_check; pause ;;
-            5) run_menu_action show_backtrace_routes; pause ;;
-            6) run_menu_action other_scripts_menu ;;
-            8) update_vpsbox; pause ;;
-            9) uninstall_all; pause ;;
+            4) run_menu_action firewall_menu ;;
+            5) run_menu_action run_self_check; pause ;;
+            6) run_menu_action show_backtrace_routes; pause ;;
+            7) run_menu_action other_scripts_menu ;;
+            00) update_vpsbox; pause ;;
+            88) uninstall_all; pause ;;
             0) exit 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
