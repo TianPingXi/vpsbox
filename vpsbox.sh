@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.19"
+VPSBOX_VERSION="v1.0.20"
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
@@ -610,6 +610,7 @@ lock_pid_from_file() {
     local pid=""
 
     [ -f "$path" ] || return 1
+    # 兼容早期仅写入 pid/started 的锁元数据；旧锁缺少进程身份字段时只能进入安全的人工确认路径。
     pid="$(awk -F= '$1 == "pid" { print $2; exit }' "$path" 2>/dev/null || true)"
     if is_pid "$pid"; then
         printf '%s\n' "$pid"
@@ -1561,6 +1562,7 @@ load_state() {
     local port=""
     local password=""
     local method=""
+    # 兼容早期尚未写入 PROTOCOL 字段的 SS 状态文件；缺省协议只能按 Shadowsocks 处理。
     local protocol="shadowsocks"
     local uuid=""
     local flow=""
@@ -6777,6 +6779,7 @@ firewall_sleep_process_matches() {
         sleep|*/sleep) ;;
         *) return 1 ;;
     esac
+    # 兼容 v1.0.16-v1.0.18 的一次性 sleep 90；当前 watchdog 使用 sleep 1 轮询。
     [ "${args[1]}" = "1" ] || [ "${args[1]}" = "$FIREWALL_ROLLBACK_SECONDS" ]
 }
 
@@ -6890,7 +6893,7 @@ firewall_stop_rollback_watchdog() {
     if [ -e "$dir/watchdog.pid" ]; then
         IFS= read -r pid < "$dir/watchdog.pid" || pid=""
         if is_pid "$pid" && [ "$pid" -gt 1 ] && [ "$pid" -ne "$$" ]; then
-            # 兼容 v1.0.18 仅写 watchdog.pid 的快照；同一分支也处理当前版本分步写元数据时的中断状态。
+            # 兼容 v1.0.16-v1.0.18 仅写 watchdog.pid 的快照；同一分支也处理当前版本分步写元数据时的中断状态。
             if [ -e "$dir/watchdog.start" ] && [ -e "$dir/watchdog.boot" ]; then
                 if firewall_watchdog_identity_matches "$dir" "$pid"; then
                     start="$(process_start_ticks "$pid")"

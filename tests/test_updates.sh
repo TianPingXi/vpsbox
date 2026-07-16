@@ -72,11 +72,11 @@ reset_update_case() {
 }
 
 test_version_relation() {
-    assert_eq newer "$(version_relation v1.0.20 v1.0.19)"
-    assert_eq same "$(version_relation 1.0.19 v1.0.19)"
-    assert_eq older "$(version_relation v1.0.18 1.0.19)"
+    assert_eq newer "$(version_relation v1.0.21 v1.0.20)"
+    assert_eq same "$(version_relation 1.0.20 v1.0.20)"
+    assert_eq older "$(version_relation v1.0.19 1.0.20)"
     assert_eq newer "$(version_relation v1.1.0 v1.0.99)"
-    if version_relation v1.0 v1.0.19 >/dev/null 2>&1; then
+    if version_relation v1.0 v1.0.20 >/dev/null 2>&1; then
         fail "畸形版本不应通过比较"
     fi
 }
@@ -84,9 +84,9 @@ test_version_relation() {
 test_vpsbox_same_is_noop() {
     local output="$TEST_TMP/same.out"
     reset_update_case same
-    write_fixture "$CMD_PATH" v1.0.19 installed
+    write_fixture "$CMD_PATH" v1.0.20 installed
     printf 'keep-backup\n' > "${CMD_PATH}.previous"
-    write_fixture "$MOCK_REMOTE_SCRIPT" v1.0.19 remote
+    write_fixture "$MOCK_REMOTE_SCRIPT" v1.0.20 remote
 
     update_vpsbox > "$output" 2>&1 || fail "相同版本应正常返回"
 
@@ -101,9 +101,9 @@ test_vpsbox_same_is_noop() {
 test_vpsbox_older_is_noop() {
     local output="$TEST_TMP/older.out"
     reset_update_case older
-    write_fixture "$CMD_PATH" v1.0.19 installed
+    write_fixture "$CMD_PATH" v1.0.20 installed
     printf 'keep-backup\n' > "${CMD_PATH}.previous"
-    write_fixture "$MOCK_REMOTE_SCRIPT" v1.0.18 remote
+    write_fixture "$MOCK_REMOTE_SCRIPT" v1.0.19 remote
 
     update_vpsbox > "$output" 2>&1 || fail "远端旧版本应安全返回"
 
@@ -115,12 +115,12 @@ test_vpsbox_older_is_noop() {
 
 test_vpsbox_newer_updates_once() {
     reset_update_case newer
-    write_fixture "$CMD_PATH" v1.0.19 installed
-    write_fixture "$MOCK_REMOTE_SCRIPT" v1.0.20 remote
+    write_fixture "$CMD_PATH" v1.0.20 installed
+    write_fixture "$MOCK_REMOTE_SCRIPT" v1.0.21 remote
 
     update_vpsbox > "$TEST_TMP/newer.out" 2>&1 || fail "远端新版本应更新成功"
 
-    assert_file_contains "$CMD_PATH" 'VPSBOX_VERSION="v1\.0\.20"'
+    assert_file_contains "$CMD_PATH" 'VPSBOX_VERSION="v1\.0\.21"'
     assert_file_contains "$CMD_PATH" 'remote'
     assert_file_contains "${CMD_PATH}.previous" 'installed'
     assert_file_contains "$MOCK_EVENT_LOG" '^alias$'
@@ -131,7 +131,7 @@ test_vpsbox_newer_updates_once() {
 test_vpsbox_invalid_download_preserves_current() {
     local output="$TEST_TMP/invalid.out"
     reset_update_case invalid
-    write_fixture "$CMD_PATH" v1.0.19 installed
+    write_fixture "$CMD_PATH" v1.0.20 installed
     printf 'keep-backup\n' > "${CMD_PATH}.previous"
     printf '#!/usr/bin/env bash\nif then\n' > "$MOCK_REMOTE_SCRIPT"
 
