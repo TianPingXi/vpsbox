@@ -2,12 +2,12 @@
 
 VPS 初始化、系统优化与 sing-box 节点管理脚本。
 
-当前版本：`v1.0.23`
+当前版本：`v1.0.24`
 
 ## VPS 一键安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh)
 ```
 
 ## 管理命令

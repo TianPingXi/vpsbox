@@ -3,11 +3,10 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.23"
-# 兼容 v1.0.22 的精确项目身份校验：过渡版本必须保留下面这一行原样，
-# 并在用户名变更前继续优先使用旧地址。
-SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
-SCRIPT_URL_FALLBACK="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
+VPSBOX_VERSION="v1.0.24"
+# 用户名迁移完成后使用新地址；旧地址仅作为迁移回退，并用于识别 v1.0.23 备份。
+SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
+SCRIPT_URL_FALLBACK="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
 DEFAULT_REALITY_SERVER_NAME="addons.mozilla.org"

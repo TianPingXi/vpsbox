@@ -151,20 +151,20 @@ test_username_migration_identity_compatibility() {
     local future="$TEST_TMP/future-new-owner.sh"
     local third_party="$TEST_TMP/third-party.sh"
 
-    grep -Fqx -- 'SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"' \
+    grep -Fqx -- 'SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"' \
         "$REPO_DIR/vpsbox.sh" ||
-        fail "v1.0.23 必须保留 v1.0.22 能识别的旧 SCRIPT_URL 行"
-    grep -Fqx -- 'SCRIPT_URL_FALLBACK="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"' \
+        fail "v1.0.24 必须使用 TianPingXi 作为主地址"
+    grep -Fqx -- 'SCRIPT_URL_FALLBACK="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"' \
         "$REPO_DIR/vpsbox.sh" ||
-        fail "过渡版本缺少 TianPingXi 备用地址"
+        fail "v1.0.24 必须保留旧地址作为迁移回退"
 
-    write_fixture "$legacy" "$UPDATE_TEST_OLDER" legacy "$SCRIPT_URL"
+    write_fixture "$legacy" "$UPDATE_TEST_OLDER" legacy "$SCRIPT_URL_FALLBACK"
     vpsbox_script_identity_valid "$legacy" ||
-        fail "过渡版本必须能识别并恢复 v1.0.22 旧备份"
+        fail "v1.0.24 必须能识别并恢复 v1.0.23 旧地址备份"
 
-    write_fixture "$future" "$UPDATE_TEST_NEWER" future "$SCRIPT_URL_FALLBACK"
+    write_fixture "$future" "$UPDATE_TEST_NEWER" future "$SCRIPT_URL"
     vpsbox_script_identity_valid "$future" ||
-        fail "过渡版本必须接受使用 TianPingXi 地址的未来候选"
+        fail "v1.0.24 必须接受使用 TianPingXi 地址的候选"
 
     write_fixture "$third_party" "$UPDATE_TEST_NEWER" third-party \
         "https://raw.githubusercontent.com/example/vpsbox/main/vpsbox.sh"
@@ -220,10 +220,10 @@ test_vpsbox_newer_updates_once() {
     grep -Fqx -- "reexec:${CMD_PATH}.previous" "$MOCK_EVENT_LOG" ||
         fail "更新后重新执行必须携带本次 .previous 备份路径"
     assert_eq "$SCRIPT_URL" "$(cat "$MOCK_CURL_LOG")" \
-        "改名前旧地址可用时不应访问尚未归属的新地址"
+        "新地址可用时不应访问旧迁移回退地址"
 }
 
-test_vpsbox_falls_back_to_new_owner_url() {
+test_vpsbox_falls_back_to_old_owner_url() {
     local expected_calls
 
     reset_update_case owner-fallback
@@ -232,16 +232,16 @@ test_vpsbox_falls_back_to_new_owner_url() {
     MOCK_CURL_FAIL_URLS="$SCRIPT_URL"
 
     update_vpsbox >"$TEST_TMP/owner-fallback.out" 2>&1 ||
-        fail "旧地址失败时应回退 TianPingXi 地址并完成更新"
+        fail "新地址失败时应回退旧地址并完成更新"
 
     assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_NEWER"
     expected_calls="$(printf '%s\n%s' "$SCRIPT_URL" "$SCRIPT_URL_FALLBACK")"
     assert_eq "$expected_calls" "$(cat "$MOCK_CURL_LOG")" \
-        "迁移地址回退顺序必须为旧地址后新地址"
+        "迁移地址回退顺序必须为新地址后旧地址"
 }
 
 test_all_owner_urls_fail_preserves_current() {
-    local old_count new_count
+    local primary_count fallback_count
 
     reset_update_case all-owner-urls-fail
     write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
@@ -257,10 +257,10 @@ test_all_owner_urls_fail_preserves_current() {
     assert_file_contains "$CMD_PATH" 'installed'
     assert_file_contains "${CMD_PATH}.previous" '^keep-backup$'
     assert_empty_file "$MOCK_EVENT_LOG" "下载失败不得触发替换后的副作用"
-    old_count="$(grep -Fxc -- "$SCRIPT_URL" "$MOCK_CURL_LOG" || true)"
-    new_count="$(grep -Fxc -- "$SCRIPT_URL_FALLBACK" "$MOCK_CURL_LOG" || true)"
-    assert_eq 3 "$old_count" "每轮都应尝试旧地址"
-    assert_eq 3 "$new_count" "每轮都应尝试新地址"
+    primary_count="$(grep -Fxc -- "$SCRIPT_URL" "$MOCK_CURL_LOG" || true)"
+    fallback_count="$(grep -Fxc -- "$SCRIPT_URL_FALLBACK" "$MOCK_CURL_LOG" || true)"
+    assert_eq 3 "$primary_count" "每轮都应尝试新主地址"
+    assert_eq 3 "$fallback_count" "每轮都应尝试旧回退地址"
 }
 
 test_vpsbox_invalid_download_preserves_current() {
@@ -305,7 +305,7 @@ EOF
 test_vpsbox_reexec_failure_restores_previous() {
     local output="$TEST_TMP/reexec-failure.out"
     reset_update_case reexec-failure
-    write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
+    write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed "$SCRIPT_URL_FALLBACK"
     write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_NEWER" remote
     reexec_updated_vpsbox() {
         printf 'reexec-failed:%s\n' "${1:-}" >> "$MOCK_EVENT_LOG"
@@ -376,7 +376,7 @@ test_top_level_startup_failure_restores_previous() {
 exit 41
 APP_NAME="vpsbox"
 VPSBOX_VERSION="$UPDATE_TEST_NEWER"
-SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 vpsbox_main() {
     printf '%s\n' should-not-run
 }
@@ -526,7 +526,7 @@ main() {
         test_vpsbox_same_is_noop
         test_vpsbox_older_is_noop
         test_vpsbox_newer_updates_once
-        test_vpsbox_falls_back_to_new_owner_url
+        test_vpsbox_falls_back_to_old_owner_url
         test_all_owner_urls_fail_preserves_current
         test_vpsbox_invalid_download_preserves_current
         test_vpsbox_wrong_project_preserves_current
