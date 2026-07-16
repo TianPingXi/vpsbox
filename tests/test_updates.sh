@@ -10,6 +10,8 @@ source "$REPO_DIR/vpsbox.sh"
 
 MOCK_REMOTE_SCRIPT=""
 MOCK_EVENT_LOG="$TEST_TMP/update-events.log"
+MOCK_CURL_LOG="$TEST_TMP/update-curl.log"
+MOCK_CURL_FAIL_URLS=""
 UPDATE_TEST_CURRENT=""
 UPDATE_TEST_OLDER=""
 UPDATE_TEST_NEWER=""
@@ -51,11 +53,12 @@ trap test_cleanup EXIT
 
 write_fixture() {
     local path="$1" version="$2" marker="$3"
-    cat > "$path" <<EOF
+    local script_url="${4:-$SCRIPT_URL}"
+    cat >"$path" <<EOF
 #!/usr/bin/env bash
 APP_NAME="vpsbox"
 VPSBOX_VERSION="$version"
-SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
+SCRIPT_URL="$script_url"
 vpsbox_main() {
     printf '%s\n' '$marker'
 }
@@ -75,17 +78,27 @@ assert_fixture_version() {
 }
 
 curl() {
-    local output=""
+    local output="" url=""
 
     while [ "$#" -gt 0 ]; do
-        if [ "$1" = "-o" ]; then
-            output="${2:-}"
-            shift 2
-        else
-            shift
-        fi
+        case "$1" in
+            -o)
+                output="${2:-}"
+                shift 2
+                ;;
+            https://*)
+                url="$1"
+                shift
+                ;;
+            *) shift ;;
+        esac
     done
-    [ -n "$output" ] || return 2
+    [ -n "$output" ] && [ -n "$url" ] || return 2
+    printf '%s\n' "$url" >> "$MOCK_CURL_LOG"
+    if [ -n "$MOCK_CURL_FAIL_URLS" ] &&
+        grep -Fqx -- "$url" <<< "$MOCK_CURL_FAIL_URLS"; then
+        return 22
+    fi
     cp "$MOCK_REMOTE_SCRIPT" "$output"
 }
 
@@ -113,7 +126,10 @@ reset_update_case() {
     CMD_PATH="$CASE_DIR/vpsbox"
     MOCK_REMOTE_SCRIPT="$CASE_DIR/remote.sh"
     MOCK_EVENT_LOG="$CASE_DIR/events.log"
+    MOCK_CURL_LOG="$CASE_DIR/curl.log"
+    MOCK_CURL_FAIL_URLS=""
     : > "$MOCK_EVENT_LOG"
+    : > "$MOCK_CURL_LOG"
     RUNTIME_DIR="$CASE_DIR/run"
     mkdir -p "$RUNTIME_DIR"
     REMOTE_VERSION="v9.9.9"
@@ -127,6 +143,33 @@ test_version_relation() {
     assert_eq newer "$(version_relation v1.3.0 v1.2.99)"
     if version_relation v1.2 v1.2.3 >/dev/null 2>&1; then
         fail "畸形版本不应通过比较"
+    fi
+}
+
+test_username_migration_identity_compatibility() {
+    local legacy="$TEST_TMP/legacy-old-owner.sh"
+    local future="$TEST_TMP/future-new-owner.sh"
+    local third_party="$TEST_TMP/third-party.sh"
+
+    grep -Fqx -- 'SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"' \
+        "$REPO_DIR/vpsbox.sh" ||
+        fail "v1.0.23 必须保留 v1.0.22 能识别的旧 SCRIPT_URL 行"
+    grep -Fqx -- 'SCRIPT_URL_FALLBACK="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"' \
+        "$REPO_DIR/vpsbox.sh" ||
+        fail "过渡版本缺少 TianPingXi 备用地址"
+
+    write_fixture "$legacy" "$UPDATE_TEST_OLDER" legacy "$SCRIPT_URL"
+    vpsbox_script_identity_valid "$legacy" ||
+        fail "过渡版本必须能识别并恢复 v1.0.22 旧备份"
+
+    write_fixture "$future" "$UPDATE_TEST_NEWER" future "$SCRIPT_URL_FALLBACK"
+    vpsbox_script_identity_valid "$future" ||
+        fail "过渡版本必须接受使用 TianPingXi 地址的未来候选"
+
+    write_fixture "$third_party" "$UPDATE_TEST_NEWER" third-party \
+        "https://raw.githubusercontent.com/example/vpsbox/main/vpsbox.sh"
+    if vpsbox_script_identity_valid "$third_party"; then
+        fail "第三方仓库地址不得通过项目身份校验"
     fi
 }
 
@@ -176,6 +219,48 @@ test_vpsbox_newer_updates_once() {
     assert_file_contains "$MOCK_EVENT_LOG" '^cleanup-lock$'
     grep -Fqx -- "reexec:${CMD_PATH}.previous" "$MOCK_EVENT_LOG" ||
         fail "更新后重新执行必须携带本次 .previous 备份路径"
+    assert_eq "$SCRIPT_URL" "$(cat "$MOCK_CURL_LOG")" \
+        "改名前旧地址可用时不应访问尚未归属的新地址"
+}
+
+test_vpsbox_falls_back_to_new_owner_url() {
+    local expected_calls
+
+    reset_update_case owner-fallback
+    write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
+    write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_NEWER" remote
+    MOCK_CURL_FAIL_URLS="$SCRIPT_URL"
+
+    update_vpsbox >"$TEST_TMP/owner-fallback.out" 2>&1 ||
+        fail "旧地址失败时应回退 TianPingXi 地址并完成更新"
+
+    assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_NEWER"
+    expected_calls="$(printf '%s\n%s' "$SCRIPT_URL" "$SCRIPT_URL_FALLBACK")"
+    assert_eq "$expected_calls" "$(cat "$MOCK_CURL_LOG")" \
+        "迁移地址回退顺序必须为旧地址后新地址"
+}
+
+test_all_owner_urls_fail_preserves_current() {
+    local old_count new_count
+
+    reset_update_case all-owner-urls-fail
+    write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
+    printf 'keep-backup\n' >"${CMD_PATH}.previous"
+    write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_NEWER" remote
+    MOCK_CURL_FAIL_URLS="$(printf '%s\n%s' "$SCRIPT_URL" "$SCRIPT_URL_FALLBACK")"
+    sleep() { :; }
+
+    if update_vpsbox >"$TEST_TMP/all-owner-urls-fail.out" 2>&1; then
+        fail "新旧地址都失败时更新必须报失败"
+    fi
+
+    assert_file_contains "$CMD_PATH" 'installed'
+    assert_file_contains "${CMD_PATH}.previous" '^keep-backup$'
+    assert_empty_file "$MOCK_EVENT_LOG" "下载失败不得触发替换后的副作用"
+    old_count="$(grep -Fxc -- "$SCRIPT_URL" "$MOCK_CURL_LOG" || true)"
+    new_count="$(grep -Fxc -- "$SCRIPT_URL_FALLBACK" "$MOCK_CURL_LOG" || true)"
+    assert_eq 3 "$old_count" "每轮都应尝试旧地址"
+    assert_eq 3 "$new_count" "每轮都应尝试新地址"
 }
 
 test_vpsbox_invalid_download_preserves_current() {
@@ -437,9 +522,12 @@ main() {
     local test status passed=0
     local -a tests=(
         test_version_relation
+        test_username_migration_identity_compatibility
         test_vpsbox_same_is_noop
         test_vpsbox_older_is_noop
         test_vpsbox_newer_updates_once
+        test_vpsbox_falls_back_to_new_owner_url
+        test_all_owner_urls_fail_preserves_current
         test_vpsbox_invalid_download_preserves_current
         test_vpsbox_wrong_project_preserves_current
         test_vpsbox_reexec_failure_restores_previous

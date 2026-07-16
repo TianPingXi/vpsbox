@@ -3,8 +3,11 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.22"
+VPSBOX_VERSION="v1.0.23"
+# 兼容 v1.0.22 的精确项目身份校验：过渡版本必须保留下面这一行原样，
+# 并在用户名变更前继续优先使用旧地址。
 SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
+SCRIPT_URL_FALLBACK="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 NEXTTRACE_RELEASE_VERSION="1.7.1"
 DEFAULT_REALITY_SERVER_NAME="addons.mozilla.org"
@@ -848,10 +851,27 @@ vpsbox_script_identity_valid() {
 
     [ -f "$script" ] && [ ! -L "$script" ] || return 1
     grep -Fqx 'APP_NAME="vpsbox"' "$script" || return 1
-    grep -Fqx 'SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"' "$script" || return 1
+    if ! grep -Fqx 'SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"' "$script" &&
+        ! grep -Fqx 'SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"' "$script"; then
+        return 1
+    fi
     grep -Fqx 'vpsbox_main() {' "$script" || return 1
     grep -Fqx 'if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then' "$script" || return 1
     grep -Fqx '    vpsbox_main "$@"' "$script" || return 1
+}
+
+fetch_vpsbox_script_once() {
+    local dest="$1" connect_timeout="$2" max_time="$3"
+
+    rm -f -- "$dest"
+    if curl -fsSL --connect-timeout "$connect_timeout" --max-time "$max_time" \
+        "$SCRIPT_URL" -o "$dest"; then
+        return 0
+    fi
+    rm -f -- "$dest"
+    [ "$SCRIPT_URL_FALLBACK" != "$SCRIPT_URL" ] || return 1
+    curl -fsSL --connect-timeout "$connect_timeout" --max-time "$max_time" \
+        "$SCRIPT_URL_FALLBACK" -o "$dest"
 }
 
 download_vpsbox_script() {
@@ -870,9 +890,9 @@ download_vpsbox_script() {
         : > "$tmp"
     fi
 
-    if ! retry 3 2 curl -fsSL --connect-timeout 8 --max-time 180 "$SCRIPT_URL" -o "$tmp"; then
+    if ! retry 3 2 fetch_vpsbox_script_once "$tmp" 8 180; then
         rm -f "$tmp"
-        err "下载失败，请检查网络或 GitHub raw 地址。"
+        err "新旧 GitHub Raw 地址均下载失败，请检查网络后重试。"
         return 1
     fi
 
@@ -978,7 +998,7 @@ check_vpsbox_update_on_start() {
     [ -f "$CMD_PATH" ] || return 0
 
     tmp="$(mktemp "$RUNTIME_DIR/update-check.XXXXXX")" || return 0
-    if ! curl -fsSL --connect-timeout 3 --max-time 8 "$SCRIPT_URL" -o "$tmp" >/dev/null 2>&1; then
+    if ! fetch_vpsbox_script_once "$tmp" 3 8 >/dev/null 2>&1; then
         rm -f "$tmp"
         return 0
     fi
