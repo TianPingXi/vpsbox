@@ -1,5 +1,5 @@
 {
-  "name": "vpsbox",
+  "name": "vps",
   "compatibility_date": "2026-07-17",
   "assets": {
     "directory": "./dist"
