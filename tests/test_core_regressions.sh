@@ -42,6 +42,59 @@ test_address_fallback_validation() {
     done
 }
 
+test_blank_node_host_uses_detected_public_ipv4() {
+    (
+        local domain=""
+        local output="$TEST_TMP/node-host-auto.out"
+        public_ipv4() { printf '%s\n' 198.51.100.42; }
+        node_ipv4_is_assigned_locally() { return 0; }
+
+        prompt_node_host domain "地址：" <<< $'\n' >"$output" 2>&1
+        assert_eq "198.51.100.42" "$domain" "留空时应采用自动检测到的公网 IPv4"
+        assert_file_contains "$output" '自动检测到公网 IPv4：198\.51\.100\.42'
+        assert_file_contains "$output" '已识别节点连接地址：198\.51\.100\.42'
+    )
+}
+
+test_node_host_detection_failure_falls_back_to_manual_input() {
+    (
+        local domain=""
+        local output="$TEST_TMP/node-host-fallback.out"
+        public_ipv4() { return 1; }
+
+        prompt_node_host domain "地址：" <<< $'\nnode.example.com' >"$output" 2>&1
+        assert_eq "node.example.com" "$domain" "自动检测失败后应接受手动地址"
+        assert_file_contains "$output" '公网 IPv4 自动检测失败，请手动输入节点连接地址。'
+    )
+}
+
+test_node_host_rejected_detection_falls_back_to_manual_input() {
+    (
+        local domain=""
+        local output="$TEST_TMP/node-host-reject.out"
+        public_ipv4() { printf '%s\n' 198.51.100.42; }
+        node_ipv4_is_assigned_locally() { return 0; }
+
+        prompt_node_host domain "地址：" <<< $'\nn\nnode.example.com' >"$output" 2>&1
+        assert_eq "node.example.com" "$domain" "拒绝自动地址后应接受手动地址"
+        assert_file_contains "$output" '请手动输入节点连接地址。'
+    )
+}
+
+test_node_host_warns_for_possible_nat() {
+    (
+        local domain=""
+        local output="$TEST_TMP/node-host-nat.out"
+        public_ipv4() { printf '%s\n' 198.51.100.42; }
+        node_ipv4_is_assigned_locally() { return 1; }
+
+        prompt_node_host domain "地址：" <<< $'\n' >"$output" 2>&1
+        assert_eq "198.51.100.42" "$domain"
+        assert_file_contains "$output" '当前 VPS 可能使用 NAT。'
+        assert_file_contains "$output" '将后续节点端口映射到相同端口。'
+    )
+}
+
 test_uri_write_preserves_existing_on_failure() {
     (
         CONFIG_DIR="$TEST_TMP/uri-config"
@@ -219,6 +272,10 @@ main() {
     local test status passed=0
     local -a tests=(
         test_address_fallback_validation
+        test_blank_node_host_uses_detected_public_ipv4
+        test_node_host_detection_failure_falls_back_to_manual_input
+        test_node_host_rejected_detection_falls_back_to_manual_input
+        test_node_host_warns_for_possible_nat
         test_uri_write_preserves_existing_on_failure
         test_node_eof_rolls_back_fresh_install_config
         test_reality_checks_require_bounded_dns_and_openssl

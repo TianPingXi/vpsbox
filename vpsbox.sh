@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.24"
+VPSBOX_VERSION="v1.0.25"
 # 用户名迁移完成后使用新地址；旧地址仅作为迁移回退，并用于识别 v1.0.23 备份。
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 SCRIPT_URL_FALLBACK="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
@@ -1954,6 +1954,59 @@ is_repeated_node_host() {
     [ "${host:0:half}" = "${host:half:half}" ]
 }
 
+node_ipv4_is_assigned_locally() {
+    local address="$1"
+
+    command -v ip >/dev/null 2>&1 || return 1
+    ip -4 -o addr show scope global 2>/dev/null \
+        | awk -v target="$address" '{ split($4, parts, "/"); if (parts[1] == target) found = 1 } END { exit !found }'
+}
+
+prompt_node_host() {
+    local result_var="$1"
+    local prompt="$2"
+    local input_host host
+
+    [[ "$result_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+
+    while true; do
+        read -r -p "$prompt" input_host || return 1
+        host="$(normalize_host "$input_host")"
+
+        if [ -z "$host" ]; then
+            info "正在自动检测 VPS 公网 IPv4..."
+            host="$(normalize_host "$(public_ipv4 || true)")"
+            if ! is_ipv4_address "$host"; then
+                warn "公网 IPv4 自动检测失败，请手动输入节点连接地址。"
+                continue
+            fi
+
+            info "自动检测到公网 IPv4：$host"
+            if ! confirm_default_yes "确认使用该公网 IPv4？"; then
+                info "请手动输入节点连接地址。"
+                continue
+            fi
+            if command -v ip >/dev/null 2>&1 && ! node_ipv4_is_assigned_locally "$host"; then
+                warn "该公网 IPv4 未直接配置在本机，当前 VPS 可能使用 NAT。"
+                warn "请确认公网映射地址正确，并将后续节点端口映射到相同端口。"
+            fi
+        elif ! is_valid_node_host "$host"; then
+            err "格式不正确，请输入类似 sb.example.com、1.2.3.4 或 2001:db8::1。"
+            continue
+        fi
+
+        if is_repeated_node_host "$host"; then
+            err "检测到节点地址可能被重复粘贴：$host"
+            err "请只输入一次域名或 IP。"
+            continue
+        fi
+
+        printf -v "$result_var" '%s' "$host"
+        info "已识别节点连接地址：$host"
+        return 0
+    done
+}
+
 uri_host() {
     local host="$1"
     if [[ "$host" == *:* && "$host" != \[*\] ]]; then
@@ -2570,7 +2623,6 @@ create_or_rebuild_node() {
         return 1
     fi
 
-    local input_host
     local domain
     local default_name
     local input_name
@@ -2578,26 +2630,11 @@ create_or_rebuild_node() {
     local port
     local password
 
-    while true; do
-        read -r -p "请输入节点域名或 IP：" input_host ||
-            { rollback_node_files_transaction || true; info "输入已结束，已取消。"; return 1; }
-        domain="$(normalize_host "$input_host")"
-        if [ -z "$domain" ]; then
-            err "节点域名或 IP 不能为空，请重新输入。"
-            continue
-        fi
-        if ! is_valid_node_host "$domain"; then
-            err "格式不正确，请输入类似 sb.example.com、1.2.3.4 或 2001:db8::1。"
-            continue
-        fi
-        if is_repeated_node_host "$domain"; then
-            err "检测到节点地址可能被重复粘贴：$domain"
-            err "请只输入一次域名或 IP。"
-            continue
-        fi
-        info "已识别节点连接地址：$domain"
-        break
-    done
+    if ! prompt_node_host domain "请输入节点域名或 IP（留空自动检测公网 IPv4）："; then
+        rollback_node_files_transaction || true
+        info "输入已结束，已取消。"
+        return 1
+    fi
 
     default_name="$(default_name_for_host "$domain")"
     while true; do
@@ -2697,7 +2734,7 @@ EOF
 }
 
 create_vless_reality_node() {
-    local backup_dir existing_port="" confirm input_host domain default_name input_name name port
+    local backup_dir existing_port="" confirm domain default_name input_name name port
     local input_sni server_name uuid short_id private_key public_key
     local -a keypair
 
@@ -2735,22 +2772,11 @@ create_vless_reality_node() {
         return 1
     fi
 
-    while true; do
-        read -r -p "请输入节点连接地址（域名或 IP）：" input_host ||
-            { rollback_node_files_transaction || true; info "输入已结束，已取消。"; return 1; }
-        domain="$(normalize_host "$input_host")"
-        if ! is_valid_node_host "$domain"; then
-            err "格式不正确，请输入类似 sb.example.com、1.2.3.4 或 2001:db8::1。"
-            continue
-        fi
-        if is_repeated_node_host "$domain"; then
-            err "检测到节点地址可能被重复粘贴：$domain"
-            err "请只输入一次域名或 IP。"
-            continue
-        fi
-        info "已识别节点连接地址：$domain"
-        break
-    done
+    if ! prompt_node_host domain "请输入节点连接地址（域名或 IP，留空自动检测公网 IPv4）："; then
+        rollback_node_files_transaction || true
+        info "输入已结束，已取消。"
+        return 1
+    fi
 
     default_name="$(default_name_for_host "$domain")"
     default_name="vless-${default_name#ss-}"
