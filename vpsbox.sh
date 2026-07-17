@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.29"
+VPSBOX_VERSION="v1.0.30"
 # 只从当前仓库下载可执行脚本；旧地址仅用于识别本地 v1.0.23 及更早备份，绝不联网获取。
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 LEGACY_SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
@@ -3843,6 +3843,18 @@ fq_state() {
     fi
 }
 
+bbr_fq_summary_state() {
+    local bbr fq
+
+    bbr="$(bbr_state)"
+    fq="$(fq_state)"
+    if [ "$bbr" = "已启用" ] && [ "$fq" = "已启用" ]; then
+        echo "已开启"
+    else
+        printf 'BBR %s / fq %s\n' "$bbr" "$fq"
+    fi
+}
+
 ipv4_priority_state() {
     if [ -f "$GAI_CONF" ] &&
         grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100([[:space:]]|$)' "$GAI_CONF"; then
@@ -5342,7 +5354,7 @@ change_ipv4_dns() {
 
     cat <<EOF
 ========================================
- 修改系统 IPv4 DNS
+ 修改 IPv4 DNS
 ========================================
 当前 IPv4 DNS：
 $(ipv4_dns_lines)
@@ -5402,9 +5414,9 @@ EOF
 enable_ipv4_priority() {
     local parent tmp
 
-    info "正在启用系统 IPv4 优先，不会禁用 IPv6。"
+    info "正在开启 IPv4 优先，不会禁用 IPv6。"
     if [ "$(ipv4_priority_state)" = "已启用" ]; then
-        info "系统 IPv4 优先已启用，无需重复修改。"
+        info "IPv4 优先已开启，无需重复修改。"
         return 0
     fi
     [ ! -L "$GAI_CONF" ] || { err "$GAI_CONF 是符号链接，已拒绝修改。"; return 1; }
@@ -6537,7 +6549,7 @@ show_current_ssh_config() {
     local use_dns
 
     if ! sshd_binary >/dev/null 2>&1; then
-        err "未找到 sshd，无法查看 SSH 当前生效配置。"
+        err "未找到 sshd，无法查看 SSH 生效配置。"
         return 1
     fi
 
@@ -6551,7 +6563,7 @@ show_current_ssh_config() {
 
     cat <<EOF
 ========================================
- SSH 当前生效配置
+ SSH 生效配置
 ========================================
 1. Port
    当前值：$port
@@ -6728,7 +6740,8 @@ $(ssh_port_change_firewall_hint)
 ----------------------------------------
  [1] 应用 SSH 端口修改
  [2] 恢复 vpsbox SSH 配置（高风险）
- [0] 返回
+----------------------------------------
+ [0] 返回系统优化
 ========================================
 EOF
         read -r -p "请输入选项: " opt || exit 0
@@ -6776,7 +6789,8 @@ $SSHD_VPSBOX_HARDENING_CONF
    登录时不做反向 DNS 查询，减少登录卡顿。
 ----------------------------------------
  [1] 应用 SSH 基础加固
- [0] 返回
+----------------------------------------
+ [0] 返回系统优化
 ========================================
 EOF
         read -r -p "请输入选项: " opt || exit 0
@@ -10036,6 +10050,7 @@ firewall_extra_ports_menu() {
  [4] 删除 TCP 端口
  [5] 删除 UDP 端口
  [6] 清空额外端口
+----------------------------------------
  [0] 返回主机防火墙
 ========================================
 EOF
@@ -10160,7 +10175,7 @@ firewall_menu() {
  Docker UDP：$docker_udp
  其他公网 TCP：$public_tcp
  其他公网 UDP：$public_udp
-额外 TCP：${FW_EXTRA_TCP:--}
+ 额外 TCP：${FW_EXTRA_TCP:--}
  额外 UDP：${FW_EXTRA_UDP:--}
  默认入站：拒绝未放行的连接
  出站规则：不创建
@@ -10169,6 +10184,7 @@ firewall_menu() {
  [2] 查看当前放行端口
  [3] 管理额外放行端口
  [4] 关闭并移除 vpsbox 防火墙
+----------------------------------------
  [0] 返回主菜单
 ========================================
 EOF
@@ -10276,7 +10292,7 @@ run_self_check() {
 
     cat <<EOF
 ========================================
- 一键自检
+ 一键检测
 ========================================
 EOF
     check_table_header
@@ -11572,8 +11588,17 @@ stop_service_action() {
     info "sing-box 服务已停止。"
 }
 
-singbox_install_state() {
-    singbox_installed && echo "已安装" || echo "未安装"
+singbox_summary_line() {
+    local version status
+
+    if ! singbox_installed; then
+        echo " sing-box：未安装"
+        return 0
+    fi
+    version="$(singbox_version)"
+    [ -n "$version" ] && [ "$version" != "-" ] || version="版本未知"
+    status="$(service_status_short)"
+    printf ' sing-box：%s %s\n' "$version" "$status"
 }
 
 node_state() {
@@ -11606,13 +11631,7 @@ node_summary() {
     local protocol
 
     if ! node_exists; then
-        cat <<EOF
- 当前节点：未创建
- 节点协议：-
- 节点名称：-
- 节点地址：-
- 节点端口：-
-EOF
+        echo " 当前节点：未创建"
         return 0
     fi
 
@@ -11752,9 +11771,7 @@ show_menu() {
  提示：输入 vpsbox 打开管理面板
 $(vpsbox_update_notice)
 ----------------------------------------
- sing-box：$(singbox_install_state)
- sing-box 状态：$(service_status_short)
- sing-box 版本：$(singbox_version)
+$(singbox_summary_line)
 $(node_summary)
 ----------------------------------------
  IPv4 DNS：
@@ -11764,9 +11781,9 @@ $(ipv4_dns_lines)
  [2] sing-box 管理
  [3] 系统优化
  [4] 主机防火墙
- [5] 一键自检
- [6] 查看三网回程
- [7] 其他脚本
+ [5] 一键检测
+ [6] 三网回程测试
+ [7] 第三方脚本
 ----------------------------------------
  [00] 更新 vpsbox 脚本
  [88] 卸载 vpsbox
@@ -11785,12 +11802,13 @@ node_menu() {
  节点管理
 ========================================
 $(node_summary)
- sing-box 状态：$(service_status_short)
+$(singbox_summary_line)
 ----------------------------------------
  [1] 创建/重建 SS 2022 节点
  [2] 创建/重建 VLESS Reality 节点
  [3] 查看节点链接
  [4] 删除当前节点
+----------------------------------------
  [0] 返回主菜单
 ========================================
 EOF
@@ -11817,14 +11835,13 @@ singbox_menu() {
 ========================================
  sing-box 管理
 ========================================
- sing-box：$(singbox_install_state)
- sing-box 状态：$(service_status_short)
- sing-box 版本：$(singbox_version)
+$(singbox_summary_line)
 ----------------------------------------
- [1] 启动 sing-box 服务
- [2] 停止 sing-box 服务
- [3] 重启 sing-box 服务
+ [1] 启动服务
+ [2] 停止服务
+ [3] 重启服务
  [4] 更新 sing-box
+----------------------------------------
  [0] 返回主菜单
 ========================================
 EOF
@@ -11848,7 +11865,7 @@ system_menu() {
     while true; do
         detect_os
         ntp_label="开启 NTP 时间同步"
-        journal_label="限制 systemd 日志大小"
+        journal_label="限制 journald 日志大小"
         if [ "$OS" = "alpine" ]; then
             ntp_label+="（Alpine/OpenRC 不适用）"
             journal_label+="（Alpine/OpenRC 不适用）"
@@ -11858,29 +11875,34 @@ system_menu() {
 ========================================
  系统优化
 ========================================
- BBR：$(bbr_state)
- fq：$(fq_state)
+ BBR + fq：$(bbr_fq_summary_state)
  IPv4 优先：$(ipv4_priority_state)
- SSH 端口：$(ssh_port_state)
- SSH 加固：$(ssh_hardening_state)
- Fail2ban：$(fail2ban_service_state)
- SSH 防护：$(fail2ban_sshd_state)
- NTP 同步：$(ntp_sync_state)
+ SSH：端口 $(ssh_port_state) / 加固$(ssh_hardening_state)
+ Fail2ban：$(fail2ban_service_state) / SSH 防护$(fail2ban_sshd_state)
+ NTP：$(ntp_sync_state)
  系统重启：$(reboot_required_state)
 ----------------------------------------
+ 基础
  [1] 系统更新
  [2] 垃圾清理
  [3] 修改主机名
  [4] $ntp_label
- [5] 修改系统 IPv4 DNS
- [6] 启用系统 IPv4 优先
- [7] 一键开启 BBR + fq
+
+ 网络
+ [5] 修改 IPv4 DNS
+ [6] 开启 IPv4 优先
+ [7] 开启 BBR + fq
+
+ SSH 安全
  [8] 修改 SSH 端口
  [9] SSH 基础加固
- [10] 查看 SSH 当前生效配置
+ [10] 查看 SSH 生效配置
  [11] 安装 Fail2ban
+
+ 维护
  [12] $journal_label
  [13] 查看/恢复 vpsbox 系统改动
+----------------------------------------
  [0] 返回主菜单
 ========================================
 EOF
@@ -12005,13 +12027,14 @@ other_scripts_menu() {
         clear 2>/dev/null || true
         cat <<'EOF'
 ========================================
- 其他脚本
+ 第三方脚本
 ========================================
  [1] IP 质量体检脚本（xykt）
  [2] 网络质量体检脚本（xykt）
  [3] TCP 质量检测脚本（ibsgss）
  [4] VPS 综合质量测试脚本（LloydAsp）
  [5] 一键 VPS 系统重装脚本（bin456789）
+----------------------------------------
  [0] 返回主菜单
 ========================================
 EOF

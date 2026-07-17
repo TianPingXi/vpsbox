@@ -236,6 +236,121 @@ test_service_running_requires_exact_config_process() {
     )
 }
 
+test_singbox_summary_line_states() {
+    (
+        local mock_installed=0 mock_version=1.13.14 mock_status=未运行
+        singbox_installed() { [ "$mock_installed" -eq 1 ]; }
+        singbox_version() { printf '%s\n' "$mock_version"; }
+        service_status_short() { printf '%s\n' "$mock_status"; }
+
+        assert_eq " sing-box：未安装" "$(singbox_summary_line)"
+        mock_installed=1
+        assert_eq " sing-box：1.13.14 未运行" "$(singbox_summary_line)"
+        mock_status=运行中
+        assert_eq " sing-box：1.13.14 运行中" "$(singbox_summary_line)"
+        mock_version=""
+        assert_eq " sing-box：版本未知 运行中" "$(singbox_summary_line)"
+    )
+}
+
+test_node_summary_compacts_absent_state() {
+    (
+        local mock_node_exists=0
+        node_exists() {
+            [ "$mock_node_exists" -eq 1 ] || return 1
+            # These globals are consumed dynamically by node_summary.
+            # shellcheck disable=SC2034,SC2100
+            PROTOCOL=vless-reality NAME=test-node DOMAIN=example.com PORT=30000
+        }
+
+        assert_eq " 当前节点：未创建" "$(node_summary)" \
+            "无节点时不应显示四行无意义占位符"
+        mock_node_exists=1
+        assert_eq " 当前节点：已创建
+ 节点协议：VLESS Reality
+ 节点名称：test-node
+ 节点地址：example.com
+ 节点端口：30000" "$(node_summary)" \
+            "已有节点时应保留完整五行信息"
+    )
+}
+
+test_bbr_fq_summary_preserves_partial_state() {
+    (
+        local mock_bbr=已启用 mock_fq=已启用
+        bbr_state() { printf '%s\n' "$mock_bbr"; }
+        fq_state() { printf '%s\n' "$mock_fq"; }
+
+        assert_eq "已开启" "$(bbr_fq_summary_state)"
+        mock_fq="未启用（当前：fq_codel）"
+        assert_eq "BBR 已启用 / fq 未启用（当前：fq_codel）" \
+            "$(bbr_fq_summary_state)" "不完整状态应保留具体原因"
+    )
+}
+
+test_main_and_system_menu_presentation() {
+    (
+        local main_output="$TEST_TMP/main-menu.out"
+        local system_output="$TEST_TMP/system-menu.out"
+        clear() { :; }
+        vpsbox_update_notice() { return 0; }
+        singbox_summary_line() { printf ' sing-box：未安装\n'; }
+        node_summary() { printf ' 当前节点：未创建\n'; }
+        ipv4_dns_lines() { printf ' nameserver 1.1.1.1\n'; }
+
+        show_menu > "$main_output"
+        assert_file_contains "$main_output" '^ \[5\] 一键检测$'
+        assert_file_contains "$main_output" '^ \[6\] 三网回程测试$'
+        assert_file_contains "$main_output" '^ \[7\] 第三方脚本$'
+        assert_file_not_contains "$main_output" '一键自检|查看三网回程|其他脚本'
+
+        detect_os() {
+            # OS is consumed dynamically by system_menu.
+            # shellcheck disable=SC2034
+            OS=debian
+        }
+        bbr_fq_summary_state() { printf '已开启\n'; }
+        ipv4_priority_state() { printf '已启用\n'; }
+        ssh_port_state() { printf '23333\n'; }
+        ssh_hardening_state() { printf '已配置\n'; }
+        fail2ban_service_state() { printf '运行中\n'; }
+        fail2ban_sshd_state() { printf '已启用\n'; }
+        ntp_sync_state() { printf '已同步\n'; }
+        reboot_required_state() { printf '不需要\n'; }
+
+        system_menu <<< "0" > "$system_output"
+        assert_file_contains "$system_output" '^ BBR \+ fq：已开启$'
+        assert_file_contains "$system_output" '^ SSH：端口 23333 / 加固已配置$'
+        assert_file_contains "$system_output" '^ Fail2ban：运行中 / SSH 防护已启用$'
+        assert_file_contains "$system_output" '^ 基础$'
+        assert_file_contains "$system_output" '^ 网络$'
+        assert_file_contains "$system_output" '^ SSH 安全$'
+        assert_file_contains "$system_output" '^ 维护$'
+        assert_file_contains "$system_output" '^ \[5\] 修改 IPv4 DNS$'
+        assert_file_contains "$system_output" '^ \[12\] 限制 journald 日志大小$'
+        awk 'previous == "----------------------------------------" && $0 == " [0] 返回主菜单" { found=1 }
+            { previous=$0 } END { exit(found ? 0 : 1) }' "$system_output" ||
+            fail "系统优化的返回项上方应有分割线"
+    )
+}
+
+test_third_party_menu_keeps_authors() {
+    (
+        local output="$TEST_TMP/third-party-menu.out"
+        clear() { :; }
+
+        other_scripts_menu <<< "0" > "$output"
+        assert_file_contains "$output" '^ 第三方脚本$'
+        assert_file_contains "$output" '^ \[1\] IP 质量体检脚本（xykt）$'
+        assert_file_contains "$output" '^ \[3\] TCP 质量检测脚本（ibsgss）$'
+        assert_file_contains "$output" '^ \[4\] VPS 综合质量测试脚本（LloydAsp）$'
+        assert_file_contains "$output" '^ \[5\] 一键 VPS 系统重装脚本（bin456789）$'
+        awk 'previous == "----------------------------------------" && $0 == " [0] 返回主菜单" { found=1 }
+            { previous=$0 } END { exit(found ? 0 : 1) }' "$output" ||
+            fail "第三方脚本的返回项上方应有分割线"
+    )
+}
+
 test_service_restore_checks_final_state() {
     (
         service_disable() { return 23; }
@@ -545,6 +660,11 @@ main() {
         test_view_node_propagates_uri_failure
         test_node_state_writes_are_atomic
         test_service_running_requires_exact_config_process
+        test_singbox_summary_line_states
+        test_node_summary_compacts_absent_state
+        test_bbr_fq_summary_preserves_partial_state
+        test_main_and_system_menu_presentation
+        test_third_party_menu_keeps_authors
         test_service_restore_checks_final_state
         test_start_service_action_healthy_is_noop
         test_start_service_action_uses_light_start
