@@ -174,6 +174,184 @@ test_ntp_package_rollback_restores_timesyncd() {
     assert_file_contains "$log" 'install -y systemd-timesyncd$'
 }
 
+test_chrony_source_layout_detection() {
+    (
+        local dir="$TEST_TMP/chrony-layout" test_conf
+        mkdir -p "$dir/sources.d"
+        test_conf="$dir/chrony.conf"
+        CHRONY_SOURCE_FILE="$dir/sources.d/vpsbox.sources"
+        chrony_conf_path() { printf '%s\n' "$test_conf"; }
+
+        printf 'sourcedir /etc/chrony/sources.d\n' > "$test_conf"
+        chrony_expected_sources > "$CHRONY_SOURCE_FILE"
+        chrony_sources_are_current || fail "独立 sources.d 配置应识别为当前状态"
+
+        rm -f "$CHRONY_SOURCE_FILE"
+        printf 'driftfile /var/lib/chrony/drift\n\n%s\n' "$NTP_SOURCES_BEGIN" > "$test_conf"
+        chrony_expected_sources >> "$test_conf"
+        printf '%s\n' "$NTP_SOURCES_END" >> "$test_conf"
+        chrony_sources_are_current || fail "主配置中的规范 vpsbox 区块应识别为当前状态"
+
+        printf 'pool unexpected.example iburst\n' >> "$test_conf"
+        chrony_sources_are_current || fail "区块外的用户配置不应导致重复改写"
+    )
+}
+
+test_enable_ntp_healthy_is_noop() {
+    (
+        local log="$TEST_TMP/ntp-healthy.log"
+        : > "$log"
+        detect_os() { :; }
+        is_systemd() { return 0; }
+        chrony_service_name() { printf 'chrony\n'; }
+        chrony_conf_path() { printf '/unused/chrony.conf\n'; }
+        ntp_package_installed() { [ "$1" = "chrony" ]; }
+        systemd_unit_exists() { [ "$1" = "chrony.service" ]; }
+        chrony_sources_are_current() { return 0; }
+        ntp_service_state_is_healthy() { return 0; }
+        show_ntp_runtime_details() { printf '%s\n' details >> "$log"; }
+        backup_change_file_once() { printf '%s\n' backup >> "$log"; }
+        apt_get_bounded() { printf '%s\n' package >> "$log"; }
+        repair_ntp_service_state() { printf '%s\n' repair >> "$log"; }
+
+        enable_ntp_sync >/dev/null
+        assert_eq details "$(cat "$log")" \
+            "健康但尚未同步时只能展示状态，不得安装、备份或修复"
+    )
+}
+
+test_ntp_unsynchronized_status_is_nonfatal() {
+    (
+        local output="$TEST_TMP/ntp-unsynchronized.out"
+        systemctl() {
+            case "$*" in
+                'is-enabled chrony') printf 'enabled\n' ;;
+                'is-active chrony') printf 'active\n' ;;
+                *) return 1 ;;
+            esac
+        }
+        chronyc() {
+            case "$1" in
+                sources) printf 'time.cloudflare.com\n' ;;
+                tracking) printf 'Leap status     : Not synchronised\n' ;;
+                *) return 1 ;;
+            esac
+        }
+        timedatectl() { return 0; }
+
+        show_ntp_runtime_details chrony > "$output"
+        assert_file_contains "$output" '首次同步可能需要几分钟'
+        assert_file_contains "$output" '当前配置不会重复改写'
+    )
+}
+
+test_ntp_service_drift_uses_light_repair() {
+    (
+        local log="$TEST_TMP/ntp-service-repair.log"
+        local mock_chrony_enabled=0 mock_chrony_active=0
+        local mock_timesyncd_enabled=1 mock_timesyncd_active=1
+        : > "$log"
+        systemd_unit_exists() { [ "$1" = "systemd-timesyncd.service" ]; }
+        systemctl() {
+            case "$*" in
+                'is-enabled --quiet chrony') [ "$mock_chrony_enabled" -eq 1 ] ;;
+                'is-active --quiet chrony') [ "$mock_chrony_active" -eq 1 ] ;;
+                'is-enabled --quiet systemd-timesyncd') [ "$mock_timesyncd_enabled" -eq 1 ] ;;
+                'is-active --quiet systemd-timesyncd') [ "$mock_timesyncd_active" -eq 1 ] ;;
+                'enable chrony') mock_chrony_enabled=1; printf '%s\n' 'enable chrony' >> "$log" ;;
+                'start chrony') mock_chrony_active=1; printf '%s\n' 'start chrony' >> "$log" ;;
+                'disable --now systemd-timesyncd')
+                    mock_timesyncd_enabled=0
+                    mock_timesyncd_active=0
+                    printf '%s\n' 'disable timesyncd' >> "$log"
+                    ;;
+                *) return 1 ;;
+            esac
+        }
+
+        repair_ntp_service_state chrony >/dev/null
+        assert_file_contains "$log" '^enable chrony$'
+        assert_file_contains "$log" '^start chrony$'
+        assert_file_contains "$log" '^disable timesyncd$'
+    )
+}
+
+test_bbr_fq_healthy_is_noop() {
+    (
+        local log="$TEST_TMP/bbr-healthy.log"
+        BBR_CONF="$TEST_TMP/99-vpsbox-bbr-healthy.conf"
+        render_bbr_fq_config > "$BBR_CONF"
+        : > "$log"
+        sysctl() {
+            case "$*" in
+                '-n net.ipv4.tcp_congestion_control') printf 'bbr\n' ;;
+                '-n net.core.default_qdisc') printf 'fq\n' ;;
+                *) printf '%s\n' "$*" >> "$log" ;;
+            esac
+        }
+        modprobe() { printf '%s\n' "$*" >> "$log"; }
+        backup_change_file_once() { printf '%s\n' backup >> "$log"; }
+
+        enable_bbr_fq >/dev/null
+        assert_empty_file "$log" "健康的 BBR + fq 不得加载模块、应用 sysctl 或创建备份"
+    )
+}
+
+test_bbr_fq_runtime_drift_uses_light_repair() {
+    (
+        local log="$TEST_TMP/bbr-repair.log"
+        local cc=cubic fq=pfifo_fast
+        BBR_CONF="$TEST_TMP/99-vpsbox-bbr-repair.conf"
+        render_bbr_fq_config > "$BBR_CONF"
+        : > "$log"
+        sysctl() {
+            case "$1" in
+                -n)
+                    [ "$2" = "net.ipv4.tcp_congestion_control" ] && printf '%s\n' "$cc" || printf '%s\n' "$fq"
+                    ;;
+                -p)
+                    cc=bbr
+                    fq=fq
+                    printf '%s\n' 'sysctl-p' >> "$log"
+                    ;;
+                -w) return 0 ;;
+                *) return 1 ;;
+            esac
+        }
+        modprobe() { printf 'modprobe %s\n' "$1" >> "$log"; }
+        backup_change_file_once() { printf '%s\n' backup >> "$log"; }
+        bbr_state() { printf '%s\n' "$cc"; }
+        fq_state() { printf '%s\n' "$fq"; }
+
+        enable_bbr_fq >/dev/null
+        assert_file_contains "$log" '^modprobe tcp_bbr$'
+        assert_file_contains "$log" '^modprobe sch_fq$'
+        assert_file_contains "$log" '^sysctl-p$'
+        assert_file_not_contains "$log" '^backup$' "只修复运行参数时不得改写持久化配置"
+    )
+}
+
+test_journald_healthy_is_noop() {
+    (
+        local log="$TEST_TMP/journald-healthy.log"
+        : > "$log"
+        is_systemd() { return 0; }
+        journalctl() { return 0; }
+        journald_limit_state() { printf '已配置\n'; }
+        systemctl() {
+            if [ "$*" = "is-active --quiet systemd-journald" ]; then
+                return 0
+            fi
+            printf '%s\n' "$*" >> "$log"
+        }
+        journal_disk_usage() { printf '12M\n'; }
+        backup_change_file_once() { printf '%s\n' backup >> "$log"; }
+
+        limit_systemd_journal >/dev/null
+        assert_empty_file "$log" "健康的 journald 限制不得备份、写配置或重启服务"
+    )
+}
+
 prepare_ssh_change_tracking() {
     reset_change_store "$1"
     printf '%s\n' \
@@ -373,6 +551,13 @@ main() {
         test_debian_upgrade_failure_skips_autoremove
         test_alpine_update_uses_bounded_steps
         test_ntp_package_rollback_restores_timesyncd
+        test_chrony_source_layout_detection
+        test_enable_ntp_healthy_is_noop
+        test_ntp_unsynchronized_status_is_nonfatal
+        test_ntp_service_drift_uses_light_repair
+        test_bbr_fq_healthy_is_noop
+        test_bbr_fq_runtime_drift_uses_light_repair
+        test_journald_healthy_is_noop
         test_first_ssh_port_rollback_clears_tracking
         test_first_ssh_hardening_rollback_clears_tracking
         test_existing_ssh_baseline_survives_later_rollback

@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.28"
+VPSBOX_VERSION="v1.0.29"
 # 只从当前仓库下载可执行脚本；旧地址仅用于识别本地 v1.0.23 及更早备份，绝不联网获取。
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 LEGACY_SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
@@ -23,6 +23,7 @@ CHANGE_BACKUP_DIR="$VPSBOX_STATE_DIR/backups"
 GAI_CONF="/etc/gai.conf"
 NTP_SOURCES_BEGIN="# BEGIN VPSBOX NTP SOURCES"
 NTP_SOURCES_END="# END VPSBOX NTP SOURCES"
+CHRONY_SOURCE_FILE="/etc/chrony/sources.d/vpsbox.sources"
 HOSTNAME_BEGIN="# BEGIN VPSBOX HOSTNAME"
 HOSTNAME_END="# END VPSBOX HOSTNAME"
 SSHD_MAIN_CONF="/etc/ssh/sshd_config"
@@ -2829,13 +2830,10 @@ check_reality_server() {
         </dev/null >/dev/null 2>&1
 }
 
-setup_service() {
-    local bin
-    bin="$(command -v sing-box)"
+render_singbox_systemd_service() {
+    local bin="$1"
 
-    if is_systemd; then
-        [ ! -L /etc/systemd/system/sing-box.service ] || { err "sing-box systemd 服务文件是符号链接，已拒绝覆盖。"; return 1; }
-        cat > /etc/systemd/system/sing-box.service <<EOF
+    cat <<EOF
 [Unit]
 Description=Sing-box Proxy Server
 Documentation=https://sing-box.sagernet.org
@@ -2859,12 +2857,12 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
-        retry 3 2 systemctl daemon-reload || return 1
-        service_enable || return 1
-        return 0
-    elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
-        [ ! -L /etc/init.d/sing-box ] || { err "sing-box OpenRC 服务文件是符号链接，已拒绝覆盖。"; return 1; }
-        cat > /etc/init.d/sing-box <<EOF
+}
+
+render_singbox_openrc_service() {
+    local bin="$1"
+
+    cat <<EOF
 #!/sbin/openrc-run
 name="sing-box"
 description="Sing-box Proxy Server"
@@ -2881,6 +2879,38 @@ depend() {
     need net
 }
 EOF
+}
+
+singbox_service_definition_is_current() {
+    local bin
+
+    bin="$(command -v sing-box 2>/dev/null)" || return 1
+    if is_systemd; then
+        [ -f /etc/systemd/system/sing-box.service ] &&
+            [ ! -L /etc/systemd/system/sing-box.service ] || return 1
+        render_singbox_systemd_service "$bin" |
+            cmp -s - /etc/systemd/system/sing-box.service
+    elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
+        [ -f /etc/init.d/sing-box ] && [ ! -L /etc/init.d/sing-box ] || return 1
+        render_singbox_openrc_service "$bin" | cmp -s - /etc/init.d/sing-box
+    else
+        return 1
+    fi
+}
+
+setup_service() {
+    local bin
+    bin="$(command -v sing-box)"
+
+    if is_systemd; then
+        [ ! -L /etc/systemd/system/sing-box.service ] || { err "sing-box systemd 服务文件是符号链接，已拒绝覆盖。"; return 1; }
+        render_singbox_systemd_service "$bin" > /etc/systemd/system/sing-box.service || return 1
+        retry 3 2 systemctl daemon-reload || return 1
+        service_enable || return 1
+        return 0
+    elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
+        [ ! -L /etc/init.d/sing-box ] || { err "sing-box OpenRC 服务文件是符号链接，已拒绝覆盖。"; return 1; }
+        render_singbox_openrc_service "$bin" > /etc/init.d/sing-box || return 1
         chmod +x /etc/init.d/sing-box || return 1
         service_enable || return 1
         return 0
@@ -3891,6 +3921,33 @@ fail2ban_sshd_state() {
     fi
 }
 
+render_fail2ban_sshd_config() {
+    local ports="$1" backend="$2"
+
+    cat <<EOF
+[sshd]
+enabled = true
+port = $ports
+backend = $backend
+EOF
+}
+
+fail2ban_sshd_configuration_healthy() {
+    local backend="auto" ports
+
+    fail2ban_installed || return 1
+    [ "$(fail2ban_service_state)" = "运行中" ] || return 1
+    fail2ban_service_is_enabled || return 1
+    [ -f "$FAIL2BAN_VPSBOX_SSHD_CONF" ] &&
+        [ ! -L "$FAIL2BAN_VPSBOX_SSHD_CONF" ] || return 1
+    ports="$(ssh_effective_ports_csv)" || return 1
+    is_systemd && backend="systemd"
+    render_fail2ban_sshd_config "$ports" "$backend" |
+        cmp -s - "$FAIL2BAN_VPSBOX_SSHD_CONF" || return 1
+    fail2ban-client -t -c /etc/fail2ban >/dev/null 2>&1 || return 1
+    fail2ban-client status sshd >/dev/null 2>&1
+}
+
 fail2ban_action_names() {
     local output header
 
@@ -4369,7 +4426,7 @@ remove_vpsbox_ntp_block() {
 
 write_chrony_sources() {
     local conf
-    local source_file="/etc/chrony/sources.d/vpsbox.sources"
+    local source_file="$CHRONY_SOURCE_FILE"
 
     conf="$(chrony_conf_path)"
     if [ ! -f "$conf" ]; then
@@ -4403,6 +4460,126 @@ EOF
         rm -f "$source_file" || return 1
         info "已写入 NTP 源：$conf"
     fi
+}
+
+chrony_expected_sources() {
+    cat <<EOF
+pool time.cloudflare.com iburst maxsources 4
+pool pool.ntp.org iburst maxsources 4
+EOF
+}
+
+chrony_sources_are_current() {
+    local conf source_file="$CHRONY_SOURCE_FILE"
+    local expected actual begin_count end_count
+
+    conf="$(chrony_conf_path)"
+    [ -f "$conf" ] && [ ! -L "$conf" ] || return 1
+    expected="$(chrony_expected_sources)"
+    if grep -Eq '^[[:space:]]*sourcedir[[:space:]]+/etc/chrony/sources\.d([[:space:]]|$)' "$conf"; then
+        [ -f "$source_file" ] && [ ! -L "$source_file" ] || return 1
+        actual="$(cat "$source_file")"
+        [ "$actual" = "$expected" ] || return 1
+        ! grep -Fq "$NTP_SOURCES_BEGIN" "$conf" &&
+            ! grep -Fq "$NTP_SOURCES_END" "$conf"
+        return
+    fi
+
+    [ ! -e "$source_file" ] && [ ! -L "$source_file" ] || return 1
+    begin_count="$(grep -Fxc "$NTP_SOURCES_BEGIN" "$conf" 2>/dev/null || true)"
+    end_count="$(grep -Fxc "$NTP_SOURCES_END" "$conf" 2>/dev/null || true)"
+    [ "$begin_count" = "1" ] && [ "$end_count" = "1" ] || return 1
+    actual="$(sed -n "/^${NTP_SOURCES_BEGIN}$/,/^${NTP_SOURCES_END}$/p" "$conf")"
+    [ "$actual" = "$NTP_SOURCES_BEGIN
+$expected
+$NTP_SOURCES_END" ]
+}
+
+ntp_service_state_is_healthy() {
+    local svc="$1"
+
+    systemctl is-enabled --quiet "$svc" 2>/dev/null &&
+        systemctl is-active --quiet "$svc" 2>/dev/null || return 1
+    if systemd_unit_exists systemd-timesyncd.service; then
+        ! systemctl is-enabled --quiet systemd-timesyncd 2>/dev/null &&
+            ! systemctl is-active --quiet systemd-timesyncd 2>/dev/null || return 1
+    fi
+}
+
+repair_ntp_service_state() {
+    local svc="$1" failed=0 timesyncd_unit="absent"
+    local chrony_enabled="disabled" chrony_active="inactive"
+    local timesyncd_enabled="disabled" timesyncd_active="inactive"
+
+    info "NTP 配置已存在，正在轻量修复服务状态..."
+    systemctl is-enabled --quiet "$svc" 2>/dev/null && chrony_enabled="enabled"
+    systemctl is-active --quiet "$svc" 2>/dev/null && chrony_active="active"
+    if systemd_unit_exists systemd-timesyncd.service; then
+        timesyncd_unit="present"
+        systemctl is-enabled --quiet systemd-timesyncd 2>/dev/null &&
+            timesyncd_enabled="enabled"
+        systemctl is-active --quiet systemd-timesyncd 2>/dev/null &&
+            timesyncd_active="active"
+    fi
+
+    systemctl enable "$svc" >/dev/null 2>&1 || failed=1
+    if [ "$failed" -eq 0 ] && ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+        retry 3 2 systemctl start "$svc" || failed=1
+    fi
+    if [ "$failed" -eq 0 ] && [ "$timesyncd_unit" = "present" ] &&
+        { systemctl is-enabled --quiet systemd-timesyncd 2>/dev/null ||
+            systemctl is-active --quiet systemd-timesyncd 2>/dev/null; }; then
+        systemctl disable --now systemd-timesyncd >/dev/null 2>&1 || failed=1
+    fi
+    if [ "$failed" -eq 0 ] && ntp_service_state_is_healthy "$svc"; then
+        return 0
+    fi
+
+    warn "NTP 服务状态轻量修复失败，正在恢复修改前状态。"
+    restore_ntp_unit_state "$svc" present "$chrony_enabled" "$chrony_active" || true
+    restore_ntp_unit_state systemd-timesyncd "$timesyncd_unit" \
+        "$timesyncd_enabled" "$timesyncd_active" || true
+    return 1
+}
+
+show_ntp_runtime_details() {
+    local svc="$1" enabled_state active_state sources_output tracking_output
+
+    enabled_state="$(systemctl is-enabled "$svc" 2>/dev/null || echo "unknown")"
+    active_state="$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")"
+    info "chrony 开机自启：$enabled_state"
+    info "chrony 运行状态：$active_state"
+
+    echo ""
+    info "NTP 时间源："
+    if ! sources_output="$(chronyc sources -v 2>/dev/null)"; then
+        sleep 1
+        sources_output="$(chronyc sources -v 2>/dev/null || true)"
+    fi
+    if [ -n "$sources_output" ]; then
+        printf '%s\n' "$sources_output"
+    else
+        warn "无法读取 chrony 时间源。"
+    fi
+
+    echo ""
+    info "同步状态："
+    tracking_output="$(chronyc tracking 2>/dev/null || true)"
+    if [ -n "$tracking_output" ]; then
+        printf '%s\n' "$tracking_output"
+        if echo "$tracking_output" | grep -Eq '^Leap status[[:space:]]*:[[:space:]]*Normal'; then
+            info "NTP 时间同步已启用。"
+        else
+            warn "chrony 已运行，首次同步可能需要几分钟；当前配置不会重复改写。"
+        fi
+    else
+        warn "无法读取 chrony 同步状态。"
+    fi
+
+    echo ""
+    info "系统时间关键状态："
+    timedatectl show -p Timezone -p NTP -p NTPSynchronized -p TimeUSec 2>/dev/null || true
+    warn "如确认需要立即校准，可手动执行：chronyc makestep"
 }
 
 systemd_unit_exists() {
@@ -4614,7 +4791,7 @@ restore_recorded_ntp_change() {
         warn "旧版 NTP 恢复记录缺少包状态，将保留当前已安装的软件包。"
     fi
     restore_change_file NTP_CONF "$(chrony_conf_path)" || failed=1
-    restore_change_file NTP_SOURCES /etc/chrony/sources.d/vpsbox.sources || failed=1
+    restore_change_file NTP_SOURCES "$CHRONY_SOURCE_FILE" || failed=1
 
     if [ -n "$chrony_unit" ]; then
         restore_ntp_unit_state "$svc" "$chrony_unit" "$chrony_enabled" "$chrony_active" ||
@@ -4654,7 +4831,7 @@ show_chrony_permission_hint() {
 }
 
 enable_ntp_sync() {
-    local svc active_state enabled_state sources_output tracking_output
+    local svc
     local conf source_file backup_dir
     local chrony_package="absent" timesyncd_package="absent"
     local chrony_unit="absent" timesyncd_unit="absent"
@@ -4674,7 +4851,21 @@ enable_ntp_sync() {
 
     svc="$(chrony_service_name)"
     conf="$(chrony_conf_path)"
-    source_file="/etc/chrony/sources.d/vpsbox.sources"
+    source_file="$CHRONY_SOURCE_FILE"
+    if ntp_package_installed chrony &&
+        systemd_unit_exists "${svc}.service" &&
+        chrony_sources_are_current; then
+        if ntp_service_state_is_healthy "$svc"; then
+            info "NTP 配置与 chrony 服务已正常，无需重复安装或改写。"
+        elif ! repair_ntp_service_state "$svc"; then
+            err "NTP 配置正确，但 chrony 服务状态修复失败。"
+            show_chrony_permission_hint "$svc"
+            return 1
+        fi
+        show_ntp_runtime_details "$svc"
+        return 0
+    fi
+
     ntp_package_installed chrony && chrony_package="installed"
     if [ "$OS" = "debian" ] && ntp_package_installed systemd-timesyncd; then
         timesyncd_package="installed"
@@ -4845,41 +5036,7 @@ enable_ntp_sync() {
     cleanup_ntp_snapshot "$backup_dir" ||
         warn "NTP 配置已生效，但临时快照清理失败：$backup_dir"
 
-    enabled_state="$(systemctl is-enabled "$svc" 2>/dev/null || echo "unknown")"
-    active_state="$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")"
-    info "chrony 开机自启：$enabled_state"
-    info "chrony 运行状态：$active_state"
-
-    echo ""
-    info "NTP 时间源："
-    if ! sources_output="$(chronyc sources -v 2>/dev/null)"; then
-        sleep 1
-        sources_output="$(chronyc sources -v 2>/dev/null || true)"
-    fi
-    if [ -n "$sources_output" ]; then
-        printf '%s\n' "$sources_output"
-    else
-        warn "无法读取 chrony 时间源。"
-    fi
-
-    echo ""
-    info "同步状态："
-    tracking_output="$(chronyc tracking 2>/dev/null || true)"
-    if [ -n "$tracking_output" ]; then
-        printf '%s\n' "$tracking_output"
-        if echo "$tracking_output" | grep -Eq '^Leap status[[:space:]]*:[[:space:]]*Normal'; then
-            info "NTP 时间同步已启用。"
-        else
-            warn "chrony 已运行，首次同步可能需要几分钟。"
-        fi
-    else
-        warn "无法读取 chrony 同步状态。"
-    fi
-
-    echo ""
-    info "系统时间关键状态："
-    timedatectl show -p Timezone -p NTP -p NTPSynchronized -p TimeUSec 2>/dev/null || true
-    warn "如确认需要立即校准，可手动执行：chronyc makestep"
+    show_ntp_runtime_details "$svc"
 }
 
 print_ipv4_dns_from_resolvectl() {
@@ -5955,6 +6112,10 @@ sync_fail2ban_sshd_port() {
     if ! fail2ban_installed; then
         return 0
     fi
+    if fail2ban_sshd_configuration_healthy; then
+        info "Fail2ban SSH 防护配置已是当前状态，无需重复同步。"
+        return 0
+    fi
     [ "$(fail2ban_service_state)" = "运行中" ] && was_running=1
     manifest_set_once FAIL2BAN_ACTIVE "$([ "$was_running" -eq 1 ] && echo active || echo inactive)" || return 1
     if fail2ban_service_is_enabled; then
@@ -5978,12 +6139,10 @@ sync_fail2ban_sshd_port() {
     begin_change_transaction FAIL2BAN_SSHD || { err "记录 Fail2ban 修改事务失败，已取消修改。"; return 1; }
 
     tmp="$(mktemp "$FAIL2BAN_CONFIG_DIR/.vpsbox-sshd.XXXXXX")" || return 1
-    cat > "$tmp" <<EOF
-[sshd]
-enabled = true
-port = $ports
-backend = $backend
-EOF
+    render_fail2ban_sshd_config "$ports" "$backend" > "$tmp" || {
+        rm -f "$tmp"
+        return 1
+    }
     chmod 644 "$tmp" || { rm -f "$tmp"; return 1; }
 
     mv -f "$tmp" "$FAIL2BAN_VPSBOX_SSHD_CONF" || return 1
@@ -6700,9 +6859,56 @@ EOF
     fi
 }
 
+render_bbr_fq_config() {
+    cat <<EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+}
+
+bbr_fq_persistent_config_is_current() {
+    [ -f "$BBR_CONF" ] && [ ! -L "$BBR_CONF" ] || return 1
+    render_bbr_fq_config | cmp -s - "$BBR_CONF"
+}
+
+bbr_fq_runtime_is_current() {
+    [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" = "bbr" ] &&
+        [ "$(sysctl -n net.core.default_qdisc 2>/dev/null || true)" = "fq" ]
+}
+
+repair_bbr_fq_runtime() {
+    local old_cc old_fq
+
+    old_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+    old_fq="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
+    if ! modprobe tcp_bbr >/dev/null 2>&1 ||
+        ! modprobe sch_fq >/dev/null 2>&1 ||
+        ! sysctl -p "$BBR_CONF" >/dev/null 2>&1 ||
+        ! bbr_fq_runtime_is_current; then
+        [ -n "$old_cc" ] && sysctl -w "net.ipv4.tcp_congestion_control=$old_cc" >/dev/null 2>&1 || true
+        [ -n "$old_fq" ] && sysctl -w "net.core.default_qdisc=$old_fq" >/dev/null 2>&1 || true
+        return 1
+    fi
+}
+
 enable_bbr_fq() {
     local old_cc old_fq tmp backup_dir
     local had_old_conf=0
+
+    if bbr_fq_persistent_config_is_current; then
+        if bbr_fq_runtime_is_current; then
+            info "BBR + fq 配置和运行状态已正确，无需重复应用。"
+            return 0
+        fi
+        info "BBR + fq 持久化配置已存在，正在轻量修复运行参数..."
+        if ! repair_bbr_fq_runtime; then
+            err "BBR + fq 运行参数修复失败，已恢复修改前的运行参数。"
+            return 1
+        fi
+        info "当前 BBR：$(bbr_state)"
+        info "当前 fq：$(fq_state)"
+        return 0
+    fi
 
     old_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
     old_fq="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
@@ -6717,10 +6923,11 @@ enable_bbr_fq() {
     fi
     begin_change_transaction BBR_CONF || { rm -rf "$backup_dir"; err "记录 BBR 修改事务失败，已取消修改。"; return 1; }
     tmp="$(mktemp /etc/sysctl.d/.vpsbox-bbr.XXXXXX)" || { rm -rf "$backup_dir"; return 1; }
-    cat > "$tmp" <<EOF
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
+    render_bbr_fq_config > "$tmp" || {
+        rm -f "$tmp"
+        rm -rf "$backup_dir"
+        return 1
+    }
 
     if ! modprobe tcp_bbr >/dev/null 2>&1 || ! modprobe sch_fq >/dev/null 2>&1; then
         rm -f "$tmp"; rm -rf "$backup_dir"
@@ -6751,64 +6958,72 @@ EOF
     info "当前 fq：$(fq_state)"
 }
 
-install_fail2ban() {
-    info "正在安装 Fail2ban..."
+ensure_fail2ban_service_running() {
+    if is_systemd; then
+        systemctl enable fail2ban >/dev/null 2>&1 || return 1
+        if [ "$(fail2ban_service_state)" != "运行中" ]; then
+            retry 3 2 systemctl start fail2ban || return 1
+        fi
+    elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
+        command -v rc-update >/dev/null 2>&1 || return 1
+        rc-update add fail2ban default >/dev/null 2>&1 || return 1
+        if [ "$(fail2ban_service_state)" != "运行中" ]; then
+            retry 3 2 rc-service fail2ban start || return 1
+        fi
+    else
+        return 1
+    fi
+}
 
+install_fail2ban() {
     detect_os
-    case "$OS" in
-        debian)
-            export DEBIAN_FRONTEND=noninteractive
-            if ! apt_get_bounded "$PACKAGE_UPDATE_TIMEOUT" update ||
-                ! apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban ||
-                ! retry 3 2 systemctl enable --now fail2ban; then
-                warn "Fail2ban 安装或启动未完全成功，将尝试写入最小 SSH 配置后重启。"
-            fi
-            ;;
-        alpine)
-            if ! apk_bounded "$PACKAGE_UPDATE_TIMEOUT" update ||
-                ! apk_bounded "$PACKAGE_INSTALL_TIMEOUT" add --no-cache fail2ban; then
-                err "Fail2ban 安装失败。"
+    if fail2ban_sshd_configuration_healthy; then
+        info "Fail2ban SSH 防护已正常运行，无需重复安装或配置。"
+        return 0
+    fi
+
+    if ! fail2ban_installed; then
+        info "正在安装 Fail2ban..."
+        case "$OS" in
+            debian)
+                export DEBIAN_FRONTEND=noninteractive
+                if ! apt_get_bounded "$PACKAGE_UPDATE_TIMEOUT" update ||
+                    ! apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban; then
+                    warn "Fail2ban 安装未完全成功，将检查最终安装状态。"
+                fi
+                ;;
+            alpine)
+                if ! apk_bounded "$PACKAGE_UPDATE_TIMEOUT" update ||
+                    ! apk_bounded "$PACKAGE_INSTALL_TIMEOUT" add --no-cache fail2ban; then
+                    err "Fail2ban 安装失败。"
+                    return 1
+                fi
+                ;;
+            redhat)
+                if command -v dnf >/dev/null 2>&1; then
+                    dnf_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban || { err "Fail2ban 安装失败。"; return 1; }
+                else
+                    yum_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban || { err "Fail2ban 安装失败。"; return 1; }
+                fi
+                ;;
+            *)
+                err "未识别系统类型，无法自动安装 Fail2ban。"
                 return 1
-            fi
-            if command -v rc-update >/dev/null 2>&1; then
-                rc-update add fail2ban default >/dev/null 2>&1 || true
-            fi
-            if command -v rc-service >/dev/null 2>&1; then
-                retry 3 2 rc-service fail2ban start || true
-            fi
-            ;;
-        redhat)
-            if command -v dnf >/dev/null 2>&1; then
-                dnf_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban || { err "Fail2ban 安装失败。"; return 1; }
-            else
-                yum_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban || { err "Fail2ban 安装失败。"; return 1; }
-            fi
-            if is_systemd; then
-                retry 3 2 systemctl enable --now fail2ban || true
-            fi
-            ;;
-        *)
-            err "未识别系统类型，无法自动安装 Fail2ban。"
-            return 1
-            ;;
-    esac
+                ;;
+        esac
+    else
+        info "Fail2ban 已安装，正在检查服务与 SSH 防护配置..."
+    fi
 
     if ! fail2ban_installed; then
         err "Fail2ban 未安装成功，请检查软件源或网络。"
         return 1
     fi
 
-    if is_systemd; then
-        systemctl enable fail2ban >/dev/null 2>&1 || {
-            err "无法设置 Fail2ban 开机自启。"
-            return 1
-        }
-    elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
-        rc-update add fail2ban default >/dev/null 2>&1 || {
-            err "无法设置 Fail2ban 开机自启。"
-            return 1
-        }
-    fi
+    ensure_fail2ban_service_running || {
+        err "无法启动 Fail2ban 或设置开机自启。"
+        return 1
+    }
 
     info "正在按 SSH 当前生效端口配置 Fail2ban..."
     sync_fail2ban_sshd_port || {
@@ -6816,7 +7031,9 @@ install_fail2ban() {
         return 1
     }
 
-    if [ "$(fail2ban_service_state)" != "运行中" ] || [ "$(fail2ban_sshd_state)" != "已启用" ]; then
+    if ! fail2ban_service_is_enabled ||
+        [ "$(fail2ban_service_state)" != "运行中" ] ||
+        [ "$(fail2ban_sshd_state)" != "已启用" ]; then
         err "Fail2ban 未达到预期状态，请检查服务日志和 SSH 端口配置。"
         return 1
     fi
@@ -11292,9 +11509,30 @@ start_service_action() {
         warn "当前没有节点配置，请先创建节点。"
         return 0
     fi
+
+    if service_is_running &&
+        verify_current_node_runtime &&
+        singbox_service_definition_is_current; then
+        if ! service_is_enabled; then
+            service_enable || {
+                err "sing-box 正在运行，但设置开机自启失败。"
+                return 1
+            }
+        fi
+        info "sing-box 服务已在运行，无需重复启动。"
+        return 0
+    fi
+
     install_singbox_if_missing || return 1
-    setup_service || return 1
-    restart_singbox_cleanly || return 1
+    if singbox_service_definition_is_current &&
+        ! service_manager_is_active &&
+        [ -z "$(singbox_config_pids)" ]; then
+        service_is_enabled || service_enable || return 1
+        service_start || return 1
+    else
+        setup_service || return 1
+        restart_singbox_cleanly || return 1
+    fi
     if ! verify_current_node_runtime; then
         err "sing-box 未保持运行或节点端口未按协议完整监听。"
         return 1
@@ -11441,6 +11679,15 @@ limit_systemd_journal() {
     if ! command -v journalctl >/dev/null 2>&1; then
         err "未找到 journalctl，无法清理 systemd 日志。"
         return 1
+    fi
+
+    if [ "$(journald_limit_state)" = "已配置" ] &&
+        systemctl is-active --quiet systemd-journald 2>/dev/null; then
+        info "systemd 日志限制已正确生效，无需重复写入或重启服务。"
+        info "当前日志占用：$(journal_disk_usage)"
+        info "总大小：500M"
+        info "单文件：50M"
+        return 0
     fi
 
     conf_dir="$(dirname "$JOURNALD_VPSBOX_CONF")"

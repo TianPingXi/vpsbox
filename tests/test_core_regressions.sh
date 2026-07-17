@@ -257,6 +257,71 @@ test_service_restore_checks_final_state() {
     )
 }
 
+test_start_service_action_healthy_is_noop() {
+    (
+        local log="$TEST_TMP/start-service-healthy.log"
+        : > "$log"
+        require_valid_node_state_if_present() { return 0; }
+        node_exists() { return 0; }
+        service_is_running() { return 0; }
+        verify_current_node_runtime() { return 0; }
+        singbox_service_definition_is_current() { return 0; }
+        service_is_enabled() { return 0; }
+        install_singbox_if_missing() { printf '%s\n' install >> "$log"; }
+        service_enable() { printf '%s\n' enable >> "$log"; }
+        setup_service() { printf '%s\n' setup >> "$log"; }
+        restart_singbox_cleanly() { printf '%s\n' restart >> "$log"; }
+        service_start() { printf '%s\n' start >> "$log"; }
+
+        start_service_action >/dev/null
+        assert_empty_file "$log" "健康的 sing-box 启动操作不得产生修改"
+    )
+}
+
+test_start_service_action_uses_light_start() {
+    (
+        local log="$TEST_TMP/start-service-light.log"
+        : > "$log"
+        require_valid_node_state_if_present() { return 0; }
+        node_exists() { return 0; }
+        service_is_running() { return 1; }
+        install_singbox_if_missing() { printf '%s\n' install >> "$log"; }
+        singbox_service_definition_is_current() { return 0; }
+        service_manager_is_active() { return 1; }
+        singbox_config_pids() { return 0; }
+        service_is_enabled() { return 0; }
+        service_enable() { printf '%s\n' enable >> "$log"; }
+        service_start() { printf '%s\n' start >> "$log"; }
+        setup_service() { printf '%s\n' setup >> "$log"; }
+        restart_singbox_cleanly() { printf '%s\n' restart >> "$log"; }
+        verify_current_node_runtime() { return 0; }
+
+        start_service_action >/dev/null
+        assert_file_contains "$log" '^install$'
+        assert_file_contains "$log" '^start$'
+        assert_file_not_contains "$log" '^(enable|setup|restart)$' \
+            "当前服务定义只需启动时不得重写或重启"
+    )
+}
+
+test_restart_service_action_keeps_full_restart() {
+    (
+        local log="$TEST_TMP/restart-service-full.log"
+        : > "$log"
+        require_valid_node_state_if_present() { return 0; }
+        node_exists() { return 0; }
+        install_singbox_if_missing() { printf '%s\n' install >> "$log"; }
+        setup_service() { printf '%s\n' setup >> "$log"; }
+        restart_singbox_cleanly() { printf '%s\n' restart >> "$log"; }
+        verify_current_node_runtime() { return 0; }
+
+        restart_service_action >/dev/null
+        assert_file_contains "$log" '^install$'
+        assert_file_contains "$log" '^setup$'
+        assert_file_contains "$log" '^restart$'
+    )
+}
+
 test_test_mode_blocks_real_service_mutation() {
     if service_start >"$TEST_TMP/service-guard.out" 2>&1; then
         fail "测试模式不得调用真实服务启动命令"
@@ -481,6 +546,9 @@ main() {
         test_node_state_writes_are_atomic
         test_service_running_requires_exact_config_process
         test_service_restore_checks_final_state
+        test_start_service_action_healthy_is_noop
+        test_start_service_action_uses_light_start
+        test_restart_service_action_keeps_full_restart
         test_test_mode_blocks_real_service_mutation
         test_protocol_specific_listener_checks
         test_install_self_reports_download_failure

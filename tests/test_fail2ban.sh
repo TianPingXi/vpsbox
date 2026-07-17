@@ -358,6 +358,81 @@ test_sync_restores_initial_stopped_state() {
     assert_eq 0 "$running" "同步后不得把原本停止的 Fail2ban 留在运行状态"
 }
 
+test_sync_healthy_configuration_is_noop() {
+    (
+        local log="$TEST_TMP/fail2ban-sync-healthy.log"
+        : > "$log"
+        fail2ban_installed() { return 0; }
+        fail2ban_sshd_configuration_healthy() { return 0; }
+        manifest_set_once() { printf '%s\n' manifest >> "$log"; }
+        backup_change_file_once() { printf '%s\n' backup >> "$log"; }
+        verify_fail2ban_real_ban() { printf '%s\n' ban-test >> "$log"; }
+
+        sync_fail2ban_sshd_port >/dev/null
+        assert_empty_file "$log" "健康的 Fail2ban 配置不得备份、改写或测试封禁"
+    )
+}
+
+test_fail2ban_health_requires_canonical_current_config() {
+    (
+        local dir="$TEST_TMP/fail2ban-health"
+        reset_mock
+        mkdir -p "$dir"
+        FAIL2BAN_VPSBOX_SSHD_CONF="$dir/99-vpsbox-sshd.local"
+        render_fail2ban_sshd_config 22222 systemd > "$FAIL2BAN_VPSBOX_SSHD_CONF"
+        fail2ban_installed() { return 0; }
+        fail2ban_service_state() { printf '运行中\n'; }
+        fail2ban_service_is_enabled() { return 0; }
+        ssh_effective_ports_csv() { printf '22222\n'; }
+        is_systemd() { return 0; }
+
+        fail2ban_sshd_configuration_healthy ||
+            fail "规范配置、端口及服务状态正常时应识别为健康"
+        printf 'port = 22\n' >> "$FAIL2BAN_VPSBOX_SSHD_CONF"
+        if fail2ban_sshd_configuration_healthy; then
+            fail "含额外漂移内容的 Fail2ban 配置不得跳过同步"
+        fi
+    )
+}
+
+test_install_fail2ban_healthy_is_noop() {
+    (
+        local log="$TEST_TMP/fail2ban-install-healthy.log"
+        : > "$log"
+        detect_os() { OS=debian; }
+        fail2ban_sshd_configuration_healthy() { return 0; }
+        fail2ban_installed() { printf '%s\n' installed-check >> "$log"; return 0; }
+        apt_get_bounded() { printf '%s\n' package >> "$log"; }
+        ensure_fail2ban_service_running() { printf '%s\n' service >> "$log"; }
+        sync_fail2ban_sshd_port() { printf '%s\n' sync >> "$log"; }
+
+        install_fail2ban >/dev/null
+        assert_empty_file "$log" "健康的 Fail2ban 安装操作不得触发包管理或服务修改"
+    )
+}
+
+test_installed_fail2ban_repairs_without_package_manager() {
+    (
+        local log="$TEST_TMP/fail2ban-install-repair.log"
+        : > "$log"
+        detect_os() { OS=debian; }
+        fail2ban_sshd_configuration_healthy() { return 1; }
+        fail2ban_installed() { return 0; }
+        apt_get_bounded() { printf '%s\n' package >> "$log"; }
+        ensure_fail2ban_service_running() { printf '%s\n' service >> "$log"; }
+        sync_fail2ban_sshd_port() { printf '%s\n' sync >> "$log"; }
+        fail2ban_service_is_enabled() { return 0; }
+        fail2ban_service_state() { printf '运行中\n'; }
+        fail2ban_sshd_state() { printf '已启用\n'; }
+        ssh_effective_ports_csv() { printf '22222\n'; }
+
+        install_fail2ban >/dev/null
+        assert_file_contains "$log" '^service$'
+        assert_file_contains "$log" '^sync$'
+        assert_file_not_contains "$log" '^package$' "已安装时不得访问软件源"
+    )
+}
+
 test_fail2ban_backup_rotation_keeps_five() {
     local dir="$TEST_TMP/fail2ban-backups" i count
     mkdir -p "$dir"
@@ -394,6 +469,10 @@ main() {
         test_stale_active_test_blocks_new_ban
         test_sync_validation_failure_rolls_back
         test_sync_restores_initial_stopped_state
+        test_sync_healthy_configuration_is_noop
+        test_fail2ban_health_requires_canonical_current_config
+        test_install_fail2ban_healthy_is_noop
+        test_installed_fail2ban_repairs_without_package_manager
         test_fail2ban_backup_rotation_keeps_five
     )
 
