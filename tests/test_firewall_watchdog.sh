@@ -62,6 +62,8 @@ reset_firewall_case() {
 
     CASE_DIR="$TEST_TMP/$name"
     RUNTIME_DIR="$CASE_DIR/run"
+    VPSBOX_STATE_DIR="$CASE_DIR/state"
+    FIREWALL_ROLLBACK_DIR="$VPSBOX_STATE_DIR/firewall-rollbacks"
     # These globals are consumed by functions sourced from vpsbox.sh.
     # shellcheck disable=SC2034
     FIREWALL_CONFIG="$CASE_DIR/etc/vpsbox-firewall.nft"
@@ -110,6 +112,8 @@ test_commit_stops_watchdog_and_sleep() {
     trap cleanup_case_processes EXIT
     reset_firewall_case commit
     firewall_create_rollback_snapshot snapshot ""
+    [[ "$snapshot" == "$FIREWALL_ROLLBACK_DIR"/firewall-rollback.* ]] ||
+        fail "新防火墙回滚快照必须保存在持久目录"
     firewall_start_rollback_watchdog "$snapshot"
     watchdog="$(cat "$snapshot/watchdog.pid")"
     CASE_TEST_PIDS="$watchdog"

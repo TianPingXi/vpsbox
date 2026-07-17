@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.25"
+VPSBOX_VERSION="v1.0.26"
 # 用户名迁移完成后使用新地址；旧地址仅作为迁移回退，并用于识别 v1.0.23 备份。
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 SCRIPT_URL_FALLBACK="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
@@ -38,6 +38,7 @@ FIREWALL_SYSTEMD_UNIT="/etc/systemd/system/vpsbox-firewall.service"
 FIREWALL_OPENRC_SERVICE="/etc/init.d/vpsbox-firewall"
 FIREWALL_SERVICE_NAME="vpsbox-firewall"
 FIREWALL_ROLLBACK_SECONDS=90
+FIREWALL_ROLLBACK_DIR="$VPSBOX_STATE_DIR/firewall-rollbacks"
 PACKAGE_CONNECT_TIMEOUT=15
 PACKAGE_UPDATE_TIMEOUT=120
 PACKAGE_INSTALL_TIMEOUT=600
@@ -63,6 +64,13 @@ ACTIVE_TRACE_TMP=""
 ACTIVE_UNAPPLIED_SSH_TRACKING=0
 ACTIVE_FAIL2BAN_TEST_IP=""
 ACTIVE_FAIL2BAN_TEST_BACKENDS=""
+ACTIVE_SINGBOX_UPDATE_BINARY=""
+ACTIVE_SINGBOX_UPDATE_BACKUP=""
+ACTIVE_SINGBOX_UPDATE_DIR=""
+ACTIVE_SINGBOX_UPDATE_WAS_ENABLED=0
+ACTIVE_SINGBOX_UPDATE_WAS_ACTIVE=0
+ACTIVE_SINGBOX_UPDATE_MUTATED=0
+ACTIVE_SINGBOX_UPDATE_ROLLING_BACK=0
 SERVICE_NAME="sing-box"
 METHOD="2022-blake3-aes-128-gcm"
 PORT_MIN=10000
@@ -568,6 +576,10 @@ cleanup_vpsbox_runtime() {
     if declare -F cleanup_active_bounded_command >/dev/null 2>&1; then
         cleanup_active_bounded_command
     fi
+    if declare -F rollback_active_singbox_update >/dev/null 2>&1; then
+        rollback_active_singbox_update ||
+            warn "sing-box 更新被中断，旧版本或原服务状态未能完整恢复；更新备份已保留。"
+    fi
     if [[ "$backup" == /tmp/vpsbox-node-backup.* ]] && [ -d "$backup" ]; then
         if declare -F rollback_active_node_transaction >/dev/null 2>&1; then
             rollback_active_node_transaction || true
@@ -586,7 +598,8 @@ cleanup_vpsbox_runtime() {
         firewall_abort_port_transition ||
             warn "端口切换被中断，防火墙临时规则恢复失败，请重新进入防火墙菜单更新。"
     fi
-    if [[ "$firewall_rollback" == "$RUNTIME_DIR"/firewall-rollback.* ]] &&
+    if declare -F firewall_rollback_dir_valid >/dev/null 2>&1 &&
+        firewall_rollback_dir_valid "$firewall_rollback" &&
         [ -d "$firewall_rollback" ] && [ ! -L "$firewall_rollback" ] &&
         declare -F firewall_restore_snapshot_now >/dev/null 2>&1; then
         if [ -e "$firewall_rollback/completed" ]; then
@@ -715,6 +728,19 @@ write_lockdir_metadata() {
     } > "$LOCK_DIR/pid"
 }
 
+wait_for_lockdir_metadata() {
+    local i
+
+    # mkdir 是原子的，但创建者在写入 pid 元数据前存在极短窗口；等待后再判断残留，
+    # 避免没有 flock 的系统上两个并发菜单互相删除刚创建的有效锁。
+    for i in {1..10}; do
+        [ -s "$LOCK_DIR/pid" ] && return 0
+        [ -d "$LOCK_DIR" ] && [ ! -L "$LOCK_DIR" ] || return 1
+        sleep 0.1
+    done
+    [ -s "$LOCK_DIR/pid" ]
+}
+
 acquire_lock() {
     local old_pid=""
 
@@ -761,6 +787,12 @@ acquire_lock() {
         return 0
     fi
 
+    if [ -L "$LOCK_DIR" ] || { [ -e "$LOCK_DIR" ] && [ ! -d "$LOCK_DIR" ]; }; then
+        err "$LOCK_DIR 不是安全的锁目录，已拒绝使用。"
+        exit 1
+    fi
+
+    wait_for_lockdir_metadata || true
     old_pid="$(lock_pid_from_file "$LOCK_DIR/pid" || true)"
     [ -z "$old_pid" ] && old_pid="$(find_running_vpsbox_pid || true)"
     if ! process_alive "$old_pid"; then
@@ -825,8 +857,14 @@ is_systemd() {
 }
 
 install_command_alias() {
-    chmod 755 "$CMD_PATH" 2>/dev/null || true
-    ln -sf "$CMD_PATH" /usr/bin/vpsbox 2>/dev/null || true
+    chmod 755 "$CMD_PATH" || {
+        err "无法设置管理命令权限：$CMD_PATH"
+        return 1
+    }
+    ln -sf "$CMD_PATH" /usr/bin/vpsbox || {
+        err "无法创建命令入口：/usr/bin/vpsbox"
+        return 1
+    }
 }
 
 ensure_curl() {
@@ -1109,31 +1147,31 @@ run_singbox_installer() {
 
 install_self_command() {
     local src
-    src="${BASH_SOURCE[0]:-$0}"
+    src="${1:-${BASH_SOURCE[0]:-$0}}"
 
-    mkdir -p "$(dirname "$CMD_PATH")" || { warn "无法创建管理命令目录。"; return 0; }
+    mkdir -p "$(dirname "$CMD_PATH")" || { err "无法创建管理命令目录。"; return 1; }
 
     case "$src" in
         /dev/fd/*|/proc/*)
             if download_vpsbox_script "$CMD_PATH"; then
-                install_command_alias
+                install_command_alias || return 1
                 return 0
             fi
-            warn "管理命令安装失败，可重新运行安装命令。"
-            return 0
+            err "管理命令安装失败，请检查网络后重新运行安装命令。"
+            return 1
             ;;
     esac
 
-    [ -f "$src" ] || return 0
+    [ -f "$src" ] || { err "找不到当前 vpsbox 脚本：$src"; return 1; }
 
     if [ "$(readlink -f "$src" 2>/dev/null || echo "$src")" != "$CMD_PATH" ]; then
         if ! cp "$src" "$CMD_PATH" 2>/dev/null; then
-            warn "无法安装管理命令到 $CMD_PATH。"
-            return 0
+            err "无法安装管理命令到 $CMD_PATH。"
+            return 1
         fi
-        install_command_alias
+        install_command_alias || return 1
     else
-        install_command_alias
+        install_command_alias || return 1
     fi
 }
 
@@ -1366,7 +1404,15 @@ install_singbox_if_missing() {
     info "sing-box 安装完成：$(singbox_version)"
 }
 
+refuse_service_mutation_in_test() {
+    if [ "${VPSBOX_TEST_MODE:-0}" = "1" ]; then
+        err "测试模式禁止调用真实服务管理命令：$1"
+        return 1
+    fi
+}
+
 service_start() {
+    refuse_service_mutation_in_test service_start || return 1
     if is_systemd; then
         retry 3 2 systemctl start "$SERVICE_NAME"
     elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
@@ -1378,6 +1424,7 @@ service_start() {
 }
 
 service_stop() {
+    refuse_service_mutation_in_test service_stop || return 1
     if is_systemd; then
         retry 3 2 systemctl stop "$SERVICE_NAME"
     elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
@@ -1389,6 +1436,7 @@ service_stop() {
 }
 
 service_enable() {
+    refuse_service_mutation_in_test service_enable || return 1
     if is_systemd; then
         systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
     elif [ "$OS" = "alpine" ] && command -v rc-update >/dev/null 2>&1; then
@@ -1409,6 +1457,7 @@ service_is_enabled() {
 }
 
 service_disable() {
+    refuse_service_mutation_in_test service_disable || return 1
     if is_systemd; then
         systemctl disable "$SERVICE_NAME" >/dev/null 2>&1
     elif [ "$OS" = "alpine" ] && command -v rc-update >/dev/null 2>&1; then
@@ -1418,31 +1467,30 @@ service_disable() {
     fi
 }
 
-service_status_short() {
-    if ! singbox_installed; then
-        echo "未运行"
-        return
-    fi
-
+service_manager_is_active() {
     if is_systemd; then
-        if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-            echo "运行中"
-        else
-            echo "未运行"
-        fi
+        systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null
     elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
-        if rc-service "$SERVICE_NAME" status >/dev/null 2>&1; then
-            echo "运行中"
-        else
-            echo "未运行"
-        fi
+        rc-service "$SERVICE_NAME" status >/dev/null 2>&1
     else
-        echo "未知"
+        return 1
     fi
 }
 
 service_is_running() {
-    [ "$(service_status_short)" = "运行中" ]
+    singbox_installed && service_manager_is_active && [ -n "$(singbox_config_pids)" ]
+}
+
+service_status_short() {
+    if ! singbox_installed; then
+        echo "未运行"
+    elif service_is_running; then
+        echo "运行中"
+    elif is_systemd || { [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; }; then
+        echo "未运行"
+    else
+        echo "未知"
+    fi
 }
 
 singbox_config_pids() {
@@ -1471,6 +1519,7 @@ singbox_config_pids() {
 stop_singbox_config_processes() {
     local pids pid i
 
+    refuse_service_mutation_in_test stop_singbox_config_processes || return 1
     pids="$(singbox_config_pids)"
     [ -n "$pids" ] || return 0
     warn "检测到使用 $CONFIG_PATH 的残留 sing-box 进程，正在停止：$(echo "$pids" | tr '\n' ' ')"
@@ -1490,12 +1539,19 @@ stop_singbox_config_processes() {
 }
 
 restart_singbox_cleanly() {
-    service_stop 2>/dev/null || true
+    local stop_failed=0
+
+    service_stop 2>/dev/null || stop_failed=1
     stop_singbox_config_processes || {
         err "旧 sing-box 进程无法停止，已拒绝启动新实例。"
         return 1
     }
-    service_start
+    if [ "$stop_failed" -eq 1 ] && service_manager_is_active; then
+        err "服务管理器未能停止旧 sing-box，已拒绝启动新实例。"
+        return 1
+    fi
+    service_start || return 1
+    service_is_running
 }
 
 restore_singbox_service_state() {
@@ -1503,14 +1559,21 @@ restore_singbox_service_state() {
 
     if [ "$was_enabled" = "1" ]; then
         service_enable || return 1
+        service_is_enabled || return 1
     else
-        service_disable 2>/dev/null || true
+        if ! service_disable && service_is_enabled; then
+            return 1
+        fi
+        service_is_enabled && return 1
     fi
     if [ "$was_active" = "1" ]; then
         restart_singbox_cleanly && service_is_running
     else
-        service_stop 2>/dev/null || true
-        stop_singbox_config_processes
+        if ! service_stop && service_manager_is_active; then
+            return 1
+        fi
+        stop_singbox_config_processes || return 1
+        ! service_manager_is_active && [ -z "$(singbox_config_pids)" ]
     fi
 }
 
@@ -1749,43 +1812,62 @@ load_state() {
     FINGERPRINT="$fingerprint"
 }
 
+commit_node_state_file() {
+    local tmp="$1"
+
+    if ! chown root:root "$tmp" ||
+        ! chmod 600 "$tmp" ||
+        ! mv -f -- "$tmp" "$STATE_FILE"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
 save_state() {
     local domain="$1"
     local name="$2"
     local port="$3"
     local password="$4"
+    local tmp
 
     secure_config_dir || return 1
-    {
-        printf 'PROTOCOL=shadowsocks\n'
-        printf 'DOMAIN=%s\n' "$domain"
-        printf 'NAME=%s\n' "$name"
-        printf 'PORT=%s\n' "$port"
-        printf 'PASSWORD=%s\n' "$password"
-        printf 'METHOD=%s\n' "$METHOD"
-    } > "$STATE_FILE"
-    chown root:root "$STATE_FILE" || return 1
-    chmod 600 "$STATE_FILE" || return 1
+    tmp="$(mktemp "$CONFIG_DIR/.vpsbox-state.XXXXXX")" || return 1
+    if ! {
+        printf 'PROTOCOL=shadowsocks\n' &&
+            printf 'DOMAIN=%s\n' "$domain" &&
+            printf 'NAME=%s\n' "$name" &&
+            printf 'PORT=%s\n' "$port" &&
+            printf 'PASSWORD=%s\n' "$password" &&
+            printf 'METHOD=%s\n' "$METHOD"
+    } > "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    commit_node_state_file "$tmp"
 }
 
 save_vless_reality_state() {
     local domain="$1" name="$2" port="$3" uuid="$4" server_name="$5" public_key="$6" short_id="$7"
+    local tmp
 
     secure_config_dir || return 1
-    {
-        printf 'PROTOCOL=vless-reality\n'
-        printf 'DOMAIN=%s\n' "$domain"
-        printf 'NAME=%s\n' "$name"
-        printf 'PORT=%s\n' "$port"
-        printf 'UUID=%s\n' "$uuid"
-        printf 'FLOW=xtls-rprx-vision\n'
-        printf 'REALITY_SERVER_NAME=%s\n' "$server_name"
-        printf 'REALITY_PUBLIC_KEY=%s\n' "$public_key"
-        printf 'REALITY_SHORT_ID=%s\n' "$short_id"
-        printf 'FINGERPRINT=chrome\n'
-    } > "$STATE_FILE"
-    chown root:root "$STATE_FILE" || return 1
-    chmod 600 "$STATE_FILE" || return 1
+    tmp="$(mktemp "$CONFIG_DIR/.vpsbox-state.XXXXXX")" || return 1
+    if ! {
+        printf 'PROTOCOL=vless-reality\n' &&
+            printf 'DOMAIN=%s\n' "$domain" &&
+            printf 'NAME=%s\n' "$name" &&
+            printf 'PORT=%s\n' "$port" &&
+            printf 'UUID=%s\n' "$uuid" &&
+            printf 'FLOW=xtls-rprx-vision\n' &&
+            printf 'REALITY_SERVER_NAME=%s\n' "$server_name" &&
+            printf 'REALITY_PUBLIC_KEY=%s\n' "$public_key" &&
+            printf 'REALITY_SHORT_ID=%s\n' "$short_id" &&
+            printf 'FINGERPRINT=chrome\n'
+    } > "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    commit_node_state_file "$tmp"
 }
 
 normalize_host() {
@@ -2184,15 +2266,59 @@ cleanup_node_backup() {
     rm -rf "$backup_dir"
 }
 
-port_in_use() {
+port_in_use_tcp() {
     local port="$1"
-    ss -tuln 2>/dev/null | awk '{print $5}' | grep -Eq "[:.]${port}$"
+    ss -H -ltn 2>/dev/null |
+        awk -v port="$port" '$4 ~ ("[:.]" port "$") { found=1 } END { exit !found }'
+}
+
+port_in_use_udp() {
+    local port="$1"
+    ss -H -lun 2>/dev/null |
+        awk -v port="$port" '$4 ~ ("[:.]" port "$") { found=1 } END { exit !found }'
+}
+
+port_in_use_for_protocols() {
+    local port="$1" protocols="${2:-both}"
+
+    case "$protocols" in
+        tcp) port_in_use_tcp "$port" ;;
+        udp) port_in_use_udp "$port" ;;
+        both) port_in_use_tcp "$port" || port_in_use_udp "$port" ;;
+        *) return 2 ;;
+    esac
+}
+
+port_in_use() {
+    port_in_use_for_protocols "$1" both
+}
+
+port_conflicts_with_existing_node() {
+    local port="$1" desired="$2" existing="$3"
+
+    case "$desired:$existing" in
+        tcp:tcp|tcp:both|udp:udp|udp:both|both:both) return 1 ;;
+        both:tcp) port_in_use_udp "$port" ;;
+        both:udp) port_in_use_tcp "$port" ;;
+        *) port_in_use_for_protocols "$port" "$desired" ;;
+    esac
+}
+
+port_listener_ready() {
+    local port="$1" protocols="${2:-both}"
+
+    case "$protocols" in
+        tcp) port_in_use_tcp "$port" ;;
+        udp) port_in_use_udp "$port" ;;
+        both) port_in_use_tcp "$port" && port_in_use_udp "$port" ;;
+        *) return 2 ;;
+    esac
 }
 
 wait_for_port_listener() {
-    local port="$1" i
+    local port="$1" protocols="${2:-both}" i
     for i in 1 2 3 4 5; do
-        port_in_use "$port" && return 0
+        port_listener_ready "$port" "$protocols" && return 0
         sleep 1
     done
     return 1
@@ -2231,19 +2357,19 @@ listen_mode() {
 }
 
 random_port() {
-    local port docker_ports
+    local port docker_ports protocols="${2:-both}"
     local i
     if [ "$#" -ge 1 ]; then
         docker_ports="$1"
     else
-        docker_ports="$(docker_reserved_ports_csv)" || {
+        docker_ports="$(docker_reserved_ports_csv "$protocols")" || {
             err "无法可靠读取 Docker 已发布端口，已取消随机端口选择。"
             return 1
         }
     fi
     for i in $(seq 1 100); do
         port="$(shuf -i "${PORT_MIN}-${PORT_MAX}" -n 1 2>/dev/null || echo $((RANDOM % (PORT_MAX - PORT_MIN + 1) + PORT_MIN)))"
-        if ! port_in_use "$port" &&
+        if ! port_in_use_for_protocols "$port" "$protocols" &&
             ! port_is_effective_ssh_port "$port" &&
             ! csv_contains_port "$docker_ports" "$port"; then
             echo "$port"
@@ -2260,7 +2386,7 @@ random_trace_source_port() {
     # 探测源端口不是入站服务端口，不应依赖 Docker daemon 的保留端口清单。
     for i in $(seq 1 100); do
         port="$(shuf -i "${PORT_MIN}-${PORT_MAX}" -n 1 2>/dev/null || echo $((RANDOM % (PORT_MAX - PORT_MIN + 1) + PORT_MIN)))"
-        if ! port_in_use "$port"; then
+        if ! port_in_use_tcp "$port"; then
             echo "$port"
             return 0
         fi
@@ -2298,9 +2424,10 @@ port_is_effective_ssh_port() {
 }
 
 choose_node_port() {
-    local existing_port="${1:-}" input confirm docker_ports
+    local existing_port="${1:-}" protocols="${2:-both}" existing_protocols="${3:-}"
+    local input confirm docker_ports
 
-    docker_ports="$(docker_reserved_ports_for_port_choice)" || {
+    docker_ports="$(docker_reserved_ports_for_port_choice "$protocols")" || {
         err "无法可靠读取 Docker 已发布端口，已取消节点端口选择。"
         return 1
     }
@@ -2313,7 +2440,7 @@ choose_node_port() {
         fi
         read -r input || return 1
         if [ -z "$input" ]; then
-            random_port "$docker_ports"
+            random_port "$docker_ports" "$protocols"
             return $?
         fi
         if ! is_valid_port "$input"; then
@@ -2324,11 +2451,13 @@ choose_node_port() {
             err "端口 $input 是当前 SSH 生效端口，不能用于节点。"
             continue
         fi
-        if [ "$input" != "$existing_port" ] && port_in_use "$input"; then
+        if { [ "$input" = "$existing_port" ] &&
+            port_conflicts_with_existing_node "$input" "$protocols" "$existing_protocols"; } ||
+            { [ "$input" != "$existing_port" ] && port_in_use_for_protocols "$input" "$protocols"; }; then
             err "端口 $input 已被占用，请更换。"
             continue
         fi
-        if [ "$input" != "$existing_port" ] && csv_contains_port "$docker_ports" "$input"; then
+        if csv_contains_port "$docker_ports" "$input"; then
             err "端口 $input 已被 Docker 发布规则占用，请更换。"
             continue
         fi
@@ -2588,7 +2717,7 @@ EOF
 
 create_or_rebuild_node() {
     local backup_dir
-    local existing_port=""
+    local existing_port="" existing_protocols=""
     require_valid_node_state_if_present || return 1
     backup_dir="$(mktemp -d /tmp/vpsbox-node-backup.XXXXXX)" || return 1
     if ! backup_node_files "$backup_dir"; then
@@ -2602,6 +2731,7 @@ create_or_rebuild_node() {
 
     if node_exists; then
         existing_port="$PORT"
+        [ "${PROTOCOL:-shadowsocks}" = "vless-reality" ] && existing_protocols=tcp || existing_protocols=both
         warn "检测到已有节点。"
         if ! read -r -p "是否覆盖重建？(y/N): " confirm; then
             ACTIVE_NODE_BACKUP=""
@@ -2651,7 +2781,7 @@ create_or_rebuild_node() {
         break
     done
 
-    if ! port="$(choose_node_port "$existing_port")"; then
+    if ! port="$(choose_node_port "$existing_port" both "$existing_protocols")"; then
         rollback_node_files_transaction || true
         err "节点端口选择失败，未创建新节点。"
         return 1
@@ -2711,7 +2841,7 @@ EOF
         err "sing-box 启动失败，未创建新节点。"
         return 1
     fi
-    if ! service_is_running || ! wait_for_port_listener "$port"; then
+    if ! service_is_running || ! wait_for_port_listener "$port" both; then
         rollback_active_node_transaction || true
         err "sing-box 未保持运行或节点端口未监听，未创建新节点。"
         return 1
@@ -2734,7 +2864,7 @@ EOF
 }
 
 create_vless_reality_node() {
-    local backup_dir existing_port="" confirm domain default_name input_name name port
+    local backup_dir existing_port="" existing_protocols="" confirm domain default_name input_name name port
     local input_sni server_name uuid short_id private_key public_key
     local -a keypair
 
@@ -2751,6 +2881,7 @@ create_vless_reality_node() {
 
     if node_exists; then
         existing_port="$PORT"
+        [ "${PROTOCOL:-shadowsocks}" = "vless-reality" ] && existing_protocols=tcp || existing_protocols=both
         warn "检测到已有 ${PROTOCOL:-shadowsocks} 节点。"
         if ! read -r -p "创建 VLESS Reality 将替换当前节点，是否继续？(y/N): " confirm; then
             ACTIVE_NODE_BACKUP=""
@@ -2810,7 +2941,7 @@ create_vless_reality_node() {
         break
     done
 
-    if ! port="$(choose_node_port "$existing_port")"; then
+    if ! port="$(choose_node_port "$existing_port" tcp "$existing_protocols")"; then
         rollback_node_files_transaction || true
         err "节点端口选择失败，未创建新节点。"
         return 1
@@ -2875,7 +3006,7 @@ EOF
         return 1
     fi
     info "正在启动 sing-box 服务..."
-    if ! restart_singbox_cleanly || ! service_is_running || ! wait_for_port_listener "$port"; then
+    if ! restart_singbox_cleanly || ! service_is_running || ! wait_for_port_listener "$port" tcp; then
         rollback_active_node_transaction || true
         err "sing-box 未保持运行或节点端口未监听，未创建新节点。"
         return 1
@@ -2948,7 +3079,7 @@ EOF
 }
 
 delete_node() {
-    local node_port backup_dir
+    local node_port node_protocols backup_dir
 
     require_valid_node_state_if_present || return 1
     if ! node_exists; then
@@ -2960,6 +3091,7 @@ delete_node() {
         return 1
     }
     node_port="$PORT"
+    [ "${PROTOCOL:-shadowsocks}" = "vless-reality" ] && node_protocols=tcp || node_protocols=both
 
     read -r -p "确认删除当前 ${PROTOCOL:-shadowsocks} 节点？sing-box 服务将停止。(y/N): " confirm
     [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消。"; return 0; }
@@ -2989,7 +3121,7 @@ delete_node() {
         err "sing-box 服务仍在运行，已保留节点配置。"
         return 1
     fi
-    if port_in_use "$node_port"; then
+    if port_in_use_for_protocols "$node_port" "$node_protocols"; then
         rollback_active_node_transaction || true
         err "节点端口 $node_port 仍在监听，已保留节点配置。"
         return 1
@@ -3021,8 +3153,18 @@ restore_singbox_update_backup() {
     local was_enabled="$4" was_active="$5"
     local failed=0
 
-    service_stop 2>/dev/null || true
-    stop_singbox_config_processes 2>/dev/null || true
+    if ! service_stop 2>/dev/null && service_manager_is_active; then
+        err "更新后的 sing-box 服务无法停止，已拒绝在运行中覆盖二进制。"
+        failed=1
+    fi
+    if ! stop_singbox_config_processes 2>/dev/null; then
+        err "更新后的 sing-box 进程无法停止，已拒绝在运行中覆盖二进制。"
+        failed=1
+    fi
+    if [ "$failed" -ne 0 ]; then
+        warn "sing-box 更新备份已保留：$backup_dir"
+        return 1
+    fi
     if ! cp -a -- "$backup_binary" "$binary_path"; then
         err "旧 sing-box 二进制恢复失败：$backup_binary"
         failed=1
@@ -3041,6 +3183,80 @@ restore_singbox_update_backup() {
     # 更新失败时保留本地二进制备份，避免包管理器处于异常状态后失去最后恢复副本。
     warn "sing-box 更新备份已保留：$backup_dir"
     [ "$failed" -eq 0 ]
+}
+
+begin_singbox_update_transaction() {
+    ACTIVE_SINGBOX_UPDATE_BINARY="$1"
+    ACTIVE_SINGBOX_UPDATE_BACKUP="$2"
+    ACTIVE_SINGBOX_UPDATE_DIR="$3"
+    ACTIVE_SINGBOX_UPDATE_WAS_ENABLED="$4"
+    ACTIVE_SINGBOX_UPDATE_WAS_ACTIVE="$5"
+    ACTIVE_SINGBOX_UPDATE_MUTATED=0
+}
+
+cancel_unmodified_singbox_update_transaction() {
+    local backup_dir="${ACTIVE_SINGBOX_UPDATE_DIR:-}"
+
+    ACTIVE_SINGBOX_UPDATE_BINARY=""
+    ACTIVE_SINGBOX_UPDATE_BACKUP=""
+    ACTIVE_SINGBOX_UPDATE_DIR=""
+    ACTIVE_SINGBOX_UPDATE_WAS_ENABLED=0
+    ACTIVE_SINGBOX_UPDATE_WAS_ACTIVE=0
+    ACTIVE_SINGBOX_UPDATE_MUTATED=0
+    if { [[ "$backup_dir" == /tmp/vpsbox-sing-box-update.* ]] ||
+        [ "${VPSBOX_TEST_MODE:-0}" = "1" ]; } &&
+        [ -d "$backup_dir" ] && [ ! -L "$backup_dir" ]; then
+        rm -rf -- "$backup_dir"
+    fi
+}
+
+rollback_active_singbox_update() {
+    local binary_path backup_binary backup_dir was_enabled was_active mutated result=0
+
+    [ "${ACTIVE_SINGBOX_UPDATE_ROLLING_BACK:-0}" = "0" ] || return 0
+    backup_dir="${ACTIVE_SINGBOX_UPDATE_DIR:-}"
+    [ -n "$backup_dir" ] || return 0
+    binary_path="$ACTIVE_SINGBOX_UPDATE_BINARY"
+    backup_binary="$ACTIVE_SINGBOX_UPDATE_BACKUP"
+    was_enabled="$ACTIVE_SINGBOX_UPDATE_WAS_ENABLED"
+    was_active="$ACTIVE_SINGBOX_UPDATE_WAS_ACTIVE"
+    mutated="$ACTIVE_SINGBOX_UPDATE_MUTATED"
+    ACTIVE_SINGBOX_UPDATE_ROLLING_BACK=1
+
+    # 先清空全局事务，防止恢复命令再次收到信号时重复进入同一回滚。
+    ACTIVE_SINGBOX_UPDATE_BINARY=""
+    ACTIVE_SINGBOX_UPDATE_BACKUP=""
+    ACTIVE_SINGBOX_UPDATE_DIR=""
+    ACTIVE_SINGBOX_UPDATE_WAS_ENABLED=0
+    ACTIVE_SINGBOX_UPDATE_WAS_ACTIVE=0
+    ACTIVE_SINGBOX_UPDATE_MUTATED=0
+    if [ "$mutated" = "1" ]; then
+        restore_singbox_update_backup \
+            "$binary_path" "$backup_binary" "$backup_dir" "$was_enabled" "$was_active" || result=1
+    elif { [[ "$backup_dir" == /tmp/vpsbox-sing-box-update.* ]] ||
+        [ "${VPSBOX_TEST_MODE:-0}" = "1" ]; } &&
+        [ -d "$backup_dir" ] && [ ! -L "$backup_dir" ]; then
+        rm -rf -- "$backup_dir" || result=1
+    else
+        result=1
+    fi
+    ACTIVE_SINGBOX_UPDATE_ROLLING_BACK=0
+    return "$result"
+}
+
+commit_singbox_update_transaction() {
+    local backup_dir="${ACTIVE_SINGBOX_UPDATE_DIR:-}"
+
+    ACTIVE_SINGBOX_UPDATE_BINARY=""
+    ACTIVE_SINGBOX_UPDATE_BACKUP=""
+    ACTIVE_SINGBOX_UPDATE_DIR=""
+    ACTIVE_SINGBOX_UPDATE_WAS_ENABLED=0
+    ACTIVE_SINGBOX_UPDATE_WAS_ACTIVE=0
+    ACTIVE_SINGBOX_UPDATE_MUTATED=0
+    { [[ "$backup_dir" == /tmp/vpsbox-sing-box-update.* ]] ||
+        [ "${VPSBOX_TEST_MODE:-0}" = "1" ]; } &&
+        [ -d "$backup_dir" ] && [ ! -L "$backup_dir" ] || return 1
+    rm -rf -- "$backup_dir"
 }
 
 update_singbox() {
@@ -3082,49 +3298,50 @@ update_singbox() {
     if service_is_enabled; then
         was_enabled=1
     fi
+    begin_singbox_update_transaction \
+        "$binary_path" "$backup_binary" "$backup_dir" "$was_enabled" "$was_active"
 
     if ! install_deps; then
-        rm -rf "$backup_dir"
+        cancel_unmodified_singbox_update_transaction
         err "更新依赖准备失败；sing-box 二进制和服务状态均未修改。"
         return 1
     fi
     info "正在更新 sing-box..."
+    ACTIVE_SINGBOX_UPDATE_MUTATED=1
     if ! run_singbox_installer; then
         err "sing-box 安装过程失败，正在恢复旧二进制和原服务状态。"
-        restore_singbox_update_backup \
-            "$binary_path" "$backup_binary" "$backup_dir" "$was_enabled" "$was_active" || true
+        rollback_active_singbox_update || true
         return 1
     fi
 
     new_version="$(singbox_version)"
     if [ "$new_version" != "$SINGBOX_RELEASE_VERSION" ]; then
         err "安装后的 sing-box 版本异常（当前：$new_version），正在恢复旧版本。"
-        restore_singbox_update_backup \
-            "$binary_path" "$backup_binary" "$backup_dir" "$was_enabled" "$was_active" || true
+        rollback_active_singbox_update || true
         return 1
     fi
 
     if node_exists; then
         if ! sing-box check -c "$CONFIG_PATH" >/dev/null; then
             err "当前节点配置未通过新版 sing-box 检查，正在恢复旧二进制。"
-            restore_singbox_update_backup \
-                "$binary_path" "$backup_binary" "$backup_dir" "$was_enabled" "$was_active" || true
+            rollback_active_singbox_update || true
             return 1
         fi
         if ! setup_service || ! restore_singbox_service_state "$was_enabled" "$was_active"; then
             err "新版 sing-box 未能恢复原服务状态，正在恢复旧二进制。"
-            restore_singbox_update_backup \
-                "$binary_path" "$backup_binary" "$backup_dir" "$was_enabled" "$was_active" || true
+            rollback_active_singbox_update || true
             return 1
         fi
     elif ! restore_singbox_service_state "$was_enabled" "$was_active"; then
         err "新版 sing-box 未能恢复原服务状态，正在恢复旧二进制。"
-        restore_singbox_update_backup \
-            "$binary_path" "$backup_binary" "$backup_dir" "$was_enabled" "$was_active" || true
+        rollback_active_singbox_update || true
         return 1
     fi
 
-    rm -rf "$backup_dir"
+    commit_singbox_update_transaction || {
+        err "sing-box 已更新，但临时备份清理失败：$backup_dir"
+        return 1
+    }
     info "更新完成：$(singbox_version)"
 }
 
@@ -3149,7 +3366,7 @@ restore_previous_vpsbox() {
         err "旧版 vpsbox 恢复失败，备份仍保留在：$backup"
         return 1
     fi
-    install_command_alias
+    install_command_alias || return 1
     info "已从 $backup 恢复旧版 vpsbox。"
 }
 
@@ -5278,7 +5495,7 @@ ssh_socket_activation_active() {
 choose_ssh_target_port() {
     local input confirm docker_ports
 
-    docker_ports="$(docker_reserved_ports_for_port_choice)" || {
+    docker_ports="$(docker_reserved_ports_for_port_choice tcp)" || {
         err "无法可靠读取 Docker 已发布端口，已取消 SSH 端口选择。"
         return 1
     }
@@ -5287,7 +5504,7 @@ choose_ssh_target_port() {
         read -r -p "请输入新 SSH 端口（1-65535，留空默认 23333）: " input || return 1
         input="${input:-23333}"
         is_valid_port "$input" || { err "端口必须是 1-65535 的整数。"; continue; }
-        if ! port_is_effective_ssh_port "$input" && port_in_use "$input"; then
+        if ! port_is_effective_ssh_port "$input" && port_in_use_tcp "$input"; then
             err "端口 $input 已被占用，请更换。"
             continue
         fi
@@ -5462,6 +5679,36 @@ restore_fail2ban_sshd_sync_state() {
     fi
 }
 
+restore_fail2ban_runtime_after_sync() {
+    local was_running="$1"
+
+    [ "$was_running" -eq 0 ] || return 0
+    if is_systemd; then
+        retry 3 1 systemctl stop fail2ban >/dev/null || return 1
+    elif command -v rc-service >/dev/null 2>&1; then
+        retry 3 1 rc-service fail2ban stop >/dev/null || return 1
+    else
+        return 1
+    fi
+    [ "$(fail2ban_service_state)" != "运行中" ]
+}
+
+prune_fail2ban_sshd_backups() {
+    local backup nullglob_was_set=0
+    local -a backups
+
+    shopt -q nullglob && nullglob_was_set=1
+    shopt -s nullglob
+    backups=("${FAIL2BAN_VPSBOX_SSHD_CONF}.bak."*)
+    [ "$nullglob_was_set" -eq 1 ] || shopt -u nullglob
+    while [ "${#backups[@]}" -gt 5 ]; do
+        backup="${backups[0]}"
+        [ -f "$backup" ] && [ ! -L "$backup" ] || return 1
+        rm -f -- "$backup" || return 1
+        backups=("${backups[@]:1}")
+    done
+}
+
 sync_fail2ban_sshd_port() {
     local backup=""
     local backend="auto"
@@ -5593,7 +5840,12 @@ EOF
         fi
         return 1
     fi
+    if ! restore_fail2ban_runtime_after_sync "$was_running"; then
+        err "Fail2ban 配置验证通过，但无法恢复同步前的停止状态。"
+        return 1
+    fi
     mark_change_applied FAIL2BAN_SSHD || return 1
+    prune_fail2ban_sshd_backups || warn "Fail2ban 历史备份清理不完整，最多保留 5 份的策略未完全执行。"
 }
 
 apply_ssh_port_change() {
@@ -6758,6 +7010,13 @@ docker_go_bool_value() {
     esac
 }
 
+timestamp_strictly_after() {
+    local candidate="$1" reference="$2"
+
+    [[ "$candidate" =~ ^[0-9]+$ ]] && [[ "$reference" =~ ^[0-9]+$ ]] &&
+        [ "$candidate" -gt "$reference" ]
+}
+
 firewall_validate_docker_daemon_mode() {
     local comm_file comm_name cmdline_file="" config_file="/etc/docker/daemon.json"
     local config_view config_parent arg value parsed_bool i daemon_found=0 config_explicit=0
@@ -6890,8 +7149,10 @@ firewall_validate_docker_daemon_mode() {
             }
             config_mtime="$(stat -c '%Y' "$config_parent" 2>/dev/null)" || return 1
             config_ctime="$(stat -c '%Z' "$config_parent" 2>/dev/null)" || return 1
-            if [ "$config_mtime" -ge "$daemon_start_epoch" ] ||
-                [ "$config_ctime" -ge "$daemon_start_epoch" ]; then
+            # /proc 的 btime 与 stat 时间只有秒级；同一秒无法证明目录变更晚于 daemon，
+            # 仅在时间戳严格更晚时拒绝，避免刚启动 Docker 时产生同秒误报。
+            if timestamp_strictly_after "$config_mtime" "$daemon_start_epoch" ||
+                timestamp_strictly_after "$config_ctime" "$daemon_start_epoch"; then
                 err "dockerd 默认配置文件当前不存在，但配置目录在 daemon 启动后发生过变化。"
                 err "无法排除配置已被删除；请重启 Docker 后再更新 vpsbox 防火墙。"
                 return 1
@@ -6917,7 +7178,9 @@ firewall_validate_docker_daemon_mode() {
         err "无法确认 dockerd 配置文件时间，已拒绝更新防火墙。"
         return 1
     fi
-    if [ "$config_mtime" -ge "$daemon_start_epoch" ] || [ "$config_ctime" -ge "$daemon_start_epoch" ]; then
+    # 同秒时间戳在现有内核接口精度下无法排序，只有严格晚于启动秒才视为未加载变更。
+    if timestamp_strictly_after "$config_mtime" "$daemon_start_epoch" ||
+        timestamp_strictly_after "$config_ctime" "$daemon_start_epoch"; then
         err "dockerd 配置文件在 daemon 启动后发生过变化，当前运行态可能尚未加载。"
         err "请重启 Docker 并确认容器正常后，再更新 vpsbox 防火墙。"
         return 1
@@ -7312,10 +7575,16 @@ firewall_detect_docker_ports() {
 }
 
 docker_reserved_ports_csv() {
+    local protocols="${1:-both}"
     local docker_host context endpoint effective_endpoint container container_list
-    local bindings mapping host_port running port_mappings swarm_state control_available
+    local bindings mapping host_port binding_protocol running port_mappings swarm_state control_available
     local service service_list published_ports port reserved=""
     local daemon_pid daemon_start_ticks current_pid current_start_ticks
+
+    case "$protocols" in
+        tcp|udp|both) ;;
+        *) return 2 ;;
+    esac
 
     if ! command -v docker >/dev/null 2>&1; then
         docker_daemon_process_present || return 0
@@ -7359,10 +7628,18 @@ docker_reserved_ports_csv() {
             "$container" 2>/dev/null)" || return 1
         while IFS= read -r mapping; do
             [ -n "$mapping" ] || continue
+            binding_protocol="${mapping%%|*}"
+            binding_protocol="${binding_protocol##*/}"
+            case "$binding_protocol" in
+                tcp|udp) ;;
+                *) continue ;;
+            esac
             host_port="${mapping##*|}"
             [ -z "$host_port" ] || [ "$host_port" = "0" ] || {
                 is_valid_port "$host_port" || return 1
-                reserved="$(csv_add_port "$reserved" "$host_port")" || return 1
+                if [ "$protocols" = "both" ] || [ "$protocols" = "$binding_protocol" ]; then
+                    reserved="$(csv_add_port "$reserved" "$host_port")" || return 1
+                fi
             }
         done <<< "$bindings"
 
@@ -7371,9 +7648,17 @@ docker_reserved_ports_csv() {
         port_mappings="$(docker_with_timeout port "$container" 2>/dev/null)" || return 1
         while IFS= read -r mapping; do
             [ -n "$mapping" ] || continue
+            binding_protocol="${mapping%% ->*}"
+            binding_protocol="${binding_protocol##*/}"
+            case "$binding_protocol" in
+                tcp|udp) ;;
+                *) continue ;;
+            esac
             host_port="${mapping##*:}"
             is_valid_port "$host_port" || return 1
-            reserved="$(csv_add_port "$reserved" "$host_port")" || return 1
+            if [ "$protocols" = "both" ] || [ "$protocols" = "$binding_protocol" ]; then
+                reserved="$(csv_add_port "$reserved" "$host_port")" || return 1
+            fi
         done <<< "$port_mappings"
     done <<< "$container_list"
 
@@ -7392,12 +7677,18 @@ docker_reserved_ports_csv() {
         while IFS= read -r service; do
             [ -n "$service" ] || continue
             published_ports="$(docker_with_timeout service inspect --format \
-                '{{range .Endpoint.Spec.Ports}}{{printf "%d\n" .PublishedPort}}{{end}}' \
+                '{{range .Endpoint.Spec.Ports}}{{printf "%d|%s\n" .PublishedPort .Protocol}}{{end}}' \
                 "$service" 2>/dev/null)" || return 1
-            while IFS= read -r port; do
+            while IFS='|' read -r port binding_protocol; do
                 [ -n "$port" ] || continue
+                case "$binding_protocol" in
+                    tcp|udp) ;;
+                    *) continue ;;
+                esac
                 is_valid_port "$port" || return 1
-                reserved="$(csv_add_port "$reserved" "$port")" || return 1
+                if [ "$protocols" = "both" ] || [ "$protocols" = "$binding_protocol" ]; then
+                    reserved="$(csv_add_port "$reserved" "$port")" || return 1
+                fi
             done <<< "$published_ports"
         done <<< "$service_list"
     fi
@@ -7411,9 +7702,9 @@ docker_reserved_ports_csv() {
 }
 
 docker_reserved_ports_for_port_choice() {
-    local result
+    local protocols="${1:-both}" result
 
-    if result="$(docker_reserved_ports_csv)"; then
+    if result="$(docker_reserved_ports_csv "$protocols")"; then
         printf '%s\n' "$result"
         return 0
     fi
@@ -7654,12 +7945,33 @@ firewall_snapshot_file() {
     fi
 }
 
+firewall_prepare_rollback_store() {
+    [ ! -L "$VPSBOX_STATE_DIR" ] && [ ! -L "$FIREWALL_ROLLBACK_DIR" ] || {
+        err "防火墙回滚目录包含符号链接，已拒绝使用。"
+        return 1
+    }
+    mkdir -p "$FIREWALL_ROLLBACK_DIR" || return 1
+    chown root:root "$FIREWALL_ROLLBACK_DIR" || return 1
+    chmod 700 "$FIREWALL_ROLLBACK_DIR" || return 1
+}
+
+firewall_rollback_dir_valid() {
+    local dir="${1:-}"
+
+    case "$dir" in
+        "$FIREWALL_ROLLBACK_DIR"/firewall-rollback.*) ;;
+        # 兼容 v1.0.25 及更早版本在 /run/vpsbox 中留下、尚未完成的回滚快照。
+        "$RUNTIME_DIR"/firewall-rollback.*) ;;
+        *) return 1 ;;
+    esac
+    [ -d "$dir" ] && [ ! -L "$dir" ]
+}
+
 firewall_watchdog_cmdline_matches() {
     local dir="$1" pid="$2"
     local -a args=()
 
-    [[ "$dir" == "$RUNTIME_DIR"/firewall-rollback.* ]] &&
-        [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    firewall_rollback_dir_valid "$dir" || return 1
     is_pid "$pid" && [ "$pid" -gt 1 ] && [ "$pid" -ne "$$" ] || return 1
     process_alive "$pid" || return 1
     process_is_zombie "$pid" && return 1
@@ -7684,8 +7996,7 @@ firewall_watchdog_identity_matches() {
     local dir="$1" pid="$2"
     local path recorded_pid recorded_start recorded_boot current_start current_boot
 
-    [[ "$dir" == "$RUNTIME_DIR"/firewall-rollback.* ]] &&
-        [ -d "$dir" ] && [ ! -L "$dir" ] || return 2
+    firewall_rollback_dir_valid "$dir" || return 2
     is_pid "$pid" && [ "$pid" -gt 1 ] && [ "$pid" -ne "$$" ] || return 2
     for path in "$dir/watchdog.pid" "$dir/watchdog.start" "$dir/watchdog.boot"; do
         [ -f "$path" ] && [ ! -L "$path" ] || return 2
@@ -7823,8 +8134,7 @@ firewall_find_watchdog_pids() {
 firewall_stop_rollback_watchdog() {
     local dir="$1" path pid start found_pid
 
-    [[ "$dir" == "$RUNTIME_DIR"/firewall-rollback.* ]] &&
-        [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    firewall_rollback_dir_valid "$dir" || return 1
     for path in "$dir/watchdog.pid" "$dir/watchdog.start" "$dir/watchdog.boot"; do
         [ ! -e "$path" ] || { [ -f "$path" ] && [ ! -L "$path" ]; } || {
             warn "防火墙回滚进程元数据路径不安全，已保留快照：$dir"
@@ -7875,8 +8185,7 @@ firewall_stop_rollback_watchdog() {
 firewall_cleanup_finished_rollback() {
     local dir="$1"
 
-    [[ "$dir" == "$RUNTIME_DIR"/firewall-rollback.* ]] &&
-        [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    firewall_rollback_dir_valid "$dir" || return 1
     [ -e "$dir/completed" ] || [ -e "$dir/rolled-back" ] || return 1
     firewall_stop_rollback_watchdog "$dir" || return 1
     [ "${ACTIVE_FIREWALL_ROLLBACK_DIR:-}" = "$dir" ] && ACTIVE_FIREWALL_ROLLBACK_DIR=""
@@ -7884,38 +8193,43 @@ firewall_cleanup_finished_rollback() {
 }
 
 firewall_recover_pending_rollbacks() {
-    local dir decision owner
+    local dir decision owner root
 
     prepare_runtime_dir
-    for dir in "$RUNTIME_DIR"/.firewall-rollback-build.*; do
-        [ -e "$dir" ] || continue
-        if [ ! -d "$dir" ] || [ -L "$dir" ]; then
-            err "检测到不安全的防火墙回滚构建目录：$dir"
-            return 1
-        fi
-        rm -rf "$dir" || return 1
-    done
-    for dir in "$RUNTIME_DIR"/firewall-rollback.*; do
-        [ -d "$dir" ] || continue
-        if [ -L "$dir" ]; then
-            err "检测到不安全的防火墙回滚目录：$dir"
-            return 1
-        fi
-        if [ -e "$dir/completed" ] || [ -e "$dir/rolled-back" ]; then
-            if ! firewall_cleanup_finished_rollback "$dir"; then
-                err "已完成的防火墙快照清理失败，已拒绝开始新的防火墙操作：$dir"
+    firewall_prepare_rollback_store || return 1
+    for root in "$FIREWALL_ROLLBACK_DIR" "$RUNTIME_DIR"; do
+        for dir in "$root"/.firewall-rollback-build.*; do
+            [ -e "$dir" ] || continue
+            if [ ! -d "$dir" ] || [ -L "$dir" ]; then
+                err "检测到不安全的防火墙回滚构建目录：$dir"
                 return 1
             fi
-            continue
-        fi
-        decision="$(cat "$dir/decision" 2>/dev/null || true)"
-        owner=0
-        [ "$decision" = "commit" ] && owner=1
-        warn "检测到未完成的防火墙操作，正在先恢复快照：$dir"
-        if ! firewall_restore_snapshot_now "$dir" "$owner"; then
-            err "旧防火墙快照尚未恢复，已拒绝开始新的防火墙操作。"
-            return 1
-        fi
+            rm -rf "$dir" || return 1
+        done
+    done
+    for root in "$FIREWALL_ROLLBACK_DIR" "$RUNTIME_DIR"; do
+        for dir in "$root"/firewall-rollback.*; do
+            [ -e "$dir" ] || continue
+            if [ ! -d "$dir" ] || [ -L "$dir" ]; then
+                err "检测到不安全的防火墙回滚目录：$dir"
+                return 1
+            fi
+            if [ -e "$dir/completed" ] || [ -e "$dir/rolled-back" ]; then
+                if ! firewall_cleanup_finished_rollback "$dir"; then
+                    err "已完成的防火墙快照清理失败，已拒绝开始新的防火墙操作：$dir"
+                    return 1
+                fi
+                continue
+            fi
+            decision="$(cat "$dir/decision" 2>/dev/null || true)"
+            owner=0
+            [ "$decision" = "commit" ] && owner=1
+            warn "检测到未完成的防火墙操作，正在先恢复快照：$dir"
+            if ! firewall_restore_snapshot_now "$dir" "$owner"; then
+                err "旧防火墙快照尚未恢复，已拒绝开始新的防火墙操作。"
+                return 1
+            fi
+        done
     done
 }
 
@@ -7926,16 +8240,16 @@ firewall_create_rollback_snapshot() {
         err "已有未完成的防火墙回滚快照，已拒绝创建新快照。"
         return 1
     fi
-    prepare_runtime_dir
-    for dir in "$RUNTIME_DIR"/firewall-rollback.*; do
+    firewall_prepare_rollback_store || return 1
+    for dir in "$FIREWALL_ROLLBACK_DIR"/firewall-rollback.*; do
         [ -d "$dir" ] || continue
         err "检测到尚未处理的防火墙回滚目录：$dir"
         return 1
     done
 
-    build_dir="$(mktemp -d "$RUNTIME_DIR/.firewall-rollback-build.XXXXXX")" || return 1
+    build_dir="$(mktemp -d "$FIREWALL_ROLLBACK_DIR/.firewall-rollback-build.XXXXXX")" || return 1
     suffix="${build_dir##*.firewall-rollback-build.}"
-    final_dir="$RUNTIME_DIR/firewall-rollback.$suffix"
+    final_dir="$FIREWALL_ROLLBACK_DIR/firewall-rollback.$suffix"
     if [ -e "$final_dir" ] || [ -L "$final_dir" ]; then
         rm -rf "$build_dir"
         err "防火墙回滚目录发生冲突，已拒绝继续。"
@@ -8118,8 +8432,7 @@ EOF
 
 firewall_start_rollback_watchdog() {
     local dir="$1" pid start boot
-    [[ "$dir" == "$RUNTIME_DIR"/firewall-rollback.* ]] &&
-        [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    firewall_rollback_dir_valid "$dir" || return 1
     : > "$dir/armed"
     # watchdog 必须独立于菜单存活以执行超时回滚，但不能继承菜单的 flock FD 200。
     nohup sh "$dir/rollback.sh" >> "$dir/rollback.log" 2>&1 200>&- &
@@ -8140,8 +8453,7 @@ firewall_start_rollback_watchdog() {
 firewall_restore_snapshot_now() {
     local dir="$1" commit_owner="${2:-0}" i mode="--now"
 
-    if [[ "$dir" != "$RUNTIME_DIR"/firewall-rollback.* ]] ||
-        [ ! -d "$dir" ] || [ -L "$dir" ]; then
+    if ! firewall_rollback_dir_valid "$dir"; then
         return 1
     fi
     if [ -e "$dir/completed" ]; then
@@ -8172,8 +8484,7 @@ firewall_restore_snapshot_now() {
 
 firewall_begin_commit() {
     local dir="$1"
-    [[ "$dir" == "$RUNTIME_DIR"/firewall-rollback.* ]] &&
-        [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    firewall_rollback_dir_valid "$dir" || return 1
     : > "$dir/committing" || return 1
     if ! ln "$dir/commit.token" "$dir/decision" 2>/dev/null; then
         rm -f "$dir/committing"
@@ -8184,8 +8495,7 @@ firewall_begin_commit() {
 firewall_finish_commit() {
     local dir="$1"
 
-    [[ "$dir" == "$RUNTIME_DIR"/firewall-rollback.* ]] &&
-        [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    firewall_rollback_dir_valid "$dir" || return 1
     [ "$(cat "$dir/decision" 2>/dev/null || true)" = "commit" ] || return 1
     : > "$dir/completed" || return 1
     ACTIVE_FIREWALL_ROLLBACK_DIR=""
@@ -8311,11 +8621,10 @@ firewall_apply_desired_state() {
         rm -rf "$work_dir"
         return 1
     fi
-    if ! firewall_install_managed_file "$work_dir/firewall.env" "$FIREWALL_STATE_FILE" 600 ||
-        ! firewall_install_managed_file "$work_dir/firewall.nft" "$FIREWALL_CONFIG" 600 ||
-        ! firewall_install_managed_file "$service_file" "$service_target" "$service_mode" ||
-        ! firewall_apply_config_file "$FIREWALL_CONFIG"; then
-        err "防火墙配置写入或校验失败，正在恢复原状态。"
+    # SSH 二次确认前只修改内核运行态，不覆盖开机配置。若此时异常重启，
+    # 系统仍按原有持久配置启动；持久快照会在下次进入防火墙功能时继续恢复/清理。
+    if ! firewall_apply_config_file "$work_dir/firewall.nft"; then
+        err "防火墙临时配置校验或应用失败，正在恢复原状态。"
         if ! firewall_restore_snapshot_now "$rollback_dir"; then
             err "原状态恢复失败，必须先处理保留的回滚快照。"
         fi
@@ -8343,7 +8652,10 @@ firewall_apply_desired_state() {
         rm -rf "$work_dir"
         return 1
     fi
-    if ! firewall_enable_persistence ||
+    if ! firewall_install_managed_file "$work_dir/firewall.env" "$FIREWALL_STATE_FILE" 600 ||
+        ! firewall_install_managed_file "$work_dir/firewall.nft" "$FIREWALL_CONFIG" 600 ||
+        ! firewall_install_managed_file "$service_file" "$service_target" "$service_mode" ||
+        ! firewall_enable_persistence ||
         ! firewall_runtime_enabled ||
         ! firewall_persistence_enabled ||
         ! firewall_service_active; then
@@ -9119,7 +9431,7 @@ run_self_check() {
     local has_node="0"
     local max_use
     local max_file
-    local state
+    local state node_protocols
 
     max_use="$(journald_conf_value SystemMaxUse || echo "未配置")"
     max_file="$(journald_conf_value SystemMaxFileSize || echo "未配置")"
@@ -9184,7 +9496,12 @@ EOF
     fi
 
     if [ "$has_node" = "1" ] && [ -n "${PORT:-}" ]; then
-        if port_in_use "$PORT"; then
+        if [ "${PROTOCOL:-shadowsocks}" = "vless-reality" ]; then
+            node_protocols=tcp
+        else
+            node_protocols=both
+        fi
+        if port_listener_ready "$PORT" "$node_protocols"; then
             check_ok "端口监听" "$PORT 正在监听"
         else
             check_warn "端口监听" "$PORT 未监听"
@@ -10303,6 +10620,14 @@ restore_vpsbox_system_changes() {
     info "已恢复已记录项目；请使用自检和对应服务状态确认结果。"
 }
 
+verify_current_node_runtime() {
+    local protocols
+
+    load_state || return 1
+    [ "${PROTOCOL:-shadowsocks}" = "vless-reality" ] && protocols=tcp || protocols=both
+    service_is_running && wait_for_port_listener "$PORT" "$protocols"
+}
+
 start_service_action() {
     require_valid_node_state_if_present || return 1
     if ! node_exists; then
@@ -10311,7 +10636,11 @@ start_service_action() {
     fi
     install_singbox_if_missing || return 1
     setup_service || return 1
-    service_start || return 1
+    restart_singbox_cleanly || return 1
+    if ! verify_current_node_runtime; then
+        err "sing-box 未保持运行或节点端口未按协议完整监听。"
+        return 1
+    fi
     info "sing-box 服务已启动。"
 }
 
@@ -10324,11 +10653,26 @@ restart_service_action() {
     install_singbox_if_missing || return 1
     setup_service || return 1
     restart_singbox_cleanly || return 1
+    if ! verify_current_node_runtime; then
+        err "sing-box 未保持运行或节点端口未按协议完整监听。"
+        return 1
+    fi
     info "sing-box 服务已重启。"
 }
 
 stop_service_action() {
-    service_stop || return 1
+    local failed=0
+
+    service_stop || failed=1
+    stop_singbox_config_processes || failed=1
+    if service_manager_is_active || [ -n "$(singbox_config_pids)" ]; then
+        err "sing-box 服务或当前配置对应的残留进程仍在运行。"
+        return 1
+    fi
+    if [ "$failed" -ne 0 ]; then
+        err "sing-box 已停止，但服务管理命令执行失败，请检查服务定义。"
+        return 1
+    fi
     info "sing-box 服务已停止。"
 }
 

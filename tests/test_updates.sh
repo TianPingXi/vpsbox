@@ -479,11 +479,17 @@ singbox_installed() { return 0; }
 singbox_version() { printf '%s\n' "$MOCK_SINGBOX_VERSION"; }
 service_is_running() { return 1; }
 service_is_enabled() { return 1; }
+service_manager_is_active() { return 1; }
+service_stop() { printf '%s\n' service-stop >> "$MOCK_SINGBOX_EVENT_LOG"; }
+stop_singbox_config_processes() { printf '%s\n' process-stop >> "$MOCK_SINGBOX_EVENT_LOG"; }
 node_exists() { return 1; }
 install_deps() { printf '%s\n' deps >> "$MOCK_SINGBOX_EVENT_LOG"; }
 run_singbox_installer() {
     printf 'installer:%s\n' "${1:-$SINGBOX_RELEASE_VERSION}" >> "$MOCK_SINGBOX_EVENT_LOG"
     MOCK_SINGBOX_VERSION="${1:-$SINGBOX_RELEASE_VERSION}"
+}
+restore_singbox_service_state() {
+    printf 'restore:%s:%s\n' "$1" "$2" >> "$MOCK_SINGBOX_EVENT_LOG"
 }
 
 reset_singbox_case() {

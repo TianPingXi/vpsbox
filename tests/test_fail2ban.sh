@@ -323,6 +323,54 @@ test_sync_validation_failure_rolls_back() {
     assert_file_not_contains "$systemctl_log" '^marked$' "验证失败不得标记变更已应用"
 }
 
+test_sync_restores_initial_stopped_state() {
+    local sync_dir="$TEST_TMP/sync-stopped" systemctl_log="$TEST_TMP/systemctl-stopped.log"
+    local running=0
+    reset_mock
+    mkdir -p "$sync_dir"
+    FAIL2BAN_CONFIG_DIR="$sync_dir"
+    FAIL2BAN_VPSBOX_SSHD_CONF="$sync_dir/99-vpsbox-sshd.local"
+    : > "$systemctl_log"
+
+    fail2ban_installed() { return 0; }
+    fail2ban_service_state() { [ "$running" -eq 1 ] && printf '运行中\n' || printf '未运行\n'; }
+    fail2ban_service_is_enabled() { return 1; }
+    manifest_set_once() { return 0; }
+    backup_change_file_once() { return 0; }
+    ssh_effective_ports_csv() { printf '2222\n'; }
+    is_systemd() { return 0; }
+    systemctl() {
+        printf '%s\n' "$*" >> "$systemctl_log"
+        case "${1:-}" in
+            start|restart) running=1 ;;
+            stop) running=0 ;;
+        esac
+    }
+    mark_change_applied() { printf 'marked\n' >> "$systemctl_log"; }
+
+    sync_fail2ban_sshd_port > "$TEST_TMP/sync-stopped.out" 2>&1 ||
+        fail "原本停止的 Fail2ban 应能临时验证并恢复停止状态"
+    assert_file_contains "$systemctl_log" '^start fail2ban$' "验证前应临时启动 Fail2ban"
+    assert_file_contains "$systemctl_log" '^stop fail2ban$' "验证后应恢复原停止状态"
+    assert_file_contains "$systemctl_log" '^marked$'
+    assert_eq 0 "$running" "同步后不得把原本停止的 Fail2ban 留在运行状态"
+}
+
+test_fail2ban_backup_rotation_keeps_five() {
+    local dir="$TEST_TMP/fail2ban-backups" i count
+    mkdir -p "$dir"
+    FAIL2BAN_VPSBOX_SSHD_CONF="$dir/99-vpsbox-sshd.local"
+    for i in {1..8}; do
+        printf '%s\n' "$i" > "${FAIL2BAN_VPSBOX_SSHD_CONF}.bak.2026010100000${i}"
+    done
+
+    prune_fail2ban_sshd_backups
+    count="$(find "$dir" -maxdepth 1 -type f -name '*.bak.*' | wc -l | tr -d ' ')"
+    assert_eq 5 "$count" "Fail2ban 历史备份应只保留最近 5 份"
+    [ ! -e "${FAIL2BAN_VPSBOX_SSHD_CONF}.bak.20260101000001" ] || fail "最旧备份未删除"
+    [ -e "${FAIL2BAN_VPSBOX_SSHD_CONF}.bak.20260101000008" ] || fail "最新备份不应删除"
+}
+
 main() {
     local -a required=(
         fail2ban_action_names
@@ -343,6 +391,8 @@ main() {
         test_runtime_cleanup_reuses_active_unban
         test_stale_active_test_blocks_new_ban
         test_sync_validation_failure_rolls_back
+        test_sync_restores_initial_stopped_state
+        test_fail2ban_backup_rotation_keeps_five
     )
 
     for name in "${required[@]}"; do

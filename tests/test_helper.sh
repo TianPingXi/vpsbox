@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+# 所有测试默认禁止调用真实 systemd/OpenRC 服务管理命令；需要服务行为时必须显式 mock。
+export VPSBOX_TEST_MODE=1
+
 TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # These variables are consumed by test files that source this helper.
 # shellcheck disable=SC2034

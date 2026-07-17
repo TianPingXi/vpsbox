@@ -184,6 +184,169 @@ test_view_node_propagates_uri_failure() {
     )
 }
 
+test_node_state_writes_are_atomic() {
+    (
+        local old_state="$TEST_TMP/state-atomic/old"
+        CONFIG_DIR="$TEST_TMP/state-atomic/config"
+        STATE_FILE="$CONFIG_DIR/vpsbox.env"
+        mkdir -p "$CONFIG_DIR"
+        printf '%s\n' keep-old > "$STATE_FILE"
+        secure_config_dir() { return 0; }
+        printf() {
+            [ "${1:-}" != 'NAME=%s\n' ] || return 42
+            builtin printf "$@"
+        }
+
+        if save_state example.com node 12345 secret; then
+            unset -f printf
+            fail "SS 状态中途写入失败时不应报告成功"
+        fi
+        unset -f printf
+        cp "$STATE_FILE" "$old_state"
+        assert_file_contains "$old_state" '^keep-old$' "SS 写入失败不得截断旧状态"
+        [ -z "$(find "$CONFIG_DIR" -maxdepth 1 -name '.vpsbox-state.*' -print -quit)" ] ||
+            fail "SS 写入失败后残留临时状态文件"
+
+        printf '%s\n' keep-vless > "$STATE_FILE"
+        printf() {
+            [ "${1:-}" != 'UUID=%s\n' ] || return 42
+            builtin printf "$@"
+        }
+        if save_vless_reality_state example.com node 12345 uuid sni key abcdef0123456789; then
+            unset -f printf
+            fail "VLESS 状态中途写入失败时不应报告成功"
+        fi
+        unset -f printf
+        assert_file_contains "$STATE_FILE" '^keep-vless$' "VLESS 写入失败不得截断旧状态"
+        [ -z "$(find "$CONFIG_DIR" -maxdepth 1 -name '.vpsbox-state.*' -print -quit)" ] ||
+            fail "VLESS 写入失败后残留临时状态文件"
+    )
+}
+
+test_service_running_requires_exact_config_process() {
+    (
+        singbox_installed() { return 0; }
+        service_manager_is_active() { return 0; }
+        singbox_config_pids() { return 0; }
+        if service_is_running; then
+            fail "服务管理器 active 但没有配置匹配进程时不得报告运行中"
+        fi
+        singbox_config_pids() { printf '%s\n' 1234; }
+        service_is_running || fail "服务 active 且存在配置匹配进程时应报告运行中"
+    )
+}
+
+test_service_restore_checks_final_state() {
+    (
+        service_disable() { return 23; }
+        service_is_enabled() { return 1; }
+        service_stop() { return 23; }
+        service_manager_is_active() { return 1; }
+        stop_singbox_config_processes() { return 0; }
+        singbox_config_pids() { return 0; }
+
+        restore_singbox_service_state 0 0 ||
+            fail "服务命令报错但禁用/停止目标状态已满足时应允许恢复完成"
+
+        service_start() { return 0; }
+        service_is_running() { return 1; }
+        service_stop() { return 0; }
+        if restart_singbox_cleanly; then
+            fail "服务启动命令成功但实际进程未运行时不得报告重启成功"
+        fi
+    )
+}
+
+test_test_mode_blocks_real_service_mutation() {
+    if service_start >"$TEST_TMP/service-guard.out" 2>&1; then
+        fail "测试模式不得调用真实服务启动命令"
+    fi
+    assert_file_contains "$TEST_TMP/service-guard.out" '测试模式禁止调用真实服务管理命令'
+}
+
+test_protocol_specific_listener_checks() {
+    (
+        local tcp_ready=1 udp_ready=0
+        ss() {
+            case "$*" in
+                '-H -ltn') [ "$tcp_ready" -eq 1 ] && printf '%s\n' 'LISTEN 0 4096 0.0.0.0:43333 0.0.0.0:*' ;;
+                '-H -lun') [ "$udp_ready" -eq 1 ] && printf '%s\n' 'UNCONN 0 0 0.0.0.0:43333 0.0.0.0:*' ;;
+            esac
+        }
+
+        port_listener_ready 43333 tcp || fail "VLESS 的 TCP 监听应被识别"
+        if port_listener_ready 43333 both; then
+            fail "SS 只有 TCP、缺少 UDP 时不得通过监听检查"
+        fi
+        if port_conflicts_with_existing_node 43333 both tcp; then
+            fail "VLESS 切换到 SS 时，旧节点占用的 TCP 不应被误判为外部冲突"
+        fi
+        udp_ready=1
+        port_listener_ready 43333 both || fail "SS 的 TCP 与 UDP 都监听时应通过"
+        port_conflicts_with_existing_node 43333 both tcp ||
+            fail "VLESS 切换到 SS 时应识别额外的 UDP 端口冲突"
+        if port_conflicts_with_existing_node 43333 tcp both; then
+            fail "SS 切换到 VLESS 时，旧节点已有的 TCP 监听可以复用"
+        fi
+    )
+}
+
+test_install_self_reports_download_failure() {
+    (
+        CMD_PATH="$TEST_TMP/install-self/bin/vpsbox"
+        download_vpsbox_script() { return 23; }
+        if install_self_command /dev/fd/63 >"$TEST_TMP/install-self.out" 2>&1; then
+            fail "进程替换首次安装下载失败时必须返回非零"
+        fi
+        [ ! -e "$CMD_PATH" ] || fail "下载失败不应留下管理命令"
+    )
+}
+
+test_interrupted_singbox_update_rolls_back() {
+    (
+        local case_dir="$TEST_TMP/singbox-interrupt"
+        local binary="$case_dir/sing-box" backup_dir="$case_dir/update" backup="$case_dir/update/sing-box"
+        mkdir -p "$backup_dir"
+        printf '%s\n' old-binary > "$binary"
+        cp "$binary" "$backup"
+        service_stop() { return 0; }
+        service_manager_is_active() { return 1; }
+        stop_singbox_config_processes() { return 0; }
+        node_exists() { return 1; }
+        restore_singbox_service_state() { printf '%s %s\n' "$1" "$2" > "$case_dir/service-state"; }
+        cleanup_vpsbox_lock() { return 0; }
+
+        begin_singbox_update_transaction "$binary" "$backup" "$backup_dir" 1 1
+        # 由已 source 的 cleanup_vpsbox_runtime 间接读取。
+        # shellcheck disable=SC2034
+        ACTIVE_SINGBOX_UPDATE_MUTATED=1
+        printf '%s\n' partial-new-binary > "$binary"
+        cleanup_vpsbox_runtime
+
+        assert_file_contains "$binary" '^old-binary$' "更新中断后应恢复旧二进制"
+        assert_file_contains "$case_dir/service-state" '^1 1$' "更新中断后应恢复原服务状态"
+        assert_eq "" "$ACTIVE_SINGBOX_UPDATE_DIR" "回滚后必须清空活动更新事务"
+    )
+}
+
+test_lockdir_metadata_window_is_waited() {
+    (
+        LOCK_DIR="$TEST_TMP/lock-window/lockdir"
+        mkdir -p "$LOCK_DIR"
+        (sleep 0.2; printf '%s\n' 'pid=4242' > "$LOCK_DIR/pid") &
+        wait_for_lockdir_metadata || fail "锁目录创建后应等待并发持有者写入元数据"
+        assert_eq 4242 "$(lock_pid_from_file "$LOCK_DIR/pid")"
+        wait
+    )
+}
+
+test_same_second_timestamp_is_not_after() {
+    if timestamp_strictly_after 100 100; then
+        fail "同秒 Docker 配置时间不得误判为启动后修改"
+    fi
+    timestamp_strictly_after 101 100 || fail "严格更晚的配置时间应被识别"
+}
+
 test_singbox_dependency_failure_does_not_touch_service() {
     (
         local fake_bin="$TEST_TMP/singbox-deps-bin"
@@ -280,6 +443,15 @@ main() {
         test_node_eof_rolls_back_fresh_install_config
         test_reality_checks_require_bounded_dns_and_openssl
         test_view_node_propagates_uri_failure
+        test_node_state_writes_are_atomic
+        test_service_running_requires_exact_config_process
+        test_service_restore_checks_final_state
+        test_test_mode_blocks_real_service_mutation
+        test_protocol_specific_listener_checks
+        test_install_self_reports_download_failure
+        test_interrupted_singbox_update_rolls_back
+        test_lockdir_metadata_window_is_waited
+        test_same_second_timestamp_is_not_after
         test_singbox_dependency_failure_does_not_touch_service
         test_failed_singbox_update_restores_binary_and_state
     )
