@@ -188,8 +188,39 @@ test_restore_lock_metadata_is_atomically_published() {
         'mktemp "\$parent/[.]vpsbox-firewall-restore[.]XXXXXX"'
     assert_file_contains "$snapshot/rollback.sh" \
         'mv -f "\$tmp" "\$target"'
+    assert_file_contains "$snapshot/rollback.sh" \
+        'if \[ -L "\$target" \]; then'
+    assert_file_contains "$snapshot/rollback.sh" \
+        '\[ ! -d "\$target" \] \|\| return 1'
     assert_file_not_contains "$snapshot/rollback.sh" \
         '> "\$lock_dir/pid"'
+}
+
+test_rollback_rejects_directory_symlink_target() {
+    local snapshot="" victim
+
+    reset_firewall_case directory-symlink-target
+    cat > "$FIREWALL_CONFIG" <<'EOF'
+table inet vpsbox {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        tcp dport { 22 } accept
+    }
+}
+EOF
+    firewall_create_rollback_snapshot snapshot "22"
+    rm -f "$FIREWALL_CONFIG"
+    victim="$CASE_DIR/linked-directory"
+    mkdir "$victim"
+    ln -s "$victim" "$FIREWALL_CONFIG"
+
+    if sh "$snapshot/rollback.sh" --now >/dev/null 2>&1; then
+        fail "防火墙回滚不得把目录符号链接当作恢复目录"
+    fi
+    [ -L "$FIREWALL_CONFIG" ] || fail "失败后应保留原目标符号链接"
+    [ -z "$(find "$victim" -mindepth 1 -maxdepth 1 -print -quit)" ] ||
+        fail "防火墙回滚不得向符号链接指向的目录写入文件"
+    [ -e "$snapshot/rollback-failed" ] || fail "失败的防火墙回滚应保留可重试标记"
 }
 
 test_identity_mismatch_is_cleaned_without_kill() {
@@ -334,6 +365,7 @@ main() {
         test_immediate_restore_stops_timed_watchdog
         test_stale_restore_lock_is_reclaimed
         test_restore_lock_metadata_is_atomically_published
+        test_rollback_rejects_directory_symlink_target
         test_identity_mismatch_is_cleaned_without_kill
         test_pid_only_partial_watchdog_is_stopped
         test_partial_dead_metadata_is_cleaned

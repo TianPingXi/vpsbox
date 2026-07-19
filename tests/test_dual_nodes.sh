@@ -594,6 +594,28 @@ test_pending_transaction_recovers_after_hard_interruption() {
     )
 }
 
+test_absent_backup_entry_removes_target_and_invalid_entry_is_rejected() {
+    (
+        local backup_dir target
+
+        backup_dir="$TEST_TMP/restore-entry-status/backup"
+        target="$TEST_TMP/restore-entry-status/target"
+        mkdir -p "$backup_dir"
+        printf 'current\n' > "$target"
+        node_backup_entry_is_present() { return 1; }
+
+        restore_node_file_from_backup "$backup_dir" absent "$backup_dir/unused" "$target"
+        [ ! -e "$target" ] || fail "备份清单标记 absent 时应删除当前目标文件"
+
+        printf 'current\n' > "$target"
+        node_backup_entry_is_present() { return 2; }
+        if restore_node_file_from_backup "$backup_dir" invalid "$backup_dir/unused" "$target"; then
+            fail "备份清单条目无效时不得继续恢复"
+        fi
+        assert_file_contains "$target" '^current$' "条目无效时不得删除当前目标文件"
+    )
+}
+
 test_unmodified_pending_transaction_is_discarded_without_service_stop() {
     (
         set_node_paths "$TEST_TMP/pending-unmodified"
@@ -927,6 +949,7 @@ main() {
         test_dual_node_backup_restore_round_trip
         test_verify_runtime_checks_both_protocols
         test_cancel_eof_and_input_interrupt_have_no_mutation
+        test_absent_backup_entry_removes_target_and_invalid_entry_is_rejected
         test_pending_transaction_recovers_after_hard_interruption
         test_unmodified_pending_transaction_is_discarded_without_service_stop
         test_corrupted_node_backup_is_rejected_before_overwrite

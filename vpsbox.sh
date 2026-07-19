@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.36"
+VPSBOX_VERSION="v1.0.37"
 # 只从当前仓库下载可执行脚本；旧地址仅用于识别本地 v1.0.23 及更早备份，绝不联网获取。
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 LEGACY_SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
@@ -1013,7 +1013,11 @@ restore_file_atomically_from_snapshot() {
     local snapshot="$1" target="$2" parent tmp
 
     [ -f "$snapshot" ] && [ ! -L "$snapshot" ] || return 1
-    if [ -e "$target" ] && [ ! -f "$target" ] && [ ! -L "$target" ]; then
+    # mv 会把“指向目录的符号链接”当作目标目录；此处明确拒绝，避免把
+    # 临时恢复文件移入链接指向的目录后仍误报成功。
+    if [ -L "$target" ]; then
+        [ ! -d "$target" ] || return 1
+    elif [ -e "$target" ] && [ ! -f "$target" ]; then
         return 1
     fi
     parent="$(dirname "$target")"
@@ -3369,8 +3373,9 @@ restore_node_file_from_backup() {
     if node_backup_entry_is_present "$backup_dir/manifest" "$entry"; then
         restore_file_atomically_from_snapshot "$snapshot" "$target"
         return $?
+    else
+        status=$?
     fi
-    status=$?
     [ "$status" -eq 1 ] || return 1
     remove_snapshot_target_file "$target"
 }
@@ -3393,8 +3398,9 @@ restore_node_config_dir_from_backup() {
             "$backup_dir/vpsbox.d/${VLESS_CONFIG_PATH##*/}" "$VLESS_CONFIG_PATH" || return 1
         node_config_dir_contents_valid
         return $?
+    else
+        status=$?
     fi
-    status=$?
     [ "$status" -eq 1 ] || return 1
     restore_node_file_from_backup "$backup_dir" "vpsbox.d/${SS_CONFIG_PATH##*/}" \
         "$backup_dir/vpsbox.d/${SS_CONFIG_PATH##*/}" "$SS_CONFIG_PATH" || return 1
@@ -11090,7 +11096,10 @@ restore_file() {
     if [ -e "\$dir/\$name.present" ]; then
         source="\$dir/\$name"
         [ -f "\$source" ] && [ ! -L "\$source" ] || return 1
-        if [ -e "\$target" ] && [ ! -f "\$target" ] && [ ! -L "\$target" ]; then
+        # 防止 mv 将临时文件移入符号链接指向的目录并误报恢复成功。
+        if [ -L "\$target" ]; then
+            [ ! -d "\$target" ] || return 1
+        elif [ -e "\$target" ] && [ ! -f "\$target" ]; then
             return 1
         fi
         parent="\$(dirname "\$target")"

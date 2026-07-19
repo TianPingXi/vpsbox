@@ -101,6 +101,62 @@ test_atomic_snapshot_restore_replaces_target_symlink() {
     assert_file_contains "$victim" '^victim$' "不得写入原符号链接指向的文件"
 }
 
+test_atomic_snapshot_restore_rejects_directory_symlink() {
+    local source target victim
+
+    source="$TEST_TMP/atomic-restore-dir/source"
+    target="$TEST_TMP/atomic-restore-dir/target"
+    victim="$TEST_TMP/atomic-restore-dir/victim"
+    mkdir -p "$(dirname "$source")" "$victim"
+    printf 'snapshot\n' > "$source"
+    ln -s "$victim" "$target"
+
+    if restore_file_atomically_from_snapshot "$source" "$target"; then
+        fail "指向目录的目标符号链接不得被当作恢复目录"
+    fi
+    [ -L "$target" ] || fail "拒绝恢复后应保留原目标符号链接"
+    [ -z "$(find "$victim" -mindepth 1 -maxdepth 1 -print -quit)" ] ||
+        fail "不得向符号链接指向的目录写入任何文件"
+}
+
+test_atomic_snapshot_restore_replaces_dangling_symlink() {
+    local source target missing
+
+    source="$TEST_TMP/atomic-restore-dangling/source"
+    target="$TEST_TMP/atomic-restore-dangling/target"
+    missing="$TEST_TMP/atomic-restore-dangling/missing"
+    mkdir -p "$(dirname "$source")"
+    printf 'snapshot\n' > "$source"
+    ln -s "$missing" "$target"
+
+    restore_file_atomically_from_snapshot "$source" "$target"
+
+    [ -f "$target" ] && [ ! -L "$target" ] ||
+        fail "原子恢复应安全替换悬空符号链接"
+    assert_file_contains "$target" '^snapshot$'
+    [ ! -e "$missing" ] || fail "不得创建悬空链接原本指向的文件"
+}
+
+test_atomic_snapshot_restore_move_failure_preserves_target() {
+    (
+        local source target
+
+        source="$TEST_TMP/atomic-restore-move-failure/source"
+        target="$TEST_TMP/atomic-restore-move-failure/target"
+        mkdir -p "$(dirname "$source")"
+        printf 'snapshot\n' > "$source"
+        printf 'current\n' > "$target"
+        mv() { return 1; }
+
+        if restore_file_atomically_from_snapshot "$source" "$target"; then
+            fail "最终替换失败时原子恢复不得报告成功"
+        fi
+        assert_file_contains "$target" '^current$' "最终替换失败时应保留原目标文件"
+        [ -z "$(find "$(dirname "$target")" -maxdepth 1 -name '.vpsbox-restore.*' -print -quit)" ] ||
+            fail "最终替换失败后应清理临时恢复文件"
+    )
+}
+
 test_debian_update_stops_after_first_failure() {
     local log="$TEST_TMP/debian-update.log"
 
@@ -870,6 +926,9 @@ main() {
         test_clear_change_tracking_reports_partial_failure
         test_restore_replaces_target_symlink
         test_atomic_snapshot_restore_replaces_target_symlink
+        test_atomic_snapshot_restore_rejects_directory_symlink
+        test_atomic_snapshot_restore_replaces_dangling_symlink
+        test_atomic_snapshot_restore_move_failure_preserves_target
         test_debian_update_stops_after_first_failure
         test_debian_update_uses_upgrade_timeout
         test_debian_upgrade_failure_skips_autoremove
