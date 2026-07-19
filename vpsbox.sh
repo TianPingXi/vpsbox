@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.34"
+VPSBOX_VERSION="v1.0.35"
 # 只从当前仓库下载可执行脚本；旧地址仅用于识别本地 v1.0.23 及更早备份，绝不联网获取。
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 LEGACY_SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
@@ -718,7 +718,10 @@ terminate_old_vpsbox_menu() {
     warn "检测到旧 vpsbox 菜单仍在运行："
     show_process_summary "$pid"
     echo ""
-    read -r -p "输入 YES 结束旧菜单并继续，其他任意输入取消: " confirm
+    if ! read -r -p "输入 YES 结束旧菜单并继续，其他任意输入取消: " confirm; then
+        err "输入已结束，未终止旧 vpsbox 菜单。"
+        exit 1
+    fi
     if [ "$confirm" != "YES" ]; then
         err "检测到另一个 vpsbox 正在运行，请先退出旧菜单。"
         exit 1
@@ -990,6 +993,9 @@ install_root_file_atomically() {
     [ -f "$source" ] && [ ! -L "$source" ] || return 1
     [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
     [ ! -L "$target" ] || return 1
+    if [ -e "$target" ] && [ ! -f "$target" ]; then
+        return 1
+    fi
     parent="$(dirname "$target")"
     [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
     command -v mktemp >/dev/null 2>&1 || return 1
@@ -3824,7 +3830,10 @@ choose_node_port() {
             continue
         fi
         if [ "$input" -lt 1024 ]; then
-            read -r -p "端口 $input 属于特权端口，确认使用？请输入 YES：" confirm
+            if ! read -r -p "端口 $input 属于特权端口，确认使用？请输入 YES：" confirm; then
+                info "输入已结束，已取消节点端口选择。"
+                return 1
+            fi
             [ "$confirm" = "YES" ] || continue
         fi
         printf '%s\n' "$input"
@@ -4230,6 +4239,21 @@ depend() {
 EOF
 }
 
+publish_singbox_service_definition() {
+    local renderer="$1" bin="$2" target="$3" mode="$4"
+    local tmp
+
+    [ -n "$bin" ] && [ -x "$bin" ] || return 1
+    [ ! -L "$target" ] || return 1
+    tmp="$(mktemp)" || return 1
+    if ! "$renderer" "$bin" > "$tmp" ||
+        ! install_root_file_atomically "$tmp" "$target" "$mode"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    rm -f -- "$tmp"
+}
+
 singbox_service_definition_is_current() {
     local bin
 
@@ -4249,18 +4273,34 @@ singbox_service_definition_is_current() {
 
 setup_service() {
     local bin
-    bin="$(command -v sing-box)"
+    bin="$(command -v sing-box 2>/dev/null)" || {
+        err "未找到 sing-box 可执行文件，无法创建服务。"
+        return 1
+    }
+    [ -x "$bin" ] || {
+        err "sing-box 文件不可执行，无法创建服务：$bin"
+        return 1
+    }
 
     if is_systemd; then
         [ ! -L /etc/systemd/system/sing-box.service ] || { err "sing-box systemd 服务文件是符号链接，已拒绝覆盖。"; return 1; }
-        render_singbox_systemd_service "$bin" > /etc/systemd/system/sing-box.service || return 1
+        publish_singbox_service_definition \
+            render_singbox_systemd_service "$bin" \
+            /etc/systemd/system/sing-box.service 644 || {
+            err "无法安全写入 sing-box systemd 服务文件。"
+            return 1
+        }
         retry 3 2 systemctl daemon-reload || return 1
         service_enable || return 1
         return 0
     elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
         [ ! -L /etc/init.d/sing-box ] || { err "sing-box OpenRC 服务文件是符号链接，已拒绝覆盖。"; return 1; }
-        render_singbox_openrc_service "$bin" > /etc/init.d/sing-box || return 1
-        chmod +x /etc/init.d/sing-box || return 1
+        publish_singbox_service_definition \
+            render_singbox_openrc_service "$bin" \
+            /etc/init.d/sing-box 755 || {
+            err "无法安全写入 sing-box OpenRC 服务文件。"
+            return 1
+        }
         service_enable || return 1
         return 0
     else
@@ -7079,7 +7119,10 @@ $(ipv4_dns_lines)
 ========================================
 EOF
 
-    read -r -p "请输入选项: " choice
+    if ! read -r -p "请输入选项: " choice; then
+        info "输入已结束，已取消。"
+        return 0
+    fi
     case "$choice" in
         1)
             dns1="1.1.1.1"
@@ -7087,7 +7130,10 @@ EOF
             ;;
         2)
             while true; do
-                read -r -p "请输入 DNS1 IPv4 地址: " dns1
+                if ! read -r -p "请输入 DNS1 IPv4 地址: " dns1; then
+                    info "输入已结束，已取消。"
+                    return 0
+                fi
                 if is_ipv4_address "$dns1"; then
                     break
                 fi
@@ -7095,7 +7141,10 @@ EOF
             done
 
             while true; do
-                read -r -p "请输入 DNS2 IPv4 地址，留空跳过: " dns2
+                if ! read -r -p "请输入 DNS2 IPv4 地址，留空跳过: " dns2; then
+                    info "输入已结束，已取消。"
+                    return 0
+                fi
                 [ -z "$dns2" ] && break
                 if is_ipv4_address "$dns2"; then
                     break
@@ -7725,7 +7774,10 @@ choose_ssh_target_port() {
             continue
         fi
         if [ "$input" -lt 1024 ]; then
-            read -r -p "端口 $input 属于特权端口，输入 YES 确认使用: " confirm
+            if ! read -r -p "端口 $input 属于特权端口，输入 YES 确认使用: " confirm; then
+                info "输入已结束，已取消修改。"
+                return 1
+            fi
             [ "$confirm" = "YES" ] || continue
         fi
         printf '%s\n' "$input"
@@ -8102,7 +8154,10 @@ apply_ssh_port_change() {
 
     if ssh_effective_ports_match_target; then
         info "SSH 端口已经是 $SSH_TARGET_PORT，无需重复修改。"
-        read -r -p "仍要重新写入并重启 SSH？[y/N]: " confirm
+        if ! read -r -p "仍要重新写入并重启 SSH？[y/N]: " confirm; then
+            info "输入已结束，已取消重复修改。"
+            return 0
+        fi
         case "$confirm" in
             y|Y|yes|YES) ;;
             *) info "已取消重复修改。"; return 0 ;;
@@ -8111,9 +8166,15 @@ apply_ssh_port_change() {
 
     if firewall_runtime_enabled; then
         vpsbox_firewall_active=1
-        read -r -p "vpsbox 防火墙将自动临时放行 TCP $SSH_TARGET_PORT；如厂商另有安全组，请先在厂商面板放行。输入 YES 继续: " confirm
+        if ! read -r -p "vpsbox 防火墙将自动临时放行 TCP $SSH_TARGET_PORT；如厂商另有安全组，请先在厂商面板放行。输入 YES 继续: " confirm; then
+            info "输入已结束，已取消，未修改 SSH 配置。"
+            return 0
+        fi
     else
-        read -r -p "确认已在商家安全组或其他外部防火墙放行 TCP $SSH_TARGET_PORT？输入 YES 继续: " confirm
+        if ! read -r -p "确认已在商家安全组或其他外部防火墙放行 TCP $SSH_TARGET_PORT？输入 YES 继续: " confirm; then
+            info "输入已结束，已取消，未修改 SSH 配置。"
+            return 0
+        fi
     fi
     if [ "$confirm" != "YES" ]; then
         info "已取消，未修改 SSH 配置。"
@@ -8272,14 +8333,20 @@ apply_ssh_basic_hardening() {
 
     if ssh_basic_hardening_effective; then
         info "SSH 基础加固已经生效，无需重复应用。"
-        read -r -p "仍要重新写入并重启 SSH？[y/N]: " confirm
+        if ! read -r -p "仍要重新写入并重启 SSH？[y/N]: " confirm; then
+            info "输入已结束，已取消重复应用。"
+            return 0
+        fi
         case "$confirm" in
             y|Y|yes|YES) ;;
             *) info "已取消重复应用。"; return 0 ;;
         esac
     fi
 
-    read -r -p "确认应用 SSH 基础加固并重启 SSH？[y/N]: " confirm
+    if ! read -r -p "确认应用 SSH 基础加固并重启 SSH？[y/N]: " confirm; then
+        info "输入已结束，已取消，未修改 SSH 配置。"
+        return 0
+    fi
     case "$confirm" in
         y|Y|yes|YES) ;;
         *) info "已取消，未修改 SSH 配置。"; return 0 ;;
@@ -8702,7 +8769,10 @@ restore_vpsbox_ssh_config() {
     }
     echo "将恢复 SSH 主配置及 vpsbox 端口/加固 drop-in。"
     echo "预期恢复端口：${original_ports:-未知}；当前连接可能断开。"
-    read -r -p "请确认已有控制台或备用连接。输入 YES 执行 SSH 恢复：" confirm
+    if ! read -r -p "请确认已有控制台或备用连接。输入 YES 执行 SSH 恢复：" confirm; then
+        info "输入已结束，已取消 SSH 恢复。"
+        return 0
+    fi
     [ "$confirm" = "YES" ] || { info "已取消 SSH 恢复。"; return 0; }
     if ! ssh_firewall_transition_begin "$transition_ports"; then
         err "主机防火墙无法临时放行待恢复的 SSH 端口，已取消恢复。"
@@ -11327,13 +11397,23 @@ firewall_sync_active_config() {
     FW_ALLOWED_TCP="$(merge_port_csv "$FW_ALLOWED_TCP" "$temporary_tcp")" || return 1
     FW_ALLOWED_UDP="$(merge_port_csv "$FW_ALLOWED_UDP" "$temporary_udp")" || return 1
     tmp="$(mktemp "$RUNTIME_DIR/firewall-refresh.XXXXXX")" || return 1
-    backup="$(mktemp "$RUNTIME_DIR/firewall-config-backup.XXXXXX")" || { rm -f "$tmp"; return 1; }
+    backup="$(mktemp "$FIREWALL_ROLLBACK_DIR/firewall-config-backup.XXXXXX")" || { rm -f "$tmp"; return 1; }
     cp "$FIREWALL_CONFIG" "$backup" || { rm -f "$tmp" "$backup"; return 1; }
     if ! firewall_write_config "$tmp" ||
-        ! nft -c -f "$tmp" ||
-        ! firewall_install_managed_file "$tmp" "$FIREWALL_CONFIG" 600 ||
-        ! nft -f "$FIREWALL_CONFIG"; then
-        firewall_install_managed_file "$backup" "$FIREWALL_CONFIG" 600 || true
+        ! nft -c -f "$tmp"; then
+        rm -f "$tmp" "$backup"
+        return 1
+    fi
+    if ! firewall_install_managed_file "$tmp" "$FIREWALL_CONFIG" 600; then
+        rm -f "$tmp" "$backup"
+        return 1
+    fi
+    if ! nft -f "$FIREWALL_CONFIG"; then
+        if ! firewall_install_managed_file "$backup" "$FIREWALL_CONFIG" 600; then
+            rm -f "$tmp"
+            err "防火墙同步失败，且磁盘配置未能恢复；旧配置持久备份已保留：$backup"
+            return 1
+        fi
         rm -f "$tmp" "$backup"
         return 1
     fi
@@ -12602,7 +12682,10 @@ ensure_nexttrace() {
     fi
 
     warn "未检测到 nexttrace。"
-    read -r -p "是否自动安装 nexttrace？(y/N): " confirm
+    if ! read -r -p "是否自动安装 nexttrace？(y/N): " confirm; then
+        info "输入已结束，已取消。"
+        return 1
+    fi
     [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消。"; return 1; }
 
     install_deps || return 1
@@ -13143,7 +13226,15 @@ EOF
 }
 
 uninstall_singbox_and_nodes() {
-    local failed=0
+    local failed=0 package_remove_failed=0
+    local was_active=0 was_enabled=0
+
+    if service_is_running; then
+        was_active=1
+    fi
+    if service_is_enabled; then
+        was_enabled=1
+    fi
 
     info "正在停止并禁用 sing-box 服务..."
     service_stop 2>/dev/null || warn "服务管理器未能正常停止 sing-box，将继续检查 vpsbox 配置对应的进程。"
@@ -13159,6 +13250,38 @@ uninstall_singbox_and_nodes() {
     service_disable 2>/dev/null ||
         warn "无法通过服务管理器禁用 sing-box，将继续清理并在最后复核。"
 
+    if [ "$OS" = "alpine" ]; then
+        if singbox_package_installed &&
+            ! apk_bounded "$PACKAGE_INSTALL_TIMEOUT" del sing-box; then
+            package_remove_failed=1
+        fi
+    elif [ "$OS" = "debian" ]; then
+        if singbox_package_installed &&
+            ! apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" purge -y sing-box; then
+            package_remove_failed=1
+        fi
+    elif [ "$OS" = "redhat" ]; then
+        if singbox_package_installed; then
+            if command -v dnf >/dev/null 2>&1; then
+                dnf_bounded "$PACKAGE_INSTALL_TIMEOUT" remove -y sing-box ||
+                    package_remove_failed=1
+            else
+                yum_bounded "$PACKAGE_INSTALL_TIMEOUT" remove -y sing-box ||
+                    package_remove_failed=1
+            fi
+        fi
+    fi
+
+    if [ "$package_remove_failed" -eq 1 ]; then
+        err "sing-box 软件包卸载失败，vpsbox 未继续删除服务文件、二进制或节点配置。"
+        if restore_singbox_service_state "$was_enabled" "$was_active"; then
+            info "已恢复 sing-box 原运行与自启状态。"
+        else
+            err "sing-box 原服务状态恢复失败，请立即检查服务、软件包和节点配置。"
+        fi
+        return 1
+    fi
+
     if is_systemd; then
         rm -f /etc/systemd/system/sing-box.service \
             /etc/systemd/system/multi-user.target.wants/sing-box.service \
@@ -13166,23 +13289,8 @@ uninstall_singbox_and_nodes() {
             /lib/systemd/system/sing-box.service || failed=1
         systemctl daemon-reload 2>/dev/null || failed=1
         systemctl reset-failed sing-box 2>/dev/null || true
-    fi
-
-    if [ "$OS" = "alpine" ]; then
+    elif [ "$OS" = "alpine" ]; then
         rm -f /etc/init.d/sing-box /etc/runlevels/default/sing-box || failed=1
-        if singbox_package_installed &&
-            ! apk_bounded "$PACKAGE_INSTALL_TIMEOUT" del sing-box; then failed=1; fi
-    elif [ "$OS" = "debian" ]; then
-        if singbox_package_installed &&
-            ! apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" purge -y sing-box; then failed=1; fi
-    elif [ "$OS" = "redhat" ]; then
-        if singbox_package_installed; then
-            if command -v dnf >/dev/null 2>&1; then
-                dnf_bounded "$PACKAGE_INSTALL_TIMEOUT" remove -y sing-box || failed=1
-            else
-                yum_bounded "$PACKAGE_INSTALL_TIMEOUT" remove -y sing-box || failed=1
-            fi
-        fi
     fi
 
     info "正在删除 sing-box 和节点配置..."
@@ -13209,37 +13317,56 @@ uninstall_singbox_and_nodes() {
 
 uninstall_all() {
     local confirm
-    local remove_singbox
-    local remove_firewall
+    local remove_singbox=""
+    local remove_firewall=""
+    local has_singbox=0
+    local has_firewall=0
 
     echo "此操作会卸载 vpsbox 管理命令。"
     echo "默认不会删除 sing-box，也不会删除节点配置。"
     echo "如有已记录的系统设置，卸载前可选择恢复。"
-    read -r -p "确认卸载 vpsbox？请输入 YES：" confirm
+    if ! read -r -p "确认卸载 vpsbox？请输入 YES：" confirm; then
+        info "输入已结束，已取消卸载。"
+        return 0
+    fi
     [ "$confirm" = "YES" ] || { info "已取消。"; return 0; }
+
+    if firewall_artifacts_present; then
+        has_firewall=1
+        echo "检测到由 vpsbox 管理的主机防火墙。"
+        if ! read -r -p "卸载前必须关闭并移除该防火墙，输入 YES 继续：" remove_firewall; then
+            info "输入已结束，已取消卸载。"
+            return 0
+        fi
+        if [ "$remove_firewall" != "YES" ]; then
+            info "已取消卸载，主机防火墙和 vpsbox 命令均已保留。"
+            return 0
+        fi
+    fi
+
+    if ! singbox_artifacts_present; then
+        info "未安装 sing-box，无需删除节点配置。"
+    else
+        has_singbox=1
+        if ! read -r -p "是否同时删除 sing-box 和所有节点配置？请输入 YES 确认：" remove_singbox; then
+            info "输入已结束，已取消卸载。"
+            return 0
+        fi
+    fi
 
     offer_restore_recorded_changes_before_uninstall || {
         err "系统设置恢复未完成，已取消卸载并保留 vpsbox 管理命令。"
         return 1
     }
 
-    if firewall_artifacts_present; then
-        echo "检测到由 vpsbox 管理的主机防火墙。"
-        read -r -p "卸载前必须关闭并移除该防火墙，输入 YES 继续：" remove_firewall
-        if [ "$remove_firewall" != "YES" ]; then
-            info "已取消卸载，主机防火墙和 vpsbox 命令均已保留。"
-            return 0
-        fi
+    if [ "$has_firewall" -eq 1 ]; then
         firewall_disable_internal || {
             err "主机防火墙未能完整移除，已取消卸载 vpsbox。"
             return 1
         }
     fi
 
-    if ! singbox_artifacts_present; then
-        info "未安装 sing-box，无需删除节点配置。"
-    else
-        read -r -p "是否同时删除 sing-box 和所有节点配置？请输入 YES 确认：" remove_singbox
+    if [ "$has_singbox" -eq 1 ]; then
         if [ "$remove_singbox" = "YES" ]; then
             uninstall_singbox_and_nodes || {
                 err "sing-box 卸载未完成，已保留 vpsbox 管理命令便于重试。"
@@ -13399,7 +13526,10 @@ change_system_hostname() {
     local old new short_name hosts_entry tmp operation_snapshot=""
     old="$(hostname_current_value)"
     echo "当前主机名：$old"
-    read -r -p "请输入新主机名（留空取消）: " new
+    if ! read -r -p "请输入新主机名（留空取消）: " new; then
+        info "输入已结束，已取消。"
+        return 0
+    fi
     new="$(sanitize_paste_input "$new")"
     [ -n "$new" ] || { info "已取消。"; return 0; }
     is_valid_hostname_value "$new" || { err "主机名格式不正确：仅允许字母、数字、点和连字符，长度不超过 64。"; return 1; }
@@ -13556,7 +13686,10 @@ cleanup_system_garbage() {
     echo "将扫描并清理：包管理器缓存、超过 7 天的 vpsbox 临时文件、未引用的 vpsbox 过期备份。"
     echo "不会清理节点配置、用户主目录、Docker 数据卷或数据库。"
     cleanup_preview
-    read -r -p "确认执行垃圾清理？请输入 YES：" confirm
+    if ! read -r -p "确认执行垃圾清理？请输入 YES：" confirm; then
+        info "输入已结束，已取消清理。"
+        return 0
+    fi
     [ "$confirm" = "YES" ] || { info "已取消清理。"; return 0; }
 
     if command -v apt-get >/dev/null 2>&1; then apt-get clean || warn "APT 缓存清理失败。"; fi
@@ -13569,7 +13702,9 @@ cleanup_system_garbage() {
     cleanup_old_temp_dirs /var/tmp
     cleanup_orphaned_change_backups || warn "vpsbox 未引用备份清理不完整。"
     if command -v journalctl >/dev/null 2>&1; then
-        read -r -p "是否清理超过 30 天的 systemd 日志？请输入 YES，其他输入跳过：" journal_confirm
+        if ! read -r -p "是否清理超过 30 天的 systemd 日志？请输入 YES，其他输入跳过：" journal_confirm; then
+            journal_confirm=""
+        fi
         if [ "$journal_confirm" = "YES" ]; then
             journalctl --vacuum-time=30d || warn "systemd 历史日志清理失败。"
         else
@@ -13627,7 +13762,10 @@ restore_vpsbox_system_changes() {
 
     if [ "$skip_confirmation" != "1" ]; then
         show_vpsbox_changes
-        read -r -p "恢复上述 vpsbox 已记录的系统设置？请输入 YES：" confirm
+        if ! read -r -p "恢复上述 vpsbox 已记录的系统设置？请输入 YES：" confirm; then
+            info "输入已结束，已取消恢复。"
+            return 0
+        fi
         [ "$confirm" = "YES" ] || { info "已取消恢复。"; return 0; }
     fi
 
@@ -13944,7 +14082,9 @@ EOF
     info "当前日志占用：$(journal_disk_usage)"
     info "总大小：500M"
     info "单文件：50M"
-    read -r -p "是否立即清理历史日志至 500M？此操作不可恢复。请输入 YES 确认：" confirm
+    if ! read -r -p "是否立即清理历史日志至 500M？此操作不可恢复。请输入 YES 确认：" confirm; then
+        confirm=""
+    fi
     if [ "$confirm" = "YES" ]; then
         if retry 3 2 journalctl --vacuum-size=500M; then
             info "清理完成，当前日志占用：$(journal_disk_usage)"

@@ -178,6 +178,142 @@ test_interactive_confirm_is_function_local() {
     )
 }
 
+test_sensitive_interaction_eof_cancels_before_mutation() {
+    (
+        local event_log="$TEST_TMP/dns-eof-events"
+        : > "$event_log"
+        ipv4_dns_lines() { printf '%s\n' 1.1.1.1; }
+        apply_ipv4_dns() { printf '%s\n' apply >> "$event_log"; }
+
+        change_ipv4_dns </dev/null >"$TEST_TMP/dns-eof.out" 2>&1
+        assert_empty_file "$event_log" "DNS 输入结束后不得应用配置"
+        assert_file_contains "$TEST_TMP/dns-eof.out" '输入已结束，已取消'
+    )
+
+    (
+        local event_log="$TEST_TMP/ssh-port-eof-events"
+        : > "$event_log"
+        SSHD_MAIN_CONF="$TEST_TMP/ssh-port-eof-sshd_config"
+        : > "$SSHD_MAIN_CONF"
+        sshd_binary() { printf '%s\n' /usr/sbin/sshd; }
+        ssh_socket_activation_enabled_or_active() { return 1; }
+        settle_stale_unapplied_ssh_tracking() { return 0; }
+        choose_ssh_target_port() { printf '%s\n' 23333; }
+        ssh_effective_ports_match_target() { return 1; }
+        firewall_runtime_enabled() { return 1; }
+        backup_change_file_once() { printf '%s\n' backup >> "$event_log"; }
+        ssh_firewall_transition_begin() { printf '%s\n' firewall >> "$event_log"; }
+
+        apply_ssh_port_change </dev/null >"$TEST_TMP/ssh-port-eof.out" 2>&1
+        assert_empty_file "$event_log" "SSH 确认输入结束后不得备份或修改配置"
+        assert_file_contains "$TEST_TMP/ssh-port-eof.out" '输入已结束，已取消'
+    )
+
+    (
+        local event_log="$TEST_TMP/ssh-hardening-eof-events"
+        : > "$event_log"
+        SSHD_MAIN_CONF="$TEST_TMP/ssh-hardening-eof-sshd_config"
+        : > "$SSHD_MAIN_CONF"
+        sshd_binary() { printf '%s\n' /usr/sbin/sshd; }
+        settle_stale_unapplied_ssh_tracking() { return 0; }
+        ssh_basic_hardening_effective() { return 1; }
+        backup_change_file_once() { printf '%s\n' backup >> "$event_log"; }
+
+        apply_ssh_basic_hardening </dev/null >"$TEST_TMP/ssh-hardening-eof.out" 2>&1
+        assert_empty_file "$event_log" "SSH 加固确认输入结束后不得备份或修改配置"
+        assert_file_contains "$TEST_TMP/ssh-hardening-eof.out" '输入已结束，已取消'
+    )
+
+    (
+        local event_log="$TEST_TMP/uninstall-eof-events"
+        : > "$event_log"
+        offer_restore_recorded_changes_before_uninstall() {
+            printf '%s\n' restore >> "$event_log"
+        }
+        firewall_artifacts_present() {
+            printf '%s\n' firewall >> "$event_log"
+            return 1
+        }
+
+        uninstall_all </dev/null >"$TEST_TMP/uninstall-eof.out" 2>&1
+        assert_empty_file "$event_log" "卸载确认输入结束后不得进入卸载流程"
+        assert_file_contains "$TEST_TMP/uninstall-eof.out" '输入已结束，已取消卸载'
+    )
+
+    (
+        local event_log="$TEST_TMP/uninstall-late-eof-events"
+        : > "$event_log"
+        firewall_artifacts_present() { return 0; }
+        singbox_artifacts_present() { return 0; }
+        offer_restore_recorded_changes_before_uninstall() {
+            printf '%s\n' restore >> "$event_log"
+        }
+        firewall_disable_internal() {
+            printf '%s\n' firewall-disable >> "$event_log"
+        }
+        uninstall_singbox_and_nodes() {
+            printf '%s\n' singbox-remove >> "$event_log"
+        }
+
+        uninstall_all < <(printf 'YES\nYES\n') \
+            >"$TEST_TMP/uninstall-late-eof.out" 2>&1
+        assert_empty_file "$event_log" \
+            "卸载后段输入结束前不得恢复系统设置、关闭防火墙或删除 sing-box"
+        assert_file_contains "$TEST_TMP/uninstall-late-eof.out" '输入已结束，已取消卸载'
+    )
+
+    (
+        local event_log="$TEST_TMP/hostname-eof-events"
+        : > "$event_log"
+        hostname_current_value() { printf '%s\n' old-host; }
+        backup_change_file_once() { printf '%s\n' backup >> "$event_log"; }
+
+        change_system_hostname </dev/null >"$TEST_TMP/hostname-eof.out" 2>&1
+        assert_empty_file "$event_log" "主机名输入结束后不得备份或修改文件"
+        assert_file_contains "$TEST_TMP/hostname-eof.out" '输入已结束，已取消'
+    )
+
+    (
+        local event_log="$TEST_TMP/restore-eof-events"
+        : > "$event_log"
+        show_vpsbox_changes() { return 0; }
+        change_needs_restore() {
+            printf '%s\n' restore >> "$event_log"
+            return 1
+        }
+
+        restore_vpsbox_system_changes </dev/null >"$TEST_TMP/restore-eof.out" 2>&1
+        assert_empty_file "$event_log" "恢复确认输入结束后不得读取或恢复变更"
+        assert_file_contains "$TEST_TMP/restore-eof.out" '输入已结束，已取消恢复'
+    )
+
+    (
+        ss() { return 1; }
+        ssh_effective_ports_csv() { printf '%s\n' 22; }
+        docker_reserved_ports_for_port_choice() { printf '\n'; }
+        port_is_effective_ssh_port() { return 1; }
+        port_in_use_for_protocols() { return 1; }
+        singbox_config_pids() { return 0; }
+
+        if choose_node_port "" tcp "" "" <<< 80 >"$TEST_TMP/node-port-eof.out" 2>&1; then
+            fail "特权节点端口确认输入结束后不应返回端口"
+        fi
+        assert_file_contains "$TEST_TMP/node-port-eof.out" '输入已结束，已取消节点端口选择'
+    )
+
+    (
+        ss() { return 1; }
+        ssh_effective_ports_csv() { printf '%s\n' 22; }
+        docker_reserved_ports_for_port_choice() { printf '\n'; }
+        port_in_use_tcp() { return 1; }
+
+        if choose_ssh_target_port <<< 80 >"$TEST_TMP/ssh-privileged-port-eof.out" 2>&1; then
+            fail "特权 SSH 端口确认输入结束后不应返回端口"
+        fi
+        assert_file_contains "$TEST_TMP/ssh-privileged-port-eof.out" '输入已结束，已取消修改'
+    )
+}
+
 test_ss_password_generation_failure_rolls_back_before_mutation() {
     (
         local event_log="$TEST_TMP/password-failure-events"
@@ -264,6 +400,191 @@ test_atomic_root_publish_preserves_existing_target() {
         if find "$dir" -maxdepth 1 -name '.vpsbox-publish.*' -print -quit | grep -q .; then
             fail "原子发布失败后不应遗留临时文件"
         fi
+    )
+}
+
+test_singbox_service_publish_preserves_existing_target() {
+    (
+        local dir="$TEST_TMP/service-atomic-publish"
+        local target="$dir/sing-box.service"
+        local fake_bin="$dir/sing-box"
+        local install_log="$dir/install.log"
+        mkdir -p "$dir"
+        printf '%s\n' old-service > "$target"
+        printf '%s\n' '#!/bin/sh' 'exit 0' > "$fake_bin"
+        chmod 755 "$fake_bin"
+        : > "$install_log"
+        failing_renderer() {
+            printf '%s\n' partial-service
+            return 23
+        }
+        install_root_file_atomically() {
+            printf '%s\n' called >> "$install_log"
+            return 0
+        }
+
+        if publish_singbox_service_definition \
+            failing_renderer "$fake_bin" "$target" 644; then
+            fail "服务定义渲染失败时不应报告成功"
+        fi
+        assert_file_contains "$target" '^old-service$' \
+            "服务定义渲染失败不得截断现有文件"
+        assert_empty_file "$install_log" \
+            "服务定义渲染失败后不得进入发布阶段"
+    )
+
+    (
+        local dir="$TEST_TMP/service-directory-target"
+        local target="$dir/sing-box.service"
+        local fake_bin="$dir/sing-box"
+        mkdir -p "$target"
+        printf '%s\n' '#!/bin/sh' 'exit 0' > "$fake_bin"
+        chmod 755 "$fake_bin"
+        valid_renderer() {
+            printf '%s\n' '[Unit]' 'Description=sing-box'
+        }
+        chown() { return 0; }
+
+        if publish_singbox_service_definition \
+            valid_renderer "$fake_bin" "$target" 644; then
+            fail "服务定义目标为目录时不应报告发布成功"
+        fi
+        [ -d "$target" ] || fail "拒绝目录目标时不得替换原目录"
+        if find "$target" -mindepth 1 -print -quit | grep -q .; then
+            fail "拒绝目录目标时不得在目录内遗留发布文件"
+        fi
+    )
+}
+
+test_setup_service_rejects_missing_binary_before_mutation() {
+    (
+        local event_log="$TEST_TMP/service-missing-binary-events"
+        local output="$TEST_TMP/service-missing-binary.out"
+        : > "$event_log"
+        command() {
+            if [ "${1:-}" = "-v" ] && [ "${2:-}" = sing-box ]; then
+                return 1
+            fi
+            builtin command "$@"
+        }
+        is_systemd() {
+            printf '%s\n' systemd >> "$event_log"
+            return 0
+        }
+        publish_singbox_service_definition() {
+            printf '%s\n' publish >> "$event_log"
+            return 0
+        }
+        service_enable() {
+            printf '%s\n' enable >> "$event_log"
+            return 0
+        }
+
+        if setup_service >"$output" 2>&1; then
+            fail "缺少 sing-box 可执行文件时 setup_service 不应成功"
+        fi
+        assert_empty_file "$event_log" \
+            "缺少 sing-box 可执行文件时不得探测服务管理器或修改服务"
+        assert_file_contains "$output" '未找到 sing-box 可执行文件'
+    )
+}
+
+test_singbox_package_removal_failure_preserves_files() {
+    (
+        local delete_log="$TEST_TMP/singbox-uninstall-failure-delete-events"
+        local service_log="$TEST_TMP/singbox-uninstall-failure-service-events"
+        local output="$TEST_TMP/singbox-uninstall-failure.out"
+        local service_active=1 service_enabled=1
+        : > "$delete_log"
+        : > "$service_log"
+        OS=debian
+        service_stop() {
+            printf '%s\n' stop >> "$service_log"
+            service_active=0
+        }
+        service_start() {
+            printf '%s\n' start >> "$service_log"
+            service_active=1
+        }
+        stop_singbox_config_processes() { return 0; }
+        singbox_config_pids() { return 0; }
+        sleep() { return 0; }
+        service_is_running() { [ "$service_active" -eq 1 ]; }
+        service_manager_is_active() { [ "$service_active" -eq 1 ]; }
+        service_is_enabled() { [ "$service_enabled" -eq 1 ]; }
+        service_disable() {
+            printf '%s\n' disable >> "$service_log"
+            service_enabled=0
+        }
+        service_enable() {
+            printf '%s\n' enable >> "$service_log"
+            service_enabled=1
+        }
+        singbox_package_installed() { return 0; }
+        apt_get_bounded() { return 23; }
+        is_systemd() {
+            printf '%s\n' systemd >> "$delete_log"
+            return 0
+        }
+        rm() {
+            printf 'rm %s\n' "$*" >> "$delete_log"
+            return 0
+        }
+
+        if uninstall_singbox_and_nodes >"$output" 2>&1; then
+            fail "sing-box 软件包卸载失败时整体卸载不应成功"
+        fi
+        assert_empty_file "$delete_log" \
+            "软件包卸载失败后不得删除服务、二进制或节点文件"
+        [ "$service_active" -eq 1 ] || fail "软件包卸载失败后应恢复原运行状态"
+        [ "$service_enabled" -eq 1 ] || fail "软件包卸载失败后应恢复原自启状态"
+        assert_file_contains "$service_log" '^enable$'
+        assert_file_contains "$service_log" '^start$'
+        assert_file_contains "$output" \
+            '已恢复 sing-box 原运行与自启状态'
+    )
+}
+
+test_firewall_sync_restore_failure_preserves_backup() {
+    (
+        local install_calls=0 backup
+        local case_dir="$TEST_TMP/firewall-sync-restore"
+        RUNTIME_DIR="$case_dir/run"
+        FIREWALL_ROLLBACK_DIR="$case_dir/persistent-rollbacks"
+        FIREWALL_CONFIG="$case_dir/firewall.nft"
+        FIREWALL_STATE_FILE="$case_dir/firewall.env"
+        mkdir -p "$RUNTIME_DIR" "$FIREWALL_ROLLBACK_DIR"
+        printf '%s\n' old-config > "$FIREWALL_CONFIG"
+        printf '%s\n' state > "$FIREWALL_STATE_FILE"
+        firewall_recover_pending_rollbacks() { return 0; }
+        firewall_runtime_enabled() { return 0; }
+        firewall_load_state() { return 0; }
+        firewall_detect_allowed_ports() { return 0; }
+        firewall_write_config() { printf '%s\n' new-config > "$1"; }
+        firewall_install_managed_file() {
+            install_calls=$((install_calls + 1))
+            if [ "$install_calls" -eq 1 ]; then
+                cp -- "$1" "$2"
+            else
+                return 23
+            fi
+        }
+        nft() {
+            [ "${1:-}" = "-c" ] && return 0
+            return 42
+        }
+
+        if firewall_sync_active_config "" "" 1 >"$TEST_TMP/firewall-sync-restore.out" 2>&1; then
+            fail "新防火墙规则应用失败时同步不应成功"
+        fi
+        backup="$(find "$FIREWALL_ROLLBACK_DIR" -maxdepth 1 -name 'firewall-config-backup.*' -print -quit)"
+        [ -n "$backup" ] || fail "旧防火墙配置恢复失败时必须保留备份"
+        assert_file_contains "$backup" '^old-config$'
+        if find "$RUNTIME_DIR" -maxdepth 1 -name 'firewall-config-backup.*' -print -quit | grep -q .; then
+            fail "旧防火墙救援备份不得只保存在易失运行目录"
+        fi
+        assert_file_contains "$TEST_TMP/firewall-sync-restore.out" \
+            '磁盘配置未能恢复；旧配置持久备份已保留'
     )
 }
 
@@ -1007,9 +1328,14 @@ main() {
         test_uri_write_preserves_existing_on_failure
         test_node_eof_has_no_mutation
         test_interactive_confirm_is_function_local
+        test_sensitive_interaction_eof_cancels_before_mutation
         test_ss_password_generation_failure_rolls_back_before_mutation
         test_first_singbox_install_marks_transaction_before_install
         test_atomic_root_publish_preserves_existing_target
+        test_singbox_service_publish_preserves_existing_target
+        test_setup_service_rejects_missing_binary_before_mutation
+        test_singbox_package_removal_failure_preserves_files
+        test_firewall_sync_restore_failure_preserves_backup
         test_runtime_dir_permission_failure_is_fatal
         test_lockdir_first_acquisition_uses_reclaim_guard
         test_reality_checks_require_bounded_dns_and_openssl
