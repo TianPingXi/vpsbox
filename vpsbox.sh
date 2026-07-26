@@ -76,6 +76,7 @@ FIREWALL_STATE_FILE="$VPSBOX_STATE_DIR/firewall.env"
 FIREWALL_SYSTEMD_UNIT="/etc/systemd/system/vpsbox-firewall.service"
 FIREWALL_OPENRC_SERVICE="/etc/init.d/vpsbox-firewall"
 FIREWALL_SERVICE_NAME="vpsbox-firewall"
+FIREWALL_OPENRC_RUNLEVELS_DIR="/etc/runlevels"
 FIREWALL_ROLLBACK_SECONDS=90
 FIREWALL_ROLLBACK_DIR="$VPSBOX_STATE_DIR/firewall-rollbacks"
 PACKAGE_CONNECT_TIMEOUT=15
@@ -9813,8 +9814,8 @@ firewall_persistence_enabled() {
     if is_systemd; then
         systemctl is-enabled --quiet "$FIREWALL_SERVICE_NAME" 2>/dev/null
     elif [ "$OS" = "alpine" ]; then
-        [ -e "/etc/runlevels/default/$FIREWALL_SERVICE_NAME" ] ||
-            [ -L "/etc/runlevels/default/$FIREWALL_SERVICE_NAME" ]
+        [ -e "$FIREWALL_OPENRC_RUNLEVELS_DIR/default/$FIREWALL_SERVICE_NAME" ] ||
+            [ -L "$FIREWALL_OPENRC_RUNLEVELS_DIR/default/$FIREWALL_SERVICE_NAME" ]
     else
         return 1
     fi
@@ -9879,7 +9880,7 @@ firewall_native_service_enabled() {
 }
 
 firewall_openrc_service_enabled() {
-    local service="$1" runlevels_dir="${2:-/etc/runlevels}" entry
+    local service="$1" runlevels_dir="${2:-$FIREWALL_OPENRC_RUNLEVELS_DIR}" entry
 
     [ -n "$service" ] && [ -d "$runlevels_dir" ] || return 1
     for entry in "$runlevels_dir"/*/"$service"; do
@@ -11562,10 +11563,10 @@ if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
 elif command -v rc-update >/dev/null 2>&1; then
     if [ -e "\$dir/service.enabled" ]; then
         run_limited rc-update add '$FIREWALL_SERVICE_NAME' default || failed=1
-        [ -e '/etc/runlevels/default/$FIREWALL_SERVICE_NAME' ] || failed=1
+        [ -e '$FIREWALL_OPENRC_RUNLEVELS_DIR/default/$FIREWALL_SERVICE_NAME' ] || failed=1
     else
         run_limited rc-update del '$FIREWALL_SERVICE_NAME' default >/dev/null 2>&1 || true
-        [ ! -e '/etc/runlevels/default/$FIREWALL_SERVICE_NAME' ] || failed=1
+        [ ! -e '$FIREWALL_OPENRC_RUNLEVELS_DIR/default/$FIREWALL_SERVICE_NAME' ] || failed=1
     fi
     if [ -e "\$dir/service.active" ]; then
         run_limited rc-service '$FIREWALL_SERVICE_NAME' restart || failed=1
@@ -12947,8 +12948,8 @@ firewall_disable_internal() {
         rc-service "$FIREWALL_SERVICE_NAME" stop >/dev/null 2>&1 || true
         rc-update del "$FIREWALL_SERVICE_NAME" default >/dev/null 2>&1 || true
         rc-service "$FIREWALL_SERVICE_NAME" status >/dev/null 2>&1 && failed=1
-        { [ -e "/etc/runlevels/default/$FIREWALL_SERVICE_NAME" ] ||
-            [ -L "/etc/runlevels/default/$FIREWALL_SERVICE_NAME" ]; } && failed=1
+        { [ -e "$FIREWALL_OPENRC_RUNLEVELS_DIR/default/$FIREWALL_SERVICE_NAME" ] ||
+            [ -L "$FIREWALL_OPENRC_RUNLEVELS_DIR/default/$FIREWALL_SERVICE_NAME" ]; } && failed=1
     fi
     if command -v nft >/dev/null 2>&1; then
         nft delete table inet vpsbox >/dev/null 2>&1 || true

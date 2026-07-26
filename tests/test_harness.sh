@@ -171,6 +171,29 @@ test_suite_runners_keep_test_case_out_of_conditionals() {
     done
 }
 
+test_capability_preconditions_propagate_exact_status() {
+    local path file violations
+    local -a suites=()
+
+    for path in "$TEST_DIR"/test_*.sh; do
+        file="${path##*/}"
+        case "$file" in
+            test_helper.sh|test_harness.sh) continue ;;
+        esac
+        suites+=("$path")
+    done
+    [ "${#suites[@]}" -gt 0 ] || fail "未发现任何待检查的测试套件"
+
+    violations="$(awk '
+        /^[[:space:]]*require_(command|linux_proc|real_symlink)[[:space:]]/ &&
+            $0 !~ /\|\|[[:space:]]*return[[:space:]]+"\$\?"[[:space:]]*$/ {
+            print FILENAME ":" FNR ":" $0
+        }
+    ' "${suites[@]}")"
+    [ -z "$violations" ] ||
+        fail "能力前置条件必须原样传播实际状态：$violations"
+}
+
 main() {
     local test status passed=0
     local -a tests=(
@@ -183,6 +206,7 @@ main() {
         test_forbidden_marker_survives_command_substitution
         test_registration_check_rejects_missing_extra_and_duplicates
         test_suite_runners_keep_test_case_out_of_conditionals
+        test_capability_preconditions_propagate_exact_status
     )
 
     assert_all_tests_registered "${BASH_SOURCE[0]}" "${tests[@]}" || return 1

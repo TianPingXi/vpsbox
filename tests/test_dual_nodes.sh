@@ -61,33 +61,6 @@ else
         [ -d "$1" ] && [ ! -L "$1" ]
     }
 fi
-# Git for Windows 不附带 jq；该环境只用精确字段回退继续跑交互/事务测试。
-# Debian 验收存在 jq 时会直接执行生产实现和完整 JSON 语义校验。
-if ! command -v jq >/dev/null 2>&1; then
-    node_config_matches_loaded_state() {
-        local protocol="$1" config="$2"
-
-        case "$protocol" in
-            ss)
-                grep -Fq '"type": "shadowsocks"' "$config" &&
-                    grep -Fq "\"listen_port\": $PORT" "$config" &&
-                    grep -Fq "\"method\": \"$METHOD\"" "$config" &&
-                    grep -Fq "\"password\": \"$PASSWORD\"" "$config" || return 1
-                ;;
-            vless)
-                grep -Fq '"type": "vless"' "$config" &&
-                    grep -Fq "\"listen_port\": $PORT" "$config" &&
-                    grep -Fq "\"uuid\": \"$UUID\"" "$config" &&
-                    grep -Fq "\"flow\": \"$FLOW\"" "$config" &&
-                    grep -Fq "\"server_name\": \"$REALITY_SERVER_NAME\"" "$config" &&
-                    grep -Fq "\"private_key\": \"$REALITY_PRIVATE_KEY\"" "$config" &&
-                    grep -Fq "\"$REALITY_SHORT_ID\"" "$config" || return 1
-                ;;
-            *) return 2 ;;
-        esac
-        grep -Fq "$CONFIG_ID" "$config"
-    }
-fi
 
 cleanup() {
     rm -rf -- "$TEST_TMP"
@@ -1067,22 +1040,6 @@ test_insecure_node_permissions_are_rejected() {
         write_ss_config_fixture "$SS_CONFIG_PATH"
         write_ss_state_fixture "$SS_STATE_FILE"
         write_uri_files
-        node_file_is_secure() {
-            local owner group mode
-            [ -f "$1" ] && [ ! -L "$1" ] || return 1
-            owner="$(stat -c '%u' "$1")" || return 1
-            group="$(stat -c '%g' "$1")" || return 1
-            mode="$(stat -c '%a' "$1")" || return 1
-            [ "$owner" = 0 ] && [ "$group" = 0 ] && [ "$mode" = 600 ]
-        }
-        node_dir_is_secure() {
-            local owner group mode
-            [ -d "$1" ] && [ ! -L "$1" ] || return 1
-            owner="$(stat -c '%u' "$1")" || return 1
-            group="$(stat -c '%g' "$1")" || return 1
-            mode="$(stat -c '%a' "$1")" || return 1
-            [ "$owner" = 0 ] && [ "$group" = 0 ] && [ "$mode" = 700 ]
-        }
         command chown root:root "$CONFIG_DIR" "$NODE_CONFIG_DIR" \
             "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$URI_FILE" "$SS_URI_FILE"
         chmod 700 "$CONFIG_DIR" "$NODE_CONFIG_DIR"
@@ -1101,6 +1058,39 @@ test_insecure_node_permissions_are_rejected() {
         command chown 65534:65534 "$SS_STATE_FILE"
         if require_valid_node_state_if_present >/dev/null 2>&1; then
             fail "所有者不是 root 的节点状态必须被拒绝"
+        fi
+    )
+}
+
+test_node_security_predicates_reject_symlinks() {
+    (
+        local file_target file_link dir_target dir_link
+
+        if [ "$DUAL_NODES_REAL_PERMISSIONS" -ne 1 ]; then
+            skip "需要真实的 root 属主与 Unix 权限语义"
+            return "$SKIP_STATUS"
+        fi
+        require_real_symlink file || return "$?"
+        require_real_symlink directory || return "$?"
+        set_node_paths "$TEST_TMP/node-security-symlinks"
+        mkdir -p "$NODE_CONFIG_DIR"
+        file_target="$CONFIG_DIR/secure-file"
+        file_link="$CONFIG_DIR/file-link"
+        dir_target="$CONFIG_DIR/secure-dir"
+        dir_link="$CONFIG_DIR/dir-link"
+        : > "$file_target"
+        mkdir "$dir_target"
+        command chown root:root "$file_target" "$dir_target"
+        chmod 600 "$file_target"
+        chmod 700 "$dir_target"
+        ln -s "$file_target" "$file_link"
+        ln -s "$dir_target" "$dir_link"
+
+        if node_file_is_secure "$file_link"; then
+            fail "节点安全判定不得接受文件符号链接"
+        fi
+        if node_dir_is_secure "$dir_link"; then
+            fail "节点安全判定不得接受目录符号链接"
         fi
     )
 }
@@ -1128,7 +1118,17 @@ test_self_check_keeps_valid_sibling_visible() {
 }
 
 main() {
-    local test status passed=0 skipped=0
+    local name test status passed=0 skipped=0
+    local -a required=(
+        node_file_is_secure
+        node_dir_is_secure
+        node_config_matches_loaded_state
+        require_valid_node_state_if_present
+        begin_node_transaction
+        rollback_active_node_transaction
+        delete_node
+        write_uri_files
+    )
     local -a tests=(
         test_complete_configs_merge_with_unique_tags
         test_create_shadowsocks_preserves_vless_node
@@ -1159,9 +1159,17 @@ main() {
         test_uri_group_failure_restores_old_files
         test_last_uri_delete_failure_is_not_masked
         test_insecure_node_permissions_are_rejected
+        test_node_security_predicates_reject_symlinks
         test_self_check_keeps_valid_sibling_visible
     )
 
+    command -v jq >/dev/null 2>&1 || {
+        fail "缺少测试依赖：jq"
+        return 1
+    }
+    for name in "${required[@]}"; do
+        require_function "$name"
+    done
     assert_all_tests_registered "${BASH_SOURCE[0]}" "${tests[@]}" || return 1
     for test in "${tests[@]}"; do
         set +e

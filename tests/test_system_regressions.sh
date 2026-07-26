@@ -668,6 +668,31 @@ test_main_ssh_port_rewrite_handles_case_and_match_blocks() {
     )
 }
 
+test_main_ssh_port_is_inserted_before_match_without_global_port() {
+    (
+        local ssh_dir="$TEST_TMP/ssh-main-port-before-match"
+        mkdir -p "$ssh_dir"
+        SSHD_MAIN_CONF="$ssh_dir/sshd_config"
+        SSH_TARGET_PORT=49222
+        printf '%s\n' \
+            'PasswordAuthentication no' \
+            'Match Group sftponly' \
+            '    ForceCommand internal-sftp' > "$SSHD_MAIN_CONF"
+
+        set_main_ssh_port_directives
+
+        assert_eq 1 "$(grep -Eic '^[[:space:]]*port[[:space:]]+' "$SSHD_MAIN_CONF")" \
+            "没有全局 Port 时必须新增且仅新增一个目标端口"
+        awk '
+            /^Port 49222$/ { port_line = NR }
+            /^[[:space:]]*[Mm][Aa][Tt][Cc][Hh][[:space:]]/ { match_line = NR }
+            END { exit !(port_line && match_line && port_line < match_line) }
+        ' "$SSHD_MAIN_CONF" ||
+            fail "没有全局 Port 时仍必须在第一个 Match 块之前插入目标端口"
+        assert_file_contains "$SSHD_MAIN_CONF" '^[[:space:]]+ForceCommand internal-sftp$'
+    )
+}
+
 test_active_ufw_must_allow_new_ssh_port_before_mutation() {
     (
         local allow_target=0
@@ -1021,7 +1046,14 @@ test_uninstall_restore_failure_aborts_offer() {
 }
 
 main() {
-    local test status passed=0 skipped=0
+    local name test status passed=0 skipped=0
+    local -a required=(
+        set_main_ssh_port_directives
+        ensure_sshd_dropin_include
+        apply_ssh_port_change
+        enable_ipv4_priority
+        enable_ntp_sync
+    )
     local -a tests=(
         test_manifest_failure_preserves_existing_file
         test_manifest_round_trips_ssh_port_csv
@@ -1054,6 +1086,7 @@ main() {
         test_absent_resolv_conf_is_created_successfully
         test_sshd_include_only_activates_vpsbox_files
         test_main_ssh_port_rewrite_handles_case_and_match_blocks
+        test_main_ssh_port_is_inserted_before_match_without_global_port
         test_active_ufw_must_allow_new_ssh_port_before_mutation
         test_selinux_ssh_port_range_is_validated
         test_enabled_inactive_ssh_socket_is_detected
@@ -1072,6 +1105,9 @@ main() {
         test_uninstall_restore_failure_aborts_offer
     )
 
+    for name in "${required[@]}"; do
+        require_function "$name"
+    done
     assert_all_tests_registered "${BASH_SOURCE[0]}" "${tests[@]}" || return 1
     for test in "${tests[@]}"; do
         set +e

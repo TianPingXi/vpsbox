@@ -75,6 +75,7 @@ reset_firewall_case() {
     FIREWALL_OPENRC_SERVICE="$CASE_DIR/etc/vpsbox-firewall"
     # shellcheck disable=SC2034
     FIREWALL_SERVICE_NAME="vpsbox-firewall-test"
+    FIREWALL_OPENRC_RUNLEVELS_DIR="$CASE_DIR/runlevels"
     FIREWALL_ROLLBACK_SECONDS=30
     # shellcheck disable=SC2034
     ACTIVE_FIREWALL_ROLLBACK_DIR=""
@@ -286,6 +287,79 @@ EOF
     [ -e "$snapshot/rolled-back" ] || fail "服务状态恢复后缺少 rolled-back 标记"
     [ ! -e "$snapshot/rollback-failed" ] || fail "服务状态恢复留下失败标记"
     write_mock_commands
+}
+
+test_openrc_enabled_active_service_state_is_restored() {
+    local snapshot="" state_dir="$TEST_TMP/openrc-service-state"
+    local log="$TEST_TMP/openrc-service-state.log"
+    local openrc_bin="$TEST_TMP/openrc-bin" command_name command_path
+
+    require_linux_proc || return "$?"
+    reset_firewall_case openrc-service-state
+    mkdir -p "$state_dir" "$FIREWALL_OPENRC_RUNLEVELS_DIR/default" "$openrc_bin"
+    : > "$log"
+    export MOCK_OPENRC_STATE_DIR="$state_dir"
+    export MOCK_OPENRC_LOG="$log"
+    export MOCK_OPENRC_RUNLEVELS_DIR="$FIREWALL_OPENRC_RUNLEVELS_DIR"
+    # shellcheck disable=SC2034 # 被测 firewall_persistence_enabled 动态读取。
+    OS=alpine
+    is_systemd() { return 1; }
+    cat > "$openrc_bin/rc-update" <<'EOF'
+#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$MOCK_OPENRC_LOG"
+case "${1:-}" in
+    add)
+        mkdir -p "$MOCK_OPENRC_RUNLEVELS_DIR/${3:?}"
+        : > "$MOCK_OPENRC_RUNLEVELS_DIR/$3/${2:?}"
+        ;;
+    del)
+        rm -f "$MOCK_OPENRC_RUNLEVELS_DIR/${3:?}/${2:?}"
+        ;;
+    *) exit 1 ;;
+esac
+EOF
+    cat > "$openrc_bin/rc-service" <<'EOF'
+#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$MOCK_OPENRC_LOG"
+case "${2:-}" in
+    restart|start)
+        : > "$MOCK_OPENRC_STATE_DIR/active"
+        ;;
+    stop)
+        rm -f "$MOCK_OPENRC_STATE_DIR/active"
+        ;;
+    status)
+        [ -e "$MOCK_OPENRC_STATE_DIR/active" ]
+        ;;
+    *) exit 1 ;;
+esac
+EOF
+    chmod 755 "$openrc_bin/rc-update" "$openrc_bin/rc-service"
+    for command_name in awk cat chmod cp dirname ln mkdir mktemp mv rm rmdir sleep; do
+        command_path="$(command -v "$command_name")" ||
+            fail "OpenRC 回滚测试缺少命令：$command_name"
+        ln -s "$command_path" "$openrc_bin/$command_name"
+    done
+    firewall_service_active() { return 0; }
+    : > "$FIREWALL_OPENRC_RUNLEVELS_DIR/default/$FIREWALL_SERVICE_NAME"
+
+    firewall_create_rollback_snapshot snapshot "" ||
+        fail "OpenRC 服务状态恢复测试无法创建回滚快照"
+    [ -e "$snapshot/service.enabled" ] || fail "快照未记录 OpenRC 服务自启状态"
+    [ -e "$snapshot/service.active" ] || fail "快照未记录 OpenRC 服务运行状态"
+    rm -f "$FIREWALL_OPENRC_RUNLEVELS_DIR/default/$FIREWALL_SERVICE_NAME"
+
+    PATH="$openrc_bin" /bin/sh "$snapshot/rollback.sh" --now ||
+        fail "已启用且运行中的 OpenRC 服务状态未能恢复"
+    [ -e "$FIREWALL_OPENRC_RUNLEVELS_DIR/default/$FIREWALL_SERVICE_NAME" ] ||
+        fail "OpenRC 回滚未恢复服务自启状态"
+    [ -e "$state_dir/active" ] || fail "OpenRC 回滚未恢复服务运行状态"
+    assert_file_contains "$log" '^add vpsbox-firewall-test default$'
+    assert_file_contains "$log" '^vpsbox-firewall-test restart$'
+    [ -e "$snapshot/rolled-back" ] || fail "OpenRC 服务状态恢复后缺少 rolled-back 标记"
+    [ ! -e "$snapshot/rollback-failed" ] || fail "OpenRC 服务状态恢复留下失败标记"
 }
 
 test_stale_restore_lock_is_reclaimed() {
@@ -504,6 +578,7 @@ main() {
         test_natural_timeout_rolls_back_snapshot
         test_hup_does_not_cancel_timeout_rollback
         test_enabled_active_service_state_is_restored
+        test_openrc_enabled_active_service_state_is_restored
         test_stale_restore_lock_is_reclaimed
         test_restore_lock_metadata_is_atomically_published
         test_rollback_rejects_directory_symlink_target

@@ -1772,7 +1772,17 @@ test_dangling_node_symlink_is_not_treated_as_no_node() {
 }
 
 main() {
-    local test status passed=0 skipped=0
+    local name test status passed=0 skipped=0
+    local -a required=(
+        prompt_node_host
+        create_or_rebuild_node
+        cleanup_vpsbox_runtime
+        update_singbox
+        install_self_command
+        ssh_port_summary_line
+        main_loop
+        system_menu
+    )
     local -a tests=(
         test_address_fallback_validation
         test_blank_node_host_uses_detected_public_ipv4
@@ -1837,6 +1847,9 @@ main() {
         test_dangling_node_symlink_is_not_treated_as_no_node
     )
 
+    for name in "${required[@]}"; do
+        require_function "$name"
+    done
     assert_all_tests_registered "${BASH_SOURCE[0]}" "${tests[@]}" || return 1
     for test in "${tests[@]}"; do
         set +e

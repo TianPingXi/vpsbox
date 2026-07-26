@@ -593,7 +593,15 @@ test_singbox_redhat_release_arch_mapping() {
 }
 
 main() {
-    local test status passed=0 skipped=0
+    local name test status passed=0 skipped=0
+    local -a required=(
+        version_is_newer
+        version_relation
+        download_vpsbox_script
+        update_vpsbox
+        auto_update_vpsbox_on_start
+        rollback_pending_vpsbox_update
+    )
     local -a tests=(
         test_version_relation
         test_username_migration_identity_compatibility
@@ -615,6 +623,9 @@ main() {
         test_singbox_redhat_release_arch_mapping
     )
 
+    for name in "${required[@]}"; do
+        require_function "$name"
+    done
     assert_all_tests_registered "${BASH_SOURCE[0]}" "${tests[@]}" || return 1
     for test in "${tests[@]}"; do
         set +e
