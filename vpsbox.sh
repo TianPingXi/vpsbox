@@ -204,7 +204,7 @@ err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 confirm_default_yes() {
     local prompt="$1" answer
     while true; do
-        read -r -p "$prompt (Y/n): " answer || return 1
+        read -r -p "$prompt (y/n): " answer || return 1
         case "$answer" in
             ""|Y|y) return 0 ;;
             N|n) return 1 ;;

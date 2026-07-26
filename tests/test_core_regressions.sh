@@ -142,6 +142,28 @@ test_node_eof_has_no_mutation() {
     done
 }
 
+test_default_yes_confirmation_uses_lowercase_prompt() {
+    local definition output="$TEST_TMP/default-yes-confirm.out"
+
+    definition="$(declare -f confirm_default_yes)"
+    grep -Fq '(y/n): ' <<< "$definition" ||
+        fail "默认确认提示应使用小写 (y/n)"
+    if grep -Fq '(Y/n)' <<< "$definition"; then
+        fail "默认确认提示不应再使用 (Y/n)"
+    fi
+
+    confirm_default_yes "确认？" <<< "" ||
+        fail "默认确认直接回车时应继续按 y 处理"
+    confirm_default_yes "确认？" <<< y ||
+        fail "默认确认应接受小写 y"
+    if confirm_default_yes "确认？" <<< n; then
+        fail "默认确认应在输入小写 n 时取消"
+    fi
+    confirm_default_yes "确认？" <<< $'invalid\ny' >"$output" 2>&1 ||
+        fail "无效输入后重新输入 y 应确认"
+    assert_file_contains "$output" '请输入 y 或 n；直接回车默认 y。'
+}
+
 test_interactive_confirm_is_function_local() {
     (
         confirm=sentinel
@@ -1602,6 +1624,7 @@ main() {
         test_node_host_warns_for_possible_nat
         test_uri_write_preserves_existing_on_failure
         test_node_eof_has_no_mutation
+        test_default_yes_confirmation_uses_lowercase_prompt
         test_interactive_confirm_is_function_local
         test_detect_os_preserves_node_state_globals
         test_sensitive_interaction_eof_cancels_before_mutation
