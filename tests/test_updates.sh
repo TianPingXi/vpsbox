@@ -513,10 +513,10 @@ singbox_version() { printf '%s\n' "$MOCK_SINGBOX_VERSION"; }
 service_is_running() { return 1; }
 service_is_enabled() { return 1; }
 service_manager_is_active() { return 1; }
-service_stop() { printf '%s\n' service-stop >> "$MOCK_SINGBOX_EVENT_LOG"; }
-stop_singbox_config_processes() { printf '%s\n' process-stop >> "$MOCK_SINGBOX_EVENT_LOG"; }
+service_stop() { printf '%s\n' service-stop >> "${MOCK_SINGBOX_EVENT_LOG:?先调用 reset_singbox_case}"; }
+stop_singbox_config_processes() { printf '%s\n' process-stop >> "${MOCK_SINGBOX_EVENT_LOG:?先调用 reset_singbox_case}"; }
 node_exists() { return 1; }
-install_deps() { printf '%s\n' deps >> "$MOCK_SINGBOX_EVENT_LOG"; }
+install_deps() { printf '%s\n' deps >> "${MOCK_SINGBOX_EVENT_LOG:?先调用 reset_singbox_case}"; }
 singbox_binary_is_package_managed() { return 0; }
 prepare_singbox_rollback_package() {
     local package="$2/sing-box-old.deb"
@@ -524,11 +524,13 @@ prepare_singbox_rollback_package() {
     printf '%s\n' "$package"
 }
 run_singbox_installer() {
-    printf 'installer:%s\n' "${1:-$SINGBOX_RELEASE_VERSION}" >> "$MOCK_SINGBOX_EVENT_LOG"
+    printf 'installer:%s\n' "${1:-$SINGBOX_RELEASE_VERSION}" \
+        >> "${MOCK_SINGBOX_EVENT_LOG:?先调用 reset_singbox_case}"
     MOCK_SINGBOX_VERSION="${1:-$SINGBOX_RELEASE_VERSION}"
 }
 restore_singbox_service_state() {
-    printf 'restore:%s:%s\n' "$1" "$2" >> "$MOCK_SINGBOX_EVENT_LOG"
+    printf 'restore:%s:%s\n' "$1" "$2" \
+        >> "${MOCK_SINGBOX_EVENT_LOG:?先调用 reset_singbox_case}"
 }
 
 reset_singbox_case() {
@@ -598,7 +600,7 @@ test_singbox_redhat_release_arch_mapping() {
 }
 
 main() {
-    local test status passed=0
+    local test status passed=0 skipped=0
     local -a tests=(
         test_version_relation
         test_username_migration_identity_compatibility
@@ -620,20 +622,31 @@ main() {
         test_singbox_redhat_release_arch_mapping
     )
 
+    assert_all_tests_registered "${BASH_SOURCE[0]}" "${tests[@]}" || return 1
     for test in "${tests[@]}"; do
         set +e
-        (set -e; "$test")
+        run_test_case "$test"
         status=$?
         set -e
-        if [ "$status" -eq 0 ]; then
-            printf 'ok - %s\n' "$test"
-            passed=$((passed + 1))
-        else
-            printf 'not ok - %s\n' "$test" >&2
-            return 1
-        fi
+        case "$status" in
+            0)
+                printf 'ok - %s\n' "$test"
+                passed=$((passed + 1))
+                ;;
+            "$SKIP_STATUS")
+                printf 'ok - %s # SKIP %s\n' "$test" "$(test_skip_reason)"
+                skipped=$((skipped + 1))
+                ;;
+            *)
+                printf 'not ok - %s\n' "$test" >&2
+                return 1
+                ;;
+        esac
     done
-    printf '%s update mock tests passed.\n' "$passed"
+    printf '%s update mock tests passed, %s skipped, %s registered.\n' \
+        "$passed" "$skipped" "${#tests[@]}"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

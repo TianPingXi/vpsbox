@@ -545,6 +545,7 @@ test_delete_last_residual_node_without_singbox_skips_missing_service() {
 test_static_node_backup_validation_does_not_execute_singbox() {
     (
         local backup="$TEST_TMP/static-backup-validation/backup"
+        forbid_init
         set_node_paths "$TEST_TMP/static-backup-validation/node"
         mkdir -p "$NODE_CONFIG_DIR"
         write_ss_config_fixture "$SS_CONFIG_PATH"
@@ -552,7 +553,7 @@ test_static_node_backup_validation_does_not_execute_singbox() {
         write_uri_files
         service_is_running() { return 1; }
         service_is_enabled() { return 1; }
-        sing-box() { fail "静态事务备份校验不得执行 sing-box"; }
+        sing-box() { forbid "静态事务备份校验不得执行 sing-box"; }
 
         backup_node_files "$backup"
         validate_node_transaction_backup "$backup" ||
@@ -561,6 +562,7 @@ test_static_node_backup_validation_does_not_execute_singbox() {
         if validate_node_transaction_backup "$backup"; then
             fail "静态校验仍必须拒绝哈希被篡改的备份"
         fi
+        assert_no_forbidden "静态事务备份校验执行了 sing-box"
     )
 }
 
@@ -771,6 +773,7 @@ test_absent_backup_entry_removes_target_and_invalid_entry_is_rejected() {
 
 test_unmodified_pending_transaction_is_discarded_without_service_stop() {
     (
+        forbid_init
         set_node_paths "$TEST_TMP/pending-unmodified"
         mkdir -p "$NODE_CONFIG_DIR"
         write_ss_config_fixture "$SS_CONFIG_PATH"
@@ -780,18 +783,20 @@ test_unmodified_pending_transaction_is_discarded_without_service_stop() {
         service_is_enabled() { return 1; }
         begin_node_transaction
         ACTIVE_NODE_BACKUP=""
-        service_stop() { fail "尚未修改节点文件时不得停止 sing-box"; }
+        service_stop() { forbid "尚未修改节点文件时不得停止 sing-box"; }
 
         recover_pending_node_transaction >/dev/null
 
         assert_file_contains "$SS_CONFIG_PATH" '"type": "shadowsocks"'
         [ ! -e "$NODE_TRANSACTION_DIR" ] ||
             fail "没有 mutated 标记的 pending 事务应直接清理"
+        assert_no_forbidden "未修改的 pending 事务停止了 sing-box"
     )
 }
 
 test_corrupted_node_backup_is_rejected_before_overwrite() {
     (
+        forbid_init
         set_node_paths "$TEST_TMP/pending-corrupt"
         mkdir -p "$NODE_CONFIG_DIR"
         write_ss_config_fixture "$SS_CONFIG_PATH"
@@ -804,7 +809,7 @@ test_corrupted_node_backup_is_rejected_before_overwrite() {
         printf '%s\n' tampered >> "$NODE_TRANSACTION_BACKUP/ss-state.env"
         printf '%s\n' current-live > "$SS_CONFIG_PATH"
         ACTIVE_NODE_BACKUP=""
-        service_stop() { fail "备份校验失败时不得停止或覆盖现有服务"; }
+        service_stop() { forbid "备份校验失败时不得停止或覆盖现有服务"; }
 
         if recover_pending_node_transaction >/dev/null 2>&1; then
             fail "哈希损坏的节点备份不得自动恢复"
@@ -812,6 +817,7 @@ test_corrupted_node_backup_is_rejected_before_overwrite() {
         assert_file_contains "$SS_CONFIG_PATH" '^current-live$'
         [ -d "$NODE_TRANSACTION_BACKUP" ] ||
             fail "损坏的事务备份必须保留供人工处理"
+        assert_no_forbidden "损坏备份校验失败后停止了现有服务"
     )
 }
 
@@ -848,6 +854,7 @@ test_failed_recovery_keeps_transaction_backup() {
 
 test_committed_transaction_is_not_rolled_back() {
     (
+        forbid_init
         set_node_paths "$TEST_TMP/committed-recovery"
         mkdir -p "$NODE_CONFIG_DIR"
         write_ss_config_fixture "$SS_CONFIG_PATH"
@@ -861,12 +868,13 @@ test_committed_transaction_is_not_rolled_back() {
         chmod 600 "$NODE_TRANSACTION_DIR/committed"
         # shellcheck disable=SC2034 # 被被测的事务恢复函数动态读取。
         ACTIVE_NODE_BACKUP=""
-        service_stop() { fail "committed 事务不得触发操作前状态恢复"; }
+        service_stop() { forbid "committed 事务不得触发操作前状态恢复"; }
 
         recover_pending_node_transaction >/dev/null
 
         assert_file_contains "$SS_CONFIG_PATH" '^committed-new-state$'
         [ ! -e "$NODE_TRANSACTION_DIR" ] || fail "committed 残留事务应只清理目录"
+        assert_no_forbidden "committed 事务触发了操作前状态恢复"
     )
 }
 
@@ -1021,7 +1029,8 @@ test_last_uri_delete_failure_is_not_masked() {
 test_insecure_node_permissions_are_rejected() {
     (
         if [ "$(id -u)" -ne 0 ]; then
-            return 0
+            skip "需要 root 才能验证节点属主与权限"
+            return "$SKIP_STATUS"
         fi
         set_node_paths "$TEST_TMP/insecure-permissions"
         mkdir -p "$NODE_CONFIG_DIR"
@@ -1089,7 +1098,7 @@ test_self_check_keeps_valid_sibling_visible() {
 }
 
 main() {
-    local test status passed=0
+    local test status passed=0 skipped=0
     local -a tests=(
         test_complete_configs_merge_with_unique_tags
         test_create_shadowsocks_preserves_vless_node
@@ -1123,20 +1132,31 @@ main() {
         test_self_check_keeps_valid_sibling_visible
     )
 
+    assert_all_tests_registered "${BASH_SOURCE[0]}" "${tests[@]}" || return 1
     for test in "${tests[@]}"; do
         set +e
-        (set -e; "$test")
+        run_test_case "$test"
         status=$?
         set -e
-        if [ "$status" -eq 0 ]; then
-            printf 'ok - %s\n' "$test"
-            passed=$((passed + 1))
-        else
-            printf 'not ok - %s\n' "$test" >&2
-            return 1
-        fi
+        case "$status" in
+            0)
+                printf 'ok - %s\n' "$test"
+                passed=$((passed + 1))
+                ;;
+            "$SKIP_STATUS")
+                printf 'ok - %s # SKIP %s\n' "$test" "$(test_skip_reason)"
+                skipped=$((skipped + 1))
+                ;;
+            *)
+                printf 'not ok - %s\n' "$test" >&2
+                return 1
+                ;;
+        esac
     done
-    printf '%s dual node tests passed.\n' "$passed"
+    printf '%s dual node tests passed, %s skipped, %s registered.\n' \
+        "$passed" "$skipped" "${#tests[@]}"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

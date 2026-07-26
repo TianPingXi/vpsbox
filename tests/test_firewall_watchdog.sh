@@ -105,6 +105,29 @@ assert_process_gone() {
     fail "$message（PID $pid，状态：$(cat "/proc/$pid/stat" 2>/dev/null || echo 未知)）"
 }
 
+write_managed_firewall_fixture() {
+    cat > "$FIREWALL_CONFIG" <<'EOF'
+table inet vpsbox {
+    chain input {
+        type filter hook input priority filter; policy drop;
+        tcp dport { 22 } accept
+    }
+}
+EOF
+}
+
+wait_for_snapshot_rollback() {
+    local snapshot="$1"
+
+    for _ in {1..60}; do
+        [ -e "$snapshot/rolled-back" ] && return 0
+        [ ! -e "$snapshot/rollback-failed" ] ||
+            fail "watchdog 自动回滚失败：$(cat "$snapshot/rollback.log" 2>/dev/null || true)"
+        sleep 0.1
+    done
+    fail "watchdog 未在预期时间内完成自动回滚"
+}
+
 test_commit_stops_watchdog_and_sleep() {
     local snapshot="" watchdog child elapsed
 
@@ -156,6 +179,109 @@ test_immediate_restore_stops_timed_watchdog() {
     assert_process_gone "$child" "恢复后 sleep 子进程仍在运行"
     CASE_TEST_PIDS=""
     trap - EXIT
+}
+
+test_natural_timeout_rolls_back_snapshot() {
+    local snapshot="" watchdog original="$TEST_TMP/natural-timeout-original.nft"
+
+    CASE_TEST_PIDS=""
+    trap cleanup_case_processes EXIT
+    reset_firewall_case natural-timeout
+    FIREWALL_ROLLBACK_SECONDS=2
+    write_managed_firewall_fixture
+    cp "$FIREWALL_CONFIG" "$original"
+    firewall_create_rollback_snapshot snapshot "22" ||
+        fail "自然超时测试无法创建回滚快照"
+    firewall_start_rollback_watchdog "$snapshot"
+    watchdog="$(cat "$snapshot/watchdog.pid")"
+    CASE_TEST_PIDS="$watchdog"
+    printf '%s\n' 'temporary-unconfirmed-rules' > "$FIREWALL_CONFIG"
+
+    wait_for_snapshot_rollback "$snapshot"
+    cmp -s "$original" "$FIREWALL_CONFIG" ||
+        fail "自然超时后未恢复倒计时开始前的防火墙配置"
+    [ ! -e "$snapshot/rollback-failed" ] || fail "自然超时回滚留下失败标记"
+    assert_process_gone "$watchdog" "自然超时回滚后 watchdog 仍在运行"
+    CASE_TEST_PIDS=""
+    trap - EXIT
+}
+
+test_hup_does_not_cancel_timeout_rollback() {
+    local snapshot="" watchdog child original="$TEST_TMP/hup-timeout-original.nft"
+
+    CASE_TEST_PIDS=""
+    trap cleanup_case_processes EXIT
+    reset_firewall_case hup-timeout
+    FIREWALL_ROLLBACK_SECONDS=2
+    write_managed_firewall_fixture
+    cp "$FIREWALL_CONFIG" "$original"
+    firewall_create_rollback_snapshot snapshot "22" ||
+        fail "HUP 测试无法创建回滚快照"
+    firewall_start_rollback_watchdog "$snapshot"
+    watchdog="$(cat "$snapshot/watchdog.pid")"
+    CASE_TEST_PIDS="$watchdog"
+    wait_for_sleep_child "$watchdog" child
+    CASE_TEST_PIDS="$CASE_TEST_PIDS $child"
+    printf '%s\n' 'temporary-unconfirmed-rules' > "$FIREWALL_CONFIG"
+
+    kill -HUP "$watchdog"
+    sleep 0.1
+    kill -0 "$watchdog" 2>/dev/null ||
+        fail "nohup 启动的 watchdog 不应因 HUP 提前退出"
+    wait_for_snapshot_rollback "$snapshot"
+    cmp -s "$original" "$FIREWALL_CONFIG" ||
+        fail "HUP 后倒计时结束时未恢复原防火墙配置"
+    [ ! -e "$snapshot/rollback-failed" ] || fail "HUP 后自动回滚留下失败标记"
+    assert_process_gone "$watchdog" "HUP 后完成回滚的 watchdog 仍在运行"
+    CASE_TEST_PIDS=""
+    trap - EXIT
+}
+
+test_enabled_active_service_state_is_restored() {
+    local snapshot="" state_dir="$TEST_TMP/service-state" log="$TEST_TMP/service-state.log"
+
+    if [ ! -d /run/systemd/system ]; then
+        skip "需要 systemd 运行目录才能验证服务状态恢复"
+        return "$SKIP_STATUS"
+    fi
+    reset_firewall_case service-state
+    mkdir -p "$state_dir"
+    : > "$log"
+    export MOCK_SYSTEMCTL_STATE_DIR="$state_dir"
+    export MOCK_SYSTEMCTL_LOG="$log"
+    cat > "$TEST_TMP/bin/systemctl" <<'EOF'
+#!/bin/sh
+set -eu
+printf '%s\n' "$*" >> "$MOCK_SYSTEMCTL_LOG"
+case "${1:-}" in
+    daemon-reload) exit 0 ;;
+    enable) : > "$MOCK_SYSTEMCTL_STATE_DIR/enabled"; exit 0 ;;
+    disable) rm -f "$MOCK_SYSTEMCTL_STATE_DIR/enabled"; exit 0 ;;
+    restart|start) : > "$MOCK_SYSTEMCTL_STATE_DIR/active"; exit 0 ;;
+    stop) rm -f "$MOCK_SYSTEMCTL_STATE_DIR/active"; exit 0 ;;
+    is-enabled) [ -e "$MOCK_SYSTEMCTL_STATE_DIR/enabled" ] ;;
+    is-active) [ -e "$MOCK_SYSTEMCTL_STATE_DIR/active" ] ;;
+    *) exit 0 ;;
+esac
+EOF
+    chmod 755 "$TEST_TMP/bin/systemctl"
+    firewall_persistence_enabled() { return 0; }
+    firewall_service_active() { return 0; }
+
+    firewall_create_rollback_snapshot snapshot "" ||
+        fail "服务状态恢复测试无法创建回滚快照"
+    [ -e "$snapshot/service.enabled" ] || fail "快照未记录服务自启状态"
+    [ -e "$snapshot/service.active" ] || fail "快照未记录服务运行状态"
+
+    sh "$snapshot/rollback.sh" --now ||
+        fail "已启用且运行中的服务状态未能恢复"
+    [ -e "$state_dir/enabled" ] || fail "回滚未恢复服务自启状态"
+    [ -e "$state_dir/active" ] || fail "回滚未恢复服务运行状态"
+    assert_file_contains "$log" '^enable vpsbox-firewall-test$'
+    assert_file_contains "$log" '^restart vpsbox-firewall-test$'
+    [ -e "$snapshot/rolled-back" ] || fail "服务状态恢复后缺少 rolled-back 标记"
+    [ ! -e "$snapshot/rollback-failed" ] || fail "服务状态恢复留下失败标记"
+    write_mock_commands
 }
 
 test_stale_restore_lock_is_reclaimed() {
@@ -353,7 +479,7 @@ test_stale_pid_does_not_hide_real_watchdog() {
 }
 
 main() {
-    local name test status passed=0
+    local name test status passed=0 skipped=0
     local -a required=(
         firewall_create_rollback_snapshot
         firewall_start_rollback_watchdog
@@ -363,6 +489,9 @@ main() {
     local -a tests=(
         test_commit_stops_watchdog_and_sleep
         test_immediate_restore_stops_timed_watchdog
+        test_natural_timeout_rolls_back_snapshot
+        test_hup_does_not_cancel_timeout_rollback
+        test_enabled_active_service_state_is_restored
         test_stale_restore_lock_is_reclaimed
         test_restore_lock_metadata_is_atomically_published
         test_rollback_rejects_directory_symlink_target
@@ -377,20 +506,29 @@ main() {
     for name in "${required[@]}"; do
         require_function "$name"
     done
+    assert_all_tests_registered "${BASH_SOURCE[0]}" "${tests[@]}" || return 1
     for test in "${tests[@]}"; do
         set +e
-        (set -e; "$test")
+        run_test_case "$test"
         status=$?
         set -e
-        if [ "$status" -eq 0 ]; then
-            printf 'ok - %s\n' "$test"
-            passed=$((passed + 1))
-        else
-            printf 'not ok - %s\n' "$test" >&2
-            return 1
-        fi
+        case "$status" in
+            0)
+                printf 'ok - %s\n' "$test"
+                passed=$((passed + 1))
+                ;;
+            "$SKIP_STATUS")
+                printf 'ok - %s # SKIP %s\n' "$test" "$(test_skip_reason)"
+                skipped=$((skipped + 1))
+                ;;
+            *)
+                printf 'not ok - %s\n' "$test" >&2
+                return 1
+                ;;
+        esac
     done
-    printf '%s firewall watchdog tests passed.\n' "$passed"
+    printf '%s firewall watchdog tests passed, %s skipped, %s registered.\n' \
+        "$passed" "$skipped" "${#tests[@]}"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

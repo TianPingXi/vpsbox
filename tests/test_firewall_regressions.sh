@@ -258,12 +258,147 @@ table inet vpsbox {
 EOF
 }
 
+set_minimal_live_match_expectations() {
+    FW_ALLOWED_TCP='22,80'
+    FW_ALLOWED_UDP='443'
+    FW_DOCKER_PUBLIC4_TCP=''
+    FW_DOCKER_PUBLIC4_UDP=''
+    FW_DOCKER_PUBLIC6_TCP=''
+    FW_DOCKER_PUBLIC6_UDP=''
+    FW_DOCKER_PROXY4_TCP=''
+    FW_DOCKER_PROXY4_UDP=''
+    FW_DOCKER_PROXY6_TCP=''
+    FW_DOCKER_PROXY6_UDP=''
+    FW_DOCKER_BRIDGES=''
+    FW_EXTRA_TCP=''
+    FW_EXTRA_UDP=''
+}
+
+emit_numeric_live_table_fixture() {
+    cat <<EOF
+table inet vpsbox {
+$([ "${LIVE_MATCH_DRIFT:-}" != unexpected-set ] || printf '%s\n' \
+'    set unexpected_ports {' \
+'        type inet_service' \
+'        elements = { 9999 }' \
+'    }')
+    chain input {
+        type filter hook input priority filter; policy drop;
+        ct state 0x1 drop
+        ct state 0x2,0x4 accept
+        iifname "lo" accept
+        ip protocol 1 accept
+        meta l4proto 58 accept
+        meta nfproto 2 udp sport 67 udp dport 68 accept
+        meta nfproto 10 udp sport 547 udp dport 546 accept
+        tcp dport { 22, 80 } accept
+        udp dport 443 accept
+    }
+    chain docker_port_guard {
+        meta l4proto 6 drop
+        meta l4proto 17 drop
+        drop
+    }
+    chain docker_forward {
+        type filter hook forward priority -1; policy accept;
+        ct state 0x2,0x4 accept
+        ct direction 0 ct status 0x20 jump docker_port_guard
+    }
+}
+EOF
+}
+
+emit_numeric_live_input_fixture() {
+    local priority=filter
+    [ "${LIVE_MATCH_DRIFT:-}" != input-priority ] || priority=10
+    cat <<EOF
+table inet vpsbox {
+    chain input {
+        type filter hook input priority $priority; policy drop;
+        ct state 0x1 drop
+        ct state 0x2,0x4 accept
+        iifname "lo" accept
+        ip protocol 1 accept
+        meta l4proto 58 accept
+        meta nfproto 2 udp sport 67 udp dport 68 accept
+        meta nfproto 10 udp sport 547 udp dport 546 accept
+        tcp dport { 22, 80 } accept
+        udp dport 443 accept
+    }
+}
+EOF
+}
+
+emit_numeric_live_guard_fixture() {
+    cat <<'EOF'
+table inet vpsbox {
+    chain docker_port_guard {
+        meta l4proto 6 drop
+        meta l4proto 17 drop
+        drop
+    }
+}
+EOF
+}
+
+emit_numeric_live_forward_fixture() {
+    cat <<EOF
+table inet vpsbox {
+    chain docker_forward {
+        type filter hook forward priority -1; policy accept;
+$([ "${LIVE_MATCH_DRIFT:-}" = forward-rule ] || printf '%s\n' '        ct state 0x2,0x4 accept')
+        ct direction 0 ct status 0x20 jump docker_port_guard
+    }
+}
+EOF
+}
+
+mock_numeric_live_nft() {
+    case "$*" in
+        '-nn list table inet vpsbox') emit_numeric_live_table_fixture ;;
+        '-nn list chain inet vpsbox input') emit_numeric_live_input_fixture ;;
+        '-nn list chain inet vpsbox docker_port_guard') emit_numeric_live_guard_fixture ;;
+        '-nn list chain inet vpsbox docker_forward') emit_numeric_live_forward_fixture ;;
+        'list chain inet vpsbox output'|'list set inet vpsbox '*) return 1 ;;
+        *) return 1 ;;
+    esac
+}
+
+test_live_config_match_accepts_numeric_nft_snapshot() {
+    (
+        set_minimal_live_match_expectations
+        LIVE_MATCH_DRIFT=''
+        firewall_runtime_enabled() { return 0; }
+        nft() { mock_numeric_live_nft "$@"; }
+
+        firewall_live_config_matches_expected ||
+            fail "与期望一致的 nft -nn 规则快照应通过 live 配置校验"
+    )
+}
+
+test_live_config_match_rejects_critical_drift() {
+    (
+        local drift
+        set_minimal_live_match_expectations
+        firewall_runtime_enabled() { return 0; }
+        nft() { mock_numeric_live_nft "$@"; }
+
+        for drift in input-priority forward-rule unexpected-set; do
+            LIVE_MATCH_DRIFT="$drift"
+            if firewall_live_config_matches_expected; then
+                fail "live 配置校验必须拒绝漂移：$drift"
+            fi
+        done
+    )
+}
+
 test_view_rules_reads_live_nft_instead_of_current_listeners() {
     (
         local output="$TEST_TMP/firewall-live-view.out"
+        forbid_init
         firewall_runtime_enabled() { return 0; }
         firewall_persistence_state() { printf '已启用\n'; }
-        firewall_detect_allowed_ports() { fail "查看实际规则不得重新扫描当前监听"; }
+        firewall_detect_allowed_ports() { forbid "查看实际规则不得重新扫描当前监听"; }
         nft() {
             [ "$*" = '-nn list table inet vpsbox' ] || return 1
             emit_live_firewall_table_sample
@@ -278,23 +413,26 @@ test_view_rules_reads_live_nft_instead_of_current_listeners() {
         assert_file_contains "$output" '额外 DNAT[[:space:]]+TCP[[:space:]]+20000'
         assert_file_not_contains "$output" '(^|[^0-9])(68|546|80|443)([^0-9]|$)' \
             "未实际放行的新监听和 DHCP 客户端端口不得显示"
+        assert_no_forbidden "查看实际规则时重新扫描了当前监听"
     )
 }
 
 test_view_rules_inactive_reports_no_live_ports_without_scanning() {
     (
         local output="$TEST_TMP/firewall-inactive-view.out"
+        forbid_init
         firewall_runtime_enabled() { return 1; }
         firewall_runtime_state() { printf '配置存在但未运行\n'; }
         firewall_persistence_state() { printf '已启用\n'; }
-        firewall_detect_allowed_ports() { fail "停用防火墙的查看操作不得扫描期望端口"; }
-        nft() { fail "停用防火墙时不得读取不存在的 live 表"; }
+        firewall_detect_allowed_ports() { forbid "停用防火墙的查看操作不得扫描期望端口"; }
+        nft() { forbid "停用防火墙时不得读取不存在的 live 表"; }
 
         firewall_view_rules > "$output"
 
         assert_file_contains "$output" '主机入站[[:space:]]+TCP[[:space:]]+-$'
         assert_file_contains "$output" '防火墙：配置存在但未运行'
         assert_file_contains "$output" '当前没有正在生效的 vpsbox 防火墙规则'
+        assert_no_forbidden "停用防火墙的查看操作读取了 live 表或扫描了期望端口"
     )
 }
 
@@ -669,6 +807,7 @@ test_additive_config_builder_creates_first_udp_rule_and_set() {
 test_adding_port_uses_lightweight_commit_path() {
     (
         local log="$TEST_TMP/additive-route.log"
+        forbid_init
         firewall_settle_pending_port_transition() { :; }
         firewall_load_state() { FW_EXTRA_TCP="8080"; FW_EXTRA_UDP=""; }
         firewall_prompt_port() { printf '%s\n' 8443; }
@@ -676,16 +815,18 @@ test_adding_port_uses_lightweight_commit_path() {
         firewall_apply_added_ports() {
             printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "$FW_EXTRA_TCP" "$FW_EXTRA_UDP" > "$log"
         }
-        firewall_apply_desired_state() { fail "新增端口不得调用完整防火墙更新"; }
+        firewall_apply_desired_state() { forbid "新增端口不得调用完整防火墙更新"; }
 
         firewall_add_extra_port tcp
         assert_file_contains "$log" '^tcp\|8443\|8080\|8080,8443\|$'
+        assert_no_forbidden "新增端口调用了完整防火墙更新"
     )
 }
 
 test_lightweight_add_does_not_rescan_docker_or_ssh() {
     (
         local case_dir="$TEST_TMP/additive-apply" log="$TEST_TMP/additive-apply.log"
+        forbid_init
         mkdir -p "$case_dir"
         RUNTIME_DIR="$case_dir/run"
         FIREWALL_CONFIG="$case_dir/firewall.nft"
@@ -716,7 +857,7 @@ test_lightweight_add_does_not_rescan_docker_or_ssh() {
         firewall_begin_commit() { printf '%s\n' begin >> "$log"; }
         firewall_install_managed_file() { printf '%s\n' install >> "$log"; }
         firewall_finish_commit() { printf '%s\n' finish >> "$log"; }
-        firewall_detect_allowed_ports() { fail "轻量新增不得重新扫描 SSH、节点或 Docker"; }
+        firewall_detect_allowed_ports() { forbid "轻量新增不得重新扫描 SSH、节点或 Docker"; }
 
         firewall_apply_added_ports tcp 8443 8080 ""
         assert_file_contains "$log" '^snapshot:6384$'
@@ -725,11 +866,12 @@ test_lightweight_add_does_not_rescan_docker_or_ssh() {
         assert_file_contains "$log" '^begin$'
         assert_eq 2 "$(grep -Fxc install "$log")" "配置与状态应分别原子落盘"
         assert_file_contains "$log" '^finish$'
+        assert_no_forbidden "轻量新增重新扫描了 SSH、节点或 Docker"
     )
 }
 
 main() {
-    local name test status passed=0
+    local name test status passed=0 skipped=0
     local -a required=(
         normalize_port_decimal
         normalize_port_csv
@@ -746,6 +888,7 @@ main() {
         firewall_build_config_with_added_ports
         firewall_read_live_allowed_ports
         firewall_view_rules
+        firewall_live_config_matches_expected
     )
     local -a tests=(
         test_port_decimal_normalization
@@ -754,6 +897,8 @@ main() {
         test_security_group_suggestions_exclude_dhcp_clients
         test_allowed_ports_merge_known_public_docker_and_extra_sources
         test_stopped_public_service_is_removed_unless_extra
+        test_live_config_match_accepts_numeric_nft_snapshot
+        test_live_config_match_rejects_critical_drift
         test_view_rules_reads_live_nft_instead_of_current_listeners
         test_view_rules_inactive_reports_no_live_ports_without_scanning
         test_view_rules_accepts_normalized_forward_priority_expression
@@ -776,20 +921,29 @@ main() {
     for name in "${required[@]}"; do
         require_function "$name"
     done
+    assert_all_tests_registered "${BASH_SOURCE[0]}" "${tests[@]}" || return 1
     for test in "${tests[@]}"; do
         set +e
-        (set -e; "$test")
+        run_test_case "$test"
         status=$?
         set -e
-        if [ "$status" -eq 0 ]; then
-            printf 'ok - %s\n' "$test"
-            passed=$((passed + 1))
-        else
-            printf 'not ok - %s\n' "$test" >&2
-            return 1
-        fi
+        case "$status" in
+            0)
+                printf 'ok - %s\n' "$test"
+                passed=$((passed + 1))
+                ;;
+            "$SKIP_STATUS")
+                printf 'ok - %s # SKIP %s\n' "$test" "$(test_skip_reason)"
+                skipped=$((skipped + 1))
+                ;;
+            *)
+                printf 'not ok - %s\n' "$test" >&2
+                return 1
+                ;;
+        esac
     done
-    printf '%s firewall regression tests passed.\n' "$passed"
+    printf '%s firewall regression tests passed, %s skipped, %s registered.\n' \
+        "$passed" "$skipped" "${#tests[@]}"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

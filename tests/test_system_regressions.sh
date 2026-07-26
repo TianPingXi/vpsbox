@@ -671,6 +671,7 @@ test_multiple_ssh_socket_streams_are_parsed() {
 test_ssh_restore_does_not_require_current_config_to_parse() {
     (
         local ssh_dir="$TEST_TMP/ssh-invalid-current" transition_log="$TEST_TMP/ssh-invalid-transition"
+        forbid_init
         reset_change_store ssh-invalid-current
         mkdir -p "$ssh_dir/sshd_config.d"
         SSHD_MAIN_CONF="$ssh_dir/sshd_config"
@@ -688,7 +689,7 @@ test_ssh_restore_does_not_require_current_config_to_parse() {
             esac
         }
         ssh_listening_ports_csv() { printf '%s\n' 23333; }
-        ssh_effective_ports_csv() { fail "损坏配置恢复入口不得调用 sshd -T"; }
+        ssh_effective_ports_csv() { forbid "损坏配置恢复入口不得调用 sshd -T"; }
         ssh_firewall_transition_begin() { printf '%s\n' "$1" > "$transition_log"; }
         restore_change_file() { return 0; }
         sshd_binary() { printf '%s\n' /bin/true; }
@@ -700,6 +701,7 @@ test_ssh_restore_does_not_require_current_config_to_parse() {
 
         restore_vpsbox_ssh_config <<< "YES" >/dev/null
         assert_file_contains "$transition_log" '^22,6384,23333$'
+        assert_no_forbidden "损坏配置恢复入口调用了 sshd -T"
     )
 }
 
@@ -941,7 +943,7 @@ test_uninstall_restore_failure_aborts_offer() {
 }
 
 main() {
-    local test status passed=0
+    local test status passed=0 skipped=0
     local -a tests=(
         test_manifest_failure_preserves_existing_file
         test_manifest_round_trips_ssh_port_csv
@@ -989,20 +991,29 @@ main() {
         test_uninstall_restore_failure_aborts_offer
     )
 
+    assert_all_tests_registered "${BASH_SOURCE[0]}" "${tests[@]}" || return 1
     for test in "${tests[@]}"; do
         set +e
-        (set -e; "$test")
+        run_test_case "$test"
         status=$?
         set -e
-        if [ "$status" -eq 0 ]; then
-            printf 'ok - %s\n' "$test"
-            passed=$((passed + 1))
-        else
-            printf 'not ok - %s\n' "$test" >&2
-            return 1
-        fi
+        case "$status" in
+            0)
+                printf 'ok - %s\n' "$test"
+                passed=$((passed + 1))
+                ;;
+            "$SKIP_STATUS")
+                printf 'ok - %s # SKIP %s\n' "$test" "$(test_skip_reason)"
+                skipped=$((skipped + 1))
+                ;;
+            *)
+                printf 'not ok - %s\n' "$test" >&2
+                return 1
+                ;;
+        esac
     done
-    printf '%s system regression tests passed.\n' "$passed"
+    printf '%s system regression tests passed, %s skipped, %s registered.\n' \
+        "$passed" "$skipped" "${#tests[@]}"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

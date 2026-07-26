@@ -1615,7 +1615,7 @@ test_dangling_node_symlink_is_not_treated_as_no_node() {
 }
 
 main() {
-    local test status passed=0
+    local test status passed=0 skipped=0
     local -a tests=(
         test_address_fallback_validation
         test_blank_node_host_uses_detected_public_ipv4
@@ -1676,20 +1676,31 @@ main() {
         test_dangling_node_symlink_is_not_treated_as_no_node
     )
 
+    assert_all_tests_registered "${BASH_SOURCE[0]}" "${tests[@]}" || return 1
     for test in "${tests[@]}"; do
         set +e
-        (set -e; "$test")
+        run_test_case "$test"
         status=$?
         set -e
-        if [ "$status" -eq 0 ]; then
-            printf 'ok - %s\n' "$test"
-            passed=$((passed + 1))
-        else
-            printf 'not ok - %s\n' "$test" >&2
-            return 1
-        fi
+        case "$status" in
+            0)
+                printf 'ok - %s\n' "$test"
+                passed=$((passed + 1))
+                ;;
+            "$SKIP_STATUS")
+                printf 'ok - %s # SKIP %s\n' "$test" "$(test_skip_reason)"
+                skipped=$((skipped + 1))
+                ;;
+            *)
+                printf 'not ok - %s\n' "$test" >&2
+                return 1
+                ;;
+        esac
     done
-    printf '%s core regression tests passed.\n' "$passed"
+    printf '%s core regression tests passed, %s skipped, %s registered.\n' \
+        "$passed" "$skipped" "${#tests[@]}"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
