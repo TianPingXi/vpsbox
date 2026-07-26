@@ -138,6 +138,63 @@ test_action_parser() {
     assert_eq "nftables-multiport" "${actions[0]}" "action 名称解析错误"
 }
 
+test_sshd_config_forces_nftables_banaction() {
+    local output="$TEST_TMP/fail2ban-nftables-config.out"
+
+    render_fail2ban_sshd_config 6384 systemd > "$output"
+    assert_file_contains "$output" '^banaction = nftables-multiport$' \
+        "vpsbox 管理的 sshd jail 应固定使用 nftables"
+}
+
+test_missing_nftables_dependency_is_installed_automatically() {
+    (
+        local nft_ready=0
+        local log="$TEST_TMP/fail2ban-nftables-auto-install.log"
+        : > "$log"
+        command() {
+            if [ "${1:-}" = "-v" ] && [ "${2:-}" = "nft" ]; then
+                [ "$nft_ready" -eq 1 ]
+            else
+                builtin command "$@"
+            fi
+        }
+        install_fail2ban_nftables_dependency() {
+            printf '%s\n' install >> "$log"
+            nft_ready=1
+        }
+        confirm_default_yes() {
+            printf '%s\n' confirm >> "$log"
+            return 1
+        }
+
+        ensure_fail2ban_nftables_dependency
+        assert_file_contains "$log" '^install$' \
+            "缺少 nft 时应自动安装 nftables"
+        assert_file_not_contains "$log" '^confirm$' \
+            "自动补齐 nftables 前不得询问用户"
+    )
+}
+
+test_nftables_dependency_install_requires_nft_command() {
+    (
+        local nft_ready=0
+        local output="$TEST_TMP/fail2ban-nftables-incomplete.out"
+        command() {
+            if [ "${1:-}" = "-v" ] && [ "${2:-}" = "nft" ]; then
+                [ "$nft_ready" -eq 1 ]
+            else
+                builtin command "$@"
+            fi
+        }
+        install_fail2ban_nftables_dependency() { return 0; }
+
+        if ensure_fail2ban_nftables_dependency >"$output" 2>&1; then
+            fail "nftables 安装后仍缺少 nft 命令时不得继续"
+        fi
+        assert_file_contains "$output" 'nftables 安装后仍找不到 nft 命令'
+    )
+}
+
 test_exact_ipv4_match() {
     fail2ban_ipv4_in_text '192.0.2.1' 'elements = { 192.0.2.10 }' &&
         fail "精确匹配不得把 192.0.2.10 识别为 192.0.2.1"
@@ -359,18 +416,20 @@ test_sync_restores_initial_stopped_state() {
     assert_eq 0 "$running" "同步后不得把原本停止的 Fail2ban 留在运行状态"
 }
 
-test_sync_healthy_configuration_is_noop() {
+test_sync_healthy_configuration_only_checks_nftables_dependency() {
     (
         local log="$TEST_TMP/fail2ban-sync-healthy.log"
         : > "$log"
         fail2ban_installed() { return 0; }
         fail2ban_sshd_configuration_healthy() { return 0; }
+        ensure_fail2ban_nftables_dependency() { printf '%s\n' dependency >> "$log"; }
         manifest_set_once() { printf '%s\n' manifest >> "$log"; }
         backup_change_file_once() { printf '%s\n' backup >> "$log"; }
         verify_fail2ban_real_ban() { printf '%s\n' ban-test >> "$log"; }
 
         sync_fail2ban_sshd_port >/dev/null
-        assert_empty_file "$log" "健康的 Fail2ban 配置不得备份、改写或测试封禁"
+        assert_eq dependency "$(cat "$log")" \
+            "健康配置只应复核 nftables 依赖，不得备份、改写或测试封禁"
     )
 }
 
@@ -389,6 +448,13 @@ test_fail2ban_health_requires_canonical_current_config() {
 
         fail2ban_sshd_configuration_healthy ||
             fail "规范配置、端口及服务状态正常时应识别为健康"
+        MOCK_ACTION_NAME="iptables-multiport"
+        MOCK_ACTIONBAN="/usr/sbin/iptables -w -I f2b-sshd 1 -s <ip> -j REJECT"
+        if fail2ban_sshd_configuration_healthy; then
+            fail "配置文件正确但运行态仍使用 iptables 时不得识别为健康"
+        fi
+        MOCK_ACTION_NAME="nftables-multiport"
+        MOCK_ACTIONBAN="/usr/sbin/nft add element inet f2b-table addr-set-sshd { <ip> }"
         printf 'port = 22\n' >> "$FAIL2BAN_VPSBOX_SSHD_CONF"
         if fail2ban_sshd_configuration_healthy; then
             fail "含额外漂移内容的 Fail2ban 配置不得跳过同步"
@@ -396,19 +462,21 @@ test_fail2ban_health_requires_canonical_current_config() {
     )
 }
 
-test_install_fail2ban_healthy_is_noop() {
+test_install_fail2ban_healthy_only_checks_nftables_dependency() {
     (
         local log="$TEST_TMP/fail2ban-install-healthy.log"
         : > "$log"
         detect_os() { OS=debian; }
         fail2ban_sshd_configuration_healthy() { return 0; }
+        ensure_fail2ban_nftables_dependency() { printf '%s\n' dependency >> "$log"; }
         fail2ban_installed() { printf '%s\n' installed-check >> "$log"; return 0; }
         apt_get_bounded() { printf '%s\n' package >> "$log"; }
         ensure_fail2ban_service_running() { printf '%s\n' service >> "$log"; }
         sync_fail2ban_sshd_port() { printf '%s\n' sync >> "$log"; }
 
         install_fail2ban >/dev/null
-        assert_empty_file "$log" "健康的 Fail2ban 安装操作不得触发包管理或服务修改"
+        assert_eq dependency "$(cat "$log")" \
+            "健康的 Fail2ban 只应复核 nftables 依赖，不得触发其他包管理或服务修改"
     )
 }
 
@@ -512,6 +580,7 @@ test_install_fail2ban_first_install_records_baseline_before_package_mutation() {
         begin_change_transaction() { printf 'begin:%s\n' "$1" >> "$log"; }
         apt_get_bounded() {
             if [ "${2:-}" = install ]; then
+                printf 'package-args:%s\n' "$*" >> "$log"
                 printf '%s\n' package-mutation >> "$log"
                 installed=1
                 running=1
@@ -530,6 +599,9 @@ test_install_fail2ban_first_install_records_baseline_before_package_mutation() {
         assert_file_contains "$log" '^manifest:FAIL2BAN_ENABLED=disabled$'
         assert_file_contains "$log" '^begin:FAIL2BAN_SSHD$'
         assert_file_contains "$log" '^package-mutation$'
+        assert_file_contains "$log" \
+            '^package-args:[0-9][0-9]* install -y fail2ban nftables$' \
+            "首次安装 Fail2ban 应同时安装 nftables"
         manifest_active_line="$(grep -n '^manifest:FAIL2BAN_ACTIVE=' "$log" | cut -d: -f1)"
         manifest_enabled_line="$(grep -n '^manifest:FAIL2BAN_ENABLED=' "$log" | cut -d: -f1)"
         begin_line="$(grep -n '^begin:FAIL2BAN_SSHD$' "$log" | cut -d: -f1)"
@@ -616,12 +688,16 @@ main() {
     local -a required=(
         fail2ban_action_names
         fail2ban_ipv4_in_text
+        ensure_fail2ban_nftables_dependency
         verify_fail2ban_real_ban
         cleanup_active_fail2ban_test
     )
     local name test status passed=0
     local -a tests=(
         test_action_parser
+        test_sshd_config_forces_nftables_banaction
+        test_missing_nftables_dependency_is_installed_automatically
+        test_nftables_dependency_install_requires_nft_command
         test_exact_ipv4_match
         test_supported_backend_snapshots
         test_supported_action_round_trips
@@ -633,9 +709,9 @@ main() {
         test_stale_active_test_blocks_new_ban
         test_sync_validation_failure_rolls_back
         test_sync_restores_initial_stopped_state
-        test_sync_healthy_configuration_is_noop
+        test_sync_healthy_configuration_only_checks_nftables_dependency
         test_fail2ban_health_requires_canonical_current_config
-        test_install_fail2ban_healthy_is_noop
+        test_install_fail2ban_healthy_only_checks_nftables_dependency
         test_installed_fail2ban_repairs_without_package_manager
         test_install_fail2ban_records_service_state_before_mutation
         test_fail2ban_service_state_does_not_require_client_binary

@@ -2,6 +2,28 @@
 set -euo pipefail
 umask 077
 
+# ==============================================================================
+# 源码导航
+# ==============================================================================
+# 0. 全局配置与运行时状态
+# 1. 核心运行时：输出、输入、超时、进程、清理与实例锁
+# 2. 平台适配与通用持久化：系统识别、启动更新探测、下载、依赖与变更记录
+# 3. 节点与 sing-box：依赖、服务、监听检查、状态、配置、事务及版本更新
+# 4. vpsbox 自更新发布与回滚事务
+# 5. 系统优化与安全：BBR、Fail2ban、NTP、DNS、SSH 与系统维护
+# 6. 主机防火墙：端口发现、nftables、Docker 转发、回滚与菜单
+# 7. 检测与路由测试：一键检测、NextTrace、三网回程与大小包
+# 8. 维护、恢复与末端菜单动作
+# 9. 菜单与交互
+# 10. 程序入口
+#
+# vpsbox.sh 是唯一运行时源码；tests/ 通过 source 本文件并按场景替换部分函数与入口。
+# 章节标题只描述当前职责边界，不代表已经拆分为可独立加载的模块。
+
+# ==============================================================================
+# 0. 全局配置与运行时状态
+# ==============================================================================
+# 产品、版本、受管路径和超时均在加载时确定，业务函数只读取这些配置。
 APP_NAME="vpsbox"
 VPSBOX_VERSION="v1.0.40"
 # 只从当前仓库下载可执行脚本；旧地址仅用于识别本地 v1.0.23 及更早备份，绝不联网获取。
@@ -45,6 +67,7 @@ SSHD_MAIN_CONF="/etc/ssh/sshd_config"
 SSHD_CONFIG_DIR="/etc/ssh/sshd_config.d"
 SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
 SSHD_VPSBOX_HARDENING_CONF="$SSHD_CONFIG_DIR/01-vpsbox-ssh-hardening.conf"
+# SSH 端口修改流程维护的当前目标值；文件头只提供初始默认值。
 SSH_TARGET_PORT="23333"
 FAIL2BAN_CONFIG_DIR="/etc/fail2ban/jail.d"
 FAIL2BAN_VPSBOX_SSHD_CONF="$FAIL2BAN_CONFIG_DIR/99-vpsbox-sshd.local"
@@ -63,16 +86,25 @@ VPSBOX_UPDATE_STARTUP_TIMEOUT=60
 PACKAGE_KILL_GRACE=10
 PACKAGE_RETRY_MAX=2
 PACKAGE_RETRY_DELAY=2
+
+# 有界命令状态由 run_bounded_* / cleanup_active_bounded_command 独占维护；
+# 任何退出路径都必须经统一清理，不能由业务函数直接复用这些字段。
 ACTIVE_BOUNDED_PID=""
 ACTIVE_BOUNDED_START=""
 ACTIVE_BOUNDED_TIMER_PID=""
 ACTIVE_BOUNDED_MARKER=""
+
+# 实例锁状态由 acquire_lock 与 cleanup_vpsbox_runtime 管理。
 RUNTIME_DIR="/run/vpsbox"
 LOCK_FILE="$RUNTIME_DIR/vpsbox.lock"
 LOCK_DIR="$RUNTIME_DIR/lockdir"
 LOCK_RECLAIM_DIR="$RUNTIME_DIR/lockdir-reclaim"
 LOCK_USING_FLOCK=0
 LOCK_USING_DIR=0
+
+# ACTIVE_* 是各操作域的进程内生命周期句柄。所属节点、防火墙、SSH、Fail2ban、
+# 路由测试或 sing-box 更新流程负责写入。统一退出清理可以先接管并清空句柄再调用
+# 对应恢复入口，也可以在操作完成后清空；失败后的保留与提示策略由各领域清理函数负责。
 ACTIVE_NODE_BACKUP=""
 ACTIVE_NODE_TRANSACTION_MUTATED=0
 ACTIVE_FIREWALL_TRANSITION_DIR=""
@@ -91,11 +123,15 @@ ACTIVE_SINGBOX_UPDATE_WAS_ENABLED=0
 ACTIVE_SINGBOX_UPDATE_WAS_ACTIVE=0
 ACTIVE_SINGBOX_UPDATE_MUTATED=0
 ACTIVE_SINGBOX_UPDATE_ROLLING_BACK=0
+
+# sing-box 与节点默认值；load_state_file 会把最近一次成功加载的节点字段写入全局变量。
 SERVICE_NAME="sing-box"
 SS_METHOD="2022-blake3-aes-128-gcm"
 METHOD="$SS_METHOD"
 PORT_MIN=10000
 PORT_MAX=60000
+
+# 路由测试目标与采样参数仅由检测模块读取。
 TRACE_NAMES=(
     "北京电信" "北京联通" "北京移动"
     "上海电信" "上海联通" "上海移动"
@@ -115,6 +151,8 @@ TRACE_ISPS=("电信" "联通" "移动")
 TRACE_SIZE_SMALL=64
 TRACE_SIZE_LARGE=1400
 TRACE_SIZE_QUERIES=3
+
+# vpsbox 自更新握手状态由检查、watchdog 与新进程启动确认流程共同维护。
 REMOTE_VERSION=""
 UPDATE_AVAILABLE=0
 PENDING_VPSBOX_UPDATE_BACKUP="${VPSBOX_UPDATE_BACKUP:-}"
@@ -122,6 +160,9 @@ PENDING_VPSBOX_UPDATE_READY_FILE="${VPSBOX_UPDATE_READY_FILE:-}"
 VPSBOX_UPDATE_STARTUP_CONFIRMED=0
 VPSBOX_UPDATE_WATCHDOG_PID=""
 VPSBOX_UPDATE_WATCHDOG_DIR=""
+
+# FW_* 是防火墙模块的一次内存快照：先由加载/探测函数重置并填充，
+# 再由计算、展示和渲染函数消费，不应跨两次防火墙操作缓存。
 FW_EXTRA_TCP=""
 FW_EXTRA_UDP=""
 FW_SSH_PORTS=""
@@ -153,6 +194,9 @@ FW_DOCKER_CUSTOM_BRIDGE=0
 FW_ALLOWED_TCP=""
 FW_ALLOWED_UDP=""
 
+# ==============================================================================
+# 1. 核心运行时：输出、输入、超时、进程、清理与实例锁
+# ==============================================================================
 info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
@@ -962,16 +1006,23 @@ acquire_lock() {
     [ "$reclaim_guard" = "1" ] && release_lockdir_reclaim_guard
 }
 
+# ==============================================================================
+# 2. 平台适配与通用持久化：系统识别、启动更新探测、下载、依赖与变更记录
+# ==============================================================================
 detect_os() {
+    local os_release_values=""
+
     OS="unknown"
     OS_ID=""
     OS_ID_LIKE=""
 
     if [ -f /etc/os-release ]; then
-        # shellcheck disable=SC1091
-        . /etc/os-release
-        OS_ID="${ID:-}"
-        OS_ID_LIKE="${ID_LIKE:-}"
+        os_release_values="$(
+            # shellcheck disable=SC1091
+            . /etc/os-release || exit 1
+            printf '%s\034%s' "${ID:-}" "${ID_LIKE:-}"
+        )" || os_release_values=""
+        IFS=$'\034' read -r OS_ID OS_ID_LIKE <<< "$os_release_values"
     fi
 
     if echo "$OS_ID $OS_ID_LIKE" | grep -qi "alpine"; then
@@ -1222,6 +1273,9 @@ version_relation() {
     fi
 }
 
+# ------------------------------------------------------------------------------
+# vpsbox 启动更新探测；发布、启动确认与回滚见第 4 节
+# ------------------------------------------------------------------------------
 check_vpsbox_update_on_start() {
     local src
     local current_path
@@ -1669,6 +1723,9 @@ install_deps() {
     esac
 }
 
+# ==============================================================================
+# 3. 节点与 sing-box：依赖、服务、监听检查、状态、配置、事务及版本更新
+# ==============================================================================
 node_commands_available() {
     local command_name
 
@@ -1734,29 +1791,12 @@ ensure_node_dependencies() {
     fi
 }
 
-confirm_node_dependency_install() {
-    if node_dependencies_available; then
-        return 0
-    fi
-
-    warn "vpsbox 节点管理依赖不完整。"
-    if ! confirm_default_yes "是否安装缺少的依赖并继续？"; then
-        info "已取消，未安装依赖。"
-        return 1
-    fi
-    ensure_node_dependencies
-}
-
 ensure_node_runtime_commands() {
     local missing
 
     missing="$(missing_node_commands jq ss)"
     [ -z "$missing" ] && return 0
-    warn "节点服务管理缺少必要命令：$missing。"
-    if ! confirm_default_yes "是否安装缺少的依赖并继续？"; then
-        info "已取消，未安装依赖。"
-        return 1
-    fi
+    info "节点服务管理缺少必要命令：$missing，正在自动补齐..."
     install_deps || {
         err "节点服务管理依赖安装失败，请检查软件源或网络。"
         return 1
@@ -2034,6 +2074,9 @@ show_logs() {
     fi
 }
 
+# ------------------------------------------------------------------------------
+# 共用监听地址分类、socket 采集与安全组建议
+# ------------------------------------------------------------------------------
 is_loopback_listen_addr() {
     local addr="$1"
 
@@ -2281,6 +2324,9 @@ EOF
     rm -f "$public_file" "$local_file" "$suggest_file"
 }
 
+# ------------------------------------------------------------------------------
+# 节点状态与配置
+# ------------------------------------------------------------------------------
 node_config_path() {
     case "$1" in
         ss) printf '%s\n' "$SS_CONFIG_PATH" ;;
@@ -2335,6 +2381,9 @@ node_dir_is_secure() {
     [ "$owner" = "0" ] && [ "$group" = "0" ] && [ "$mode" = "700" ]
 }
 
+# 成功时会覆盖 DOMAIN、NAME、PORT、PASSWORD、METHOD、PROTOCOL、UUID、FLOW、
+# Reality 字段及 CONFIG_ID。调用者应立即消费或复制所需值；再次成功调用会替换当前节点视图，
+# 调用失败则保留上一次成功加载的值。
 load_state_file() {
     local file="$1"
     local expected_protocol="$2"
@@ -4081,6 +4130,7 @@ write_shadowsocks_inbound_json() {
     local password="$4"
     local suffix="${5:-}"
 
+    # --- BEGIN GENERATED TEMPLATE: Shadowsocks inbound JSON ---
     cat <<EOF
     {
       "type": "shadowsocks",
@@ -4091,6 +4141,7 @@ write_shadowsocks_inbound_json() {
       "password": "$password"
     }$suffix
 EOF
+    # --- END GENERATED TEMPLATE: Shadowsocks inbound JSON ---
 }
 
 write_config() {
@@ -4122,6 +4173,7 @@ write_config() {
     esac
 
     tmp="$(mktemp "$CONFIG_DIR/.10-ss.XXXXXX")" || return 1
+    # --- BEGIN GENERATED TEMPLATE: Shadowsocks node JSON ---
     cat > "$tmp" <<EOF
 {
   "log": {
@@ -4153,6 +4205,7 @@ EOF
   ]
 }
 EOF
+    # --- END GENERATED TEMPLATE: Shadowsocks node JSON ---
     if ! chown root:root "$tmp" ||
         ! chmod 600 "$tmp" ||
         ! sing-box check -c "$tmp" >/dev/null ||
@@ -4165,6 +4218,7 @@ EOF
 write_vless_reality_inbound_json() {
     local tag="$1" listen="$2" port="$3" uuid="$4" server_name="$5" private_key="$6" short_id="$7" suffix="${8:-}"
 
+    # --- BEGIN GENERATED TEMPLATE: VLESS Reality inbound JSON ---
     cat <<EOF
     {
       "type": "vless",
@@ -4193,6 +4247,7 @@ write_vless_reality_inbound_json() {
       }
     }$suffix
 EOF
+    # --- END GENERATED TEMPLATE: VLESS Reality inbound JSON ---
 }
 
 write_vless_reality_config() {
@@ -4214,6 +4269,7 @@ write_vless_reality_config() {
     esac
 
     tmp="$(mktemp "$CONFIG_DIR/.20-vless-reality.XXXXXX")" || return 1
+    # --- BEGIN GENERATED TEMPLATE: VLESS Reality node JSON ---
     cat > "$tmp" <<EOF
 {
   "log": {
@@ -4240,6 +4296,7 @@ EOF
   ]
 }
 EOF
+    # --- END GENERATED TEMPLATE: VLESS Reality node JSON ---
     if ! chown root:root "$tmp" ||
         ! chmod 600 "$tmp" ||
         ! sing-box check -c "$tmp" >/dev/null ||
@@ -4400,6 +4457,7 @@ render_singbox_systemd_service() {
     require_valid_node_state_if_present || return 1
     node_exists || return 1
 
+    # --- BEGIN GENERATED TEMPLATE: sing-box systemd unit ---
     cat <<EOF
 [Unit]
 Description=Sing-box Proxy Server
@@ -4424,6 +4482,7 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
+    # --- END GENERATED TEMPLATE: sing-box systemd unit ---
 }
 
 render_singbox_openrc_service() {
@@ -4432,6 +4491,7 @@ render_singbox_openrc_service() {
     require_valid_node_state_if_present || return 1
     node_exists || return 1
 
+    # --- BEGIN GENERATED TEMPLATE: sing-box OpenRC service ---
     cat <<EOF
 #!/sbin/openrc-run
 name="sing-box"
@@ -4449,6 +4509,7 @@ depend() {
     need net
 }
 EOF
+    # --- END GENERATED TEMPLATE: sing-box OpenRC service ---
 }
 
 publish_singbox_service_definition() {
@@ -4548,7 +4609,7 @@ create_or_rebuild_node() {
     local staged_config staged_state
     local existing_port="" existing_protocols="" sibling_ports=""
 
-    confirm_node_dependency_install || return 1
+    ensure_node_dependencies || return 1
     require_valid_node_state_if_present || return 1
     if protocol_visible_exists ss; then
         load_protocol_state ss || return 1
@@ -4685,7 +4746,7 @@ create_vless_reality_node() {
     local sibling_ports=""
     local -a keypair
 
-    confirm_node_dependency_install || return 1
+    ensure_node_dependencies || return 1
     require_valid_node_state_if_present || return 1
     if protocol_visible_exists vless; then
         load_protocol_state vless || return 1
@@ -5585,6 +5646,9 @@ update_singbox() {
     info "更新完成：$(singbox_version)"
 }
 
+# ==============================================================================
+# 4. vpsbox 自更新发布与回滚事务
+# ==============================================================================
 restore_previous_vpsbox() {
     local backup="$1"
     local tmp
@@ -5828,6 +5892,9 @@ reexec_updated_vpsbox() {
     return "$status"
 }
 
+# ==============================================================================
+# 5. 系统优化与安全：BBR、Fail2ban、NTP、DNS、SSH 与系统维护
+# ==============================================================================
 bbr_state() {
     local cc
     cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")"
@@ -5934,12 +6001,15 @@ fail2ban_sshd_state() {
 render_fail2ban_sshd_config() {
     local ports="$1" backend="$2"
 
+    # --- BEGIN GENERATED TEMPLATE: Fail2ban sshd jail ---
     cat <<EOF
 [sshd]
 enabled = true
 port = $ports
 backend = $backend
+banaction = nftables-multiport
 EOF
+    # --- END GENERATED TEMPLATE: Fail2ban sshd jail ---
 }
 
 fail2ban_sshd_configuration_healthy() {
@@ -5955,7 +6025,8 @@ fail2ban_sshd_configuration_healthy() {
     render_fail2ban_sshd_config "$ports" "$backend" |
         cmp -s - "$FAIL2BAN_VPSBOX_SSHD_CONF" || return 1
     fail2ban-client -t -c /etc/fail2ban >/dev/null 2>&1 || return 1
-    fail2ban-client status sshd >/dev/null 2>&1
+    fail2ban-client status sshd >/dev/null 2>&1 || return 1
+    fail2ban_sshd_uses_only_nftables
 }
 
 fail2ban_action_names() {
@@ -6156,6 +6227,56 @@ fail2ban_effective_firewall_backends() {
 
     [ -n "$backends" ] || return 1
     printf '%s\n' "$backends"
+}
+
+fail2ban_sshd_uses_only_nftables() {
+    local backends
+
+    backends="$(fail2ban_effective_firewall_backends 2>/dev/null)" || return 1
+    [ "$backends" = "nftables" ]
+}
+
+install_fail2ban_nftables_dependency() {
+    # 这里只补齐 Fail2ban 动作需要的 nft 命令；不启用 nftables.service，
+    # 不写入 /etc/nftables.conf，也不调用 vpsbox 主机防火墙模块。
+    detect_os
+
+    case "$OS" in
+        alpine)
+            apk_bounded "$PACKAGE_UPDATE_TIMEOUT" update || return 1
+            apk_bounded "$PACKAGE_INSTALL_TIMEOUT" add --no-cache nftables || return 1
+            ;;
+        debian)
+            export DEBIAN_FRONTEND=noninteractive
+            apt_get_bounded "$PACKAGE_UPDATE_TIMEOUT" update || return 1
+            apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y nftables || return 1
+            ;;
+        redhat)
+            if command -v dnf >/dev/null 2>&1; then
+                dnf_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y nftables || return 1
+            else
+                yum_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y nftables || return 1
+            fi
+            ;;
+        *)
+            err "未识别系统类型，无法自动安装 Fail2ban 的 nftables 依赖。"
+            return 1
+            ;;
+    esac
+}
+
+ensure_fail2ban_nftables_dependency() {
+    command -v nft >/dev/null 2>&1 && return 0
+
+    info "Fail2ban 缺少 nftables 后端依赖，正在自动补齐..."
+    if ! install_fail2ban_nftables_dependency; then
+        err "Fail2ban 的 nftables 后端依赖安装失败，请检查软件源或网络。"
+        return 1
+    fi
+    command -v nft >/dev/null 2>&1 || {
+        err "nftables 安装后仍找不到 nft 命令。"
+        return 1
+    }
 }
 
 fail2ban_backend_dump() {
@@ -6446,10 +6567,12 @@ write_chrony_sources() {
 
     if grep -Eq '^[[:space:]]*sourcedir[[:space:]]+/etc/chrony/sources\.d([[:space:]]|$)' "$conf"; then
         mkdir -p /etc/chrony/sources.d || return 1
+        # --- BEGIN GENERATED TEMPLATE: chrony source file ---
         if ! cat > "$source_file" <<EOF
 pool time.cloudflare.com iburst maxsources 4
 pool pool.ntp.org iburst maxsources 4
 EOF
+        # --- END GENERATED TEMPLATE: chrony source file ---
         then
             return 1
         fi
@@ -6457,6 +6580,7 @@ EOF
         info "已写入 NTP 源：$source_file"
     else
         remove_vpsbox_ntp_block "$conf" || return 1
+        # --- BEGIN GENERATED TEMPLATE: chrony managed source block ---
         if ! cat >> "$conf" <<EOF
 
 $NTP_SOURCES_BEGIN
@@ -6464,6 +6588,7 @@ pool time.cloudflare.com iburst maxsources 4
 pool pool.ntp.org iburst maxsources 4
 $NTP_SOURCES_END
 EOF
+        # --- END GENERATED TEMPLATE: chrony managed source block ---
         then
             return 1
         fi
@@ -6473,10 +6598,12 @@ EOF
 }
 
 chrony_expected_sources() {
+    # --- BEGIN GENERATED TEMPLATE: chrony expected source set ---
     cat <<EOF
 pool time.cloudflare.com iburst maxsources 4
 pool pool.ntp.org iburst maxsources 4
 EOF
+    # --- END GENERATED TEMPLATE: chrony expected source set ---
 }
 
 chrony_sources_are_current() {
@@ -7284,11 +7411,13 @@ write_systemd_resolved_dns() {
     begin_change_transaction DNS_RESOLVED || { err "记录 DNS 修改事务失败，已取消修改。"; return 1; }
 
     tmp="$(mktemp "$conf_dir/.vpsbox.conf.XXXXXX")" || return 1
+    # --- BEGIN GENERATED TEMPLATE: systemd-resolved DNS drop-in ---
     if ! cat > "$tmp" <<EOF
 [Resolve]
 DNS=$(dns_values_line "$dns1" "$dns2")
 Domains=~.
 EOF
+    # --- END GENERATED TEMPLATE: systemd-resolved DNS drop-in ---
     then
         rm -f "$tmp"
         err "写入 $conf_file 失败。"
@@ -7706,10 +7835,12 @@ write_vpsbox_ssh_port_config() {
 
     mkdir -p "$SSHD_CONFIG_DIR" || return 1
     tmp="$(mktemp)" || return 1
+    # --- BEGIN GENERATED TEMPLATE: SSH port drop-in ---
     cat > "$tmp" <<EOF || { rm -f "$tmp"; return 1; }
 # Managed by vpsbox
 Port $SSH_TARGET_PORT
 EOF
+    # --- END GENERATED TEMPLATE: SSH port drop-in ---
     install_ssh_config_atomically "$tmp" "$SSHD_VPSBOX_PORT_CONF" 644 ||
         { rm -f "$tmp"; return 1; }
     rm -f "$tmp"
@@ -7720,6 +7851,7 @@ write_vpsbox_ssh_hardening_config() {
 
     mkdir -p "$SSHD_CONFIG_DIR" || return 1
     tmp="$(mktemp)" || return 1
+    # --- BEGIN GENERATED TEMPLATE: SSH hardening drop-in ---
     cat > "$tmp" <<'EOF' || { rm -f "$tmp"; return 1; }
 # Managed by vpsbox
 LoginGraceTime 1m
@@ -7729,6 +7861,7 @@ PermitEmptyPasswords no
 UsePAM yes
 UseDNS no
 EOF
+    # --- END GENERATED TEMPLATE: SSH hardening drop-in ---
     install_ssh_config_atomically "$tmp" "$SSHD_VPSBOX_HARDENING_CONF" 644 ||
         { rm -f "$tmp"; return 1; }
     rm -f "$tmp"
@@ -8260,6 +8393,7 @@ sync_fail2ban_sshd_port() {
     if ! fail2ban_installed; then
         return 0
     fi
+    ensure_fail2ban_nftables_dependency || return 1
     if fail2ban_sshd_configuration_healthy; then
         info "Fail2ban SSH 防护配置已是当前状态，无需重复同步。"
         return 0
@@ -9221,10 +9355,12 @@ EOF
 }
 
 render_bbr_fq_config() {
+    # --- BEGIN GENERATED TEMPLATE: BBR and fq sysctl drop-in ---
     cat <<EOF
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
+    # --- END GENERATED TEMPLATE: BBR and fq sysctl drop-in ---
 }
 
 bbr_fq_persistent_config_is_current() {
@@ -9334,6 +9470,7 @@ install_fail2ban() {
 
     detect_os
     if fail2ban_sshd_configuration_healthy; then
+        ensure_fail2ban_nftables_dependency || return 1
         info "Fail2ban SSH 防护已正常运行，无需重复安装或配置。"
         return 0
     fi
@@ -9363,22 +9500,22 @@ install_fail2ban() {
             debian)
                 export DEBIAN_FRONTEND=noninteractive
                 if ! apt_get_bounded "$PACKAGE_UPDATE_TIMEOUT" update ||
-                    ! apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban; then
+                    ! apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban nftables; then
                     warn "Fail2ban 安装未完全成功，将检查最终安装状态。"
                 fi
                 ;;
             alpine)
                 if ! apk_bounded "$PACKAGE_UPDATE_TIMEOUT" update ||
-                    ! apk_bounded "$PACKAGE_INSTALL_TIMEOUT" add --no-cache fail2ban; then
+                    ! apk_bounded "$PACKAGE_INSTALL_TIMEOUT" add --no-cache fail2ban nftables; then
                     err "Fail2ban 安装失败。"
                     return 1
                 fi
                 ;;
             redhat)
                 if command -v dnf >/dev/null 2>&1; then
-                    dnf_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban || { err "Fail2ban 安装失败。"; return 1; }
+                    dnf_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban nftables || { err "Fail2ban 安装失败。"; return 1; }
                 else
-                    yum_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban || { err "Fail2ban 安装失败。"; return 1; }
+                    yum_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban nftables || { err "Fail2ban 安装失败。"; return 1; }
                 fi
                 ;;
             *)
@@ -9394,6 +9531,7 @@ install_fail2ban() {
         err "Fail2ban 未安装成功，请检查软件源或网络。"
         return 1
     fi
+    ensure_fail2ban_nftables_dependency || return 1
 
     ensure_fail2ban_service_running || {
         err "无法启动 Fail2ban 或设置开机自启。"
@@ -9420,6 +9558,9 @@ install_fail2ban() {
     info "Fail2ban 已安装，SSH 防护已启用，端口：$(ssh_effective_ports_csv)"
 }
 
+# ==============================================================================
+# 6. 主机防火墙：端口发现、nftables、Docker 转发、回滚与菜单
+# ==============================================================================
 normalize_port_csv() {
     local input="${1:-}" item
     local -a items normalized_items=()
@@ -10651,6 +10792,7 @@ firewall_write_config() {
     proxy4_udp="$(printf '%s' "$FW_DOCKER_PROXY4_UDP" | sed 's/,/, /g')"
     proxy6_tcp="$(printf '%s' "$FW_DOCKER_PROXY6_TCP" | sed 's/,/, /g')"
     proxy6_udp="$(printf '%s' "$FW_DOCKER_PROXY6_UDP" | sed 's/,/, /g')"
+    # --- BEGIN GENERATED TEMPLATE: nftables managed table ---
     cat > "$dest" <<'EOF'
 # Managed by vpsbox. Replace only the dedicated table; never flush the global ruleset.
 delete table inet vpsbox
@@ -10755,6 +10897,7 @@ EOF
     cat >> "$dest" <<'EOF'
 }
 EOF
+    # --- END GENERATED TEMPLATE: nftables managed table ---
 }
 
 firewall_write_service_definition() {
@@ -10762,6 +10905,7 @@ firewall_write_service_definition() {
     nft_path="$(command -v nft)" || return 1
 
     if is_systemd; then
+        # --- BEGIN GENERATED TEMPLATE: vpsbox firewall systemd unit ---
         cat > "$dest" <<EOF
 [Unit]
 Description=vpsbox host firewall
@@ -10780,7 +10924,9 @@ ExecStop=-$nft_path delete table inet vpsbox
 [Install]
 WantedBy=sysinit.target
 EOF
+        # --- END GENERATED TEMPLATE: vpsbox firewall systemd unit ---
     elif [ "$OS" = "alpine" ] && command -v rc-update >/dev/null 2>&1; then
+        # --- BEGIN GENERATED TEMPLATE: vpsbox firewall OpenRC service ---
         cat > "$dest" <<EOF
 #!/sbin/openrc-run
 description="vpsbox host firewall"
@@ -10803,6 +10949,7 @@ stop() {
     eend 0
 }
 EOF
+        # --- END GENERATED TEMPLATE: vpsbox firewall OpenRC service ---
     else
         err "未检测到受支持的 systemd/OpenRC 服务管理器。"
         return 1
@@ -11156,6 +11303,7 @@ firewall_create_rollback_snapshot() {
     printf '%s\n' commit > "$build_dir/commit.token" || { rm -rf "$build_dir"; return 1; }
     printf '%s\n' rollback > "$build_dir/rollback.token" || { rm -rf "$build_dir"; return 1; }
 
+    # --- BEGIN GENERATED TEMPLATE: firewall rollback helper ---
     if ! cat > "$build_dir/rollback.sh" <<EOF
 #!/bin/sh
 set -u
@@ -11392,6 +11540,7 @@ EOF
         rm -rf "$build_dir"
         return 1
     fi
+    # --- END GENERATED TEMPLATE: firewall rollback helper ---
     chmod 700 "$build_dir/rollback.sh" || { rm -rf "$build_dir"; return 1; }
     sh -n "$build_dir/rollback.sh" || { rm -rf "$build_dir"; return 1; }
 
@@ -12782,6 +12931,9 @@ EOF
     done
 }
 
+# ==============================================================================
+# 7. 检测与路由测试：一键检测、NextTrace、三网回程与大小包
+# ==============================================================================
 check_table_header() {
     cat <<'EOF'
 ----------------------------------------
@@ -13613,6 +13765,9 @@ EOF
 EOF
 }
 
+# ==============================================================================
+# 8. 维护、恢复与末端菜单动作
+# ==============================================================================
 uninstall_singbox_and_nodes() {
     local failed=0 package_remove_failed=0
     local was_active=0 was_enabled=0
@@ -14441,11 +14596,13 @@ limit_systemd_journal() {
     fi
     begin_change_transaction JOURNALD_CONF || { rm -rf "$backup_dir"; err "记录 journald 修改事务失败，已取消修改。"; return 1; }
     tmp="$(mktemp "$conf_dir/.99-vpsbox.XXXXXX")" || { rm -rf "$backup_dir"; return 1; }
+    # --- BEGIN GENERATED TEMPLATE: journald drop-in ---
     cat > "$tmp" <<EOF
 [Journal]
 SystemMaxUse=500M
 SystemMaxFileSize=50M
 EOF
+    # --- END GENERATED TEMPLATE: journald drop-in ---
     if ! chown root:root "$tmp" || ! chmod 644 "$tmp" || ! mv -f "$tmp" "$JOURNALD_VPSBOX_CONF"; then
         rm -f "$tmp"
         rm -rf "$backup_dir"
@@ -14487,6 +14644,9 @@ EOF
     fi
 }
 
+# ==============================================================================
+# 9. 菜单与交互
+# ==============================================================================
 show_menu() {
     clear 2>/dev/null || true
     cat <<EOF
@@ -14821,6 +14981,9 @@ main_loop() {
     done
 }
 
+# ==============================================================================
+# 10. 程序入口
+# ==============================================================================
 vpsbox_main() {
     if [ -n "${PENDING_VPSBOX_UPDATE_BACKUP:-}${PENDING_VPSBOX_UPDATE_READY_FILE:-}" ]; then
         # 更新后的新进程可能在取得菜单锁前失败，必须提前安装 EXIT 回滚处理。

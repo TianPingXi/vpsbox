@@ -182,6 +182,51 @@ test_interactive_confirm_is_function_local() {
     )
 }
 
+test_detect_os_preserves_node_state_globals() {
+    (
+        local before after variable os_release_values
+        local expected_os="unknown"
+        local expected_os_id=""
+        local expected_os_id_like=""
+        local -a node_state_vars=(
+            DOMAIN NAME PORT PASSWORD METHOD PROTOCOL UUID FLOW
+            REALITY_SERVER_NAME REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY
+            REALITY_SHORT_ID FINGERPRINT CONFIG_ID
+        )
+
+        if [ -f /etc/os-release ]; then
+            os_release_values="$(
+                # shellcheck disable=SC1091
+                . /etc/os-release || exit 1
+                printf '%s\034%s' "${ID:-}" "${ID_LIKE:-}"
+            )"
+            IFS=$'\034' read -r expected_os_id expected_os_id_like <<< "$os_release_values"
+        fi
+        case "$expected_os_id $expected_os_id_like" in
+            *alpine*) expected_os="alpine" ;;
+            *debian*|*ubuntu*) expected_os="debian" ;;
+            *centos*|*rhel*|*fedora*|*rocky*|*almalinux*) expected_os="redhat" ;;
+        esac
+
+        for variable in "${node_state_vars[@]}"; do
+            printf -v "$variable" 'sentinel-%s' "$variable"
+        done
+        before="$(declare -p "${node_state_vars[@]}")"
+
+        detect_os
+
+        after="$(declare -p "${node_state_vars[@]}")"
+        assert_eq "$before" "$after" \
+            "detect_os 不得覆盖当前节点状态变量"
+        assert_eq "$expected_os_id" "$OS_ID" \
+            "detect_os 应刷新系统 ID"
+        assert_eq "$expected_os_id_like" "$OS_ID_LIKE" \
+            "detect_os 应刷新系统兼容 ID"
+        assert_eq "$expected_os" "$OS" \
+            "detect_os 应按 os-release 正确分类系统"
+    )
+}
+
 test_sensitive_interaction_eof_cancels_before_mutation() {
     (
         local event_log="$TEST_TMP/dns-eof-events"
@@ -1401,29 +1446,38 @@ test_first_singbox_install_prepares_dependencies_once() {
     )
 }
 
-test_node_dependency_install_requires_confirmation() {
+test_node_dependency_install_is_automatic() {
     local creator
 
     for creator in create_or_rebuild_node create_vless_reality_node; do
         (
-            local event_log="$TEST_TMP/$creator-dependency-confirm.log"
+            local dependencies_ready=0
+            local event_log="$TEST_TMP/$creator-dependency-auto.log"
             : > "$event_log"
 
-            node_dependencies_available() { return 1; }
-            confirm_default_yes() { return 1; }
-            install_deps() { printf '%s\n' install >> "$event_log"; }
+            node_dependencies_available() { [ "$dependencies_ready" -eq 1 ]; }
+            confirm_default_yes() { printf '%s\n' confirm >> "$event_log"; return 1; }
+            install_deps() {
+                printf '%s\n' install >> "$event_log"
+                dependencies_ready=1
+            }
             require_valid_node_state_if_present() {
                 printf '%s\n' validation >> "$event_log"
+                return 23
             }
             begin_node_transaction() { printf '%s\n' transaction >> "$event_log"; }
 
-            if "$creator" >"$TEST_TMP/$creator-dependency-confirm.out" 2>&1; then
-                fail "$creator 拒绝安装依赖后不得继续"
+            if "$creator" >"$TEST_TMP/$creator-dependency-auto.out" 2>&1; then
+                fail "$creator 应在后续节点校验失败时停止"
             fi
-            assert_empty_file "$event_log" \
-                "$creator 未确认依赖安装时不得安装软件或开始节点流程"
-            assert_file_contains "$TEST_TMP/$creator-dependency-confirm.out" \
-                '已取消，未安装依赖'
+            assert_file_contains "$event_log" '^install$' \
+                "$creator 缺少依赖时应自动调用安装流程"
+            assert_file_contains "$event_log" '^validation$' \
+                "$creator 依赖补齐后应继续节点校验"
+            assert_file_not_contains "$event_log" '^confirm$' \
+                "$creator 自动补齐依赖前不得询问用户"
+            assert_file_not_contains "$event_log" '^transaction$' \
+                "$creator 后续校验失败时不得开始节点事务"
         )
     done
 }
@@ -1479,32 +1533,36 @@ test_singbox_update_prepares_dependencies_before_validation() {
     )
 }
 
-test_runtime_dependency_install_requires_confirmation() {
-    (
-        local event_log="$TEST_TMP/runtime-dependency-decline.log"
-        : > "$event_log"
-        missing_node_commands() { printf '%s\n' jq; }
-        confirm_default_yes() { return 1; }
-        install_deps() { printf '%s\n' install >> "$event_log"; }
-
-        if ensure_node_runtime_commands >"$TEST_TMP/runtime-dependency-decline.out" 2>&1; then
-            fail "拒绝安装运行依赖后不得继续"
-        fi
-        assert_empty_file "$event_log" "拒绝时不得调用软件包管理器"
-    )
+test_runtime_dependency_install_is_automatic() {
     (
         local dependencies_ready=0 dependency_runs=0
+        local event_log="$TEST_TMP/runtime-dependency-auto.log"
+        : > "$event_log"
         missing_node_commands() {
             [ "$dependencies_ready" -eq 1 ] && printf '\n' || printf '%s\n' jq
         }
-        confirm_default_yes() { return 0; }
+        confirm_default_yes() {
+            printf '%s\n' confirm >> "$event_log"
+            return 1
+        }
         install_deps() {
             dependency_runs=$((dependency_runs + 1))
             dependencies_ready=1
         }
 
         ensure_node_runtime_commands
-        assert_eq 1 "$dependency_runs" "确认后运行依赖只能安装一次"
+        assert_eq 1 "$dependency_runs" "运行依赖只能自动安装一次"
+        assert_file_not_contains "$event_log" '^confirm$' "自动补齐运行依赖前不得询问用户"
+    )
+    (
+        missing_node_commands() { printf '%s\n' jq; }
+        install_deps() { return 0; }
+
+        if ensure_node_runtime_commands >"$TEST_TMP/runtime-dependency-incomplete.out" 2>&1; then
+            fail "运行依赖安装后仍不完整时不得继续"
+        fi
+        assert_file_contains "$TEST_TMP/runtime-dependency-incomplete.out" \
+            '节点服务管理 缺少必要命令：jq'
     )
 }
 
@@ -1545,6 +1603,7 @@ main() {
         test_uri_write_preserves_existing_on_failure
         test_node_eof_has_no_mutation
         test_interactive_confirm_is_function_local
+        test_detect_os_preserves_node_state_globals
         test_sensitive_interaction_eof_cancels_before_mutation
         test_ss_password_generation_failure_rolls_back_before_mutation
         test_first_singbox_install_marks_transaction_before_install
@@ -1587,10 +1646,10 @@ main() {
         test_node_dependency_repair_requires_complete_result
         test_node_ca_trust_detection
         test_first_singbox_install_prepares_dependencies_once
-        test_node_dependency_install_requires_confirmation
+        test_node_dependency_install_is_automatic
         test_read_only_node_actions_do_not_install_dependencies
         test_singbox_update_prepares_dependencies_before_validation
-        test_runtime_dependency_install_requires_confirmation
+        test_runtime_dependency_install_is_automatic
         test_dangling_node_symlink_is_not_treated_as_no_node
     )
 
