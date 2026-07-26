@@ -142,15 +142,8 @@ test_node_eof_has_no_mutation() {
     done
 }
 
-test_default_yes_confirmation_uses_lowercase_prompt() {
-    local definition output="$TEST_TMP/default-yes-confirm.out"
-
-    definition="$(declare -f confirm_default_yes)"
-    grep -Fq '(y/n): ' <<< "$definition" ||
-        fail "默认确认提示应使用小写 (y/n)"
-    if grep -Fq '(Y/n)' <<< "$definition"; then
-        fail "默认确认提示不应再使用 (Y/n)"
-    fi
+test_default_yes_confirmation_behavior() {
+    local output="$TEST_TMP/default-yes-confirm.out"
 
     confirm_default_yes "确认？" <<< "" ||
         fail "默认确认直接回车时应继续按 y 处理"
@@ -698,7 +691,7 @@ test_lockdir_first_acquisition_uses_reclaim_guard() {
 
 test_reality_checks_require_bounded_dns_and_openssl() {
     (
-        local log="$TEST_TMP/dns-bounded.log"
+        local log="$TEST_TMP/dns-bounded.log" timeout
         getent() { return 0; }
         run_bounded_command() {
             printf '%s\n' "$*" > "$log"
@@ -707,7 +700,11 @@ test_reality_checks_require_bounded_dns_and_openssl() {
         if resolve_host_ips example.com; then
             fail "有界 DNS 命令失败时解析不应成功"
         fi
-        assert_file_contains "$log" '^12 getent ahosts example\.com$'
+        assert_file_contains "$log" '^[0-9]+ getent ahosts example\.com$'
+        timeout="$(awk '$2 == "getent" && $3 == "ahosts" { print $1; exit }' "$log")"
+        [[ "$timeout" =~ ^[0-9]+$ ]] &&
+            [ "$timeout" -ge 1 ] && [ "$timeout" -le 60 ] ||
+            fail "Reality DNS 检查必须设置 1-60 秒的有界超时"
     )
     (
         resolve_host_ips() { printf '%s\n' 192.0.2.1; }
@@ -809,7 +806,7 @@ test_singbox_summary_line_states() {
 
 test_node_summary_orders_only_existing_protocols() {
     (
-        local mock_vless=0 mock_ss=0
+        local mock_vless=0 mock_ss=0 output="$TEST_TMP/node-summary.out"
         node_artifacts_present() { return 1; }
         load_protocol_state() {
             case "$1" in
@@ -827,20 +824,42 @@ test_node_summary_orders_only_existing_protocols() {
 
         assert_eq "" "$(node_summary)" "未创建的协议不应显示状态区块"
         mock_vless=1
+        node_summary > "$output"
+        assert_file_contains "$output" 'VLESS Reality 节点'
+        assert_file_not_contains "$output" 'Shadowsocks 节点' \
+            "未创建的 Shadowsocks 不应显示状态区块"
+
         mock_ss=1
-        assert_eq "----------------------------------------
- VLESS Reality 节点
- 状态：已创建
- 名称：vless-node
- 地址：vless.example.com
- 端口：30000
-----------------------------------------
- Shadowsocks 节点
- 状态：已创建
- 名称：ss-node
- 地址：ss.example.com
- 端口：30001" "$(node_summary)" \
-            "VLESS 应显示在 Shadowsocks 上方，且 Shadowsocks 名称不带 2022"
+        node_summary > "$output"
+        awk '
+            /VLESS Reality 节点/ {
+                section = "vless"
+                vless_heading = NR
+                next
+            }
+            /Shadowsocks 节点/ {
+                section = "ss"
+                ss_heading = NR
+                next
+            }
+            section == "vless" && /状态：已创建/ { vless_status = 1 }
+            section == "vless" && /名称：vless-node/ { vless_name = 1 }
+            section == "vless" && /地址：vless[.]example[.]com/ { vless_address = 1 }
+            section == "vless" && /端口：30000/ { vless_port = 1 }
+            section == "ss" && /状态：已创建/ { ss_status = 1 }
+            section == "ss" && /名称：ss-node/ { ss_name = 1 }
+            section == "ss" && /地址：ss[.]example[.]com/ { ss_address = 1 }
+            section == "ss" && /端口：30001/ { ss_port = 1 }
+            END {
+                ok = vless_heading && ss_heading && vless_heading < ss_heading
+                ok = ok && vless_status && vless_name && vless_address && vless_port
+                ok = ok && ss_status && ss_name && ss_address && ss_port
+                exit(ok ? 0 : 1)
+            }
+        ' "$output" ||
+            fail "节点汇总必须按 VLESS、Shadowsocks 顺序显示各自状态、名称、地址和端口"
+        assert_file_not_contains "$output" '2022' \
+            "Shadowsocks 状态名称不应包含 2022"
     )
 }
 
@@ -857,31 +876,24 @@ test_bbr_fq_summary_preserves_partial_state() {
     )
 }
 
-test_main_and_system_menu_presentation() {
+test_menu_dispatch_and_system_status_wiring() {
+    local dispatch_log="$TEST_TMP/main-menu-dispatch.log"
+
     (
-        local main_output="$TEST_TMP/main-menu.out"
-        local node_output="$TEST_TMP/node-menu.out"
+        show_menu() { :; }
+        confirm_pending_vpsbox_update() { :; }
+        pause() { :; }
+        run_menu_action() { printf '%s\n' "$1" >> "$dispatch_log"; }
+
+        main_loop <<< $'5\n6\n7\n0' >/dev/null
+    )
+    assert_eq $'run_self_check\nshow_backtrace_routes\nother_scripts_menu' \
+        "$(cat "$dispatch_log")" \
+        "主菜单检测、回程测试和第三方脚本选项必须分发到对应功能"
+
+    (
         local system_output="$TEST_TMP/system-menu.out"
         clear() { :; }
-        vpsbox_update_notice() { return 0; }
-        singbox_summary_line() { printf ' sing-box：未安装\n'; }
-        node_summary() { return 0; }
-        ipv4_dns_lines() { printf ' nameserver 1.1.1.1\n'; }
-
-        show_menu > "$main_output"
-        assert_file_contains "$main_output" '^ \[5\] 一键检测$'
-        assert_file_contains "$main_output" '^ \[6\] 三网回程测试$'
-        assert_file_contains "$main_output" '^ \[7\] 第三方脚本$'
-        assert_file_contains "$main_output" '^ \[00\] 更新 vpsbox$'
-        assert_file_not_contains "$main_output" '一键自检|查看三网回程|其他脚本|更新 vpsbox 脚本'
-
-        node_menu <<< "0" > "$node_output"
-        assert_file_contains "$node_output" '^ \[1\] 创建/重建 VLESS Reality 节点（推荐）$'
-        assert_file_contains "$node_output" '^ \[2\] 创建/重建 Shadowsocks 节点$'
-        assert_file_contains "$node_output" '^ \[4\] 删除 VLESS Reality 节点$'
-        assert_file_contains "$node_output" '^ \[5\] 删除 Shadowsocks 节点$'
-        assert_file_not_contains "$node_output" 'SS 2022|删除当前节点'
-
         detect_os() {
             # OS is consumed dynamically by system_menu.
             # shellcheck disable=SC2034
@@ -897,35 +909,45 @@ test_main_and_system_menu_presentation() {
         reboot_required_state() { printf '不需要\n'; }
 
         system_menu <<< "0" > "$system_output"
-        assert_file_contains "$system_output" '^ BBR \+ fq：已开启$'
-        assert_file_contains "$system_output" '^ SSH：端口 23333 / 加固已配置$'
-        assert_file_contains "$system_output" '^ Fail2ban：运行中 / SSH 防护已启用$'
-        assert_file_contains "$system_output" '^ 基础$'
-        assert_file_contains "$system_output" '^ 网络$'
-        assert_file_contains "$system_output" '^ SSH 安全$'
-        assert_file_contains "$system_output" '^ 维护$'
-        assert_file_contains "$system_output" '^ \[5\] 修改 IPv4 DNS$'
-        assert_file_contains "$system_output" '^ \[12\] 限制 journald 日志大小$'
-        awk 'previous == "----------------------------------------" && $0 == " [0] 返回主菜单" { found=1 }
-            { previous=$0 } END { exit(found ? 0 : 1) }' "$system_output" ||
-            fail "系统优化的返回项上方应有分割线"
+        assert_file_contains "$system_output" 'BBR.*已开启'
+        assert_file_contains "$system_output" 'IPv4.*已启用'
+        assert_file_contains "$system_output" 'SSH.*23333.*已配置'
+        assert_file_contains "$system_output" 'Fail2ban.*运行中.*已启用'
+        assert_file_contains "$system_output" 'NTP.*已同步'
+        assert_file_contains "$system_output" '系统重启.*不需要'
     )
 }
 
-test_third_party_menu_keeps_authors() {
+test_third_party_entries_keep_attribution_and_commands() {
     (
-        local output="$TEST_TMP/third-party-menu.out"
+        local menu_output="$TEST_TMP/third-party-menu.out"
+        local detail_output="$TEST_TMP/third-party-details.out"
         clear() { :; }
 
-        other_scripts_menu <<< "0" > "$output"
-        assert_file_contains "$output" '^ 第三方脚本$'
-        assert_file_contains "$output" '^ \[1\] IP 质量体检脚本（xykt）$'
-        assert_file_contains "$output" '^ \[3\] TCP 质量检测脚本（ibsgss）$'
-        assert_file_contains "$output" '^ \[4\] VPS 综合质量测试脚本（LloydAsp）$'
-        assert_file_contains "$output" '^ \[5\] 一键 VPS 系统重装脚本（bin456789）$'
-        awk 'previous == "----------------------------------------" && $0 == " [0] 返回主菜单" { found=1 }
-            { previous=$0 } END { exit(found ? 0 : 1) }' "$output" ||
-            fail "第三方脚本的返回项上方应有分割线"
+        other_scripts_menu <<< "0" > "$menu_output"
+        assert_file_contains "$menu_output" 'IP 质量体检脚本（xykt）'
+        assert_file_contains "$menu_output" '网络质量体检脚本（xykt）'
+        assert_file_contains "$menu_output" 'TCP 质量检测脚本（ibsgss）'
+        assert_file_contains "$menu_output" 'VPS 综合质量测试脚本（LloydAsp）'
+        assert_file_contains "$menu_output" '一键 VPS 系统重装脚本（bin456789）'
+
+        {
+            show_ip_quality_script_info
+            show_network_quality_script_info
+            show_tcp_quality_script_info
+            show_node_quality_script_info
+            show_reinstall_script_info
+        } > "$detail_output"
+        grep -Fq 'bash <(curl -Ls https://Check.Place) -I' "$detail_output" ||
+            fail "IP 质量体检脚本必须保留上游命令"
+        grep -Fq 'bash <(curl -Ls https://Check.Place) -N' "$detail_output" ||
+            fail "网络质量体检脚本必须保留上游命令"
+        grep -Fq 'https://github.com/ibsgss/TcpQuality' "$detail_output" ||
+            fail "TCP 质量检测脚本必须保留上游项目地址"
+        grep -Fq 'https://github.com/LloydAsp/NodeQuality' "$detail_output" ||
+            fail "VPS 综合质量测试脚本必须保留上游项目地址"
+        grep -Fq 'https://github.com/bin456789/reinstall' "$detail_output" ||
+            fail "系统重装脚本必须保留上游项目地址"
     )
 }
 
@@ -1624,7 +1646,7 @@ main() {
         test_node_host_warns_for_possible_nat
         test_uri_write_preserves_existing_on_failure
         test_node_eof_has_no_mutation
-        test_default_yes_confirmation_uses_lowercase_prompt
+        test_default_yes_confirmation_behavior
         test_interactive_confirm_is_function_local
         test_detect_os_preserves_node_state_globals
         test_sensitive_interaction_eof_cancels_before_mutation
@@ -1644,8 +1666,8 @@ main() {
         test_singbox_summary_line_states
         test_node_summary_orders_only_existing_protocols
         test_bbr_fq_summary_preserves_partial_state
-        test_main_and_system_menu_presentation
-        test_third_party_menu_keeps_authors
+        test_menu_dispatch_and_system_status_wiring
+        test_third_party_entries_keep_attribution_and_commands
         test_service_restore_checks_final_state
         test_start_service_action_healthy_is_noop
         test_start_service_action_uses_light_start

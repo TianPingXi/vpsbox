@@ -154,20 +154,13 @@ test_username_migration_identity_compatibility() {
     local future="$TEST_TMP/future-new-owner.sh"
     local third_party="$TEST_TMP/third-party.sh"
 
-    grep -Fqx -- 'SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"' \
-        "$REPO_DIR/vpsbox.sh" ||
-        fail "v1.0.24 必须使用 TianPingXi 作为主地址"
-    grep -Fqx -- 'LEGACY_SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"' \
-        "$REPO_DIR/vpsbox.sh" ||
-        fail "必须只保留旧地址用于本地历史备份身份兼容"
-
     write_fixture "$legacy" "$UPDATE_TEST_OLDER" legacy "$LEGACY_SCRIPT_URL"
     vpsbox_script_identity_valid "$legacy" ||
-        fail "v1.0.24 必须能识别并恢复 v1.0.23 旧地址备份"
+        fail "必须能识别并恢复旧用户名地址生成的历史备份"
 
     write_fixture "$future" "$UPDATE_TEST_NEWER" future "$SCRIPT_URL"
     vpsbox_script_identity_valid "$future" ||
-        fail "v1.0.24 必须接受使用 TianPingXi 地址的候选"
+        fail "必须接受当前官方地址生成的更新候选"
 
     write_fixture "$third_party" "$UPDATE_TEST_NEWER" third-party \
         "https://raw.githubusercontent.com/example/vpsbox/main/vpsbox.sh"

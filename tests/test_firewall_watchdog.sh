@@ -307,19 +307,21 @@ test_restore_lock_metadata_is_atomically_published() {
     firewall_create_rollback_snapshot snapshot ""
 
     assert_file_contains "$snapshot/rollback.sh" \
-        'owner_tmp="\$dir/[.]restore[.]lock[.]owner[.]\$\$"'
+        '[.]restore[.]lock[.]owner[.]\$\$'
     assert_file_contains "$snapshot/rollback.sh" \
-        'mv -f "\$owner_tmp" "\$lock_dir/owner"'
+        'mv[[:space:]]+-f[[:space:]]+"\$[^"]+"[[:space:]]+"\$lock_dir/owner"'
+    assert_file_not_contains "$snapshot/rollback.sh" \
+        '>[[:space:]]*"\$lock_dir/owner"'
     assert_file_contains "$snapshot/rollback.sh" \
         'mktemp "\$parent/[.]vpsbox-firewall-restore[.]XXXXXX"'
     assert_file_contains "$snapshot/rollback.sh" \
-        'mv -f "\$tmp" "\$target"'
+        'mv[[:space:]]+-f[[:space:]]+"\$[^"]+"[[:space:]]+"\$target"'
     assert_file_contains "$snapshot/rollback.sh" \
         'if \[ -L "\$target" \]; then'
     assert_file_contains "$snapshot/rollback.sh" \
         '\[ ! -d "\$target" \] \|\| return 1'
     assert_file_not_contains "$snapshot/rollback.sh" \
-        '> "\$lock_dir/pid"'
+        '>[[:space:]]*"\$lock_dir/pid"'
 }
 
 test_rollback_rejects_directory_symlink_target() {

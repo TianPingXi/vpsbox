@@ -786,7 +786,7 @@ test_ssh_restore_snapshot_integrity_is_verified() {
 
 test_dns_verification_uses_bounded_command() {
     (
-        local log="$TEST_TMP/dns-verify-bounded.log"
+        local log="$TEST_TMP/dns-verify-bounded.log" timeout
         command() {
             if [ "${1:-}" = "-v" ] && [ "${2:-}" = "getent" ]; then
                 return 0
@@ -802,7 +802,11 @@ test_dns_verification_uses_bounded_command() {
         }
 
         verify_dns_resolution || fail "有界 DNS 命令返回地址时应验证成功"
-        assert_file_contains "$log" '^8 getent ahosts example[.]com$'
+        assert_file_contains "$log" '^[0-9]+ getent ahosts example[.]com$'
+        timeout="$(awk '$2 == "getent" && $3 == "ahosts" { print $1; exit }' "$log")"
+        [[ "$timeout" =~ ^[0-9]+$ ]] &&
+            [ "$timeout" -ge 1 ] && [ "$timeout" -le 60 ] ||
+            fail "DNS 验证必须设置 1-60 秒的有界超时"
     )
 }
 

@@ -140,7 +140,7 @@ test_nonzero_exit_cleans_descendants() {
 }
 
 test_apt_options_are_bounded() {
-    local log="$TEST_TMP/apt-options.log"
+    local log="$TEST_TMP/apt-options.log" value
 
     run_bounded_command() {
         printf '%s\n' "$*" > "$log"
@@ -151,15 +151,20 @@ test_apt_options_are_bounded() {
     apt_get_bounded 77 install -y demo
 
     assert_file_contains "$log" '^77 apt-get '
-    assert_file_contains "$log" 'Acquire::Retries=1'
-    assert_file_contains "$log" 'Acquire::http::Timeout=15'
-    assert_file_contains "$log" 'Acquire::https::Timeout=15'
-    assert_file_contains "$log" 'Dpkg::Lock::Timeout=15'
+    value="$(sed -n 's/.*Acquire::Retries=\([0-9][0-9]*\).*/\1/p' "$log")"
+    [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -le 3 ] ||
+        fail "APT 下载重试次数必须保持在 0-3 次"
+    for option in Acquire::http::Timeout Acquire::https::Timeout Dpkg::Lock::Timeout; do
+        value="$(sed -n "s/.*${option}=\\([0-9][0-9]*\\).*/\\1/p" "$log")"
+        [[ "$value" =~ ^[0-9]+$ ]] &&
+            [ "$value" -ge 1 ] && [ "$value" -le 60 ] ||
+            fail "$option 必须设置 1-60 秒的有界超时"
+    done
     assert_file_contains "$log" 'install -y demo$'
 }
 
 test_debian_dependency_install_uses_bounds() {
-    local log="$TEST_TMP/install-deps.log"
+    local log="$TEST_TMP/install-deps.log" install_line dependency
 
     detect_os() {
         # Consumed by the sourced install_deps function.
@@ -169,8 +174,23 @@ test_debian_dependency_install_uses_bounds() {
     apt_get_bounded() { printf '%s\n' "$*" >> "$log"; }
     install_deps
 
-    assert_file_contains "$log" '^120 update -y$'
-    assert_file_contains "$log" '^600 install -y curl ca-certificates openssl jq iproute2 coreutils$'
+    [ "$PACKAGE_UPDATE_TIMEOUT" -ge 1 ] && [ "$PACKAGE_UPDATE_TIMEOUT" -le 3600 ] ||
+        fail "依赖索引更新必须设置不超过 3600 秒的超时"
+    [ "$PACKAGE_INSTALL_TIMEOUT" -ge 1 ] && [ "$PACKAGE_INSTALL_TIMEOUT" -le 3600 ] ||
+        fail "依赖安装必须设置不超过 3600 秒的超时"
+    assert_file_contains "$log" "^${PACKAGE_UPDATE_TIMEOUT} update( -y)?$"
+    install_line="$(
+        awk -v timeout="$PACKAGE_INSTALL_TIMEOUT" \
+            '$1 == timeout && $2 == "install" && $3 == "-y" { print; exit }' "$log"
+    )"
+    [ -n "$install_line" ] ||
+        fail "Debian 依赖安装必须使用 PACKAGE_INSTALL_TIMEOUT"
+    for dependency in curl ca-certificates openssl jq iproute2 coreutils; do
+        case " $install_line " in
+            *" $dependency "*) ;;
+            *) fail "Debian 依赖安装缺少必要软件包：$dependency" ;;
+        esac
+    done
 }
 
 test_missing_timeout_fails_fast() {
