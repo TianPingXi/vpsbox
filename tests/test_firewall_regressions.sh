@@ -870,6 +870,67 @@ test_lightweight_add_does_not_rescan_docker_or_ssh() {
     )
 }
 
+test_internal_port_transition_preserves_unrelated_public_ports() {
+    (
+        local case_dir="$TEST_TMP/target-transition"
+        local managed_node_tcp=31423 direct_tcp direct_udp
+
+        forbid_init
+        mkdir -p "$case_dir"
+        RUNTIME_DIR="$case_dir/run"
+        FIREWALL_CONFIG="$case_dir/firewall.nft"
+        # shellcheck disable=SC2034 # 被测事务函数动态读取并更新。
+        ACTIVE_FIREWALL_TRANSITION_DIR=""
+        FW_ALLOWED_TCP="80,443,23333,31423"
+        FW_ALLOWED_UDP="443,31423"
+        FW_EXTRA_TCP=""
+        FW_EXTRA_UDP=""
+        FW_DOCKER_PUBLIC4_TCP=""
+        FW_DOCKER_PUBLIC4_UDP=""
+        FW_DOCKER_PUBLIC6_TCP=""
+        FW_DOCKER_PUBLIC6_UDP=""
+        FW_DOCKER_PROXY4_TCP=""
+        FW_DOCKER_PROXY4_UDP=""
+        FW_DOCKER_PROXY6_TCP=""
+        FW_DOCKER_PROXY6_UDP=""
+        FW_DOCKER_BRIDGES=""
+        firewall_write_config "$FIREWALL_CONFIG"
+
+        prepare_runtime_dir() { mkdir -p "$RUNTIME_DIR"; }
+        ssh_effective_ports_csv() { printf '%s\n' 23333; }
+        ssh_listening_ports_csv() { printf '%s\n' 23333; }
+        firewall_active_config_ready_for_sync() { :; }
+        firewall_load_state() { FW_EXTRA_TCP=""; FW_EXTRA_UDP=""; }
+        firewall_detect_managed_ports() {
+            # shellcheck disable=SC2034 # 被测增量同步函数动态读取。
+            FW_SSH_PORTS=23333
+            # shellcheck disable=SC2034 # 被测增量同步函数动态读取。
+            FW_NODE_TCP="$managed_node_tcp"
+            # shellcheck disable=SC2034 # 被测增量同步函数动态读取。
+            FW_NODE_UDP=""
+        }
+        firewall_replace_active_config() { cp "$1" "$FIREWALL_CONFIG"; }
+        firewall_detect_docker_ports() { forbid "内部端口切换不得重新扫描 Docker"; }
+        firewall_detect_public_listeners() { forbid "内部端口切换不得重新扫描公网监听"; }
+        firewall_sync_active_config() { forbid "内部端口切换不得走完整防火墙对账"; }
+
+        firewall_prepare_port_transition 43333 "" 31423 ""
+        direct_tcp="$(firewall_config_direct_ports "$FIREWALL_CONFIG" tcp)"
+        assert_eq '80,443,23333,31423,43333' "$direct_tcp" \
+            "准备阶段应仅增补新节点端口并保留旧节点与其他公网端口"
+
+        managed_node_tcp=43333
+        firewall_complete_port_transition
+        direct_tcp="$(firewall_config_direct_ports "$FIREWALL_CONFIG" tcp)"
+        direct_udp="$(firewall_config_direct_ports "$FIREWALL_CONFIG" udp)"
+        assert_eq '80,443,23333,43333' "$direct_tcp" \
+            "完成阶段应只移除旧节点 TCP 端口"
+        assert_eq '443,31423' "$direct_udp" \
+            "TCP 节点切换不得改动同号 UDP 或其他公网 UDP 端口"
+        assert_no_forbidden "内部端口切换触发了无关来源扫描"
+    )
+}
+
 main() {
     local name test status passed=0 skipped=0
     local -a required=(
@@ -915,6 +976,7 @@ main() {
         test_additive_config_builder_creates_first_udp_rule_and_set
         test_adding_port_uses_lightweight_commit_path
         test_lightweight_add_does_not_rescan_docker_or_ssh
+        test_internal_port_transition_preserves_unrelated_public_ports
     )
 
     command -v flock >/dev/null 2>&1 || fail "测试需要 flock"

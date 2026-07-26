@@ -378,6 +378,32 @@ test_sensitive_interaction_eof_cancels_before_mutation() {
     )
 }
 
+test_ssh_access_controls_are_checked_before_mutation() {
+    (
+        local event_log="$TEST_TMP/ssh-access-controls.events"
+        SSHD_MAIN_CONF="$TEST_TMP/ssh-access-controls-sshd_config"
+        printf '%s\n' 'Port 22' > "$SSHD_MAIN_CONF"
+        : > "$event_log"
+        sshd_binary() { printf '%s\n' /usr/sbin/sshd; }
+        ssh_socket_activation_enabled_or_active() { return 1; }
+        settle_stale_unapplied_ssh_tracking() { return 0; }
+        choose_ssh_target_port() { printf '%s\n' 23333; }
+        ssh_effective_ports_match_target() { return 1; }
+        validate_ssh_access_controls() {
+            printf '%s\n' access-check >> "$event_log"
+            return 1
+        }
+        backup_change_file_once() { printf '%s\n' backup >> "$event_log"; }
+        ssh_firewall_transition_begin() { printf '%s\n' firewall >> "$event_log"; }
+
+        if apply_ssh_port_change >"$TEST_TMP/ssh-access-controls.out" 2>&1; then
+            fail "本机访问控制未放行目标端口时 SSH 修改不应继续"
+        fi
+        assert_eq access-check "$(cat "$event_log")" \
+            "访问控制检查失败后不得备份、改配置或调整防火墙"
+    )
+}
+
 test_ss_password_generation_failure_rolls_back_before_mutation() {
     (
         local event_log="$TEST_TMP/password-failure-events"
@@ -464,6 +490,38 @@ test_atomic_root_publish_preserves_existing_target() {
         if find "$dir" -maxdepth 1 -name '.vpsbox-publish.*' -print -quit | grep -q .; then
             fail "原子发布失败后不应遗留临时文件"
         fi
+    )
+}
+
+test_node_publish_keeps_temporary_file_outside_config_set() {
+    (
+        local dir="$TEST_TMP/node-publish-layout"
+        local source copied_during_publish=0
+        CONFIG_DIR="$dir/etc/sing-box"
+        NODE_CONFIG_DIR="$CONFIG_DIR/vpsbox.d"
+        SS_CONFIG_PATH="$NODE_CONFIG_DIR/10-shadowsocks.json"
+        # shellcheck disable=SC2034 # 被测目录白名单函数动态读取。
+        VLESS_CONFIG_PATH="$NODE_CONFIG_DIR/20-vless-reality.json"
+        source="$dir/staged.json"
+        mkdir -p "$NODE_CONFIG_DIR"
+        printf '%s\n' '{"inbounds":[]}' > "$source"
+        chown() { return 0; }
+        node_dir_is_secure() { return 0; }
+        node_file_is_secure() { return 0; }
+        cp() {
+            local target="${!#}"
+            case "$target" in
+                "$CONFIG_DIR"/.vpsbox-node-publish.*) copied_during_publish=1 ;;
+                *) fail "节点发布临时文件必须位于 CONFIG_DIR，不能进入受管配置集合：$target" ;;
+            esac
+            command cp "$@"
+        }
+
+        publish_staged_node_file "$source" "$SS_CONFIG_PATH"
+        assert_eq 1 "$copied_during_publish" "节点发布必须经过受管目录外的临时文件"
+        node_config_dir_contents_valid ||
+            fail "节点发布期间的临时文件不得污染受管配置目录"
+        assert_file_contains "$SS_CONFIG_PATH" '"inbounds"'
     )
 }
 
@@ -892,6 +950,22 @@ test_menu_dispatch_and_system_status_wiring() {
         "主菜单检测、回程测试和第三方脚本选项必须分发到对应功能"
 
     (
+        local uninstall_log="$TEST_TMP/uninstall-menu-dispatch.log"
+        : > "$uninstall_log"
+        show_menu() { :; }
+        confirm_pending_vpsbox_update() { :; }
+        uninstall_all() {
+            printf '%s\n' uninstall >> "$uninstall_log"
+            return 23
+        }
+        pause() { printf '%s\n' pause >> "$uninstall_log"; }
+
+        main_loop <<< $'88\n0' >/dev/null 2>&1
+        assert_eq $'uninstall\npause' "$(cat "$uninstall_log")" \
+            "卸载失败后必须保留菜单并执行返回暂停"
+    )
+
+    (
         local system_output="$TEST_TMP/system-menu.out"
         clear() { :; }
         detect_os() {
@@ -1225,6 +1299,36 @@ test_failed_singbox_update_restores_binary_and_state() {
     )
 }
 
+test_singbox_package_restore_failure_accepts_verified_binary_fallback() {
+    (
+        local event_log="$TEST_TMP/singbox-package-fallback.events"
+        local output="$TEST_TMP/singbox-package-fallback.out"
+        : > "$event_log"
+        service_stop() { printf '%s\n' stop >> "$event_log"; }
+        service_manager_is_active() { return 1; }
+        stop_singbox_config_processes() { return 0; }
+        install_singbox_package_file() {
+            printf '%s\n' package-failed >> "$event_log"
+            return 23
+        }
+        restore_singbox_binary_atomically() {
+            printf '%s\n' binary-restored >> "$event_log"
+        }
+        node_exists() { return 1; }
+        restore_singbox_service_state() {
+            printf 'service-restored:%s:%s\n' "$1" "$2" >> "$event_log"
+        }
+
+        restore_singbox_update_backup \
+            /usr/bin/sing-box "$TEST_TMP/old-binary" "$TEST_TMP/update-backup" \
+            1 1 "$TEST_TMP/old.deb" 1.13.13 >"$output" 2>&1 ||
+            fail "软件包恢复失败但可信二进制和服务状态已恢复时，不应继续阻塞启动"
+        assert_eq $'stop\npackage-failed\nbinary-restored\nservice-restored:1:1' \
+            "$(cat "$event_log")"
+        assert_file_contains "$output" '软件包管理记录可能不一致'
+    )
+}
+
 test_port_detection_failures_are_not_treated_as_free() {
     (
         local status
@@ -1303,6 +1407,15 @@ test_openrc_service_does_not_inherit_menu_lock_fd() {
         service_start
         [ -e "/proc/$BASHPID/fd/200" ] ||
             fail "关闭子命令 FD 不得关闭父菜单自己的锁"
+
+        : > "$TEST_TMP/openrc-ssh-restart.log"
+        rc-service() {
+            [ ! -e "/proc/$BASHPID/fd/200" ] ||
+                fail "OpenRC SSH 重启命令继承了菜单锁 FD 200"
+            printf '%s\n' "$*" > "$TEST_TMP/openrc-ssh-restart.log"
+        }
+        restart_ssh_service
+        assert_file_contains "$TEST_TMP/openrc-ssh-restart.log" '^sshd restart$'
         exec 200>&-
     )
 }
@@ -1650,9 +1763,11 @@ main() {
         test_interactive_confirm_is_function_local
         test_detect_os_preserves_node_state_globals
         test_sensitive_interaction_eof_cancels_before_mutation
+        test_ssh_access_controls_are_checked_before_mutation
         test_ss_password_generation_failure_rolls_back_before_mutation
         test_first_singbox_install_marks_transaction_before_install
         test_atomic_root_publish_preserves_existing_target
+        test_node_publish_keeps_temporary_file_outside_config_set
         test_singbox_service_publish_preserves_existing_target
         test_setup_service_rejects_missing_binary_before_mutation
         test_singbox_package_removal_failure_preserves_files
@@ -1680,6 +1795,7 @@ main() {
         test_same_second_timestamp_is_not_after
         test_singbox_dependency_failure_does_not_touch_service
         test_failed_singbox_update_restores_binary_and_state
+        test_singbox_package_restore_failure_accepts_verified_binary_fallback
         test_port_detection_failures_are_not_treated_as_free
         test_lockdir_reclaim_guard_serializes_contenders
         test_openrc_service_does_not_inherit_menu_lock_fd

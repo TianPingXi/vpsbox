@@ -633,6 +633,76 @@ test_sshd_include_only_activates_vpsbox_files() {
     )
 }
 
+test_main_ssh_port_rewrite_handles_case_and_match_blocks() {
+    (
+        local ssh_dir="$TEST_TMP/ssh-main-port-rewrite"
+        mkdir -p "$ssh_dir"
+        SSHD_MAIN_CONF="$ssh_dir/sshd_config"
+        SSH_TARGET_PORT=49222
+        printf '%s\n' \
+            '# global settings' \
+            'port 22' \
+            'PORT 2200' \
+            'Match Group sftponly' \
+            '    ForceCommand internal-sftp' > "$SSHD_MAIN_CONF"
+
+        sshd_main_has_active_port_directive ||
+            fail "SSH 主配置端口识别必须忽略指令大小写"
+        set_main_ssh_port_directives
+
+        assert_eq 1 "$(grep -Eic '^[[:space:]]*port[[:space:]]+' "$SSHD_MAIN_CONF")" \
+            "多个全局 Port 指令必须收敛为一个目标端口"
+        assert_file_contains "$SSHD_MAIN_CONF" '^Port 49222$'
+        awk '
+            /^Port 49222$/ { port_line = NR }
+            /^[[:space:]]*[Mm][Aa][Tt][Cc][Hh][[:space:]]/ { match_line = NR }
+            END { exit !(port_line && match_line && port_line < match_line) }
+        ' "$SSHD_MAIN_CONF" ||
+            fail "目标 Port 必须位于第一个 Match 块之前"
+        assert_file_not_contains "$SSHD_MAIN_CONF" \
+            '^[[:space:]]*[Pp][Oo][Rr][Tt][[:space:]]+(22|2200)$'
+    )
+}
+
+test_active_ufw_must_allow_new_ssh_port_before_mutation() {
+    (
+        local allow_target=0
+
+        # shellcheck disable=SC2034 # 被测访问控制函数动态读取。
+        SSH_TARGET_PORT=49222
+        ufw() {
+            [ "$1" = status ] || return 1
+            printf '%s\n' 'Status: active'
+            [ "$allow_target" -eq 0 ] ||
+                printf '%s\n' '49222/tcp                 ALLOW       Anywhere'
+        }
+
+        if validate_ssh_access_controls >/dev/null 2>&1; then
+            fail "活动 UFW 未放行新 SSH 端口时必须拒绝继续"
+        fi
+        allow_target=1
+        validate_ssh_access_controls >/dev/null ||
+            fail "活动 UFW 已放行新 SSH 端口时应允许继续"
+    )
+}
+
+test_selinux_ssh_port_range_is_validated() {
+    (
+        # shellcheck disable=SC2034 # 被测访问控制函数动态读取。
+        SSH_TARGET_PORT=2222
+        getenforce() { printf '%s\n' Enforcing; }
+        semanage() { printf '%s\n' 'ssh_port_t              tcp      22, 2200-2299'; }
+
+        validate_ssh_access_controls >/dev/null ||
+            fail "SELinux ssh_port_t 范围内的目标端口应通过检查"
+        # shellcheck disable=SC2034 # 被测访问控制函数动态读取。
+        SSH_TARGET_PORT=49222
+        if validate_ssh_access_controls >/dev/null 2>&1; then
+            fail "SELinux ssh_port_t 范围外的目标端口必须被拒绝"
+        fi
+    )
+}
+
 test_enabled_inactive_ssh_socket_is_detected() {
     (
         is_systemd() { return 0; }
@@ -979,6 +1049,9 @@ main() {
         test_stale_unapplied_ssh_baseline_is_removed_on_next_run
         test_absent_resolv_conf_is_created_successfully
         test_sshd_include_only_activates_vpsbox_files
+        test_main_ssh_port_rewrite_handles_case_and_match_blocks
+        test_active_ufw_must_allow_new_ssh_port_before_mutation
+        test_selinux_ssh_port_range_is_validated
         test_enabled_inactive_ssh_socket_is_detected
         test_multiple_ssh_socket_streams_are_parsed
         test_ssh_restore_does_not_require_current_config_to_parse

@@ -4386,10 +4386,17 @@ validate_staged_node() {
 publish_staged_node_file() {
     local source="$1"
     local dest="$2"
-    local tmp
+    local tmp publish_dir
 
     [ -f "$source" ] && [ ! -L "$source" ] || return 1
-    tmp="$(mktemp "${dest}.publish.XXXXXX")" || return 1
+    # 节点配置目录只允许存在两份正式 JSON。临时文件必须建在同一文件系统的
+    # 上级 CONFIG_DIR，避免发布中被 SIGKILL 后，残留文件反过来阻止事务恢复。
+    case "$dest" in
+        "$NODE_CONFIG_DIR"/*) publish_dir="$CONFIG_DIR" ;;
+        *) publish_dir="$(dirname "$dest")" ;;
+    esac
+    [ -d "$publish_dir" ] && [ ! -L "$publish_dir" ] || return 1
+    tmp="$(mktemp "$publish_dir/.vpsbox-node-publish.XXXXXX")" || return 1
     if ! cp -- "$source" "$tmp" ||
         ! chown root:root "$tmp" ||
         ! chmod 600 "$tmp" ||
@@ -4701,7 +4708,7 @@ EOF
         return 1
     fi
     if ! mark_node_transaction_mutated ||
-        ! firewall_prepare_port_transition "$port" "$port"; then
+        ! firewall_prepare_port_transition "$port" "$port" "$existing_port" "$existing_port"; then
         rollback_active_node_transaction || true
         err "主机防火墙无法临时放行新节点端口，未创建 Shadowsocks 节点。"
         return 1
@@ -4885,7 +4892,7 @@ EOF
         return 1
     fi
     if ! mark_node_transaction_mutated ||
-        ! firewall_prepare_port_transition "$port" ""; then
+        ! firewall_prepare_port_transition "$port" "" "$existing_port" ""; then
         rollback_active_node_transaction || true
         err "主机防火墙无法临时放行新节点端口，未创建 VLESS Reality 节点。"
         return 1
@@ -4981,6 +4988,7 @@ EOF
 delete_node_protocol() {
     local protocol="$1" label config state uri node_port node_protocols
     local confirm port_status transaction_validation="full" singbox_available=1
+    local firewall_drop_udp=""
 
     case "$protocol" in
         vless) label="VLESS Reality"; node_protocols=tcp ;;
@@ -5005,6 +5013,9 @@ delete_node_protocol() {
         return 1
     }
     node_port="$PORT"
+    if [ "$protocol" = "ss" ]; then
+        firewall_drop_udp="$node_port"
+    fi
     if ! read -r -p "确认删除 $label 节点？(y/N): " confirm; then
         info "输入已结束，已取消。"
         return 1
@@ -5026,7 +5037,8 @@ delete_node_protocol() {
         return 1
     fi
     if ! mark_node_transaction_mutated ||
-        ! firewall_prepare_port_transition "" ""; then
+        ! firewall_prepare_port_transition \
+            "" "" "$node_port" "$firewall_drop_udp"; then
         rollback_active_node_transaction || true
         err "主机防火墙无法开始节点删除事务，已取消删除。"
         return 1
@@ -5326,7 +5338,8 @@ restore_singbox_update_backup() {
     local binary_path="$1" backup_binary="$2" backup_dir="$3"
     local was_enabled="$4" was_active="$5"
     local rollback_package="${6:-}" old_version="${7:-}"
-    local failed=0 package_restored=0 binary_ready=0 service_ready=1
+    local failed=0 package_restore_failed=0
+    local package_restored=0 binary_ready=0 service_ready=1
 
     if ! service_stop 2>/dev/null && service_manager_is_active; then
         err "更新后的 sing-box 服务无法停止，已拒绝在运行中覆盖二进制。"
@@ -5347,7 +5360,7 @@ restore_singbox_update_backup() {
             binary_ready=1
         else
             err "旧 sing-box 软件包恢复失败，正在尝试恢复二进制副本。"
-            failed=1
+            package_restore_failed=1
         fi
     fi
     if [ "$package_restored" -eq 0 ]; then
@@ -5374,6 +5387,9 @@ restore_singbox_update_backup() {
         # 更新失败时保留本地二进制备份，避免包管理器处于异常状态后失去最后恢复副本。
         warn "sing-box 更新备份已保留：$backup_dir"
         return 1
+    fi
+    if [ "$package_restore_failed" -eq 1 ]; then
+        warn "旧 sing-box 二进制和服务状态已恢复，但软件包管理记录可能不一致；后续更新前请检查系统软件包状态。"
     fi
     return 0
 }
@@ -7692,7 +7708,11 @@ ssh_hardening_state() {
 }
 
 sshd_main_has_active_port_directive() {
-    grep -Eq '^[[:space:]]*Port[[:space:]]+[0-9]+' "$SSHD_MAIN_CONF" 2>/dev/null
+    awk '
+        tolower($1) == "match" { exit }
+        tolower($1) == "port" && $2 ~ /^[0-9]+$/ { found = 1 }
+        END { exit !found }
+    ' "$SSHD_MAIN_CONF" 2>/dev/null
 }
 
 sshd_dropin_include_available() {
@@ -7815,9 +7835,21 @@ set_main_ssh_port_directives() {
 
     tmp="$(mktemp)" || return 1
     awk -v port="$SSH_TARGET_PORT" '
-        /^[[:space:]]*Port[[:space:]]+/ {
-            print "Port " port
-            changed=1
+        {
+            keyword = tolower($1)
+        }
+        keyword == "match" && !in_match {
+            if (!changed) {
+                print "Port " port
+                changed = 1
+            }
+            in_match = 1
+            print
+            next
+        }
+        keyword == "port" && !in_match {
+            if (!changed) print "Port " port
+            changed = 1
             next
         }
         { print }
@@ -7903,6 +7935,8 @@ validate_ssh_hardening_effective_config() {
 restart_ssh_service() {
     if is_systemd; then
         retry 3 2 systemctl restart ssh || retry 3 2 systemctl restart sshd
+    elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
+        retry 3 2 run_openrc_service sshd restart
     elif command -v service >/dev/null 2>&1; then
         retry 3 2 service ssh restart || retry 3 2 service sshd restart
     else
@@ -8280,24 +8314,40 @@ rollback_ssh_hardening_change() {
     fi
 }
 
-warn_ssh_access_controls() {
+validate_ssh_access_controls() {
+    local failed=0
+
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
         ufw status 2>/dev/null | grep -Eq "^${SSH_TARGET_PORT}/tcp[[:space:]]+ALLOW" ||
-            warn "UFW 正在运行，但未确认已放行 TCP $SSH_TARGET_PORT。"
+            { err "UFW 正在运行，但未放行 TCP $SSH_TARGET_PORT；请先放行后重试。"; failed=1; }
     fi
     if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
         firewall-cmd --quiet --query-port="${SSH_TARGET_PORT}/tcp" >/dev/null 2>&1 ||
-            warn "firewalld 正在运行，但未确认已放行 TCP $SSH_TARGET_PORT。"
+            { err "firewalld 正在运行，但未放行 TCP $SSH_TARGET_PORT；请先放行后重试。"; failed=1; }
     fi
     if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]; then
         if command -v semanage >/dev/null 2>&1; then
-            semanage port -l 2>/dev/null | awk '$1 == "ssh_port_t" { print $3 }' |
-                tr ',' '\n' | grep -Eq "(^|[[:space:]])${SSH_TARGET_PORT}($|[[:space:]])" ||
-                warn "SELinux 为 Enforcing，未确认 ssh_port_t 包含端口 $SSH_TARGET_PORT。"
+            semanage port -l 2>/dev/null | awk -v target="$SSH_TARGET_PORT" '
+                $1 == "ssh_port_t" {
+                    for (i = 3; i <= NF; i++) {
+                        token = $i
+                        gsub(/,/, "", token)
+                        if (token ~ /^[0-9]+$/ && token + 0 == target) found = 1
+                        if (token ~ /^[0-9]+-[0-9]+$/) {
+                            split(token, range, "-")
+                            if (target >= range[1] && target <= range[2]) found = 1
+                        }
+                    }
+                }
+                END { exit !found }
+            ' ||
+                { err "SELinux 为 Enforcing，但 ssh_port_t 未包含端口 $SSH_TARGET_PORT；请先配置后重试。"; failed=1; }
         else
-            warn "SELinux 为 Enforcing，但未安装 semanage，无法验证 SSH 新端口策略。"
+            err "SELinux 为 Enforcing，但未安装 semanage，无法验证 SSH 新端口策略。"
+            failed=1
         fi
     fi
+    return "$failed"
 }
 
 restore_fail2ban_sshd_config_file() {
@@ -8544,6 +8594,11 @@ apply_ssh_port_change() {
         esac
     fi
 
+    validate_ssh_access_controls || {
+        err "本机访问控制检查未通过，未修改 SSH 配置。"
+        return 1
+    }
+
     if firewall_runtime_enabled; then
         vpsbox_firewall_active=1
         if ! read -r -p "vpsbox 防火墙将自动临时放行 TCP $SSH_TARGET_PORT；如厂商另有安全组，请先在厂商面板放行。输入 YES 继续: " confirm; then
@@ -8659,8 +8714,6 @@ apply_ssh_port_change() {
     fi
 
     info "SSH 配置写入位置：$write_action"
-
-    warn_ssh_access_controls
 
     if sync_fail2ban_sshd_port; then
         fail2ban_installed && info "Fail2ban sshd 端口已同步为 $SSH_TARGET_PORT。"
@@ -10721,8 +10774,8 @@ firewall_detect_public_listeners() {
     done <<< "$records"
 }
 
-firewall_detect_allowed_ports() {
-    local ssh_configured_ports ssh_listening_ports known_tcp known_udp protocol label
+firewall_detect_managed_ports() {
+    local ssh_configured_ports ssh_listening_ports protocol label
 
     ssh_configured_ports="$(ssh_effective_ports_csv 2>/dev/null || true)"
     [ -n "$ssh_configured_ports" ] || {
@@ -10751,7 +10804,12 @@ firewall_detect_allowed_ports() {
             FW_NODE_UDP="$(csv_add_port "$FW_NODE_UDP" "$PORT")" || return 1
         fi
     done
+}
 
+firewall_detect_allowed_ports() {
+    local known_tcp known_udp
+
+    firewall_detect_managed_ports || return 1
     firewall_detect_docker_ports || return 1
     firewall_detect_public_listeners || return 1
     known_tcp="$(merge_port_csv "$FW_SSH_PORTS" "$FW_NODE_TCP" "$FW_DOCKER_PUBLIC_TCP" "$FW_EXTRA_TCP")" || return 1
@@ -11804,12 +11862,33 @@ firewall_apply_desired_state() {
     info "主机防火墙已启用并设置为开机自动加载。"
 }
 
-firewall_sync_active_config() {
-    local temporary_tcp="${1:-}" temporary_udp="${2:-}" quiet="${3:-0}"
-    local tmp backup
+firewall_replace_active_config() {
+    local generated="$1" backup
 
+    [ -f "$generated" ] && [ ! -L "$generated" ] || return 1
+    backup="$(mktemp "$FIREWALL_ROLLBACK_DIR/firewall-config-backup.XXXXXX")" || return 1
+    cp "$FIREWALL_CONFIG" "$backup" || { rm -f "$backup"; return 1; }
+    if ! nft -c -f "$generated"; then
+        rm -f "$backup"
+        return 1
+    fi
+    if ! firewall_install_managed_file "$generated" "$FIREWALL_CONFIG" 600; then
+        rm -f "$backup"
+        return 1
+    fi
+    if ! nft -f "$FIREWALL_CONFIG"; then
+        if ! firewall_install_managed_file "$backup" "$FIREWALL_CONFIG" 600; then
+            err "防火墙同步失败，且磁盘配置未能恢复；旧配置持久备份已保留：$backup"
+            return 1
+        fi
+        rm -f "$backup"
+        return 1
+    fi
+    rm -f "$backup"
+}
+
+firewall_active_config_ready_for_sync() {
     firewall_recover_pending_rollbacks || return 1
-
     if [ ! -f "$FIREWALL_CONFIG" ]; then
         if firewall_runtime_enabled ||
             [ -e "$FIREWALL_SYSTEMD_UNIT" ] ||
@@ -11829,37 +11908,31 @@ firewall_sync_active_config() {
         err "主机防火墙配置存在但规则表未运行，无法同步端口。"
         return 1
     }
+}
+
+firewall_sync_active_config() {
+    local temporary_tcp="${1:-}" temporary_udp="${2:-}" quiet="${3:-0}"
+    local tmp
+
+    firewall_active_config_ready_for_sync || return 1
+    [ -f "$FIREWALL_CONFIG" ] || return 0
     firewall_load_state || return 1
     firewall_detect_allowed_ports || return 1
     FW_ALLOWED_TCP="$(merge_port_csv "$FW_ALLOWED_TCP" "$temporary_tcp")" || return 1
     FW_ALLOWED_UDP="$(merge_port_csv "$FW_ALLOWED_UDP" "$temporary_udp")" || return 1
     tmp="$(mktemp "$RUNTIME_DIR/firewall-refresh.XXXXXX")" || return 1
-    backup="$(mktemp "$FIREWALL_ROLLBACK_DIR/firewall-config-backup.XXXXXX")" || { rm -f "$tmp"; return 1; }
-    cp "$FIREWALL_CONFIG" "$backup" || { rm -f "$tmp" "$backup"; return 1; }
     if ! firewall_write_config "$tmp" ||
-        ! nft -c -f "$tmp"; then
-        rm -f "$tmp" "$backup"
+        ! firewall_replace_active_config "$tmp"; then
+        rm -f "$tmp"
         return 1
     fi
-    if ! firewall_install_managed_file "$tmp" "$FIREWALL_CONFIG" 600; then
-        rm -f "$tmp" "$backup"
-        return 1
-    fi
-    if ! nft -f "$FIREWALL_CONFIG"; then
-        if ! firewall_install_managed_file "$backup" "$FIREWALL_CONFIG" 600; then
-            rm -f "$tmp"
-            err "防火墙同步失败，且磁盘配置未能恢复；旧配置持久备份已保留：$backup"
-            return 1
-        fi
-        rm -f "$tmp" "$backup"
-        return 1
-    fi
-    rm -f "$tmp" "$backup"
+    rm -f "$tmp"
     [ "$quiet" = "1" ] || info "主机防火墙已同步当前 SSH、节点、Docker 和公网监听端口。"
 }
 
 firewall_prepare_port_transition() {
-    local tcp_ports="${1:-}" udp_ports="${2:-}" transition_dir
+    local tcp_ports="${1:-}" udp_ports="${2:-}"
+    local drop_tcp="${3:-}" drop_udp="${4:-}" transition_dir
     local ssh_configured_ports ssh_listening_ports ssh_safe_ports
 
     if [ -n "${ACTIVE_FIREWALL_TRANSITION_DIR:-}" ]; then
@@ -11891,8 +11964,17 @@ firewall_prepare_port_transition() {
         rm -rf "$transition_dir"
         return 1
     fi
+    drop_tcp="$(normalize_port_csv "$drop_tcp")" || { rm -rf "$transition_dir"; return 1; }
+    drop_udp="$(normalize_port_csv "$drop_udp")" || { rm -rf "$transition_dir"; return 1; }
+    printf '%s\n' "$drop_tcp" > "$transition_dir/drop-tcp.csv" ||
+        { rm -rf "$transition_dir"; return 1; }
+    printf '%s\n' "$drop_udp" > "$transition_dir/drop-udp.csv" ||
+        { rm -rf "$transition_dir"; return 1; }
+    chmod 600 "$transition_dir/drop-tcp.csv" "$transition_dir/drop-udp.csv" ||
+        { rm -rf "$transition_dir"; return 1; }
     ACTIVE_FIREWALL_TRANSITION_DIR="$transition_dir"
-    if ! firewall_sync_active_config "$tcp_ports" "$udp_ports" 1; then
+    # 节点与 SSH 内部操作只增补自己的目标端口，不重新扫描或收窄其他公网监听。
+    if ! firewall_sync_target_ports "$tcp_ports" "$udp_ports" "" "" 1; then
         firewall_abort_port_transition || true
         return 1
     fi
@@ -11931,15 +12013,24 @@ firewall_discard_port_transition() {
 }
 
 firewall_complete_port_transition() {
-    local transition_dir="${ACTIVE_FIREWALL_TRANSITION_DIR:-}"
+    local transition_dir="${ACTIVE_FIREWALL_TRANSITION_DIR:-}" drop_tcp="" drop_udp=""
 
-    firewall_sync_active_config "" "" 0 || return 1
-    [ -n "$transition_dir" ] || return 0
+    if [ -z "$transition_dir" ]; then
+        firewall_sync_target_ports "" "" "" "" 0
+        return $?
+    fi
     if [[ "$transition_dir" != "$RUNTIME_DIR"/firewall-transition.* ]] ||
-        [ ! -d "$transition_dir" ] || [ -L "$transition_dir" ]; then
+        [ ! -d "$transition_dir" ] || [ -L "$transition_dir" ] ||
+        [ ! -f "$transition_dir/drop-tcp.csv" ] || [ -L "$transition_dir/drop-tcp.csv" ] ||
+        [ ! -f "$transition_dir/drop-udp.csv" ] || [ -L "$transition_dir/drop-udp.csv" ]; then
         err "防火墙端口切换目录无效，无法完成清理：$transition_dir"
         return 1
     fi
+    IFS= read -r drop_tcp < "$transition_dir/drop-tcp.csv" || return 1
+    IFS= read -r drop_udp < "$transition_dir/drop-udp.csv" || return 1
+    drop_tcp="$(normalize_port_csv "$drop_tcp")" || return 1
+    drop_udp="$(normalize_port_csv "$drop_udp")" || return 1
+    firewall_sync_target_ports "" "" "$drop_tcp" "$drop_udp" 0 || return 1
     firewall_discard_port_transition
 }
 
@@ -12301,10 +12392,10 @@ firewall_replace_input_direct_ports() {
     local source="$1" dest="$2" protocol="$3" ports="$4" formatted
 
     ports="$(normalize_port_csv "$ports")" || return 1
-    [ -n "$ports" ] || return 1
     formatted="$(printf '%s' "$ports" | sed 's/,/, /g')"
     awk -v protocol="$protocol" -v formatted="$formatted" '
         function emit_rule() {
+            if (formatted == "") return
             print "        " protocol " dport { " formatted " } accept"
             inserted=1
         }
@@ -12317,17 +12408,65 @@ firewall_replace_input_direct_ports() {
             target="^[[:space:]]*" protocol "[[:space:]]+dport[[:space:]]+\\{[^}]+\\}[[:space:]]+accept[[:space:]]*$"
             if ($0 ~ target) {
                 seen++
-                if (!inserted) emit_rule()
+                if (!inserted && formatted != "") emit_rule()
                 next
             }
-            if (!inserted && protocol == "tcp" && $0 ~ /^[[:space:]]*udp[[:space:]]+dport[[:space:]]+/) emit_rule()
-            if (!inserted && $0 ~ /^[[:space:]]*meta[[:space:]]+nfproto.*(tcp|udp)[[:space:]]+dport[[:space:]]+/) emit_rule()
-            if (!inserted && $0 ~ /^[[:space:]]*}[[:space:]]*$/) emit_rule()
+            if (formatted != "" && !inserted && protocol == "tcp" && $0 ~ /^[[:space:]]*udp[[:space:]]+dport[[:space:]]+/) emit_rule()
+            if (formatted != "" && !inserted && $0 ~ /^[[:space:]]*meta[[:space:]]+nfproto.*(tcp|udp)[[:space:]]+dport[[:space:]]+/) emit_rule()
+            if (formatted != "" && !inserted && $0 ~ /^[[:space:]]*}[[:space:]]*$/) emit_rule()
             if ($0 ~ /^[[:space:]]*}[[:space:]]*$/) in_input=0
         }
         { print }
-        END { if (!inserted || seen > 1) exit 1 }
+        END {
+            if (seen > 1) exit 1
+            if (formatted != "" && !inserted) exit 1
+        }
     ' "$source" > "$dest"
+}
+
+firewall_sync_target_ports() {
+    local add_tcp="${1:-}" add_udp="${2:-}" drop_tcp="${3:-}" drop_udp="${4:-}"
+    local quiet="${5:-0}" direct_tcp direct_udp next_tcp next_udp work_dir
+
+    firewall_active_config_ready_for_sync || return 1
+    [ -f "$FIREWALL_CONFIG" ] || return 0
+    firewall_load_state || return 1
+    if ! firewall_config_additive_shape_valid \
+        "$FIREWALL_CONFIG" "$FW_EXTRA_TCP" "$FW_EXTRA_UDP"; then
+        err "当前防火墙规则结构无法安全执行目标端口增量更新；请使用 [1] 一键开启/更新防火墙。"
+        return 1
+    fi
+    firewall_detect_managed_ports || return 1
+    add_tcp="$(normalize_port_csv "$add_tcp")" || return 1
+    add_udp="$(normalize_port_csv "$add_udp")" || return 1
+    drop_tcp="$(normalize_port_csv "$drop_tcp")" || return 1
+    drop_udp="$(normalize_port_csv "$drop_udp")" || return 1
+    direct_tcp="$(firewall_config_direct_ports "$FIREWALL_CONFIG" tcp)" || return 1
+    direct_udp="$(firewall_config_direct_ports "$FIREWALL_CONFIG" udp)" || return 1
+    next_tcp="$(merge_port_csv "$direct_tcp" "$add_tcp")" || return 1
+    next_udp="$(merge_port_csv "$direct_udp" "$add_udp")" || return 1
+    next_tcp="$(subtract_port_csv "$next_tcp" "$drop_tcp")" || return 1
+    next_udp="$(subtract_port_csv "$next_udp" "$drop_udp")" || return 1
+    # 当前受管来源始终优先于删除列表，避免同端口重建或端口复用时误删有效规则。
+    next_tcp="$(merge_port_csv "$next_tcp" "$FW_SSH_PORTS" "$FW_NODE_TCP" "$FW_EXTRA_TCP")" || return 1
+    next_udp="$(merge_port_csv "$next_udp" "$FW_NODE_UDP" "$FW_EXTRA_UDP")" || return 1
+    [ -n "$next_tcp" ] || {
+        err "目标端口更新会移除全部 TCP 入站端口，已拒绝应用。"
+        return 1
+    }
+
+    prepare_runtime_dir || return 1
+    work_dir="$(mktemp -d "$RUNTIME_DIR/firewall-target-sync.XXXXXX")" || return 1
+    if ! firewall_replace_input_direct_ports \
+        "$FIREWALL_CONFIG" "$work_dir/tcp.nft" tcp "$next_tcp" ||
+        ! firewall_replace_input_direct_ports \
+        "$work_dir/tcp.nft" "$work_dir/firewall.nft" udp "$next_udp" ||
+        ! firewall_replace_active_config "$work_dir/firewall.nft"; then
+        rm -rf "$work_dir"
+        return 1
+    fi
+    rm -rf "$work_dir"
+    [ "$quiet" = "1" ] || info "主机防火墙已同步本次 SSH 或节点端口，其他现有放行端口保持不变。"
 }
 
 firewall_replace_extra_port_set() {
@@ -14974,7 +15113,7 @@ main_loop() {
             6) run_menu_action show_backtrace_routes; pause ;;
             7) run_menu_action other_scripts_menu ;;
             00) run_menu_action update_vpsbox; pause ;;
-            88) uninstall_all; pause ;;
+            88) run_menu_action uninstall_all; pause ;;
             0) exit 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
