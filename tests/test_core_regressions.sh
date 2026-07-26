@@ -863,6 +863,22 @@ test_singbox_summary_line_states() {
     )
 }
 
+test_ssh_port_summary_line_states() {
+    (
+        local mock_ports=6384 mock_failed=0
+        ssh_port_state() {
+            [ "$mock_failed" -eq 0 ] || return 1
+            printf '%s\n' "$mock_ports"
+        }
+
+        assert_eq " SSH 端口：6384" "$(ssh_port_summary_line)"
+        mock_ports="22,6384"
+        assert_eq " SSH 端口：22,6384" "$(ssh_port_summary_line)"
+        mock_failed=1
+        assert_eq " SSH 端口：无法读取" "$(ssh_port_summary_line)"
+    )
+}
+
 test_node_summary_orders_only_existing_protocols() {
     (
         local mock_vless=0 mock_ss=0 output="$TEST_TMP/node-summary.out"
@@ -1390,7 +1406,7 @@ test_lockdir_reclaim_guard_serializes_contenders() {
 }
 
 test_openrc_service_does_not_inherit_menu_lock_fd() {
-    require_linux_proc || return "$SKIP_STATUS"
+    require_linux_proc || return "$?"
 
     (
         # shellcheck disable=SC2034 # 被测的 service_start 动态读取。
@@ -1730,7 +1746,7 @@ test_runtime_dependency_install_is_automatic() {
 test_dangling_node_symlink_is_not_treated_as_no_node() {
     local action
 
-    require_real_symlink dangling-directory || return "$SKIP_STATUS"
+    require_real_symlink dangling-directory || return "$?"
 
     for action in start_service_action restart_service_action; do
         (
@@ -1785,6 +1801,7 @@ main() {
         test_node_state_writes_are_atomic
         test_service_running_requires_exact_config_process
         test_singbox_summary_line_states
+        test_ssh_port_summary_line_states
         test_node_summary_orders_only_existing_protocols
         test_bbr_fq_summary_preserves_partial_state
         test_menu_dispatch_and_system_status_wiring

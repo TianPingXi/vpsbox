@@ -103,17 +103,40 @@ require_linux_proc() {
 require_real_symlink() {
     local kind="${1:-file}" case_dir target link expect_dangling=0
 
-    case_dir="$(mktemp -d "$TEST_TMP/symlink-capability.XXXXXX")" || return 1
+    case_dir="$(mktemp -d "$TEST_TMP/symlink-capability.XXXXXX")" || {
+        fail "无法创建符号链接能力探测目录"
+        return 1
+    }
     target="$case_dir/target"
     link="$case_dir/link"
     case "$kind" in
-        file) : > "$target" || { rm -rf "$case_dir"; return 1; } ;;
-        directory) mkdir "$target" || { rm -rf "$case_dir"; return 1; } ;;
+        file)
+            : > "$target" || {
+                rm -rf "$case_dir"
+                fail "无法创建符号链接能力探测文件"
+                return 1
+            }
+            ;;
+        directory)
+            mkdir "$target" || {
+                rm -rf "$case_dir"
+                fail "无法创建符号链接能力探测目录目标"
+                return 1
+            }
+            ;;
         dangling-directory)
-            mkdir "$target" || { rm -rf "$case_dir"; return 1; }
+            mkdir "$target" || {
+                rm -rf "$case_dir"
+                fail "无法创建悬空符号链接能力探测目标"
+                return 1
+            }
             expect_dangling=1
             ;;
-        *) rm -rf "$case_dir"; return 2 ;;
+        *)
+            rm -rf "$case_dir"
+            fail "未知的符号链接能力类型：$kind"
+            return 2
+            ;;
     esac
     if ln -s "$target" "$link" 2>/dev/null &&
         [ -L "$link" ] &&
@@ -146,6 +169,10 @@ run_test_case() {
         "$name"
     )
     status=$?
+    if [ "$status" -eq "$SKIP_STATUS" ] && [ "${VPSBOX_TEST_STRICT:-0}" = "1" ]; then
+        printf '严格模式不允许跳过：%s\n' "$(test_skip_reason)" >&2
+        return 1
+    fi
     return "$status"
 }
 

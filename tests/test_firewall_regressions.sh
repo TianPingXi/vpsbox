@@ -525,7 +525,7 @@ test_systemd_enabled_inactive_firewalld_conflict() {
 test_openrc_enabled_inactive_firewalld_conflict() {
     local runlevels="$TEST_TMP/openrc-runlevels"
 
-    require_real_symlink directory || return "$SKIP_STATUS"
+    require_real_symlink directory || return "$?"
     mkdir -p "$runlevels/default"
     ln -s /etc/init.d/firewalld "$runlevels/default/firewalld"
     firewall_openrc_service_enabled firewalld "$runlevels" ||
@@ -549,8 +549,8 @@ test_bounded_background_processes_release_lock() {
     local case_dir="$TEST_TMP/bounded-lock" driver ready lock child_count=0
     local driver_pid descendants pid
 
-    require_command flock || return "$SKIP_STATUS"
-    require_linux_proc || return "$SKIP_STATUS"
+    require_command flock || return "$?"
+    require_linux_proc || return "$?"
     mkdir -p "$case_dir"
     driver="$case_dir/driver.sh"
     ready="$case_dir/ready"
@@ -641,14 +641,14 @@ EOF
 }
 
 test_timeout_processes_release_lock() {
-    require_command flock || return "$SKIP_STATUS"
-    require_linux_proc || return "$SKIP_STATUS"
+    require_command flock || return "$?"
+    require_linux_proc || return "$?"
     run_timeout_lock_case timeout-lock supported
 }
 
 test_busybox_timeout_fallback_releases_lock() {
-    require_command flock || return "$SKIP_STATUS"
-    require_linux_proc || return "$SKIP_STATUS"
+    require_command flock || return "$?"
+    require_linux_proc || return "$?"
     run_timeout_lock_case timeout-fallback busybox-fallback
 }
 
@@ -656,8 +656,8 @@ test_watchdog_survives_parent_without_holding_lock() {
     local case_dir="$TEST_TMP/watchdog-lock" driver ready lock runtime snapshot
     local driver_pid watchdog child=""
 
-    require_command flock || return "$SKIP_STATUS"
-    require_linux_proc || return "$SKIP_STATUS"
+    require_command flock || return "$?"
+    require_linux_proc || return "$?"
     mkdir -p "$case_dir"
     driver="$case_dir/driver.sh"
     ready="$case_dir/ready"

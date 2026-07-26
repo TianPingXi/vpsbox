@@ -14617,6 +14617,14 @@ singbox_summary_line() {
     printf ' sing-box：%s %s\n' "$version" "$status"
 }
 
+ssh_port_summary_line() {
+    local ports
+
+    ports="$(ssh_port_state 2>/dev/null)" || ports=""
+    [ -n "$ports" ] || ports="无法读取"
+    printf ' SSH 端口：%s\n' "$ports"
+}
+
 node_state() {
     local states=""
 
@@ -14797,6 +14805,7 @@ show_menu() {
 $(vpsbox_update_notice)
 ----------------------------------------
 $(singbox_summary_line)
+$(ssh_port_summary_line)
 $(node_summary)
 ----------------------------------------
  IPv4 DNS：

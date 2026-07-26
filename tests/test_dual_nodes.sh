@@ -25,14 +25,42 @@ chmod 755 "$TEST_TMP/bin/sing-box"
 PATH="$TEST_TMP/bin:$PATH"
 export PATH
 
-# Windows 挂载上的 WSL 测试目录不允许普通测试用户 chown root；节点权限本身由既有回归覆盖。
-chown() { return 0; }
-node_file_is_secure() {
-    [ -f "$1" ] && [ ! -L "$1" ]
+node_permission_semantics_available() {
+    local probe="$TEST_TMP/node-permission-capability" file
+    local owner group dir_mode file_mode supported=0
+
+    file="$probe/file"
+    mkdir -p "$probe" || return 1
+    : > "$file" || { rm -rf "$probe"; return 1; }
+    if command chown 0:0 "$probe" "$file" 2>/dev/null &&
+        command chmod 700 "$probe" &&
+        command chmod 600 "$file"; then
+        owner="$(stat -c '%u' "$file" 2>/dev/null || true)"
+        group="$(stat -c '%g' "$file" 2>/dev/null || true)"
+        dir_mode="$(stat -c '%a' "$probe" 2>/dev/null || true)"
+        file_mode="$(stat -c '%a' "$file" 2>/dev/null || true)"
+        if [ "$owner" = 0 ] && [ "$group" = 0 ] &&
+            [ "$dir_mode" = 700 ] && [ "$file_mode" = 600 ]; then
+            supported=1
+        fi
+    fi
+    rm -rf "$probe" || return 1
+    [ "$supported" -eq 1 ]
 }
-node_dir_is_secure() {
-    [ -d "$1" ] && [ ! -L "$1" ]
-}
+
+DUAL_NODES_REAL_PERMISSIONS=0
+if node_permission_semantics_available; then
+    DUAL_NODES_REAL_PERMISSIONS=1
+else
+    # 不支持 root 属主/Unix 模式的宿主仍运行配置与事务测试；严格验收会因权限专项 SKIP 而失败。
+    chown() { return 0; }
+    node_file_is_secure() {
+        [ -f "$1" ] && [ ! -L "$1" ]
+    }
+    node_dir_is_secure() {
+        [ -d "$1" ] && [ ! -L "$1" ]
+    }
+fi
 # Git for Windows 不附带 jq；该环境只用精确字段回退继续跑交互/事务测试。
 # Debian 验收存在 jq 时会直接执行生产实现和完整 JSON 语义校验。
 if ! command -v jq >/dev/null 2>&1; then
@@ -1030,8 +1058,8 @@ test_last_uri_delete_failure_is_not_masked() {
 
 test_insecure_node_permissions_are_rejected() {
     (
-        if [ "$(id -u)" -ne 0 ]; then
-            skip "需要 root 才能验证节点属主与权限"
+        if [ "$DUAL_NODES_REAL_PERMISSIONS" -ne 1 ]; then
+            skip "需要真实的 root 属主与 Unix 权限语义"
             return "$SKIP_STATUS"
         fi
         set_node_paths "$TEST_TMP/insecure-permissions"

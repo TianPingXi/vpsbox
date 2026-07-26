@@ -28,7 +28,7 @@ test_run_test_case_honors_errexit() {
 }
 
 test_run_test_case_preserves_caller_options() {
-    local status
+    local VPSBOX_TEST_STRICT=0 status
 
     skipped_case() {
         skip "测试跳过"
@@ -47,6 +47,22 @@ test_run_test_case_preserves_caller_options() {
     assert_eq "测试跳过" "$(test_skip_reason)" "skip 原因应跨子 shell 保留"
 }
 
+test_run_test_case_strict_mode_rejects_skip() {
+    local VPSBOX_TEST_STRICT=1 status output="$TEST_TMP/strict-skip.out"
+
+    skipped_case() {
+        skip "严格模式夹具"
+    }
+
+    set +e
+    run_test_case skipped_case >"$output" 2>&1
+    status=$?
+    set -e
+
+    assert_eq 1 "$status" "严格模式必须把 SKIP 转为失败"
+    assert_file_contains "$output" '严格模式不允许跳过：严格模式夹具'
+}
+
 test_require_command_records_explicit_skip() {
     local status
 
@@ -58,6 +74,18 @@ test_require_command_records_explicit_skip() {
     assert_eq "$SKIP_STATUS" "$status" "缺少能力时应返回统一 SKIP 状态"
     assert_eq "需要命令：vpsbox-command-that-must-not-exist" \
         "$(test_skip_reason)" "能力 SKIP 必须记录可读原因"
+}
+
+test_require_real_symlink_rejects_unknown_kind() {
+    local status output="$TEST_TMP/unknown-symlink-kind.out"
+
+    set +e
+    require_real_symlink files >"$output" 2>&1
+    status=$?
+    set -e
+
+    assert_eq 2 "$status" "能力参数错误不得被当成 SKIP"
+    assert_file_contains "$output" '未知的符号链接能力类型：files'
 }
 
 test_forbidden_marker_survives_ignored_status() {
@@ -148,7 +176,9 @@ main() {
     local -a tests=(
         test_run_test_case_honors_errexit
         test_run_test_case_preserves_caller_options
+        test_run_test_case_strict_mode_rejects_skip
         test_require_command_records_explicit_skip
+        test_require_real_symlink_rejects_unknown_kind
         test_forbidden_marker_survives_ignored_status
         test_forbidden_marker_survives_command_substitution
         test_registration_check_rejects_missing_extra_and_duplicates

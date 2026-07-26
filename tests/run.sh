@@ -2,6 +2,7 @@
 
 set -uo pipefail
 
+# 发布验收可设置 VPSBOX_TEST_STRICT=1，使任何环境能力 SKIP 都导致失败。
 TEST_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)" || exit 1
 ONLY_SUITE=""
 declare -a FAILED_SUITES=()
