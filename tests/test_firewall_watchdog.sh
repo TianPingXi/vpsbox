@@ -131,6 +131,7 @@ wait_for_snapshot_rollback() {
 test_commit_stops_watchdog_and_sleep() {
     local snapshot="" watchdog child elapsed
 
+    require_linux_proc || return "$SKIP_STATUS"
     CASE_TEST_PIDS=""
     trap cleanup_case_processes EXIT
     reset_firewall_case commit
@@ -159,6 +160,7 @@ test_commit_stops_watchdog_and_sleep() {
 test_immediate_restore_stops_timed_watchdog() {
     local snapshot="" watchdog child elapsed
 
+    require_linux_proc || return "$SKIP_STATUS"
     CASE_TEST_PIDS=""
     trap cleanup_case_processes EXIT
     reset_firewall_case restore
@@ -184,6 +186,7 @@ test_immediate_restore_stops_timed_watchdog() {
 test_natural_timeout_rolls_back_snapshot() {
     local snapshot="" watchdog original="$TEST_TMP/natural-timeout-original.nft"
 
+    require_linux_proc || return "$SKIP_STATUS"
     CASE_TEST_PIDS=""
     trap cleanup_case_processes EXIT
     reset_firewall_case natural-timeout
@@ -209,6 +212,7 @@ test_natural_timeout_rolls_back_snapshot() {
 test_hup_does_not_cancel_timeout_rollback() {
     local snapshot="" watchdog child original="$TEST_TMP/hup-timeout-original.nft"
 
+    require_linux_proc || return "$SKIP_STATUS"
     CASE_TEST_PIDS=""
     trap cleanup_case_processes EXIT
     reset_firewall_case hup-timeout
@@ -287,6 +291,7 @@ EOF
 test_stale_restore_lock_is_reclaimed() {
     local snapshot=""
 
+    require_linux_proc || return "$SKIP_STATUS"
     reset_firewall_case stale-restore-lock
     firewall_create_rollback_snapshot snapshot ""
     mkdir "$snapshot/restore.lock"
@@ -327,6 +332,7 @@ test_restore_lock_metadata_is_atomically_published() {
 test_rollback_rejects_directory_symlink_target() {
     local snapshot="" victim
 
+    require_real_symlink directory || return "$SKIP_STATUS"
     reset_firewall_case directory-symlink-target
     cat > "$FIREWALL_CONFIG" <<'EOF'
 table inet vpsbox {
@@ -354,6 +360,7 @@ EOF
 test_identity_mismatch_is_cleaned_without_kill() {
     local dir pid start boot
 
+    require_linux_proc || return "$SKIP_STATUS"
     CASE_TEST_PIDS=""
     trap cleanup_case_processes EXIT
     reset_firewall_case mismatch
@@ -381,6 +388,7 @@ test_identity_mismatch_is_cleaned_without_kill() {
 test_pid_only_partial_watchdog_is_stopped() {
     local dir watchdog child elapsed
 
+    require_linux_proc || return "$SKIP_STATUS"
     CASE_TEST_PIDS=""
     trap cleanup_case_processes EXIT
     reset_firewall_case pid-only
@@ -411,6 +419,7 @@ test_pid_only_partial_watchdog_is_stopped() {
 test_partial_dead_metadata_is_cleaned() {
     local dir
 
+    require_linux_proc || return "$SKIP_STATUS"
     reset_firewall_case partial
     dir="$RUNTIME_DIR/firewall-rollback.partial"
     mkdir -p "$dir"
@@ -443,6 +452,7 @@ test_invalid_pid_metadata_is_cleaned() {
 test_stale_pid_does_not_hide_real_watchdog() {
     local dir unrelated watchdog child start boot elapsed
 
+    require_linux_proc || return "$SKIP_STATUS"
     CASE_TEST_PIDS=""
     trap cleanup_case_processes EXIT
     reset_firewall_case stale

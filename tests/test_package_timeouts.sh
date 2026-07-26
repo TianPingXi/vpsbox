@@ -50,6 +50,7 @@ cleanup_sleep_from_file() {
 test_timeout_kills_command_tree() {
     local child_file="$TEST_TMP/timeout-child.pid" status elapsed child
 
+    require_linux_proc || return "$SKIP_STATUS"
     ACTIVE_TEST_CHILD_FILE="$child_file"
     trap cleanup_active_test_sleep EXIT
     # Consumed by the sourced timeout supervisor.
@@ -76,6 +77,7 @@ test_timeout_is_not_retried() {
     local attempts="$TEST_TMP/timeout-attempts" child_file="$TEST_TMP/retry-child.pid"
     local status count child=""
 
+    require_linux_proc || return "$SKIP_STATUS"
     ACTIVE_TEST_CHILD_FILE="$child_file"
     trap cleanup_active_test_sleep EXIT
     : > "$attempts"
@@ -100,6 +102,7 @@ test_timeout_is_not_retried() {
 test_timeout_kills_separate_process_group() {
     local child_file="$TEST_TMP/separate-group-child.pid" status child=""
 
+    require_linux_proc || return "$SKIP_STATUS"
     ACTIVE_TEST_CHILD_FILE="$child_file"
     trap cleanup_active_test_sleep EXIT
     # shellcheck disable=SC2034
@@ -122,6 +125,7 @@ test_timeout_kills_separate_process_group() {
 test_nonzero_exit_cleans_descendants() {
     local child_file="$TEST_TMP/nonzero-child.pid" status child=""
 
+    require_linux_proc || return "$SKIP_STATUS"
     ACTIVE_TEST_CHILD_FILE="$child_file"
     trap cleanup_active_test_sleep EXIT
     set +e
@@ -140,7 +144,7 @@ test_nonzero_exit_cleans_descendants() {
 }
 
 test_apt_options_are_bounded() {
-    local log="$TEST_TMP/apt-options.log" value
+    local log="$TEST_TMP/apt-options.log" value option
 
     run_bounded_command() {
         printf '%s\n' "$*" > "$log"

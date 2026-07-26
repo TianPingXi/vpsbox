@@ -81,6 +81,50 @@ skip() {
     return "$SKIP_STATUS"
 }
 
+require_command() {
+    local name="$1"
+
+    command -v "$name" >/dev/null 2>&1 && return 0
+    skip "需要命令：$name"
+}
+
+require_linux_proc() {
+    local pid="${BASHPID:-$$}"
+
+    if [ "$(uname -s 2>/dev/null || true)" = "Linux" ] &&
+        [ -r /proc/sys/kernel/random/boot_id ] &&
+        [ -r "/proc/$pid/stat" ] &&
+        [ -r "/proc/$pid/task/$pid/children" ]; then
+        return 0
+    fi
+    skip "需要 Linux /proc 的进程身份、boot_id 与进程树接口"
+}
+
+require_real_symlink() {
+    local kind="${1:-file}" case_dir target link expect_dangling=0
+
+    case_dir="$(mktemp -d "$TEST_TMP/symlink-capability.XXXXXX")" || return 1
+    target="$case_dir/target"
+    link="$case_dir/link"
+    case "$kind" in
+        file) : > "$target" || { rm -rf "$case_dir"; return 1; } ;;
+        directory) mkdir "$target" || { rm -rf "$case_dir"; return 1; } ;;
+        dangling-directory)
+            mkdir "$target" || { rm -rf "$case_dir"; return 1; }
+            expect_dangling=1
+            ;;
+        *) rm -rf "$case_dir"; return 2 ;;
+    esac
+    if ln -s "$target" "$link" 2>/dev/null &&
+        [ -L "$link" ] &&
+        { [ "$expect_dangling" -eq 0 ] || { rmdir "$target" && [ ! -e "$link" ]; }; }; then
+        rm -rf "$case_dir"
+        return 0
+    fi
+    rm -rf "$case_dir"
+    skip "需要真实的 $kind 符号链接语义"
+}
+
 test_skip_reason() {
     if [ -s "$SKIP_REASON_FILE" ]; then
         tr '\n' ' ' < "$SKIP_REASON_FILE" | sed 's/[[:space:]]*$//'

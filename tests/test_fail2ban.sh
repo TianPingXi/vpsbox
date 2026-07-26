@@ -130,6 +130,12 @@ sleep() {
     :
 }
 
+# 封禁逻辑仍通过生产选择器挑选 TEST-NET 地址；仅把本机地址枚举固定为
+# 受控夹具，避免单元测试依赖宿主机是否提供 iproute2 或 GNU hostname。
+fail2ban_local_ipv4_text() {
+    printf '%s\n' 10.0.0.1
+}
+
 test_action_parser() {
     local -a actions=()
     reset_mock
@@ -335,6 +341,7 @@ test_stale_active_test_blocks_new_ban() {
     printf '%s\n' "$old_ip" > "$MOCK_JAIL_STATE"
     printf '%s\n' "$old_ip" > "$MOCK_BACKEND_STATE"
     ACTIVE_FAIL2BAN_TEST_IP="$old_ip"
+    # shellcheck disable=SC2034 # 被测的运行时清理函数动态读取。
     ACTIVE_FAIL2BAN_TEST_BACKENDS="nftables"
     MOCK_UNBAN_FAIL=1
 
@@ -387,6 +394,7 @@ test_sync_restores_initial_stopped_state() {
     local running=0
     reset_mock
     mkdir -p "$sync_dir"
+    # shellcheck disable=SC2034 # 被测同步函数动态读取。
     FAIL2BAN_CONFIG_DIR="$sync_dir"
     FAIL2BAN_VPSBOX_SSHD_CONF="$sync_dir/99-vpsbox-sshd.local"
     : > "$systemctl_log"
@@ -617,6 +625,7 @@ test_install_fail2ban_failure_keeps_pending_baseline() {
     (
         local log="$TEST_TMP/fail2ban-install-pending.log"
         : > "$log"
+        # shellcheck disable=SC2034 # 被测安装函数动态读取。
         detect_os() { OS=debian; }
         fail2ban_sshd_configuration_healthy() { return 1; }
         fail2ban_installed() { return 0; }

@@ -106,6 +106,7 @@ test_failed_atomic_replace_preserves_original_and_is_recoverable() {
 test_symlink_target_is_rejected() {
     local victim="$TEST_TMP/gai-victim.conf"
 
+    require_real_symlink file || return "$SKIP_STATUS"
     reset_case symlink
     printf '%s\n' 'victim-content' > "$victim"
     ln -s "$victim" "$GAI_CONF"

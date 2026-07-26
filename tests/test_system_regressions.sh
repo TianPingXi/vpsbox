@@ -67,6 +67,7 @@ test_clear_change_tracking_reports_partial_failure() {
 test_restore_replaces_target_symlink() {
     local target victim
 
+    require_real_symlink file || return "$SKIP_STATUS"
     reset_change_store symlink
     target="$TEST_TMP/symlink/target"
     victim="$TEST_TMP/symlink/victim"
@@ -85,6 +86,7 @@ test_restore_replaces_target_symlink() {
 test_atomic_snapshot_restore_replaces_target_symlink() {
     local source target victim
 
+    require_real_symlink file || return "$SKIP_STATUS"
     source="$TEST_TMP/atomic-restore/source"
     target="$TEST_TMP/atomic-restore/target"
     victim="$TEST_TMP/atomic-restore/victim"
@@ -104,6 +106,7 @@ test_atomic_snapshot_restore_replaces_target_symlink() {
 test_atomic_snapshot_restore_rejects_directory_symlink() {
     local source target victim
 
+    require_real_symlink directory || return "$SKIP_STATUS"
     source="$TEST_TMP/atomic-restore-dir/source"
     target="$TEST_TMP/atomic-restore-dir/target"
     victim="$TEST_TMP/atomic-restore-dir/victim"
@@ -122,6 +125,7 @@ test_atomic_snapshot_restore_rejects_directory_symlink() {
 test_atomic_snapshot_restore_replaces_dangling_symlink() {
     local source target missing
 
+    require_real_symlink file || return "$SKIP_STATUS"
     source="$TEST_TMP/atomic-restore-dangling/source"
     target="$TEST_TMP/atomic-restore-dangling/target"
     missing="$TEST_TMP/atomic-restore-dangling/missing"

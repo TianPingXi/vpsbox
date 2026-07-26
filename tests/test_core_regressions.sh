@@ -89,6 +89,7 @@ test_node_host_warns_for_possible_nat() {
     (
         local domain=""
         local output="$TEST_TMP/node-host-nat.out"
+        ip() { :; }
         public_ipv4() { printf '%s\n' 198.51.100.42; }
         node_ipv4_is_assigned_locally() { return 1; }
 
@@ -937,6 +938,7 @@ test_bbr_fq_summary_preserves_partial_state() {
 test_menu_dispatch_and_system_status_wiring() {
     local dispatch_log="$TEST_TMP/main-menu-dispatch.log"
 
+    : > "$dispatch_log"
     (
         show_menu() { :; }
         confirm_pending_vpsbox_update() { :; }
@@ -1388,6 +1390,8 @@ test_lockdir_reclaim_guard_serializes_contenders() {
 }
 
 test_openrc_service_does_not_inherit_menu_lock_fd() {
+    require_linux_proc || return "$SKIP_STATUS"
+
     (
         # shellcheck disable=SC2034 # 被测的 service_start 动态读取。
         VPSBOX_TEST_MODE=0
@@ -1725,6 +1729,8 @@ test_runtime_dependency_install_is_automatic() {
 
 test_dangling_node_symlink_is_not_treated_as_no_node() {
     local action
+
+    require_real_symlink dangling-directory || return "$SKIP_STATUS"
 
     for action in start_service_action restart_service_action; do
         (

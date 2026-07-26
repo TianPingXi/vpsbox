@@ -47,6 +47,19 @@ test_run_test_case_preserves_caller_options() {
     assert_eq "测试跳过" "$(test_skip_reason)" "skip 原因应跨子 shell 保留"
 }
 
+test_require_command_records_explicit_skip() {
+    local status
+
+    set +e
+    require_command vpsbox-command-that-must-not-exist
+    status=$?
+    set -e
+
+    assert_eq "$SKIP_STATUS" "$status" "缺少能力时应返回统一 SKIP 状态"
+    assert_eq "需要命令：vpsbox-command-that-must-not-exist" \
+        "$(test_skip_reason)" "能力 SKIP 必须记录可读原因"
+}
+
 test_forbidden_marker_survives_ignored_status() {
     local status
 
@@ -96,18 +109,18 @@ test_registration_check_rejects_missing_extra_and_duplicates() {
 }
 
 test_suite_runners_keep_test_case_out_of_conditionals() {
-    local file count
-    local -a suites=(
-        test_updates.sh
-        test_fail2ban.sh
-        test_package_timeouts.sh
-        test_ipv4_priority.sh
-        test_firewall_watchdog.sh
-        test_core_regressions.sh
-        test_dual_nodes.sh
-        test_system_regressions.sh
-        test_firewall_regressions.sh
-    )
+    local path file count
+    local -a suites=()
+
+    for path in "$TEST_DIR"/test_*.sh; do
+        file="${path##*/}"
+        # helper 没有 runner；harness 自身故意直接执行用例，以验证 runner。
+        case "$file" in
+            test_helper.sh|test_harness.sh) continue ;;
+        esac
+        suites+=("$file")
+    done
+    [ "${#suites[@]}" -gt 0 ] || fail "未发现任何待检查的测试套件"
 
     for file in "${suites[@]}"; do
         count="$(awk '
@@ -135,6 +148,7 @@ main() {
     local -a tests=(
         test_run_test_case_honors_errexit
         test_run_test_case_preserves_caller_options
+        test_require_command_records_explicit_skip
         test_forbidden_marker_survives_ignored_status
         test_forbidden_marker_survives_command_substitution
         test_registration_check_rejects_missing_extra_and_duplicates

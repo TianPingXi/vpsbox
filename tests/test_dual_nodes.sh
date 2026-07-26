@@ -342,6 +342,7 @@ test_orphan_protocol_uri_is_rejected() {
 test_stopped_sibling_port_is_rejected() {
     (
         local output="$TEST_TMP/sibling-port.out"
+        ss() { :; }
         docker_reserved_ports_for_port_choice() { printf '\n'; }
         ssh_effective_ports_csv() { printf '%s\n' 22; }
         port_is_effective_ssh_port() { return 1; }
@@ -356,6 +357,7 @@ test_stopped_sibling_port_is_rejected() {
 test_stopped_target_port_is_rechecked_against_system_listeners() {
     (
         local output="$TEST_TMP/stopped-target-port.out"
+        ss() { :; }
         docker_reserved_ports_for_port_choice() { printf '\n'; }
         ssh_effective_ports_csv() { printf '%s\n' 22; }
         port_is_effective_ssh_port() { return 1; }
