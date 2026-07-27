@@ -205,7 +205,7 @@ err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
 confirm_default_yes() {
     local prompt="$1" answer
     while true; do
-        read -r -p "$prompt (y/n): " answer || return 1
+        read -r -p "$prompt [Y/n]: " answer || return 1
         case "$answer" in
             ""|Y|y) return 0 ;;
             N|n) return 1 ;;
@@ -4624,7 +4624,7 @@ create_or_rebuild_node() {
         existing_port="$PORT"
         existing_protocols=both
         warn "检测到已有 Shadowsocks 节点。"
-        if ! read -r -p "是否覆盖重建 Shadowsocks 节点？(y/N): " confirm; then
+        if ! read -r -p "是否覆盖重建 Shadowsocks 节点？[y/N]: " confirm; then
             info "输入已结束，已取消。"
             return 1
         fi
@@ -4761,7 +4761,7 @@ create_vless_reality_node() {
         existing_port="$PORT"
         existing_protocols=tcp
         warn "检测到已有 VLESS Reality 节点。"
-        if ! read -r -p "是否覆盖重建 VLESS Reality 节点？(y/N): " confirm; then
+        if ! read -r -p "是否覆盖重建 VLESS Reality 节点？[y/N]: " confirm; then
             info "输入已结束，已取消。"
             return 1
         fi
@@ -5017,7 +5017,7 @@ delete_node_protocol() {
     if [ "$protocol" = "ss" ]; then
         firewall_drop_udp="$node_port"
     fi
-    if ! read -r -p "确认删除 $label 节点？(y/N): " confirm; then
+    if ! read -r -p "确认删除 $label 节点？[y/N]: " confirm; then
         info "输入已结束，已取消。"
         return 1
     fi
@@ -13354,7 +13354,7 @@ ensure_nexttrace() {
     fi
 
     warn "未检测到 nexttrace。"
-    if ! read -r -p "是否自动安装 nexttrace？(y/N): " confirm; then
+    if ! read -r -p "是否自动安装 nexttrace？[y/N]: " confirm; then
         info "输入已结束，已取消。"
         return 1
     fi
