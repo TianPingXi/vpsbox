@@ -12,7 +12,7 @@ umask 077
 # 4. vpsbox 自更新发布与回滚事务
 # 5. 系统优化与安全：BBR、Fail2ban、NTP、DNS、SSH 与系统维护
 # 6. 主机防火墙：端口发现、nftables、Docker 转发、回滚与菜单
-# 7. 检测与路由测试：一键检测、NextTrace、三网回程与大小包
+# 7. 检测：一键检测
 # 8. 维护、恢复与末端菜单动作
 # 9. 菜单与交互
 # 10. 程序入口
@@ -30,8 +30,6 @@ VPSBOX_VERSION="v1.0.43"
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 LEGACY_SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
-NEXTTRACE_RELEASE_VERSION="1.7.1"
-NEXTTRACE_HELP_TIMEOUT=8
 DEFAULT_REALITY_SERVER_NAME="addons.mozilla.org"
 CMD_PATH="/usr/local/bin/vpsbox"
 CONFIG_DIR="/etc/sing-box"
@@ -103,15 +101,14 @@ LOCK_RECLAIM_DIR="$RUNTIME_DIR/lockdir-reclaim"
 LOCK_USING_FLOCK=0
 LOCK_USING_DIR=0
 
-# ACTIVE_* 是各操作域的进程内生命周期句柄。所属节点、防火墙、SSH、Fail2ban、
-# 路由测试或 sing-box 更新流程负责写入。统一退出清理可以先接管并清空句柄再调用
+# ACTIVE_* 是各操作域的进程内生命周期句柄。所属节点、防火墙、SSH、Fail2ban 或
+# sing-box 更新流程负责写入。统一退出清理可以先接管并清空句柄再调用
 # 对应恢复入口，也可以在操作完成后清空；失败后的保留与提示策略由各领域清理函数负责。
 ACTIVE_NODE_BACKUP=""
 ACTIVE_NODE_TRANSACTION_MUTATED=0
 ACTIVE_FIREWALL_TRANSITION_DIR=""
 ACTIVE_SSH_FIREWALL_TRANSITION=0
 ACTIVE_FIREWALL_ROLLBACK_DIR=""
-ACTIVE_TRACE_TMP=""
 ACTIVE_UNAPPLIED_SSH_TRACKING=0
 ACTIVE_FAIL2BAN_TEST_IP=""
 ACTIVE_FAIL2BAN_TEST_BACKENDS=""
@@ -131,27 +128,6 @@ SS_METHOD="2022-blake3-aes-128-gcm"
 METHOD="$SS_METHOD"
 PORT_MIN=10000
 PORT_MAX=60000
-
-# 路由测试目标与采样参数仅由检测模块读取。
-TRACE_NAMES=(
-    "北京电信" "北京联通" "北京移动"
-    "上海电信" "上海联通" "上海移动"
-    "广东电信" "广东联通" "广东移动"
-    "安徽电信" "安徽联通" "安徽移动"
-    "江苏电信" "江苏联通" "江苏移动"
-)
-TRACE_IPS=(
-    "106.37.68.13" "221.222.185.232" "211.136.25.153"
-    "101.226.101.195" "112.64.235.107" "117.185.117.117"
-    "183.47.102.91" "157.148.63.62" "211.139.145.129"
-    "117.68.18.76" "112.132.39.144" "39.145.24.107"
-    "117.62.242.159" "112.80.130.226" "36.155.213.87"
-)
-TRACE_REGIONS=("北京" "上海" "广东" "安徽" "江苏")
-TRACE_ISPS=("电信" "联通" "移动")
-TRACE_SIZE_SMALL=64
-TRACE_SIZE_LARGE=1400
-TRACE_SIZE_QUERIES=3
 
 # vpsbox 自更新握手状态由检查、watchdog 与新进程启动确认流程共同维护。
 REMOTE_VERSION=""
@@ -634,15 +610,6 @@ cleanup_vpsbox_lock() {
     fi
 }
 
-cleanup_active_trace_tmp() {
-    local tmp_dir="${ACTIVE_TRACE_TMP:-}"
-
-    ACTIVE_TRACE_TMP=""
-    if [[ "$tmp_dir" == /tmp/vpsbox-trace.* ]] && [ -d "$tmp_dir" ] && [ ! -L "$tmp_dir" ]; then
-        rm -rf -- "$tmp_dir"
-    fi
-}
-
 cleanup_vpsbox_runtime() {
     local backup="${ACTIVE_NODE_BACKUP:-}"
     local firewall_rollback="${ACTIVE_FIREWALL_ROLLBACK_DIR:-}"
@@ -702,7 +669,6 @@ cleanup_vpsbox_runtime() {
         cleanup_unapplied_ssh_tracking 0 ||
             warn "SSH 首次事务被中断，未能完整清理尚未应用的恢复基线。"
     fi
-    cleanup_active_trace_tmp
     cleanup_vpsbox_lock
     if declare -F rollback_pending_vpsbox_update >/dev/null 2>&1; then
         rollback_pending_vpsbox_update ||
@@ -1736,6 +1702,15 @@ change_restore_state() {
 
 change_needs_restore() {
     [ "$(change_restore_state "$1")" != none ]
+}
+
+change_applied_recorded_readonly() {
+    local name="$1"
+
+    [[ "$name" =~ ^[A-Z0-9_]+$ ]] || return 1
+    [ -f "$CHANGE_MANIFEST" ] && [ ! -L "$CHANGE_MANIFEST" ] || return 1
+    [ "$(stat -c '%u:%g %a' "$CHANGE_MANIFEST" 2>/dev/null || true)" = "0:0 600" ] || return 1
+    grep -qxF "APPLIED_$name=1" "$CHANGE_MANIFEST" 2>/dev/null
 }
 
 restore_change_file() {
@@ -3003,13 +2978,16 @@ node_ipv4_is_assigned_locally() {
 prompt_node_host() {
     local result_var="$1"
     local prompt="$2"
-    local input_host host
+    local input_host host answer delayed_host
+    local used_detected_ipv4=0 delayed_host_adopted=0
 
     [[ "$result_var" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
 
     while true; do
         read -r -p "$prompt" input_host || return 1
         host="$(normalize_host "$input_host")"
+        used_detected_ipv4=0
+        delayed_host_adopted=0
 
         if [ -z "$host" ]; then
             info "正在自动检测 VPS 公网 IPv4..."
@@ -3020,11 +2998,33 @@ prompt_node_host() {
             fi
 
             info "自动检测到公网 IPv4：$host"
-            if ! confirm_default_yes "确认使用该公网 IPv4？"; then
-                info "请手动输入节点连接地址。"
-                continue
-            fi
-            if command -v ip >/dev/null 2>&1 && ! node_ipv4_is_assigned_locally "$host"; then
+            while true; do
+                read -r -p "确认使用该公网 IPv4？ [Y/n]: " answer || return 1
+                case "$answer" in
+                    ""|Y|y)
+                        used_detected_ipv4=1
+                        break
+                        ;;
+                    N|n)
+                        info "请手动输入节点连接地址。"
+                        host=""
+                        break
+                        ;;
+                    *)
+                        delayed_host="$(normalize_host "$answer")"
+                        if is_valid_node_host "$delayed_host"; then
+                            host="$delayed_host"
+                            delayed_host_adopted=1
+                            break
+                        fi
+                        warn "请输入 y、n，或直接输入有效的节点域名或 IP；直接回车默认 y。"
+                        ;;
+                esac
+            done
+            [ -n "$host" ] || continue
+            if [ "$used_detected_ipv4" -eq 1 ] &&
+                command -v ip >/dev/null 2>&1 &&
+                ! node_ipv4_is_assigned_locally "$host"; then
                 warn "该公网 IPv4 未直接配置在本机，当前 VPS 可能使用 NAT。"
                 warn "请确认公网映射地址正确，并将后续节点端口映射到相同端口。"
             fi
@@ -3039,6 +3039,9 @@ prompt_node_host() {
             continue
         fi
 
+        if [ "$delayed_host_adopted" -eq 1 ]; then
+            info "检测到延迟到达的节点连接地址，已自动采用：$host"
+        fi
         printf -v "$result_var" '%s' "$host"
         info "已识别节点连接地址：$host"
         return 0
@@ -4037,33 +4040,6 @@ random_port() {
         fi
     done
     err "连续 100 次未找到可用随机端口。"
-    return 1
-}
-
-random_trace_source_port() {
-    local port i status
-
-    command -v ss >/dev/null 2>&1 || {
-        err "缺少 ss，无法可靠选择 TCP 探测源端口。"
-        return 1
-    }
-
-    # 探测源端口不是入站服务端口，不应依赖 Docker daemon 的保留端口清单。
-    for i in $(seq 1 100); do
-        port="$(shuf -i "${PORT_MIN}-${PORT_MAX}" -n 1 2>/dev/null || echo $((RANDOM % (PORT_MAX - PORT_MIN + 1) + PORT_MIN)))"
-        if port_in_use_tcp "$port"; then
-            continue
-        else
-            status=$?
-            if [ "$status" -eq 1 ]; then
-                echo "$port"
-                return 0
-            fi
-            err "无法检查 TCP 端口 $port，已取消探测源端口选择。"
-            return 1
-        fi
-    done
-    err "连续 100 次未找到可用的 TCP 探测源端口。"
     return 1
 }
 
@@ -12012,17 +11988,30 @@ firewall_apply_desired_state() {
     firewall_check_conflicts || return 1
     ensure_nftables || return 1
     firewall_check_conflicts || return 1
+    firewall_load_state || return 1
     firewall_detect_allowed_ports || return 1
 
+    if firewall_desired_state_is_current; then
+        info "当前防火墙规则与端口状态一致，无需更新。"
+        return 0
+    fi
     firewall_show_port_summary
     read -r -p "确认应用以上规则？请输入 YES：" answer || return 1
     [ "$answer" = "YES" ] || { info "已取消，未修改防火墙。"; return 0; }
 
     # 用户确认期间 ssh.socket、sshd、Docker 或公网监听可能变化；落盘前重新取一次实时状态。
+    firewall_load_state || {
+        err "确认后防火墙状态文件发生异常，未修改防火墙。"
+        return 1
+    }
     firewall_detect_allowed_ports || {
         err "确认后端口状态发生异常，未修改防火墙。"
         return 1
     }
+    if firewall_desired_state_is_current; then
+        info "当前防火墙规则与端口状态一致，无需更新。"
+        return 0
+    fi
 
     ensure_change_store || return 1
     work_dir="$(mktemp -d "$RUNTIME_DIR/firewall-work.XXXXXX")" || return 1
@@ -12949,6 +12938,76 @@ firewall_config_matches_expected() {
     [ "$status" -eq 0 ]
 }
 
+firewall_file_metadata_is_exact() {
+    local path="$1" expected_mode="$2"
+
+    [ -f "$path" ] && [ ! -L "$path" ] || return 1
+    [ "$(stat -c '%u:%g %a' "$path" 2>/dev/null || true)" = "0:0 $expected_mode" ]
+}
+
+firewall_directory_metadata_is_exact() {
+    local path="$1" expected_mode="$2"
+
+    [ -d "$path" ] && [ ! -L "$path" ] || return 1
+    [ "$(stat -c '%u:%g %a' "$path" 2>/dev/null || true)" = "0:0 $expected_mode" ]
+}
+
+firewall_persistence_is_canonical() {
+    local enabled_state fragment_path reload_state entry entry_target service_target
+
+    if is_systemd; then
+        enabled_state="$(systemctl is-enabled "$FIREWALL_SERVICE_NAME" 2>/dev/null)" || return 1
+        [ "$enabled_state" = "enabled" ] || return 1
+        fragment_path="$(systemctl show "$FIREWALL_SERVICE_NAME" -p FragmentPath --value 2>/dev/null)" || return 1
+        [ "$fragment_path" = "$FIREWALL_SYSTEMD_UNIT" ] || return 1
+        reload_state="$(systemctl show "$FIREWALL_SERVICE_NAME" -p NeedDaemonReload --value 2>/dev/null)" || return 1
+        [ "$reload_state" = "no" ]
+    elif [ "$OS" = "alpine" ]; then
+        entry="$FIREWALL_OPENRC_RUNLEVELS_DIR/default/$FIREWALL_SERVICE_NAME"
+        [ -L "$entry" ] || return 1
+        entry_target="$(readlink -f "$entry" 2>/dev/null)" || return 1
+        service_target="$(readlink -f "$FIREWALL_OPENRC_SERVICE" 2>/dev/null)" || return 1
+        [ "$entry_target" = "$service_target" ]
+    else
+        return 1
+    fi
+}
+
+firewall_desired_state_is_current() {
+    local work_dir service_file service_target service_mode status=0
+
+    firewall_directory_metadata_is_exact "$VPSBOX_STATE_DIR" 700 || return 1
+    firewall_file_metadata_is_exact "$FIREWALL_CONFIG" 600 || return 1
+    firewall_file_metadata_is_exact "$FIREWALL_STATE_FILE" 600 || return 1
+    firewall_runtime_enabled || return 1
+    firewall_service_active || return 1
+    firewall_persistence_is_canonical || return 1
+
+    work_dir="$(mktemp -d "$RUNTIME_DIR/firewall-current.XXXXXX")" || return 1
+    if is_systemd; then
+        service_file="$work_dir/vpsbox-firewall.service"
+        service_target="$FIREWALL_SYSTEMD_UNIT"
+        service_mode=644
+    else
+        service_file="$work_dir/vpsbox-firewall"
+        service_target="$FIREWALL_OPENRC_SERVICE"
+        service_mode=755
+    fi
+    firewall_write_state_file "$work_dir/firewall.env" || status=1
+    firewall_write_config "$work_dir/firewall.nft" || status=1
+    firewall_write_service_definition "$service_file" || status=1
+    if [ "$status" -eq 0 ]; then
+        firewall_file_metadata_is_exact "$service_target" "$service_mode" || status=1
+    fi
+    if [ "$status" -eq 0 ] && ! cmp -s "$work_dir/firewall.env" "$FIREWALL_STATE_FILE"; then status=1; fi
+    if [ "$status" -eq 0 ] && ! cmp -s "$work_dir/firewall.nft" "$FIREWALL_CONFIG"; then status=1; fi
+    if [ "$status" -eq 0 ] && ! cmp -s "$service_file" "$service_target"; then status=1; fi
+    if [ "$status" -eq 0 ] && ! nft -c -f "$FIREWALL_CONFIG" >/dev/null 2>&1; then status=1; fi
+    if [ "$status" -eq 0 ] && ! firewall_live_config_matches_expected; then status=1; fi
+    rm -rf -- "$work_dir" || return 1
+    [ "$status" -eq 0 ]
+}
+
 firewall_live_set_ports_from_table() {
     local table_rules="$1" set_name="$2"
     local set_names body guard_rules
@@ -13318,7 +13377,7 @@ EOF
 }
 
 # ==============================================================================
-# 7. 检测与路由测试：一键检测、NextTrace、三网回程与大小包
+# 7. 检测：一键检测
 # ==============================================================================
 check_table_header() {
     cat <<'EOF'
@@ -13364,6 +13423,12 @@ pad_right_display() {
 }
 
 check_row() {
+    case "$1" in
+        OK) CHECK_OK_COUNT=$(( ${CHECK_OK_COUNT:-0} + 1 )) ;;
+        INFO) CHECK_INFO_COUNT=$(( ${CHECK_INFO_COUNT:-0} + 1 )) ;;
+        WARN) CHECK_WARN_COUNT=$(( ${CHECK_WARN_COUNT:-0} + 1 )) ;;
+        FAIL) CHECK_FAIL_COUNT=$(( ${CHECK_FAIL_COUNT:-0} + 1 )) ;;
+    esac
     printf ' %-6s | ' "$1"
     pad_right_display "$2" 16
     printf ' | %s\n' "${3:-}"
@@ -13400,15 +13465,20 @@ resolve_host_ips() {
 }
 
 run_self_check() {
-    detect_os
     local has_node="0"
+    local has_node_artifacts="0"
     local node_integrity_failed="0"
     local max_use
     local max_file
-    local state node_protocols protocol label ips
+    local state node_protocols protocol label ips detail ports_report
+    local bbr_config_expected=0 ipv4_priority_expected=0 ssh_hardening_expected=0
+    local singbox_available=0
+    local CHECK_OK_COUNT=0
+    local CHECK_INFO_COUNT=0
+    local CHECK_WARN_COUNT=0
+    local CHECK_FAIL_COUNT=0
 
-    max_use="$(journald_conf_value SystemMaxUse || echo "未配置")"
-    max_file="$(journald_conf_value SystemMaxFileSize || echo "未配置")"
+    detect_os
 
     cat <<EOF
 ========================================
@@ -13429,15 +13499,20 @@ EOF
         check_warn "vpsbox 命令" "未安装到 $CMD_PATH"
     fi
 
-    if singbox_installed; then
-        check_ok "sing-box" "$(singbox_version)"
-    else
-        check_warn "sing-box" "未安装"
+    if node_artifacts_present; then
+        has_node_artifacts="1"
+        if ! require_valid_node_state_if_present >/dev/null 2>&1; then
+            node_integrity_failed="1"
+            check_fail "配置完整性" "未通过"
+        fi
     fi
-
-    if node_artifacts_present && ! require_valid_node_state_if_present >/dev/null 2>&1; then
-        node_integrity_failed="1"
-        check_fail "配置完整性" "未通过"
+    if singbox_installed; then
+        singbox_available=1
+        check_ok "sing-box" "$(singbox_version)"
+    elif [ "$has_node_artifacts" = "1" ]; then
+        check_fail "sing-box" "未安装，现有节点无法运行"
+    else
+        check_info "sing-box" "未安装"
     fi
     for protocol in vless ss; do
         load_protocol_state "$protocol" >/dev/null 2>&1 || continue
@@ -13453,7 +13528,7 @@ EOF
         if port_listener_ready "$PORT" "$node_protocols"; then
             check_ok "$label 监听" "$PORT 正在监听"
         else
-            check_warn "$label 监听" "$PORT 未监听"
+            check_fail "$label 监听" "$PORT 未监听"
         fi
         if is_ip_address "$DOMAIN"; then
             check_ok "$label 地址" "$DOMAIN"
@@ -13469,36 +13544,32 @@ EOF
         fi
     done
     if [ "$has_node" != "1" ] && [ "$node_integrity_failed" != "1" ]; then
-        check_warn "节点" "未创建"
+        check_info "节点" "未创建"
     fi
 
-    if [ "$node_integrity_failed" = "1" ]; then
-        check_fail "配置语法" "配置完整性未通过"
-    elif [ "$has_node" = "1" ] && singbox_installed; then
+    if [ "$node_integrity_failed" != "1" ] && [ "$has_node" = "1" ] && [ "$singbox_available" -eq 1 ]; then
         if check_active_node_config >/dev/null 2>&1; then
             check_ok "配置语法" "通过"
         else
             check_fail "配置语法" "未通过"
         fi
-    elif [ "$has_node" = "1" ]; then
-        check_warn "配置语法" "sing-box 未安装，无法检查"
-    elif ! node_artifacts_present; then
-        check_warn "配置文件" "不存在"
     fi
 
-    state="$(service_status_short)"
-    if [ "$state" = "运行中" ]; then
-        check_ok "服务状态" "$state"
-    elif [ "$has_node" = "1" ]; then
-        check_fail "服务状态" "$state"
-    else
-        check_warn "服务状态" "$state"
+    if [ "$has_node" = "1" ] && [ "$singbox_available" -eq 1 ]; then
+        state="$(service_status_short)"
+        if [ "$state" = "运行中" ]; then
+            check_ok "服务状态" "$state"
+        else
+            check_fail "服务状态" "$state"
+        fi
     fi
 
-    if [ "$has_node" = "1" ] && [ -s "$URI_FILE" ]; then
-        check_ok "节点链接" "$URI_FILE"
-    elif [ "$has_node" = "1" ]; then
-        check_warn "节点链接" "未生成"
+    if [ "$has_node" = "1" ] && [ "$node_integrity_failed" != "1" ]; then
+        if [ -s "$URI_FILE" ]; then
+            check_ok "节点链接" "$URI_FILE"
+        else
+            check_fail "节点链接" "未生成"
+        fi
     fi
 
     local ip
@@ -13511,38 +13582,93 @@ EOF
 
     check_ok "系统时间" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
     state="$(ntp_sync_state)"
-    if [ "$state" = "已同步" ]; then
-        check_ok "NTP 同步" "$state"
-    else
-        check_warn "NTP 同步" "$state"
-    fi
+    case "$state" in
+        已同步) check_ok "NTP 同步" "$state" ;;
+        未安装|不支持) check_info "NTP 同步" "$state" ;;
+        未运行) check_fail "NTP 同步" "$state" ;;
+        *) check_warn "NTP 同步" "$state" ;;
+    esac
     check_ok "运行时间" "$(uptime -p 2>/dev/null || echo "无法检测")"
+    if [ -e "$BBR_CONF" ] || [ -L "$BBR_CONF" ] || change_applied_recorded_readonly BBR_CONF; then
+        bbr_config_expected=1
+    fi
+    if change_applied_recorded_readonly GAI_CONF; then
+        ipv4_priority_expected=1
+    fi
+    if [ -e "$SSHD_VPSBOX_HARDENING_CONF" ] || [ -L "$SSHD_VPSBOX_HARDENING_CONF" ]; then
+        ssh_hardening_expected=1
+    fi
     state="$(bbr_state)"
-    if [ "$state" = "已启用" ]; then check_ok "BBR" "$state"; else check_warn "BBR" "$state"; fi
+    if [ "$state" = "已启用" ]; then
+        check_ok "BBR" "$state"
+    elif [ "$bbr_config_expected" -eq 1 ]; then
+        check_fail "BBR" "配置存在但未生效"
+    else
+        check_info "BBR" "$state"
+    fi
     state="$(fq_state)"
-    if [ "$state" = "已启用" ]; then check_ok "fq" "$state"; else check_warn "fq" "$state"; fi
+    if [ "$state" = "已启用" ]; then
+        check_ok "fq" "$state"
+    elif [ "$bbr_config_expected" -eq 1 ]; then
+        check_fail "fq" "配置存在但未生效"
+    else
+        check_info "fq" "$state"
+    fi
     state="$(ipv4_priority_state)"
-    if [ "$state" = "已启用" ]; then check_ok "IPv4 优先" "$state"; else check_warn "IPv4 优先" "$state"; fi
+    if [ "$state" = "已启用" ]; then
+        check_ok "IPv4 优先" "$state"
+    elif [ "$ipv4_priority_expected" -eq 1 ]; then
+        check_fail "IPv4 优先" "配置记录存在但未生效"
+    else
+        check_info "IPv4 优先" "$state"
+    fi
+    state="$(ssh_port_state || true)"
+    [ -n "$state" ] || state="无法读取"
     if ssh_effective_ports_listening; then
-        check_ok "SSH 端口" "$(ssh_port_state)"
+        check_ok "SSH 端口" "$state"
     else
-        check_warn "SSH 端口" "$(ssh_port_state)"
+        check_fail "SSH 端口" "$state"
     fi
-    if ssh_basic_hardening_effective; then
-        check_ok "SSH 基础加固" "$(ssh_hardening_state)"
+    state="$(ssh_hardening_state)"
+    case "$state" in
+        已配置) check_ok "SSH 基础加固" "$state" ;;
+        未配置)
+            if [ "$ssh_hardening_expected" -eq 1 ]; then
+                check_fail "SSH 基础加固" "配置存在但未生效"
+            else
+                check_info "SSH 基础加固" "$state"
+            fi
+            ;;
+        *) check_fail "SSH 基础加固" "$state" ;;
+    esac
+    if ! fail2ban_installed; then
+        check_info "Fail2ban" "未安装"
+    elif fail2ban_sshd_configuration_healthy; then
+        check_ok "Fail2ban" "运行中，SSH 防护已启用"
     else
-        check_warn "SSH 基础加固" "$(ssh_hardening_state)"
+        state="$(fail2ban_service_state)"
+        if [ "$state" != "运行中" ]; then
+            detail="已安装，但服务$state"
+        elif ! fail2ban_service_is_enabled; then
+            detail="已安装，但未启用自启"
+        else
+            state="$(fail2ban_sshd_state)"
+            if [ "$state" = "已启用" ]; then
+                detail="已安装，但配置或 nftables 后端异常"
+            else
+                detail="已安装，但 SSH 防护$state"
+            fi
+        fi
+        check_fail "Fail2ban" "$detail"
     fi
-    state="$(fail2ban_install_state)"
-    if [ "$state" = "已安装" ]; then check_ok "Fail2ban" "$state"; else check_warn "Fail2ban" "$state"; fi
-    state="$(fail2ban_service_state)"
-    if [ "$state" = "运行中" ]; then check_ok "Fail2ban 状态" "$state"; else check_warn "Fail2ban 状态" "$state"; fi
-    state="$(fail2ban_sshd_state)"
-    if [ "$state" = "已启用" ]; then check_ok "SSH 防护" "$state"; else check_warn "SSH 防护" "$state"; fi
 
     if ! firewall_control_plane_present; then
-        if [ -e "$FIREWALL_STATE_FILE" ]; then
-            check_info "主机防火墙" "未启用，已保存额外端口"
+        if [ -e "$FIREWALL_STATE_FILE" ] || [ -L "$FIREWALL_STATE_FILE" ]; then
+            if firewall_state_file_is_secure && (firewall_load_state >/dev/null 2>&1); then
+                check_info "主机防火墙" "未启用，已保存额外端口"
+            else
+                check_fail "主机防火墙" "未启用，但状态文件不完整或不安全"
+            fi
         else
             check_info "主机防火墙" "未启用（如已使用厂商安全组可忽略）"
         fi
@@ -13573,582 +13699,38 @@ EOF
     state="$(journal_disk_usage)"
     if [ "$state" = "无法检测" ]; then check_warn "日志占用" "$state"; else check_ok "日志占用" "$state"; fi
     state="$(journald_limit_state)"
-    if [ "$state" = "已配置" ]; then
-        check_ok "日志限制" "$state"
+    if [ -e "$JOURNALD_VPSBOX_CONF" ] || [ -L "$JOURNALD_VPSBOX_CONF" ]; then
+        if [ "$state" = "已配置" ] &&
+            [ -f "$JOURNALD_VPSBOX_CONF" ] && [ ! -L "$JOURNALD_VPSBOX_CONF" ] &&
+            [ "$(stat -c '%u:%g %a' "$JOURNALD_VPSBOX_CONF" 2>/dev/null || true)" = "0:0 644" ]; then
+            max_use="$(journald_conf_value SystemMaxUse || echo "未配置")"
+            max_file="$(journald_conf_value SystemMaxFileSize || echo "未配置")"
+            check_ok "日志限制" "$state"
+            check_ok "日志最大占用" "$max_use"
+            check_ok "单个日志最大" "$max_file"
+        else
+            check_fail "日志限制" "配置存在但未按预期生效或不安全"
+        fi
+    elif [ "$state" = "已配置" ]; then
+        max_use="$(journald_conf_value SystemMaxUse || echo "未配置")"
+        max_file="$(journald_conf_value SystemMaxFileSize || echo "未配置")"
+        check_ok "日志限制" "已配置（系统配置已生效）"
         check_ok "日志最大占用" "$max_use"
         check_ok "单个日志最大" "$max_file"
     else
-        check_warn "日志限制" "$state"
-        check_warn "日志最大占用" "$max_use"
-        check_warn "单个日志最大" "$max_file"
+        check_info "日志限制" "未配置"
     fi
 
-    check_table_footer
-
-    show_ports_security_group || true
-}
-
-nexttrace_installed() {
-    command -v nexttrace >/dev/null 2>&1
-}
-
-ensure_nexttrace() {
-    local arch asset tmp confirm
-
-    if nexttrace_installed; then
-        return 0
-    fi
-
-    warn "未检测到 nexttrace。"
-    if ! read -r -p "是否自动安装 nexttrace？[y/N]: " confirm; then
-        info "输入已结束，已取消。"
-        return 1
-    fi
-    [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消。"; return 1; }
-
-    install_deps || return 1
-
-    case "$(uname -m)" in
-        x86_64) arch="amd64" ;;
-        aarch64) arch="arm64" ;;
-        armv7l|armv7) arch="armv7" ;;
-        i?86) arch="386" ;;
-        *) err "不支持的 nexttrace 架构：$(uname -m)"; return 1 ;;
-    esac
-    asset="nexttrace_linux_$arch"
-    tmp="$(mktemp "/tmp/$asset.XXXXXX")" || return 1
-    info "正在下载并校验 nexttrace v$NEXTTRACE_RELEASE_VERSION（$asset）..."
-    if ! download_verified_github_asset "nxtrace/NTrace-core" "v$NEXTTRACE_RELEASE_VERSION" "$asset" "$tmp"; then
-        rm -f "$tmp"
-        return 1
-    fi
-    if ! install -o root -g root -m 755 "$tmp" /usr/local/bin/nexttrace; then
-        rm -f "$tmp"
-        err "安装 nexttrace 二进制失败。"
-        return 1
-    fi
-    rm -f "$tmp"
-
-    if nexttrace_installed; then
-        info "nexttrace 安装完成。"
-        return 0
-    fi
-
-    err "未找到 nexttrace 命令，安装可能未成功。"
-    return 1
-}
-
-trace_has() {
-    local output="$1"
-    local pattern="$2"
-    printf '%s\n' "$output" | grep -Eiq "$pattern"
-}
-
-trace_has_asn() {
-    local output="$1"
-    local asn="$2"
-
-    printf '%s\n' "$output" | grep -Eiq "(^|[^[:alnum:]_])AS[[:space:]]*${asn}([^[:alnum:]_]|$)"
-}
-
-trace_hop_count() {
-    local output="$1"
-    local prefix="$2"
-
-    printf '%s\n' "$output" | awk -v prefix="$prefix" '
-        {
-            line = $0
-            sub(/^[[:space:]]*/, "", line)
-            hop = line
-            sub(/[[:space:]].*$/, "", hop)
-            if (hop ~ /^[0-9]+$/ && index($0, prefix) > 0) seen[hop] = 1
-        }
-        END {
-            count = 0
-            for (hop in seen) count++
-            print count
-        }
-    '
-}
-
-trace_output_has_hop() {
-    trace_has "$1" '^[[:space:]]*[0-9]+[[:space:]].*([0-9]{1,3}\.){3}[0-9]{1,3}'
-}
-
-validate_trace_targets() {
-    local i
-    local expected=$(( ${#TRACE_REGIONS[@]} * ${#TRACE_ISPS[@]} ))
-
-    if [ "${#TRACE_NAMES[@]}" -ne "$expected" ] || [ "${#TRACE_IPS[@]}" -ne "$expected" ]; then
-        err "三网回程目标配置数量不一致。"
-        return 1
-    fi
-    for i in "${!TRACE_IPS[@]}"; do
-        if ! is_ipv4_address "${TRACE_IPS[$i]}"; then
-            err "三网回程目标 IP 无效：${TRACE_NAMES[$i]} (${TRACE_IPS[$i]})"
-            return 1
-        fi
-    done
-}
-
-detect_trace_line() {
-    local output="$1"
-    local has_4134=0
-    local has_4809=0
-    local count_20297=0
-    local count_5943=0
-
-    (trace_has_asn "$output" 4134 || trace_has "$output" '202\.97\.') && has_4134=1
-    (trace_has_asn "$output" 4809 || trace_has "$output" '59\.43\.') && has_4809=1
-    count_20297="$(trace_hop_count "$output" '202.97.')"
-    count_5943="$(trace_hop_count "$output" '59.43.')"
-
-    if trace_has_asn "$output" 23764 || trace_has "$output" '69\.194\.|203\.22\.'; then
-        echo "CTGNet|AS23764"
-    elif trace_has_asn "$output" 10099; then
-        echo "10099|AS10099"
-    elif trace_has_asn "$output" 58807 || trace_has "$output" '223\.120\.(1(2[89]|[3-9][0-9])|2([0-4][0-9]|5[0-5]))\.'; then
-        echo "CMIN2|AS58807"
-    elif trace_has_asn "$output" 9929 || trace_has "$output" '218\.105\.|210\.51\.'; then
-        echo "9929|AS9929"
-    elif [ "$has_4134" = "1" ] && [ "$has_4809" = "1" ] && [ "$count_20297" -gt 1 ]; then
-        echo "CN2 GT|AS4134/AS4809"
-    elif [ "$has_4809" = "1" ] && [ "$count_5943" -gt 0 ]; then
-        echo "CN2 GIA|AS4809"
-    elif [ "$has_4809" = "1" ]; then
-        echo "CN2待确认|AS4809"
-    elif [ "$has_4134" = "1" ]; then
-        echo "163|AS4134"
-    elif trace_has_asn "$output" 4837 || trace_has "$output" '219\.158\.'; then
-        echo "4837|AS4837"
-    elif trace_has_asn "$output" 58453 || trace_has "$output" '223\.(118|119|121)\.|223\.120\.(0|[1-9][0-9]|1[01][0-9]|12[0-7])\.'; then
-        echo "CMI|AS58453"
-    elif trace_has_asn "$output" 9808 || trace_has "$output" '221\.(176|183)\.'; then
-        echo "CMNET|AS9808"
-    elif trace_has_asn "$output" 3356; then
-        echo "Lumen|AS3356"
+    if ports_report="$(show_ports_security_group 2>&1)"; then
+        check_table_footer
+        printf '%s\n' "$ports_report"
     else
-        echo "Hidden|-"
+        check_warn "端口扫描" "未完成"
+        check_table_footer
+        [ -z "$ports_report" ] || printf '%s\n' "$ports_report"
     fi
-}
-
-nexttrace_supports_size_compare() {
-    local help flag status=0
-    local -a missing=()
-
-    if help="$(run_bounded_command "$NEXTTRACE_HELP_TIMEOUT" nexttrace --help 2>&1)"; then
-        :
-    else
-        status=$?
-    fi
-    if [ "$status" -ne 0 ]; then
-        err "无法在 ${NEXTTRACE_HELP_TIMEOUT} 秒内可靠读取 nexttrace 参数列表。"
-        return 1
-    fi
-    if [ -z "$help" ]; then
-        err "无法读取 nexttrace 参数列表。"
-        return 1
-    fi
-
-    for flag in --psize --source-port --parallel-requests --queries; do
-        grep -Fq -e "$flag" <<< "$help" || missing+=("$flag")
-    done
-    if [ "${#missing[@]}" -gt 0 ]; then
-        err "当前 nexttrace 不支持大小包对比所需参数：${missing[*]}"
-        err "请更新 nexttrace 后重试；vpsbox 不会覆盖已有的外部安装。"
-        return 1
-    fi
-    return 0
-}
-
-run_nexttrace_sized_target() {
-    local ip="$1"
-    local source_port="$2"
-    local packet_size="$3"
-    local -a args=(
-        -n -P -C -T -p 80
-        --source-port "$source_port"
-        --parallel-requests 1
-        --queries "$TRACE_SIZE_QUERIES"
-        --psize "$packet_size"
-        "$ip"
-    )
-
-    run_bounded_command 30 nexttrace "${args[@]}" 2>&1
-}
-
-trace_asn_path_file() {
-    local output_file="$1"
-
-    awk '
-        {
-            line = $0
-            sub(/^[[:space:]]*/, "", line)
-            hop = line
-            sub(/[[:space:]].*$/, "", hop)
-            if (hop !~ /^[0-9]+$/) next
-
-            while (match(line, /AS[[:space:]]*[0-9]+/)) {
-                asn = substr(line, RSTART, RLENGTH)
-                gsub(/[^0-9]/, "", asn)
-                if (asn != "" && asn != "0" && asn != last) {
-                    if (path != "") path = path ">"
-                    path = path asn
-                    last = asn
-                }
-                line = substr(line, RSTART + RLENGTH)
-            }
-        }
-        END { print path }
-    ' "$output_file"
-}
-
-trace_file_has_hop() {
-    grep -Eq '^[[:space:]]*[0-9]+[[:space:]].*([0-9]{1,3}\.){3}[0-9]{1,3}' "$1"
-}
-
-trace_asn_label() {
-    case "$1" in
-        4134) printf '163' ;;
-        4809) printf 'CN2' ;;
-        23764) printf 'CTGNet' ;;
-        10099) printf '10099' ;;
-        9929) printf '9929' ;;
-        4837) printf '4837' ;;
-        58807) printf 'CMIN2' ;;
-        58453) printf 'CMI' ;;
-        9808) printf 'CMNET' ;;
-        3356) printf 'Lumen' ;;
-        *) printf 'AS%s' "$1" ;;
-    esac
-}
-
-trace_asn_path_display() {
-    local path="$1"
-    local asn label output="" last_label=""
-    local -a asns=()
-
-    if [ -z "$path" ]; then
-        printf '-'
-        return 0
-    fi
-
-    IFS='>' read -r -a asns <<< "$path"
-    for asn in "${asns[@]}"; do
-        [ -n "$asn" ] || continue
-        label="$(trace_asn_label "$asn")"
-        [ "$label" = "$last_label" ] && continue
-        if [ -n "$output" ]; then
-            output+=" → "
-        fi
-        output+="$label"
-        last_label="$label"
-    done
-    printf '%s' "${output:--}"
-}
-
-capture_size_trace() {
-    local ip="$1"
-    local source_port="$2"
-    local packet_size="$3"
-    local output_file="$4"
-    local path
-
-    if ! : > "$output_file"; then
-        err "无法创建大小包探测临时文件：$output_file"
-        return 1
-    fi
-    if ! run_nexttrace_sized_target "$ip" "$source_port" "$packet_size" > "$output_file"; then
-        :
-    fi
-
-    if ! trace_file_has_hop "$output_file"; then
-        printf 'fail|\n'
-        return 0
-    fi
-
-    path="$(trace_asn_path_file "$output_file")"
-    if [ -n "$path" ]; then
-        printf 'ok|%s\n' "$path"
-    else
-        printf 'no-asn|\n'
-    fi
-}
-
-size_trace_path_display() {
-    local state="$1"
-    local path="$2"
-
-    case "$state" in
-        ok) trace_asn_path_display "$path" ;;
-        no-asn) printf '无 ASN' ;;
-        *) printf '失败' ;;
-    esac
-}
-
-write_route_result_from_trace_file() {
-    local name="$1"
-    local ip="$2"
-    local output_file="$3"
-    local result_file="$4"
-    local output detected result asn
-
-    if [ ! -f "$output_file" ]; then
-        err "三网回程探测输出不存在：$output_file"
-        return 1
-    fi
-
-    output="$(<"$output_file")"
-    detected="$(detect_trace_line "$output")"
-    result="${detected%%|*}"
-    asn="${detected#*|}"
-    if [ "$result" = "Hidden" ] && ! trace_output_has_hop "$output"; then
-        result="Fail"
-        asn="-"
-    fi
-
-    printf '%s|%s|%s|%s\n' "$name" "$ip" "$result" "$asn" > "$result_file"
-}
-
-check_combined_route_target() {
-    local name="$1"
-    local ip="$2"
-    local source_port="$3"
-    local file_prefix="$4"
-    local route_result_file="$5"
-    local size_result_file="$6"
-    local small1 large1 small2 large2
-    local small1_state large1_state small2_state="" large2_state=""
-    local small1_path large1_path small2_path="" large2_path=""
-    local small_display large_display status
-
-    small1="$(capture_size_trace "$ip" "$source_port" "$TRACE_SIZE_SMALL" "${file_prefix}.small1")" || return 1
-    small1_state="${small1%%|*}"
-    small1_path="${small1#*|}"
-    write_route_result_from_trace_file "$name" "$ip" "${file_prefix}.small1" "$route_result_file" || return 1
-
-    large1="$(capture_size_trace "$ip" "$source_port" "$TRACE_SIZE_LARGE" "${file_prefix}.large1")" || return 1
-    large1_state="${large1%%|*}"
-    large1_path="${large1#*|}"
-
-    if [ "$small1_state" = "fail" ] || [ "$large1_state" = "fail" ]; then
-        status="Fail"
-    elif [ "$small1_state" != "ok" ] || [ "$large1_state" != "ok" ]; then
-        status="Unknown"
-    elif [ "$small1_path" = "$large1_path" ]; then
-        status="Same"
-    else
-        printf '          首轮路径不同，正在执行 %s B → %s B 复测...\n' "$TRACE_SIZE_LARGE" "$TRACE_SIZE_SMALL"
-        large2="$(capture_size_trace "$ip" "$source_port" "$TRACE_SIZE_LARGE" "${file_prefix}.large2")" || return 1
-        large2_state="${large2%%|*}"
-        large2_path="${large2#*|}"
-
-        small2="$(capture_size_trace "$ip" "$source_port" "$TRACE_SIZE_SMALL" "${file_prefix}.small2")" || return 1
-        small2_state="${small2%%|*}"
-        small2_path="${small2#*|}"
-
-        if [ "$small2_state" != "ok" ] || [ "$large2_state" != "ok" ]; then
-            status="Unknown"
-        elif [ "$small1_path" = "$small2_path" ] && [ "$large1_path" = "$large2_path" ] && [ "$small1_path" != "$large1_path" ]; then
-            status="Split"
-        else
-            status="Fluctuation"
-        fi
-    fi
-
-    small_display="$(size_trace_path_display "$small1_state" "$small1_path")"
-    large_display="$(size_trace_path_display "$large1_state" "$large1_path")"
-    printf '%s|%s|%s|%s\n' "$name" "$small_display" "$large_display" "$status" > "$size_result_file"
-}
-
-size_trace_status_label() {
-    case "$1" in
-        Same) printf '未发现差异' ;;
-        Split) printf '疑似大小包分流' ;;
-        Fluctuation) printf '路由波动' ;;
-        Unknown) printf '无法判断' ;;
-        *) printf '探测失败' ;;
-    esac
-}
-
-show_size_trace_summary() {
-    local tmp_dir="$1"
-    local i name small_path large_path status
-    local same=0 split=0 fluctuation=0 unknown=0 failed=0
-    local abnormal=0
-    local -a names=() small_paths=() large_paths=() statuses=()
-
-    for i in "${!TRACE_NAMES[@]}"; do
-        if [ -s "$tmp_dir/size.$i" ]; then
-            IFS='|' read -r name small_path large_path status < "$tmp_dir/size.$i" || true
-        else
-            name="${TRACE_NAMES[$i]}"
-            small_path="失败"
-            large_path="失败"
-            status="Fail"
-        fi
-        names[i]="$name"
-        small_paths[i]="$small_path"
-        large_paths[i]="$large_path"
-        statuses[i]="$status"
-        case "$status" in
-            Same) same=$((same + 1)) ;;
-            Split) split=$((split + 1)) ;;
-            Fluctuation) fluctuation=$((fluctuation + 1)) ;;
-            Unknown) unknown=$((unknown + 1)) ;;
-            *) failed=$((failed + 1)) ;;
-        esac
-        [ "$status" = "Same" ] || abnormal=$((abnormal + 1))
-    done
-
-    cat <<EOF
-========================================
- 大小包路由对比
-========================================
-方式：TCP 80　小包：${TRACE_SIZE_SMALL} B　大包：${TRACE_SIZE_LARGE} B
-结果：一致 $same | 疑似分流 $split | 波动 $fluctuation | 无法判断 $unknown | 失败 $failed
-EOF
-    if [ "$abnormal" -eq 0 ]; then
-        printf '%d 个目标未发现大小包路径差异。\n' "${#TRACE_NAMES[@]}"
-        return 0
-    fi
-
-    cat <<'EOF'
-------------------------------------------------------------------------
-差异/异常详情：
-目标       | 小包路径 | 大包路径 | 结果
-EOF
-    for i in "${!TRACE_NAMES[@]}"; do
-        [ "${statuses[$i]}" = "Same" ] && continue
-        printf ' %-10s | %s | %s | %s\n' \
-            "${names[$i]}" "${small_paths[$i]}" "${large_paths[$i]}" "$(size_trace_status_label "${statuses[$i]}")"
-    done
-}
-
-format_trace_cell() {
-    local result="$1"
-
-    case "$result" in
-        CN2待确认) printf '%s%*s' "$result" 5 "" ;;
-        *) printf '%-14s' "$result" ;;
-    esac
-}
-
-format_trace_region() {
-    printf ' %s    ' "$1"
-}
-
-show_backtrace_matrix() {
-    local tmp_dir="$1"
-    local i result_file name ip result asn region isp
-    local identified=0 hidden=0 failed=0 total="${#TRACE_NAMES[@]}"
-    local report_time
-    local -a issues=()
-    local -A results=()
-
-    report_time="$(date '+%Y-%m-%d %H:%M:%S %Z')"
-
-    for i in "${!TRACE_NAMES[@]}"; do
-        result_file="$tmp_dir/$i"
-        if [ -s "$result_file" ]; then
-            IFS='|' read -r name ip result asn < "$result_file" || true
-        else
-            name="${TRACE_NAMES[$i]}"
-            ip="${TRACE_IPS[$i]}"
-            result="Fail"
-            asn="-"
-        fi
-        results["$name"]="$result"
-        case "$result" in
-            Hidden) hidden=$((hidden + 1)); issues+=("$name|$ip|Hidden") ;;
-            Fail) failed=$((failed + 1)); issues+=("$name|$ip|Fail") ;;
-            *) identified=$((identified + 1)) ;;
-        esac
-    done
-
-    cat <<EOF
- 报告时间：$report_time
- 方式：TCP 80　包大小：${TRACE_SIZE_SMALL} B　目标：$total　并发：1
---------------------------------------------------------
- 地区    电信          联通          移动
-EOF
-
-    for region in "${TRACE_REGIONS[@]}"; do
-        format_trace_region "$region"
-        for isp in "${TRACE_ISPS[@]}"; do
-            name="${region}${isp}"
-            format_trace_cell "${results["$name"]:-Fail}"
-        done
-        printf '\n'
-    done
-
-    printf '\n--------------------------------------------------------\n'
-    printf ' 结果：目标 %d | 已识别 %d | Hidden %d | Fail %d\n' "$total" "$identified" "$hidden" "$failed"
-    if [ "${#issues[@]}" -gt 0 ]; then
-        printf '\n 未识别/失败：\n'
-        for i in "${issues[@]}"; do
-            IFS='|' read -r name ip result <<< "$i"
-            printf ' %-8s %-15s %s\n' "$name" "$ip" "$result"
-        done
-    fi
-}
-
-show_backtrace_routes() {
-    validate_trace_targets || return 1
-    ensure_nexttrace || return 1
-    nexttrace_supports_size_compare || return 1
-
-    local i name ip tmp_dir source_port
-    local total="${#TRACE_NAMES[@]}"
-
-    # 固定源端口并严格串行，避免五元组变化或并发 TCP 探测造成路径误判。
-    source_port="$(random_trace_source_port)" || return 1
-    tmp_dir="$(mktemp -d /tmp/vpsbox-trace.XXXXXX)" || { err "无法创建回程检测临时目录。"; return 1; }
-    [[ "$tmp_dir" == /tmp/vpsbox-trace.* ]] || { err "回程检测临时目录路径异常。"; return 1; }
-    ACTIVE_TRACE_TMP="$tmp_dir"
-    trap 'cleanup_active_trace_tmp' RETURN
-
-    cat <<EOF
-========================================
- 三网回程与大小包路由对比
-========================================
-模式：TCP 80
-包大小：${TRACE_SIZE_SMALL} B / ${TRACE_SIZE_LARGE} B
-策略：严格串行，首轮不同的目标自动反向复测
-目标：$total 个，每次探测最多 30 秒，请稍等...
-EOF
-
-    for i in "${!TRACE_NAMES[@]}"; do
-        name="${TRACE_NAMES[$i]}"
-        ip="${TRACE_IPS[$i]}"
-        printf '[%d/%d] %s：%s B → %s B\n' \
-            "$((i + 1))" "$total" "$name" "$TRACE_SIZE_SMALL" "$TRACE_SIZE_LARGE"
-        if ! check_combined_route_target \
-            "$name" "$ip" "$source_port" "$tmp_dir/probe.$i" "$tmp_dir/$i" "$tmp_dir/size.$i"; then
-            err "$name 的三网回程与大小包检测未完成。"
-            return 1
-        fi
-    done
-
-    cat <<EOF
-
-========================================
- 三网回程（TCP 80，${TRACE_SIZE_SMALL} B）
-========================================
-EOF
-    show_backtrace_matrix "$tmp_dir"
-
-    printf '\n'
-    show_size_trace_summary "$tmp_dir"
-
-    cleanup_active_trace_tmp
-    trap - RETURN
-
-    cat <<'EOF'
-========================================
-提示：线路判断仅供参考；CN2 GT/GIA 以完整路径的 ASN 与跳数为准，可用 nexttrace 手动复核。
-大小包结果只表示路由是否与探测包大小相关，不能单独证明线路存在人为欺骗。
-EOF
+    printf '\n检测结果：OK %s / INFO %s / WARN %s / FAIL %s\n' \
+        "$CHECK_OK_COUNT" "$CHECK_INFO_COUNT" "$CHECK_WARN_COUNT" "$CHECK_FAIL_COUNT"
 }
 
 # ==============================================================================
@@ -14554,7 +14136,7 @@ cleanup_old_temp_dirs() {
     while IFS= read -r -d '' path; do
         [ -d "$path" ] && [ ! -L "$path" ] || continue
         case "$path" in
-            "${ACTIVE_NODE_BACKUP:-}"|"${ACTIVE_TRACE_TMP:-}") continue ;;
+            "${ACTIVE_NODE_BACKUP:-}") continue ;;
         esac
         # 兼容 v1.0.32 及更早版本的 /tmp SSH 恢复快照：它可能是失败后仅存的
         # 重试依据，因此不再由垃圾清理自动删除。
@@ -14564,7 +14146,6 @@ cleanup_old_temp_dirs() {
             "$base"/vpsbox-sing-box-update.*|\
             "$base"/vpsbox-chrony.*|\
             "$base"/vpsbox-bbr.*|\
-            "$base"/vpsbox-trace.*|\
             "$base"/vpsbox-journald.*)
                 rm -rf -- "$path" || warn "清理遗留临时目录失败：$path"
                 ;;
@@ -14576,7 +14157,6 @@ cleanup_old_temp_dirs() {
             -o -name 'vpsbox-sing-box-update.*' \
             -o -name 'vpsbox-chrony.*' \
             -o -name 'vpsbox-bbr.*' \
-            -o -name 'vpsbox-trace.*' \
             -o -name 'vpsbox-journald.*' \) \
             -print0 2>/dev/null
     )
@@ -15049,7 +14629,9 @@ show_menu() {
 ========================================
  版本：$VPSBOX_VERSION
  提示：输入 vpsbox 打开管理面板
-$(vpsbox_update_notice)
+EOF
+    vpsbox_update_notice
+    cat <<EOF
 ----------------------------------------
 $(singbox_summary_line)
 $(ssh_port_summary_line)
@@ -15063,8 +14645,7 @@ $(ipv4_dns_lines)
  [3] 系统优化
  [4] 主机防火墙
  [5] 一键检测
- [6] 三网回程测试
- [7] 第三方脚本
+ [6] 第三方脚本
 ----------------------------------------
  [00] 更新 vpsbox
  [88] 卸载 vpsbox
@@ -15366,8 +14947,7 @@ main_loop() {
             3) run_menu_action system_menu ;;
             4) run_menu_action firewall_menu ;;
             5) run_menu_action run_self_check; pause ;;
-            6) run_menu_action show_backtrace_routes; pause ;;
-            7) run_menu_action other_scripts_menu ;;
+            6) run_menu_action other_scripts_menu ;;
             00) run_menu_action update_vpsbox; pause ;;
             88) run_menu_action uninstall_all; pause ;;
             0) exit 0 ;;

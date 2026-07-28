@@ -60,6 +60,42 @@ test_blank_node_host_uses_detected_public_ipv4() {
     )
 }
 
+test_delayed_node_host_paste_is_adopted() {
+    (
+        local domain=""
+        local output="$TEST_TMP/node-host-delayed-paste.out"
+        public_ipv4() { printf '%s\n' 198.51.100.42; }
+        node_ipv4_is_assigned_locally() { return 0; }
+
+        prompt_node_host domain "地址：" \
+            <<< $'\n\033[200~node.example.com\033[201~' > "$output" 2>&1
+        assert_eq "node.example.com" "$domain" \
+            "错位到确认阶段的合法节点地址必须自动采用"
+        assert_file_contains "$output" \
+            '检测到延迟到达的节点连接地址，已自动采用：node[.]example[.]com'
+        assert_file_contains "$output" '已识别节点连接地址：node[.]example[.]com'
+        assert_file_not_contains "$output" '已识别节点连接地址：198[.]51[.]100[.]42' \
+            "检测到延迟粘贴后不得继续采用自动公网 IPv4"
+        assert_file_not_contains "$output" '请输入 y、n' \
+            "合法的延迟粘贴不得被当作无效确认输入"
+    )
+    (
+        local domain=""
+        local output="$TEST_TMP/node-host-delayed-repeat.out"
+        public_ipv4() { printf '%s\n' 198.51.100.42; }
+        node_ipv4_is_assigned_locally() { return 0; }
+
+        prompt_node_host domain "地址：" \
+            <<< $'\nnode.example.comnode.example.com\nvalid.example.com' > "$output" 2>&1
+        assert_eq "valid.example.com" "$domain" \
+            "延迟到达的重复粘贴必须拒绝，并允许重新输入"
+        assert_file_contains "$output" '检测到节点地址可能被重复粘贴'
+        assert_file_not_contains "$output" \
+            '已自动采用：node[.]example[.]comnode[.]example[.]com' \
+            "重复粘贴通过公共校验前不得宣称已采用"
+    )
+}
+
 test_node_host_detection_failure_falls_back_to_manual_input() {
     (
         local domain=""
@@ -187,15 +223,6 @@ test_interactive_confirm_is_function_local() {
         assert_eq sentinel "$confirm" "删除节点确认不得覆盖同名全局变量"
     )
 
-    (
-        confirm=sentinel
-        nexttrace_installed() { return 1; }
-
-        if ensure_nexttrace <<< n >"$TEST_TMP/nexttrace-confirm.out" 2>&1; then
-            fail "取消安装 nexttrace 应返回失败"
-        fi
-        assert_eq sentinel "$confirm" "nexttrace 安装确认不得覆盖同名全局变量"
-    )
 }
 
 test_detect_os_preserves_node_state_globals() {
@@ -951,6 +978,296 @@ test_bbr_fq_summary_preserves_partial_state() {
     )
 }
 
+test_self_check_classifies_and_summarizes_results() {
+    (
+        local first_output="$TEST_TMP/self-check-empty-first.out"
+        local second_output="$TEST_TMP/self-check-empty-second.out"
+        local external_output="$TEST_TMP/self-check-external-journald.out"
+        local scan_fail_output="$TEST_TMP/self-check-scan-fail.out"
+        local status count
+        local mock_ntp_state=未安装 mock_journald_state=未配置 ports_ok=1
+
+        detect_os() { OS=debian; }
+        id() { printf '%s\n' 0; }
+        CMD_PATH=/bin/sh
+        node_artifacts_present() { return 1; }
+        load_protocol_state() { return 1; }
+        singbox_installed() { return 1; }
+        public_ipv4() { return 1; }
+        ntp_sync_state() { printf '%s\n' "$mock_ntp_state"; }
+        bbr_state() { printf '%s\n' 未启用; }
+        fq_state() { printf '%s\n' 未启用; }
+        ipv4_priority_state() { printf '%s\n' 未启用; }
+        ssh_effective_ports_listening() { return 0; }
+        ssh_port_state() { printf '%s\n' 22; }
+        ssh_hardening_state() { printf '%s\n' 未配置; }
+        fail2ban_installed() { return 1; }
+        firewall_control_plane_present() { return 1; }
+        reboot_required_state() { printf '%s\n' 不需要; }
+        journal_disk_usage() { printf '%s\n' 0B; }
+        journald_limit_state() { printf '%s\n' "$mock_journald_state"; }
+        journald_conf_value() {
+            case "$1" in
+                SystemMaxUse) printf '%s\n' 500M ;;
+                SystemMaxFileSize) printf '%s\n' 50M ;;
+                *) return 1 ;;
+            esac
+        }
+        show_ports_security_group() {
+            [ "$ports_ok" -eq 1 ] || return 1
+            printf '%s\n' PORTS_MARKER
+        }
+        JOURNALD_VPSBOX_CONF="$TEST_TMP/missing-journald.conf"
+        FIREWALL_STATE_FILE="$TEST_TMP/missing-firewall.env"
+        BBR_CONF="$TEST_TMP/missing-bbr.conf"
+        SSHD_VPSBOX_HARDENING_CONF="$TEST_TMP/missing-ssh-hardening.conf"
+        change_applied_recorded_readonly() { return 1; }
+
+        run_self_check > "$first_output" 2>&1 ||
+            fail "包含未启用项的一键检测仍应正常完成"
+        run_self_check > "$second_output" 2>&1 ||
+            fail "重复执行一键检测仍应正常完成"
+
+        for status in OK INFO WARN FAIL; do
+            count="$(awk -v status="$status" '$1 == status && $2 == "|" { count++ } END { print count + 0 }' "$first_output")"
+            assert_file_contains "$first_output" \
+                "^检测结果：.*${status} ${count}([ /]|$)" \
+                "摘要中的 $status 数量必须来自实际结果行"
+        done
+        assert_eq "$(grep '^检测结果：' "$first_output")" \
+            "$(grep '^检测结果：' "$second_output")" \
+            "每次一键检测必须重新开始计数"
+        assert_eq 1 "$(grep -c '^检测结果：' "$first_output")" \
+            "一次检测只能输出一条结果摘要"
+        awk '
+            /PORTS_MARKER/ { marker = NR }
+            /^检测结果：/ { summary = NR }
+            END { exit !(marker && summary > marker) }
+        ' "$first_output" || fail "检测摘要必须位于端口建议之后"
+        assert_eq 1 "$(grep -Ec ' INFO[[:space:]]+[|] 节点[[:space:]]+[|] 未创建' "$first_output")" \
+            "未创建节点只能显示一条 INFO"
+        assert_file_contains "$first_output" 'INFO[[:space:]]+[|] sing-box[[:space:]]+[|] 未安装'
+        assert_file_not_contains "$first_output" '配置文件.*不存在|服务状态.*未运行' \
+            "未创建节点不得重复报告派生状态"
+        assert_eq 1 "$(grep -Ec ' INFO[[:space:]]+[|] Fail2ban[[:space:]]+[|] 未安装' "$first_output")" \
+            "未安装 Fail2ban 只能显示一条 INFO"
+        assert_file_not_contains "$first_output" '（可选）|[|] Fail2ban 状态|[|] SSH 防护' \
+            "Fail2ban 未安装时不得输出重复状态行"
+        assert_eq 1 "$(grep -Ec ' INFO[[:space:]]+[|] 日志限制[[:space:]]+[|] 未配置' "$first_output")" \
+            "未配置 journald 限制只能显示一条 INFO"
+        assert_file_not_contains "$first_output" '日志最大占用|单个日志最大' \
+            "未配置 journald 限制时不得输出派生值"
+        assert_file_contains "$first_output" 'INFO[[:space:]]+[|] BBR[[:space:]]+[|] 未启用'
+        assert_file_contains "$first_output" 'INFO[[:space:]]+[|] fq[[:space:]]+[|] 未启用'
+        assert_file_contains "$first_output" 'INFO[[:space:]]+[|] IPv4 优先[[:space:]]+[|] 未启用'
+        assert_file_contains "$first_output" 'INFO[[:space:]]+[|] SSH 基础加固[[:space:]]+[|] 未配置'
+        assert_file_contains "$first_output" 'INFO[[:space:]]+[|] NTP 同步[[:space:]]+[|] 未安装'
+        assert_file_contains "$first_output" 'INFO[[:space:]]+[|] 主机防火墙[[:space:]]+[|] 未启用'
+
+        mock_ntp_state=运行中
+        mock_journald_state=已配置
+        run_self_check > "$external_output" 2>&1 ||
+            fail "外部 journald 限制已生效时一键检测应正常完成"
+        assert_file_contains "$external_output" 'WARN[[:space:]]+[|] NTP 同步[[:space:]]+[|] 运行中'
+        assert_file_contains "$external_output" 'OK[[:space:]]+[|] 日志限制[[:space:]]+[|] 已配置（系统配置已生效）'
+        assert_file_contains "$external_output" 'OK[[:space:]]+[|] 日志最大占用[[:space:]]+[|] 500M'
+        assert_file_contains "$external_output" 'OK[[:space:]]+[|] 单个日志最大[[:space:]]+[|] 50M'
+
+        ports_ok=0
+        run_self_check > "$scan_fail_output" 2>&1 ||
+            fail "端口扫描失败仍应完成其余状态报告"
+        assert_file_contains "$scan_fail_output" 'WARN[[:space:]]+[|] 端口扫描[[:space:]]+[|] 未完成'
+        assert_eq 1 "$(grep -c '^检测结果：' "$scan_fail_output")" \
+            "端口扫描失败时仍只能输出一条摘要"
+    )
+    (
+        local output="$TEST_TMP/self-check-damaged.out"
+        local state_output="$TEST_TMP/self-check-damaged-firewall-state.out"
+        local saved_state_output="$TEST_TMP/self-check-saved-firewall-state.out"
+        local status count
+        local firewall_present=1 state_secure=1 state_valid=1
+
+        detect_os() { OS=debian; }
+        id() { printf '%s\n' 0; }
+        CMD_PATH=/bin/sh
+        node_artifacts_present() { return 0; }
+        require_valid_node_state_if_present() { return 1; }
+        load_protocol_state() { return 1; }
+        singbox_installed() { return 0; }
+        singbox_version() { printf '%s\n' 1.13.14; }
+        public_ipv4() { return 1; }
+        ntp_sync_state() { printf '%s\n' 未运行; }
+        bbr_state() { printf '%s\n' 未启用; }
+        fq_state() { printf '%s\n' 未启用; }
+        ipv4_priority_state() { printf '%s\n' 未启用; }
+        ssh_effective_ports_listening() { return 1; }
+        ssh_port_state() { printf '%s\n' 22; }
+        ssh_hardening_state() { printf '%s\n' 未配置; }
+        fail2ban_installed() { return 0; }
+        fail2ban_sshd_configuration_healthy() { return 1; }
+        fail2ban_service_state() { printf '%s\n' 运行中; }
+        fail2ban_service_is_enabled() { return 0; }
+        fail2ban_sshd_state() { printf '%s\n' 已启用; }
+        firewall_control_plane_present() { [ "$firewall_present" -eq 1 ]; }
+        firewall_managed_file_is_secure() { return 1; }
+        firewall_state_file_is_secure() { [ "$state_secure" -eq 1 ]; }
+        firewall_load_state() { [ "$state_valid" -eq 1 ]; }
+        reboot_required_state() { printf '%s\n' 不需要; }
+        journal_disk_usage() { printf '%s\n' 0B; }
+        journald_limit_state() { printf '%s\n' 未配置; }
+        show_ports_security_group() { printf '%s\n' PORTS_MARKER; }
+        JOURNALD_VPSBOX_CONF="$TEST_TMP/damaged-journald.conf"
+        BBR_CONF="$TEST_TMP/damaged-bbr.conf"
+        SSHD_VPSBOX_HARDENING_CONF="$TEST_TMP/damaged-ssh-hardening.conf"
+        change_applied_recorded_readonly() { [ "$1" = GAI_CONF ]; }
+        printf '%s\n' broken > "$JOURNALD_VPSBOX_CONF"
+        printf '%s\n' broken > "$BBR_CONF"
+        printf '%s\n' broken > "$SSHD_VPSBOX_HARDENING_CONF"
+        chmod 644 "$JOURNALD_VPSBOX_CONF"
+
+        run_self_check > "$output" 2>&1 ||
+            fail "包含 FAIL 结果的一键检测仍应作为状态报告正常完成"
+        assert_eq 1 "$(grep -Ec ' FAIL[[:space:]]+[|] 配置完整性[[:space:]]+[|] 未通过' "$output")" \
+            "节点完整性损坏只能报告一次"
+        assert_file_not_contains "$output" '配置语法.*配置完整性未通过' \
+            "节点完整性失败不得派生第二条语法失败"
+        assert_eq 1 "$(grep -Ec ' FAIL[[:space:]]+[|] Fail2ban[[:space:]]+[|]' "$output")" \
+            "Fail2ban 损坏只能合并为一条 FAIL"
+        assert_file_not_contains "$output" '[|] Fail2ban 状态|[|] SSH 防护' \
+            "Fail2ban 损坏不得恢复成三行重复结果"
+        assert_file_contains "$output" '配置或 nftables 后端异常'
+        assert_file_contains "$output" 'FAIL[[:space:]]+[|] NTP 同步[[:space:]]+[|] 未运行'
+        assert_file_contains "$output" 'FAIL[[:space:]]+[|] 主机防火墙[[:space:]]+[|] 配置文件不完整或不安全'
+        assert_file_contains "$output" 'FAIL[[:space:]]+[|] 日志限制[[:space:]]+[|] 配置存在但未按预期生效或不安全'
+        assert_file_contains "$output" 'FAIL[[:space:]]+[|] BBR[[:space:]]+[|] 配置存在但未生效'
+        assert_file_contains "$output" 'FAIL[[:space:]]+[|] fq[[:space:]]+[|] 配置存在但未生效'
+        assert_file_contains "$output" 'FAIL[[:space:]]+[|] IPv4 优先[[:space:]]+[|] 配置记录存在但未生效'
+        assert_file_contains "$output" 'FAIL[[:space:]]+[|] SSH 基础加固[[:space:]]+[|] 配置存在但未生效'
+        assert_file_not_contains "$output" '日志最大占用|单个日志最大' \
+            "journald 配置损坏时不得继续显示派生值"
+        assert_eq 1 "$(grep -c '^检测结果：' "$output")" \
+            "损坏场景只能输出一条结果摘要"
+        for status in OK INFO WARN FAIL; do
+            count="$(awk -v status="$status" '$1 == status && $2 == "|" { count++ } END { print count + 0 }' "$output")"
+            assert_file_contains "$output" \
+                "^检测结果：.*${status} ${count}([ /]|$)" \
+                "损坏场景摘要中的 $status 数量必须来自实际结果行"
+        done
+
+        firewall_present=0
+        state_secure=1
+        state_valid=0
+        FIREWALL_STATE_FILE="$TEST_TMP/damaged-firewall-state.env"
+        printf '%s\n' 'EXTRA_TCP_PORTS=invalid' > "$FIREWALL_STATE_FILE"
+        run_self_check > "$state_output" 2>&1 ||
+            fail "关闭防火墙但残留损坏状态文件时仍应完成状态报告"
+        assert_file_contains "$state_output" \
+            'FAIL[[:space:]]+[|] 主机防火墙[[:space:]]+[|] 未启用，但状态文件不完整或不安全'
+
+        state_valid=1
+        printf '%s\n' 'EXTRA_TCP_PORTS=8443' 'EXTRA_UDP_PORTS=' > "$FIREWALL_STATE_FILE"
+        run_self_check > "$saved_state_output" 2>&1 ||
+            fail "关闭防火墙且状态文件有效时仍应完成状态报告"
+        assert_file_contains "$saved_state_output" \
+            'INFO[[:space:]]+[|] 主机防火墙[[:space:]]+[|] 未启用，已保存额外端口'
+    )
+    (
+        local output="$TEST_TMP/self-check-node-unavailable.out"
+
+        detect_os() { OS=debian; }
+        id() { printf '%s\n' 0; }
+        CMD_PATH=/bin/sh
+        node_artifacts_present() { return 0; }
+        require_valid_node_state_if_present() { return 0; }
+        load_protocol_state() {
+            [ "$1" = vless ] || return 1
+            DOMAIN=192.0.2.10
+            PORT=20001
+            # shellcheck disable=SC2034 # run_self_check 在状态加载后动态读取。
+            REALITY_SERVER_NAME=example.com
+        }
+        singbox_installed() { return 0; }
+        singbox_version() { printf '%s\n' 1.13.14; }
+        port_listener_ready() { return 1; }
+        check_active_node_config() { return 0; }
+        service_status_short() { printf '%s\n' 运行中; }
+        public_ipv4() { return 1; }
+        ntp_sync_state() { printf '%s\n' 已同步; }
+        bbr_state() { printf '%s\n' 已启用; }
+        fq_state() { printf '%s\n' 已启用; }
+        ipv4_priority_state() { printf '%s\n' 已启用; }
+        ssh_effective_ports_listening() { return 0; }
+        ssh_port_state() { printf '%s\n' 22; }
+        ssh_hardening_state() { printf '%s\n' 已配置; }
+        fail2ban_installed() { return 1; }
+        firewall_control_plane_present() { return 1; }
+        reboot_required_state() { printf '%s\n' 不需要; }
+        journal_disk_usage() { printf '%s\n' 0B; }
+        journald_limit_state() { printf '%s\n' 未配置; }
+        show_ports_security_group() { printf '%s\n' PORTS_MARKER; }
+        change_applied_recorded_readonly() { return 1; }
+        BBR_CONF="$TEST_TMP/missing-node-case-bbr.conf"
+        SSHD_VPSBOX_HARDENING_CONF="$TEST_TMP/missing-node-case-ssh-hardening.conf"
+        JOURNALD_VPSBOX_CONF="$TEST_TMP/missing-node-case-journald.conf"
+        FIREWALL_STATE_FILE="$TEST_TMP/missing-node-case-firewall.env"
+        URI_FILE="$TEST_TMP/missing-node-uri.txt"
+
+        run_self_check > "$output" 2>&1 ||
+            fail "节点监听和链接缺失时仍应完成状态报告"
+        assert_file_contains "$output" 'FAIL[[:space:]]+[|] VLESS Reality 监听[[:space:]]+[|] 20001 未监听'
+        assert_file_contains "$output" 'FAIL[[:space:]]+[|] 节点链接[[:space:]]+[|] 未生成'
+    )
+}
+
+test_main_menu_update_notice_spacing_and_entries() {
+    (
+        local output="$TEST_TMP/main-menu-no-update.out"
+        clear() { :; }
+        singbox_summary_line() { printf '%s\n' ' sing-box：未安装'; }
+        ssh_port_summary_line() { printf '%s\n' ' SSH 端口：22'; }
+        node_summary() { :; }
+        ipv4_dns_lines() { printf '%s\n' ' nameserver 1.1.1.1'; }
+        UPDATE_AVAILABLE=0
+
+        show_menu > "$output"
+        awk '
+            /提示：输入 vpsbox 打开管理面板/ {
+                found = 1
+                getline
+                exit($0 != "----------------------------------------")
+            }
+            END { if (!found) exit 1 }
+        ' "$output" || fail "没有更新提示时，提示行后必须直接显示分隔线"
+        assert_file_contains "$output" '^ [[]6[]] 第三方脚本$'
+        assert_file_not_contains "$output" '^ [[]7[]] ' \
+            "第三方脚本改为编号 6 后不得残留旧编号 7"
+    )
+    (
+        local output="$TEST_TMP/main-menu-with-update.out"
+        clear() { :; }
+        singbox_summary_line() { printf '%s\n' ' sing-box：未安装'; }
+        ssh_port_summary_line() { printf '%s\n' ' SSH 端口：22'; }
+        node_summary() { :; }
+        ipv4_dns_lines() { printf '%s\n' ' nameserver 1.1.1.1'; }
+        # shellcheck disable=SC2034 # 由 show_menu 调用的更新提示函数动态读取。
+        UPDATE_AVAILABLE=1
+        # shellcheck disable=SC2034 # 由 show_menu 调用的更新提示函数动态读取。
+        REMOTE_VERSION=v9.9.9
+
+        show_menu > "$output"
+        awk '
+            /提示：输入 vpsbox 打开管理面板/ {
+                found = 1
+                getline
+                if ($0 !~ /^ 新版本：v9[.]9[.]9/) exit 1
+                getline
+                exit($0 != "----------------------------------------")
+            }
+            END { if (!found) exit 1 }
+        ' "$output" || fail "有更新提示时，只能在提示与分隔线之间增加一行通知"
+    )
+}
+
 test_menu_dispatch_and_system_status_wiring() {
     local dispatch_log="$TEST_TMP/main-menu-dispatch.log"
 
@@ -963,9 +1280,9 @@ test_menu_dispatch_and_system_status_wiring() {
 
         main_loop <<< $'5\n6\n7\n0' >/dev/null
     )
-    assert_eq $'run_self_check\nshow_backtrace_routes\nother_scripts_menu' \
+    assert_eq $'run_self_check\nother_scripts_menu' \
         "$(cat "$dispatch_log")" \
-        "主菜单检测、回程测试和第三方脚本选项必须分发到对应功能"
+        "主菜单检测和第三方脚本选项必须分发到对应功能，旧编号 7 不再执行功能"
 
     (
         local uninstall_log="$TEST_TMP/uninstall-menu-dispatch.log"
@@ -1780,12 +2097,16 @@ main() {
         update_singbox
         install_self_command
         ssh_port_summary_line
+        change_applied_recorded_readonly
+        run_self_check
+        show_menu
         main_loop
         system_menu
     )
     local -a tests=(
         test_address_fallback_validation
         test_blank_node_host_uses_detected_public_ipv4
+        test_delayed_node_host_paste_is_adopted
         test_node_host_detection_failure_falls_back_to_manual_input
         test_node_host_rejected_detection_falls_back_to_manual_input
         test_node_host_warns_for_possible_nat
@@ -1814,6 +2135,8 @@ main() {
         test_ssh_port_summary_line_states
         test_node_summary_orders_only_existing_protocols
         test_bbr_fq_summary_preserves_partial_state
+        test_self_check_classifies_and_summarizes_results
+        test_main_menu_update_notice_spacing_and_entries
         test_menu_dispatch_and_system_status_wiring
         test_third_party_entries_keep_attribution_and_commands
         test_service_restore_checks_final_state

@@ -840,6 +840,7 @@ test_apply_without_rollback_watchdog_must_not_touch_firewall() {
         forbid_init
         mkdir -p "$case_dir"
         RUNTIME_DIR="$case_dir/run"
+        VPSBOX_STATE_DIR="$case_dir"
         mkdir -p "$RUNTIME_DIR"
         FIREWALL_CONFIG="$case_dir/firewall.nft"
         FIREWALL_STATE_FILE="$case_dir/firewall.env"
@@ -884,6 +885,189 @@ test_apply_without_rollback_watchdog_must_not_touch_firewall() {
         assert_file_contains "$log" '^restored$' \
             "保护启动失败后必须恢复应用前状态"
         assert_no_forbidden "在没有自动回滚保护的情况下改动了防火墙"
+    )
+}
+
+test_unchanged_firewall_skips_confirmation_and_mutation() {
+    (
+        local output="$TEST_TMP/firewall-no-change.out"
+
+        forbid_init
+        detect_os() { OS=debian; : "$OS"; }
+        firewall_settle_pending_port_transition() { :; }
+        firewall_recover_pending_rollbacks() { :; }
+        firewall_check_conflicts() { :; }
+        ensure_nftables() { :; }
+        firewall_load_state() { :; }
+        firewall_detect_allowed_ports() { :; }
+        firewall_desired_state_is_current() { return 0; }
+        firewall_show_port_summary() { forbid "无变化时不应显示应用确认摘要"; }
+        firewall_create_rollback_snapshot() { forbid "无变化时不应创建回滚快照"; }
+        firewall_start_rollback_watchdog() { forbid "无变化时不应启动 watchdog"; }
+        firewall_apply_config_file() { forbid "无变化时不应应用 nftables 规则"; }
+        firewall_install_managed_file() { forbid "无变化时不应重写受管文件"; }
+
+        firewall_apply_desired_state </dev/null > "$output" 2>&1 ||
+            fail "完全健康且无变化的防火墙应直接返回成功"
+        assert_file_contains "$output" '当前防火墙规则与端口状态一致，无需更新。'
+        assert_no_forbidden "无变化防火墙仍进入了确认或修改流程"
+    )
+}
+
+test_second_firewall_scan_can_become_noop_before_mutation() {
+    (
+        local output="$TEST_TMP/firewall-second-scan-noop.out"
+        local current_checks=0 detect_calls=0
+
+        forbid_init
+        detect_os() { OS=debian; : "$OS"; }
+        firewall_settle_pending_port_transition() { :; }
+        firewall_recover_pending_rollbacks() { :; }
+        firewall_check_conflicts() { :; }
+        ensure_nftables() { :; }
+        firewall_load_state() { :; }
+        firewall_detect_allowed_ports() { detect_calls=$((detect_calls + 1)); }
+        firewall_desired_state_is_current() {
+            current_checks=$((current_checks + 1))
+            [ "$current_checks" -eq 2 ]
+        }
+        firewall_show_port_summary() { :; }
+        firewall_create_rollback_snapshot() { forbid "二次扫描已一致时不应创建回滚快照"; }
+        firewall_start_rollback_watchdog() { forbid "二次扫描已一致时不应启动 watchdog"; }
+        firewall_apply_config_file() { forbid "二次扫描已一致时不应应用规则"; }
+
+        firewall_apply_desired_state <<< "YES" > "$output" 2>&1 ||
+            fail "确认后二次扫描已一致时应安全短路"
+        assert_eq 2 "$detect_calls" "确认前后必须分别获取一次实时端口状态"
+        assert_eq 2 "$current_checks" "两次实时状态都必须执行完整一致性判断"
+        assert_file_contains "$output" '当前防火墙规则与端口状态一致，无需更新。'
+        assert_no_forbidden "二次扫描已一致后仍进入了防火墙事务"
+    )
+}
+
+test_firewall_noop_requires_complete_managed_state() {
+    (
+        local case_dir="$TEST_TMP/firewall-current-state"
+        local runtime_ok=1 service_ok=1 live_ok=1
+        local mock_enabled_state=enabled mock_fragment_path mock_reload_state=no
+
+        [ "$(id -u)" = "0" ] || { skip "需要 root 文件属主语义"; return "$?"; }
+        mkdir -p "$case_dir/run"
+        chmod 700 "$case_dir"
+        RUNTIME_DIR="$case_dir/run"
+        VPSBOX_STATE_DIR="$case_dir"
+        FIREWALL_CONFIG="$case_dir/firewall.nft"
+        FIREWALL_STATE_FILE="$case_dir/firewall.env"
+        FIREWALL_SYSTEMD_UNIT="$case_dir/vpsbox-firewall.service"
+        OS=debian
+        mock_fragment_path="$FIREWALL_SYSTEMD_UNIT"
+        printf '%s\n' config > "$FIREWALL_CONFIG"
+        printf '%s\n' state > "$FIREWALL_STATE_FILE"
+        printf '%s\n' service > "$FIREWALL_SYSTEMD_UNIT"
+        chown root:root "$FIREWALL_CONFIG" "$FIREWALL_STATE_FILE" "$FIREWALL_SYSTEMD_UNIT"
+        chmod 600 "$FIREWALL_CONFIG" "$FIREWALL_STATE_FILE"
+        chmod 644 "$FIREWALL_SYSTEMD_UNIT"
+
+        is_systemd() { return 0; }
+        firewall_runtime_enabled() { [ "$runtime_ok" -eq 1 ]; }
+        firewall_service_active() { [ "$service_ok" -eq 1 ]; }
+        firewall_live_config_matches_expected() { [ "$live_ok" -eq 1 ]; }
+        firewall_write_state_file() { printf '%s\n' state > "$1"; }
+        firewall_write_config() { printf '%s\n' config > "$1"; }
+        firewall_write_service_definition() { printf '%s\n' service > "$1"; }
+        nft() { return 0; }
+        systemctl() {
+            case "$1" in
+                is-enabled) printf '%s\n' "$mock_enabled_state" ;;
+                show)
+                    case "$*" in
+                        *FragmentPath*) printf '%s\n' "$mock_fragment_path" ;;
+                        *NeedDaemonReload*) printf '%s\n' "$mock_reload_state" ;;
+                        *) return 1 ;;
+                    esac
+                    ;;
+                *) return 1 ;;
+            esac
+        }
+
+        firewall_desired_state_is_current || fail "完整健康状态应允许无变化短路"
+
+        chmod 755 "$VPSBOX_STATE_DIR"
+        if firewall_desired_state_is_current; then fail "状态目录权限漂移时不得短路"; fi
+        chmod 700 "$VPSBOX_STATE_DIR"
+        chmod 640 "$FIREWALL_CONFIG"
+        if firewall_desired_state_is_current; then fail "配置权限漂移时不得短路"; fi
+        chmod 600 "$FIREWALL_CONFIG"
+        printf '%s\n' drift > "$FIREWALL_STATE_FILE"
+        if firewall_desired_state_is_current; then fail "状态文件内容漂移时不得短路"; fi
+        printf '%s\n' state > "$FIREWALL_STATE_FILE"
+        printf '%s\n' drift > "$FIREWALL_SYSTEMD_UNIT"
+        if firewall_desired_state_is_current; then fail "服务定义漂移时不得短路"; fi
+        printf '%s\n' service > "$FIREWALL_SYSTEMD_UNIT"
+        live_ok=0
+        if firewall_desired_state_is_current; then fail "内核规则漂移时不得短路"; fi
+        live_ok=1
+        service_ok=0
+        if firewall_desired_state_is_current; then fail "服务未运行时不得短路"; fi
+        service_ok=1
+        mock_enabled_state=enabled-runtime
+        if firewall_desired_state_is_current; then fail "仅运行时启用的 systemd 服务不得短路"; fi
+        mock_enabled_state=enabled
+        mock_reload_state=yes
+        if firewall_desired_state_is_current; then fail "systemd 尚需 daemon-reload 时不得短路"; fi
+        mock_reload_state=no
+        mock_fragment_path="$case_dir/wrong.service"
+        if firewall_desired_state_is_current; then fail "systemd 加载了错误 unit 时不得短路"; fi
+        mock_fragment_path="$FIREWALL_SYSTEMD_UNIT"
+        runtime_ok=0
+        if firewall_desired_state_is_current; then fail "防火墙运行规则不存在时不得短路"; fi
+    )
+    (
+        local case_dir="$TEST_TMP/firewall-current-openrc"
+        local service_ok=1 live_ok=1
+
+        [ "$(id -u)" = "0" ] || { skip "需要 root 文件属主语义"; return "$?"; }
+        mkdir -p "$case_dir/run" "$case_dir/init.d" "$case_dir/runlevels/default"
+        chmod 700 "$case_dir"
+        RUNTIME_DIR="$case_dir/run"
+        VPSBOX_STATE_DIR="$case_dir"
+        FIREWALL_CONFIG="$case_dir/firewall.nft"
+        FIREWALL_STATE_FILE="$case_dir/firewall.env"
+        FIREWALL_OPENRC_SERVICE="$case_dir/init.d/vpsbox-firewall"
+        FIREWALL_OPENRC_RUNLEVELS_DIR="$case_dir/runlevels"
+        OS=alpine
+        printf '%s\n' config > "$FIREWALL_CONFIG"
+        printf '%s\n' state > "$FIREWALL_STATE_FILE"
+        printf '%s\n' service > "$FIREWALL_OPENRC_SERVICE"
+        chown root:root "$case_dir" "$FIREWALL_CONFIG" "$FIREWALL_STATE_FILE" "$FIREWALL_OPENRC_SERVICE"
+        chmod 700 "$case_dir"
+        chmod 600 "$FIREWALL_CONFIG" "$FIREWALL_STATE_FILE"
+        chmod 755 "$FIREWALL_OPENRC_SERVICE"
+        ln -s "$FIREWALL_OPENRC_SERVICE" "$FIREWALL_OPENRC_RUNLEVELS_DIR/default/$FIREWALL_SERVICE_NAME"
+
+        is_systemd() { return 1; }
+        firewall_runtime_enabled() { return 0; }
+        firewall_service_active() { [ "$service_ok" -eq 1 ]; }
+        firewall_live_config_matches_expected() { [ "$live_ok" -eq 1 ]; }
+        firewall_write_state_file() { printf '%s\n' state > "$1"; }
+        firewall_write_config() { printf '%s\n' config > "$1"; }
+        firewall_write_service_definition() { printf '%s\n' service > "$1"; }
+        nft() { return 0; }
+
+        firewall_desired_state_is_current || fail "完整健康的 OpenRC 状态应允许无变化短路"
+
+        chmod 744 "$FIREWALL_OPENRC_SERVICE"
+        if firewall_desired_state_is_current; then fail "OpenRC 服务脚本权限漂移时不得短路"; fi
+        chmod 755 "$FIREWALL_OPENRC_SERVICE"
+        rm "$FIREWALL_OPENRC_RUNLEVELS_DIR/default/$FIREWALL_SERVICE_NAME"
+        if firewall_desired_state_is_current; then fail "OpenRC default 自启链接缺失时不得短路"; fi
+        printf '%s\n' wrong > "$case_dir/wrong-service"
+        ln -s "$case_dir/wrong-service" "$FIREWALL_OPENRC_RUNLEVELS_DIR/default/$FIREWALL_SERVICE_NAME"
+        if firewall_desired_state_is_current; then fail "OpenRC default 自启链接指错目标时不得短路"; fi
+        rm "$FIREWALL_OPENRC_RUNLEVELS_DIR/default/$FIREWALL_SERVICE_NAME"
+        ln -s "$FIREWALL_OPENRC_SERVICE" "$FIREWALL_OPENRC_RUNLEVELS_DIR/default/$FIREWALL_SERVICE_NAME"
+        service_ok=0
+        if firewall_desired_state_is_current; then fail "OpenRC 服务未运行时不得短路"; fi
     )
 }
 
@@ -1008,6 +1192,8 @@ main() {
         run_bounded_with_timeout
         firewall_start_rollback_watchdog
         firewall_apply_desired_state
+        firewall_directory_metadata_is_exact
+        firewall_desired_state_is_current
         firewall_detect_docker_ports
         firewall_detect_public_listeners
         firewall_detect_allowed_ports
@@ -1041,6 +1227,9 @@ main() {
         test_additive_config_builder_creates_first_udp_rule_and_set
         test_adding_port_uses_lightweight_commit_path
         test_apply_without_rollback_watchdog_must_not_touch_firewall
+        test_unchanged_firewall_skips_confirmation_and_mutation
+        test_second_firewall_scan_can_become_noop_before_mutation
+        test_firewall_noop_requires_complete_managed_state
         test_lightweight_add_does_not_rescan_docker_or_ssh
         test_internal_port_transition_preserves_unrelated_public_ports
     )

@@ -1426,9 +1426,12 @@ test_self_check_keeps_valid_sibling_visible() {
 
         run_self_check > "$TEST_TMP/self-check-sibling.out" 2>&1
 
-        assert_file_contains "$TEST_TMP/self-check-sibling.out" '配置完整性.*未通过'
+        assert_eq 1 "$(grep -Ec 'FAIL[[:space:]]+[|] 配置完整性[[:space:]]+[|] 未通过' "$TEST_TMP/self-check-sibling.out")" \
+            "残缺节点只能产生一条配置完整性失败"
         assert_file_contains "$TEST_TMP/self-check-sibling.out" 'Shadowsocks 节点'
         assert_file_not_contains "$TEST_TMP/self-check-sibling.out" '配置文件.*不存在'
+        assert_file_not_contains "$TEST_TMP/self-check-sibling.out" '配置语法.*配置完整性未通过' \
+            "已有完整性失败时不得重复报告配置语法失败"
     )
 }
 
@@ -1452,6 +1455,7 @@ main() {
         normalize_port_decimal
         delete_node
         write_uri_files
+        run_self_check
     )
     local -a tests=(
         test_complete_configs_merge_with_unique_tags

@@ -15,14 +15,14 @@
 
 | 章节 | 起始锚点 | 主要职责 |
 |---|---|---|
-| 全局配置与运行时状态 | `APP_NAME` | 版本、路径、超时、事务句柄、路由目标和防火墙快照 |
+| 全局配置与运行时状态 | `APP_NAME` | 版本、路径、超时、事务句柄和防火墙快照 |
 | 核心运行时 | `info` | 输出、输入、重试、限时命令、进程清理和实例锁 |
 | 平台适配与通用持久化 | `detect_os` | 系统识别、启动更新探测、下载校验、依赖安装、原子文件操作和变更记录 |
 | 节点与 sing-box | `node_commands_available` | 节点依赖、sing-box 服务及 systemd/OpenRC 适配、共用监听检查、节点状态、配置、URI、事务、创建删除和 sing-box 更新 |
 | vpsbox 自更新发布与回滚事务 | `restore_previous_vpsbox` | 旧脚本恢复、watchdog、启动握手、自更新发布和重新执行 |
 | 系统优化与安全 | `bbr_state` | BBR、Fail2ban、NTP、DNS、IPv4 优先、SSH 和系统维护 |
 | 主机防火墙 | `normalize_port_csv` | 端口发现、Docker 发布端口、nftables 渲染、应用、回滚和菜单 |
-| 检测与路由测试 | `check_table_header` | 一键检测、NextTrace、三网回程和大小包比较 |
+| 检测 | `check_table_header` | 一键检测 |
 | 维护与恢复 | `uninstall_singbox_and_nodes` | 卸载、主机名、垃圾清理、变更恢复、服务动作和状态摘要 |
 | 菜单与交互 | `show_menu` | 主菜单、子菜单、第三方脚本说明和菜单循环 |
 | 程序入口 | `vpsbox_main` | 权限、系统识别、锁、未完成的 sing-box 更新与节点事务恢复、自安装、自更新检查和主循环 |
@@ -65,7 +65,6 @@ Shell 没有模块级私有变量，所有权依靠命名、注释和调用约�
 | `ACTIVE_UNAPPLIED_SSH_TRACKING` | SSH 修改事务维护，用于退出时处理尚未应用的跟踪状态 |
 | `ACTIVE_FAIL2BAN_*` | Fail2ban 真实封禁测试维护，保存当前测试或上一次解封失败后尚未清理的临时状态 |
 | `ACTIVE_SINGBOX_UPDATE_*` | sing-box 二进制更新事务的进程内句柄；回滚时先清空以避免重复进入，恢复失败时磁盘事务继续作为后续恢复依据 |
-| `ACTIVE_TRACE_TMP` | 路由测试维护，退出时用于清理当前临时目录 |
 | `REMOTE_VERSION`、`UPDATE_AVAILABLE` | vpsbox 启动更新检查及自动、手动更新流程共同维护 |
 | `PENDING_VPSBOX_UPDATE_*`、`VPSBOX_UPDATE_STARTUP_CONFIRMED`、`VPSBOX_UPDATE_WATCHDOG_*` | vpsbox 自更新 watchdog 和新进程启动握手维护 |
 | `FW_*` | 防火墙加载、探测、解析和计算流程共同维护的单次操作状态；只有完整采集成功后才构成可消费快照。采集中途失败可能留下部分新值或上一轮值，调用者必须依据返回状态丢弃结果，且不得跨操作缓存 |
