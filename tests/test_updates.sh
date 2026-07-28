@@ -35,13 +35,19 @@ derive_update_test_versions() {
     patch=$((10#$patch))
 
     UPDATE_TEST_CURRENT="v${major}.${minor}.${patch}"
-    UPDATE_TEST_NEWER="v${major}.${minor}.$((patch + 1))"
+    if [ "$patch" -lt 99 ]; then
+        UPDATE_TEST_NEWER="v${major}.${minor}.$((patch + 1))"
+    elif [ "$patch" -eq 99 ]; then
+        UPDATE_TEST_NEWER="v${major}.$((minor + 1)).0"
+    else
+        fail "VPSBOX_VERSION 的补丁位不能大于 99：$VPSBOX_VERSION"
+    fi
     if [ "$patch" -gt 0 ]; then
         UPDATE_TEST_OLDER="v${major}.${minor}.$((patch - 1))"
     elif [ "$minor" -gt 0 ]; then
-        UPDATE_TEST_OLDER="v${major}.$((minor - 1)).999"
+        UPDATE_TEST_OLDER="v${major}.$((minor - 1)).99"
     elif [ "$major" -gt 0 ]; then
-        UPDATE_TEST_OLDER="v$((major - 1)).999.999"
+        UPDATE_TEST_OLDER="v$((major - 1)).99.99"
     else
         fail "VPSBOX_VERSION 不能使用 v0.0.0：无法构造更旧版本"
     fi
@@ -233,14 +239,16 @@ test_version_relation() {
     fi
 }
 
-test_username_migration_identity_compatibility() {
+test_current_repository_identity_is_required() {
     local legacy="$TEST_TMP/legacy-old-owner.sh"
     local future="$TEST_TMP/future-new-owner.sh"
     local third_party="$TEST_TMP/third-party.sh"
+    local legacy_url="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 
-    write_fixture "$legacy" "$UPDATE_TEST_OLDER" legacy "$LEGACY_SCRIPT_URL"
-    vpsbox_script_identity_valid "$legacy" ||
-        fail "必须能识别并恢复旧用户名地址生成的历史备份"
+    write_fixture "$legacy" "$UPDATE_TEST_OLDER" legacy "$legacy_url"
+    if vpsbox_script_identity_valid "$legacy"; then
+        fail "v1.0.43 兼容基线不再接受旧用户名地址生成的历史备份"
+    fi
 
     write_fixture "$future" "$UPDATE_TEST_NEWER" future "$SCRIPT_URL"
     vpsbox_script_identity_valid "$future" ||
@@ -304,7 +312,7 @@ test_vpsbox_newer_updates_once() {
 }
 
 test_vpsbox_never_fetches_old_owner_url() {
-    local primary_count legacy_count
+    local primary_count
 
     reset_update_case owner-failure
     write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
@@ -320,9 +328,10 @@ test_vpsbox_never_fetches_old_owner_url() {
     assert_file_contains "$CMD_PATH" 'installed'
     assert_file_contains "${CMD_PATH}.previous" '^keep-backup$'
     primary_count="$(grep -Fxc -- "$SCRIPT_URL" "$MOCK_CURL_LOG" || true)"
-    legacy_count="$(grep -Fxc -- "$LEGACY_SCRIPT_URL" "$MOCK_CURL_LOG" || true)"
     assert_eq 3 "$primary_count" "应只重试当前官方地址"
-    assert_eq 0 "$legacy_count" "不得从可被重新注册的旧用户名下载脚本"
+    if grep -Fvx -- "$SCRIPT_URL" "$MOCK_CURL_LOG" >/dev/null; then
+        fail "更新失败时不得尝试当前官方地址以外的回退源"
+    fi
 }
 
 test_primary_url_failure_preserves_current() {
@@ -420,7 +429,7 @@ EOF
 test_vpsbox_reexec_failure_restores_previous() {
     local output="$TEST_TMP/reexec-failure.out"
     reset_update_case reexec-failure
-    write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed "$LEGACY_SCRIPT_URL"
+    write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed "$SCRIPT_URL"
     write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_NEWER" remote
     reexec_updated_vpsbox() {
         printf 'reexec-failed:%s\n' "${1:-}" >> "$MOCK_EVENT_LOG"
@@ -910,7 +919,7 @@ main() {
         test_production_install_command_alias_wires_target
         test_vpsbox_download_uses_bounded_curl_timeouts
         test_version_relation
-        test_username_migration_identity_compatibility
+        test_current_repository_identity_is_required
         test_vpsbox_same_is_noop
         test_vpsbox_older_is_noop
         test_vpsbox_newer_updates_once

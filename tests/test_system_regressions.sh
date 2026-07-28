@@ -317,6 +317,41 @@ test_enable_ntp_healthy_is_noop() {
     )
 }
 
+test_enable_ntp_rejects_incomplete_existing_metadata_before_backup() {
+    (
+        forbid_init
+        detect_os() {
+            # shellcheck disable=SC2034 # 被测 NTP 入口动态读取。
+            OS=debian
+        }
+        is_systemd() { return 0; }
+        chrony_service_name() { printf '%s\n' chrony; }
+        chrony_conf_path() { printf '%s\n' /unused/chrony.conf; }
+        ntp_package_installed() { return 1; }
+        systemd_unit_exists() { return 1; }
+        manifest_value() {
+            case "$1" in
+                APPLIED_NTP_CONF) printf '%s\n' 1 ;;
+                BACKUP_NTP_CONF) return 1 ;;
+                BACKUP_NTP_SOURCES) printf '%s\n' absent ;;
+                NTP_CHRONY_PACKAGE|NTP_TIMESYNCD_PACKAGE) printf '%s\n' absent ;;
+                NTP_CHRONY_UNIT|NTP_TIMESYNCD_UNIT) printf '%s\n' absent ;;
+                NTP_CHRONY_ENABLED|NTP_TIMESYNCD_ENABLED) printf '%s\n' disabled ;;
+                NTP_CHRONY_ACTIVE|NTP_TIMESYNCD_ACTIVE) printf '%s\n' inactive ;;
+                *) return 1 ;;
+            esac
+        }
+        backup_change_file_once() {
+            forbid "已有 NTP 恢复记录不完整时不得改写恢复基线"
+        }
+
+        if enable_ntp_sync >/dev/null 2>&1; then
+            fail "已有 NTP 恢复记录不完整时重复配置必须失败"
+        fi
+        assert_no_forbidden "NTP 元数据校验必须发生在备份副作用之前"
+    )
+}
+
 test_ntp_unsynchronized_status_is_nonfatal() {
     (
         local output="$TEST_TMP/ntp-unsynchronized.out"
@@ -497,7 +532,15 @@ test_enable_ntp_failure_stages_enter_runtime_rollback() {
             systemd_unit_exists() { [ "$1" = systemd-timesyncd.service ]; }
             backup_change_file_once() { return 0; }
             manifest_value() {
-                [ "$1" = APPLIED_NTP_CONF ] && printf '%s\n' 1
+                case "$1" in
+                    APPLIED_NTP_CONF) printf '%s\n' 1 ;;
+                    BACKUP_NTP_CONF|BACKUP_NTP_SOURCES) printf '%s\n' absent ;;
+                    NTP_CHRONY_PACKAGE|NTP_TIMESYNCD_PACKAGE) printf '%s\n' absent ;;
+                    NTP_CHRONY_UNIT|NTP_TIMESYNCD_UNIT) printf '%s\n' absent ;;
+                    NTP_CHRONY_ENABLED|NTP_TIMESYNCD_ENABLED) printf '%s\n' disabled ;;
+                    NTP_CHRONY_ACTIVE|NTP_TIMESYNCD_ACTIVE) printf '%s\n' inactive ;;
+                    *) return 1 ;;
+                esac
             }
             mktemp() {
                 if [ "${1:-}" = -d ]; then
@@ -1596,6 +1639,208 @@ test_signal_traps_preserve_exit_status() {
     done
 }
 
+test_ssh_restore_rejects_legacy_tmp_snapshot() {
+    local legacy="/tmp/vpsbox-ssh-restore.legacy-test.$$"
+
+    if ssh_restore_snapshot_path_allowed "$legacy"; then
+        fail "v1.0.43 兼容基线不应再接受 /tmp 中无清单的 SSH 恢复快照"
+    fi
+}
+
+test_ntp_restore_accepts_complete_current_metadata() {
+    (
+        local log="$TEST_TMP/ntp-current-metadata.log"
+        : > "$log"
+        # shellcheck disable=SC2034 # 被测恢复函数动态读取。
+        CHRONY_SOURCE_FILE="/unused/vpsbox.sources"
+        detect_os() {
+            # shellcheck disable=SC2034 # 被测恢复函数动态读取。
+            OS=debian
+        }
+        is_systemd() { return 0; }
+        chrony_service_name() { printf '%s\n' chrony; }
+        chrony_conf_path() { printf '%s\n' /unused/chrony.conf; }
+        manifest_value() {
+            case "$1" in
+                BACKUP_NTP_CONF|BACKUP_NTP_SOURCES) printf '%s\n' absent ;;
+                NTP_CHRONY_PACKAGE) printf '%s\n' installed ;;
+                NTP_TIMESYNCD_PACKAGE) printf '%s\n' absent ;;
+                NTP_CHRONY_UNIT) printf '%s\n' present ;;
+                NTP_TIMESYNCD_UNIT) printf '%s\n' absent ;;
+                NTP_CHRONY_ENABLED) printf '%s\n' enabled ;;
+                NTP_CHRONY_ACTIVE) printf '%s\n' active ;;
+                NTP_TIMESYNCD_ENABLED) printf '%s\n' disabled ;;
+                NTP_TIMESYNCD_ACTIVE) printf '%s\n' inactive ;;
+                *) return 1 ;;
+            esac
+        }
+        systemctl() { printf 'systemctl:%s\n' "$*" >> "$log"; }
+        restore_ntp_packages_to_state() {
+            printf 'packages:%s:%s\n' "$1" "$2" >> "$log"
+        }
+        restore_change_file() {
+            printf 'file:%s:%s\n' "$1" "$2" >> "$log"
+        }
+        restore_ntp_unit_state() {
+            printf 'unit:%s:%s:%s:%s\n' "$1" "$2" "$3" "$4" >> "$log"
+        }
+
+        restore_recorded_ntp_change ||
+            fail "字段完整的 v1.0.43+ NTP 恢复记录必须继续可用"
+        assert_file_contains "$log" '^systemctl:stop chrony$'
+        assert_file_contains "$log" '^packages:installed:absent$'
+        assert_file_contains "$log" '^unit:chrony:present:enabled:active$'
+        assert_file_contains "$log" \
+            '^unit:systemd-timesyncd:absent:disabled:inactive$'
+    )
+}
+
+test_ntp_restore_requires_complete_current_metadata() {
+    (
+        forbid_init
+        detect_os() {
+            # shellcheck disable=SC2034 # 被测恢复函数动态读取。
+            OS=debian
+        }
+        is_systemd() { return 0; }
+        chrony_service_name() { printf '%s\n' chrony; }
+        manifest_value() {
+            case "$1" in
+                BACKUP_NTP_CONF) return 1 ;;
+                BACKUP_NTP_SOURCES) printf '%s\n' absent ;;
+                NTP_CHRONY_PACKAGE|NTP_TIMESYNCD_PACKAGE) printf '%s\n' installed ;;
+                NTP_CHRONY_UNIT|NTP_TIMESYNCD_UNIT) printf '%s\n' present ;;
+                NTP_CHRONY_ENABLED|NTP_TIMESYNCD_ENABLED) printf '%s\n' enabled ;;
+                NTP_CHRONY_ACTIVE|NTP_TIMESYNCD_ACTIVE) printf '%s\n' active ;;
+                *) return 1 ;;
+            esac
+        }
+        systemctl() { forbid "NTP 恢复元数据不完整时不得修改服务"; }
+        restore_ntp_packages_to_state() { forbid "NTP 恢复元数据不完整时不得修改软件包"; }
+        restore_change_file() { forbid "NTP 恢复元数据不完整时不得恢复文件"; }
+
+        if restore_recorded_ntp_change >/dev/null 2>&1; then
+            fail "缺少当前格式的 NTP 文件备份状态时恢复必须失败"
+        fi
+        assert_no_forbidden "NTP 元数据校验必须发生在任何恢复副作用之前"
+    )
+}
+
+test_ntp_restore_rejects_invalid_current_metadata() {
+    (
+        forbid_init
+        detect_os() {
+            # shellcheck disable=SC2034 # 被测恢复函数动态读取。
+            OS=debian
+        }
+        is_systemd() { return 0; }
+        chrony_service_name() { printf '%s\n' chrony; }
+        manifest_value() {
+            case "$1" in
+                BACKUP_NTP_CONF|BACKUP_NTP_SOURCES) printf '%s\n' absent ;;
+                NTP_CHRONY_PACKAGE|NTP_TIMESYNCD_PACKAGE) printf '%s\n' absent ;;
+                NTP_CHRONY_UNIT|NTP_TIMESYNCD_UNIT) printf '%s\n' absent ;;
+                NTP_CHRONY_ENABLED|NTP_TIMESYNCD_ENABLED) printf '%s\n' enabled ;;
+                NTP_CHRONY_ACTIVE) printf '%s\n' damaged ;;
+                NTP_TIMESYNCD_ACTIVE) printf '%s\n' inactive ;;
+                *) return 1 ;;
+            esac
+        }
+        systemctl() { forbid "NTP 恢复枚举值非法时不得修改服务"; }
+        restore_ntp_packages_to_state() { forbid "NTP 恢复枚举值非法时不得修改软件包"; }
+        restore_change_file() { forbid "NTP 恢复枚举值非法时不得恢复文件"; }
+
+        if restore_recorded_ntp_change >/dev/null 2>&1; then
+            fail "NTP 恢复记录包含非法枚举值时必须失败"
+        fi
+        assert_no_forbidden "NTP 非法枚举值校验必须发生在任何恢复副作用之前"
+    )
+}
+
+test_fail2ban_restore_requires_complete_service_metadata() {
+    (
+        forbid_init
+        # shellcheck disable=SC2034 # 被测恢复函数动态读取。
+        OS=debian
+        change_needs_restore() { [ "$1" = FAIL2BAN_SSHD ]; }
+        manifest_value() {
+            case "$1" in
+                FAIL2BAN_ACTIVE) printf '%s\n' active ;;
+                FAIL2BAN_ENABLED) return 1 ;;
+                *) return 1 ;;
+            esac
+        }
+        restore_change_file() { forbid "Fail2ban 恢复元数据不完整时不得恢复配置"; }
+        fail2ban_installed() { return 0; }
+        is_systemd() { return 0; }
+        resolv_conf_managed_by_systemd_resolved() { return 1; }
+        systemctl() { forbid "Fail2ban 恢复元数据不完整时不得修改服务"; }
+
+        if restore_vpsbox_system_changes 1 >/dev/null 2>&1; then
+            fail "缺少当前格式的 Fail2ban 服务状态时恢复必须失败"
+        fi
+        assert_no_forbidden "Fail2ban 元数据校验必须发生在配置和服务恢复之前"
+    )
+}
+
+test_fail2ban_restore_rejects_invalid_service_metadata() {
+    (
+        forbid_init
+        # shellcheck disable=SC2034 # 被测恢复函数动态读取。
+        OS=debian
+        change_needs_restore() { [ "$1" = FAIL2BAN_SSHD ]; }
+        manifest_value() {
+            case "$1" in
+                FAIL2BAN_ACTIVE) printf '%s\n' active ;;
+                FAIL2BAN_ENABLED) printf '%s\n' damaged ;;
+                *) return 1 ;;
+            esac
+        }
+        restore_change_file() { forbid "Fail2ban 恢复枚举值非法时不得恢复配置"; }
+        fail2ban_installed() { return 0; }
+        is_systemd() { return 0; }
+        resolv_conf_managed_by_systemd_resolved() { return 1; }
+        systemctl() { forbid "Fail2ban 恢复枚举值非法时不得修改服务"; }
+
+        if restore_vpsbox_system_changes 1 >/dev/null 2>&1; then
+            fail "Fail2ban 恢复记录包含非法枚举值时必须失败"
+        fi
+        assert_no_forbidden "Fail2ban 非法枚举值校验必须发生在配置和服务恢复之前"
+    )
+}
+
+test_fail2ban_restore_accepts_complete_service_metadata() {
+    (
+        local log="$TEST_TMP/fail2ban-current-metadata.log"
+        : > "$log"
+        # shellcheck disable=SC2034 # 被测恢复函数动态读取。
+        OS=debian
+        change_needs_restore() { [ "$1" = FAIL2BAN_SSHD ]; }
+        manifest_value() {
+            case "$1" in
+                FAIL2BAN_ACTIVE) printf '%s\n' active ;;
+                FAIL2BAN_ENABLED) printf '%s\n' enabled ;;
+                *) return 1 ;;
+            esac
+        }
+        restore_change_file() { printf 'restore:%s\n' "$1" >> "$log"; }
+        fail2ban_installed() { return 0; }
+        fail2ban-client() { printf 'client:%s\n' "$*" >> "$log"; }
+        is_systemd() { return 0; }
+        resolv_conf_managed_by_systemd_resolved() { return 1; }
+        systemctl() { printf 'systemctl:%s\n' "$*" >> "$log"; }
+        clear_change_tracking() { return 0; }
+        manifest_remove() { return 0; }
+
+        restore_vpsbox_system_changes 1 ||
+            fail "字段完整的 v1.0.43+ Fail2ban 恢复记录必须继续可用"
+        assert_file_contains "$log" '^restore:FAIL2BAN_SSHD$'
+        assert_file_contains "$log" '^client:-t -c /etc/fail2ban$'
+        assert_file_contains "$log" '^systemctl:enable fail2ban$'
+        assert_file_contains "$log" '^systemctl:restart fail2ban$'
+    )
+}
+
 test_restore_system_changes_failure_preserves_manifest_and_backup() {
     (
         local target="$TEST_TMP/restore-entry/gai.conf"
@@ -1683,6 +1928,8 @@ main() {
         change_system_hostname
         restore_vpsbox_system_changes
         show_vpsbox_changes
+        restore_recorded_ntp_change
+        ssh_restore_snapshot_path_allowed
         ssh_restore_snapshot_path_is_secure
         write_systemd_resolved_dns
         write_chrony_sources
@@ -1703,6 +1950,7 @@ main() {
         test_ntp_package_rollback_restores_timesyncd
         test_chrony_source_layout_detection
         test_enable_ntp_healthy_is_noop
+        test_enable_ntp_rejects_incomplete_existing_metadata_before_backup
         test_ntp_unsynchronized_status_is_nonfatal
         test_ntp_service_drift_uses_light_repair
         test_ntp_light_repair_reports_restore_outcome
@@ -1744,6 +1992,13 @@ main() {
         test_hostname_failure_restores_current_operation_state
         test_hostname_managed_block_write_failure_rolls_back
         test_signal_traps_preserve_exit_status
+        test_ssh_restore_rejects_legacy_tmp_snapshot
+        test_ntp_restore_accepts_complete_current_metadata
+        test_ntp_restore_requires_complete_current_metadata
+        test_ntp_restore_rejects_invalid_current_metadata
+        test_fail2ban_restore_requires_complete_service_metadata
+        test_fail2ban_restore_rejects_invalid_service_metadata
+        test_fail2ban_restore_accepts_complete_service_metadata
         test_restore_system_changes_failure_preserves_manifest_and_backup
         test_uninstall_restore_offer_runs_internal_restore
         test_uninstall_restore_offer_can_preserve_changes

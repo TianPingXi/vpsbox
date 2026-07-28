@@ -330,6 +330,7 @@ test_hup_does_not_cancel_timeout_rollback() {
     CASE_TEST_PIDS=""
     trap cleanup_case_processes EXIT
     reset_firewall_case hup-timeout
+    # shellcheck disable=SC2034 # 被测回滚脚本生成器动态读取此超时覆写。
     FIREWALL_ROLLBACK_SECONDS=2
     write_managed_firewall_fixture
     cp "$FIREWALL_CONFIG" "$original"
@@ -491,6 +492,21 @@ EOF
     [ ! -e "$snapshot/rollback-failed" ] || fail "OpenRC 服务状态恢复留下失败标记"
 }
 
+test_legacy_runtime_snapshot_is_rejected() {
+    local legacy current
+
+    reset_firewall_case snapshot-path-baseline
+    legacy="$RUNTIME_DIR/firewall-rollback.legacy"
+    current="$FIREWALL_ROLLBACK_DIR/firewall-rollback.current"
+    mkdir -p "$legacy" "$current"
+
+    if firewall_rollback_dir_valid "$legacy"; then
+        fail "v1.0.43 兼容基线不应再接受 /run 中的旧防火墙快照"
+    fi
+    firewall_rollback_dir_valid "$current" ||
+        fail "当前持久化防火墙快照路径必须继续接受"
+}
+
 test_stale_restore_lock_is_reclaimed() {
     local snapshot=""
 
@@ -498,9 +514,11 @@ test_stale_restore_lock_is_reclaimed() {
     reset_firewall_case stale-restore-lock
     firewall_create_rollback_snapshot snapshot ""
     mkdir "$snapshot/restore.lock"
-    printf '%s\n' 999999 > "$snapshot/restore.lock/pid"
-    printf '%s\n' 1 > "$snapshot/restore.lock/start"
-    cat /proc/sys/kernel/random/boot_id > "$snapshot/restore.lock/boot"
+    {
+        printf 'pid=%s\n' 999999
+        printf 'start=%s\n' 1
+        printf 'boot=%s\n' "$(cat /proc/sys/kernel/random/boot_id)"
+    } > "$snapshot/restore.lock/owner"
 
     firewall_restore_snapshot_now "$snapshot" 0
 
@@ -567,7 +585,7 @@ test_identity_mismatch_is_cleaned_without_kill() {
     CASE_TEST_PIDS=""
     trap cleanup_case_processes EXIT
     reset_firewall_case mismatch
-    dir="$RUNTIME_DIR/firewall-rollback.mismatch"
+    dir="$FIREWALL_ROLLBACK_DIR/firewall-rollback.mismatch"
     mkdir -p "$dir"
     : > "$dir/completed"
     sleep 30 &
@@ -595,9 +613,9 @@ test_pid_only_partial_watchdog_is_stopped() {
     CASE_TEST_PIDS=""
     trap cleanup_case_processes EXIT
     reset_firewall_case pid-only
-    dir="$RUNTIME_DIR/firewall-rollback.pid-only"
+    dir="$FIREWALL_ROLLBACK_DIR/firewall-rollback.pid-only"
     mkdir -p "$dir"
-    printf '%s\n' '#!/bin/sh' "sleep $FIREWALL_ROLLBACK_SECONDS" > "$dir/rollback.sh"
+    printf '%s\n' '#!/bin/sh' 'while :; do sleep 1; done' > "$dir/rollback.sh"
     chmod 700 "$dir/rollback.sh"
     : > "$dir/completed"
     nohup sh "$dir/rollback.sh" >/dev/null 2>&1 &
@@ -624,7 +642,7 @@ test_partial_dead_metadata_is_cleaned() {
 
     require_linux_proc || return "$?"
     reset_firewall_case partial
-    dir="$RUNTIME_DIR/firewall-rollback.partial"
+    dir="$FIREWALL_ROLLBACK_DIR/firewall-rollback.partial"
     mkdir -p "$dir"
     : > "$dir/completed"
     printf '%s\n' 12345 > "$dir/watchdog.start"
@@ -638,7 +656,7 @@ test_invalid_pid_metadata_is_cleaned() {
 
     for suffix in empty invalid; do
         reset_firewall_case "invalid-$suffix"
-        dir="$RUNTIME_DIR/firewall-rollback.invalid-$suffix"
+        dir="$FIREWALL_ROLLBACK_DIR/firewall-rollback.invalid-$suffix"
         mkdir -p "$dir"
         : > "$dir/completed"
         if [ "$suffix" = "empty" ]; then
@@ -659,9 +677,9 @@ test_stale_pid_does_not_hide_real_watchdog() {
     CASE_TEST_PIDS=""
     trap cleanup_case_processes EXIT
     reset_firewall_case stale
-    dir="$RUNTIME_DIR/firewall-rollback.stale"
+    dir="$FIREWALL_ROLLBACK_DIR/firewall-rollback.stale"
     mkdir -p "$dir"
-    printf '%s\n' '#!/bin/sh' "sleep $FIREWALL_ROLLBACK_SECONDS" > "$dir/rollback.sh"
+    printf '%s\n' '#!/bin/sh' 'while :; do sleep 1; done' > "$dir/rollback.sh"
     chmod 700 "$dir/rollback.sh"
     : > "$dir/completed"
 
@@ -705,6 +723,7 @@ main() {
         firewall_start_rollback_watchdog
         firewall_stop_rollback_watchdog
         firewall_finish_commit
+        firewall_rollback_dir_valid
     )
     local -a tests=(
         test_commit_stops_watchdog_and_sleep
@@ -716,6 +735,7 @@ main() {
         test_hup_does_not_cancel_timeout_rollback
         test_enabled_active_service_state_is_restored
         test_openrc_enabled_active_service_state_is_restored
+        test_legacy_runtime_snapshot_is_rejected
         test_stale_restore_lock_is_reclaimed
         test_restore_lock_metadata_is_atomically_published
         test_rollback_rejects_directory_symlink_target

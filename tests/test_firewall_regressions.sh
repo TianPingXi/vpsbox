@@ -713,7 +713,7 @@ test_busybox_timeout_fallback_releases_lock() {
 }
 
 test_watchdog_survives_parent_without_holding_lock() {
-    local case_dir="$TEST_TMP/watchdog-lock" driver ready lock runtime snapshot
+    local case_dir="$TEST_TMP/watchdog-lock" driver ready lock rollback_root snapshot
     local driver_pid watchdog child=""
 
     require_command flock || return "$?"
@@ -722,14 +722,14 @@ test_watchdog_survives_parent_without_holding_lock() {
     driver="$case_dir/driver.sh"
     ready="$case_dir/ready"
     lock="$case_dir/menu.lock"
-    runtime="$case_dir/run"
-    snapshot="$runtime/firewall-rollback.test"
+    rollback_root="$case_dir/state/firewall-rollbacks"
+    snapshot="$rollback_root/firewall-rollback.test"
     cat > "$driver" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 source "$REPO_DIR/vpsbox.sh"
-RUNTIME_DIR="$RUNTIME_TARGET"
-snapshot="$RUNTIME_DIR/firewall-rollback.test"
+FIREWALL_ROLLBACK_DIR="$FIREWALL_ROLLBACK_TARGET"
+snapshot="$FIREWALL_ROLLBACK_DIR/firewall-rollback.test"
 mkdir -p "$snapshot"
 printf '%s\n' '#!/bin/sh' 'sleep 30' > "$snapshot/rollback.sh"
 chmod 700 "$snapshot/rollback.sh"
@@ -742,7 +742,7 @@ wait "$(cat "$snapshot/watchdog.pid")"
 EOF
     chmod 700 "$driver"
 
-    REPO_DIR="$REPO_DIR" RUNTIME_TARGET="$runtime" LOCK_TARGET="$lock" \
+    REPO_DIR="$REPO_DIR" FIREWALL_ROLLBACK_TARGET="$rollback_root" LOCK_TARGET="$lock" \
         WATCHDOG_FILE="$case_dir/watchdog.pid" READY_FILE="$ready" bash "$driver" &
     driver_pid=$!
     record_case_pid "$driver_pid"

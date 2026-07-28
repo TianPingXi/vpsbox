@@ -26,12 +26,12 @@ umask 077
 # 产品、版本、受管路径和超时均在加载时确定，业务函数只读取这些配置。
 APP_NAME="vpsbox"
 VPSBOX_VERSION="v1.0.44"
-# 只从当前仓库下载可执行脚本；旧地址仅用于识别本地 v1.0.23 及更早备份，绝不联网获取。
+# 只从当前仓库下载并识别可执行脚本。
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
-LEGACY_SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 DEFAULT_REALITY_SERVER_NAME="addons.mozilla.org"
 CMD_PATH="/usr/local/bin/vpsbox"
+CMD_ALIAS_PATH="/usr/bin/vpsbox"
 CONFIG_DIR="/etc/sing-box"
 # sing-box 软件包可能生成默认 config.json；vpsbox 节点只使用 vpsbox.d 独立配置。
 URI_FILE="$CONFIG_DIR/vpsbox-uri.txt"
@@ -45,6 +45,8 @@ VLESS_URI_FILE="$CONFIG_DIR/vpsbox-vless-uri.txt"
 BBR_CONF="/etc/sysctl.d/99-vpsbox-bbr.conf"
 JOURNALD_VPSBOX_CONF="/etc/systemd/journald.conf.d/99-vpsbox.conf"
 VPSBOX_STATE_DIR="/etc/vpsbox"
+# 独立于系统改动清单保存，卸载管理命令时继续保留。
+INSTALL_METADATA_FILE="$VPSBOX_STATE_DIR/install.env"
 CHANGE_MANIFEST="$VPSBOX_STATE_DIR/changes.env"
 CHANGE_BACKUP_DIR="$VPSBOX_STATE_DIR/backups"
 NODE_TRANSACTION_DIR="$VPSBOX_STATE_DIR/node-transaction"
@@ -689,8 +691,7 @@ lock_pid_from_file() {
     local pid=""
 
     [ -f "$path" ] || return 1
-    # 兼容早期版本仅写入 pid/started 的锁元数据。升级后可能仍遇到旧锁文件，
-    # 但缺少 start_ticks/boot_id 时不能防止 PID 复用，因此只读取 PID 并进入人工确认路径。
+    # PID 只用于定位候选进程；后续自动回收仍必须核对 start_ticks 与 boot_id。
     pid="$(awk -F= '$1 == "pid" { print $2; exit }' "$path" 2>/dev/null || true)"
     if is_pid "$pid"; then
         printf '%s\n' "$pid"
@@ -1144,8 +1145,8 @@ install_command_alias() {
         err "无法设置管理命令权限：$CMD_PATH"
         return 1
     }
-    ln -sf "$CMD_PATH" /usr/bin/vpsbox || {
-        err "无法创建命令入口：/usr/bin/vpsbox"
+    ln -sf "$CMD_PATH" "$CMD_ALIAS_PATH" || {
+        err "无法创建命令入口：$CMD_ALIAS_PATH"
         return 1
     }
 }
@@ -1171,10 +1172,7 @@ vpsbox_script_identity_valid() {
 
     [ -f "$script" ] && [ ! -L "$script" ] || return 1
     grep -Fqx 'APP_NAME="vpsbox"' "$script" || return 1
-    if ! grep -Fqx "SCRIPT_URL=\"$LEGACY_SCRIPT_URL\"" "$script" &&
-        ! grep -Fqx "SCRIPT_URL=\"$SCRIPT_URL\"" "$script"; then
-        return 1
-    fi
+    grep -Fqx "SCRIPT_URL=\"$SCRIPT_URL\"" "$script" || return 1
     grep -Fqx 'vpsbox_main() {' "$script" || return 1
     grep -Fqx 'if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then' "$script" || return 1
     grep -Fqx '    vpsbox_main "$@"' "$script" || return 1
@@ -1197,7 +1195,6 @@ download_vpsbox_script() {
     local require_newer="${2:-0}"
     local tmp
     local downloaded_version
-    local version_declaration
 
     ensure_curl || return 1
 
@@ -1220,20 +1217,7 @@ download_vpsbox_script() {
         return 1
     fi
 
-    if ! version_declaration="$(
-        awk '
-            /^[[:space:]]*((export|readonly|local)[[:space:]]+|(declare|typeset)([[:space:]]+-[^[:space:]]+)*[[:space:]]+)?VPSBOX_VERSION[[:space:]]*=/ {
-                print
-            }
-        ' "$tmp"
-    )"; then
-        rm -f "$tmp"
-        err "无法读取下载脚本的版本声明，已保留当前版本。"
-        return 1
-    fi
-    if [ -z "$version_declaration" ] ||
-        [[ "$version_declaration" == *$'\n'* ]] ||
-        ! [[ "$version_declaration" =~ ^VPSBOX_VERSION=\"v[0-9]+([.][0-9]+){2}\"$ ]]; then
+    if ! downloaded_version="$(vpsbox_script_version_from_file "$tmp")"; then
         rm -f "$tmp"
         err "下载到的脚本版本声明不唯一或格式无效，已保留当前版本。"
         return 1
@@ -1243,8 +1227,6 @@ download_vpsbox_script() {
         err "下载到的脚本缺少 vpsbox 项目标识或必要入口，已保留当前版本。"
         return 1
     fi
-    downloaded_version="${version_declaration#VPSBOX_VERSION=\"}"
-    downloaded_version="${downloaded_version%\"}"
     if [ "$require_newer" = "1" ]; then
         case "$(version_relation "$downloaded_version" "$VPSBOX_VERSION")" in
             newer) ;;
@@ -1543,35 +1525,199 @@ install_singbox_package_file() {
     esac
 }
 
+vpsbox_script_version_from_file() {
+    local script="$1"
+    local declaration version
+
+    [ -f "$script" ] && [ ! -L "$script" ] || return 1
+    declaration="$(
+        awk '
+            /^[[:space:]]*((export|readonly|local)[[:space:]]+|(declare|typeset)([[:space:]]+-[^[:space:]]+)*[[:space:]]+)?VPSBOX_VERSION[[:space:]]*=/ {
+                print
+            }
+        ' "$script"
+    )" || return 1
+    [ -n "$declaration" ] &&
+        [[ "$declaration" != *$'\n'* ]] &&
+        [[ "$declaration" =~ ^VPSBOX_VERSION=\"v[0-9]+([.][0-9]+){2}\"$ ]] ||
+        return 1
+    version="${declaration#VPSBOX_VERSION=\"}"
+    version="${version%\"}"
+    printf '%s\n' "$version"
+}
+
+install_metadata_values_valid() {
+    local version="$1" installed_at="$2"
+
+    if [ "$version" = "unknown" ] || [ "$installed_at" = "unknown" ]; then
+        [ "$version" = "unknown" ] && [ "$installed_at" = "unknown" ]
+        return
+    fi
+    [[ "$version" =~ ^v[0-9]+([.][0-9]+){2}$ ]] &&
+        [[ "$installed_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]
+}
+
+install_metadata_read() {
+    local owner mode line value
+    local version="" installed_at=""
+    local seen_version=0 seen_at=0
+
+    [ -d "$VPSBOX_STATE_DIR" ] && [ ! -L "$VPSBOX_STATE_DIR" ] || return 1
+    owner="$(stat -c '%u:%g' "$VPSBOX_STATE_DIR" 2>/dev/null)" || return 1
+    mode="$(stat -c '%a' "$VPSBOX_STATE_DIR" 2>/dev/null)" || return 1
+    [ "$owner" = "0:0" ] && [ "$mode" = "700" ] || return 1
+
+    [ -f "$INSTALL_METADATA_FILE" ] && [ ! -L "$INSTALL_METADATA_FILE" ] || return 1
+    owner="$(stat -c '%u:%g' "$INSTALL_METADATA_FILE" 2>/dev/null)" || return 1
+    mode="$(stat -c '%a' "$INSTALL_METADATA_FILE" 2>/dev/null)" || return 1
+    [ "$owner" = "0:0" ] && [ "$mode" = "600" ] || return 1
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            FIRST_INSTALLED_VERSION=*)
+                [ "$seen_version" -eq 0 ] || return 1
+                value="${line#FIRST_INSTALLED_VERSION=}"
+                version="$value"
+                seen_version=1
+                ;;
+            FIRST_INSTALLED_AT=*)
+                [ "$seen_at" -eq 0 ] || return 1
+                value="${line#FIRST_INSTALLED_AT=}"
+                installed_at="$value"
+                seen_at=1
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    done < "$INSTALL_METADATA_FILE"
+
+    [ "$seen_version" -eq 1 ] && [ "$seen_at" -eq 1 ] || return 1
+    install_metadata_values_valid "$version" "$installed_at" || return 1
+    printf '%s\n%s\n' "$version" "$installed_at"
+}
+
+prepare_install_metadata_dir() {
+    if [ -L "$VPSBOX_STATE_DIR" ]; then
+        return 1
+    fi
+    if [ -e "$VPSBOX_STATE_DIR" ] && [ ! -d "$VPSBOX_STATE_DIR" ]; then
+        return 1
+    fi
+    mkdir -p "$VPSBOX_STATE_DIR" || return 1
+    chown root:root "$VPSBOX_STATE_DIR" || return 1
+    chmod 700 "$VPSBOX_STATE_DIR" || return 1
+}
+
+install_metadata_write_once() {
+    local version="$1" installed_at="$2"
+    local tmp
+
+    install_metadata_values_valid "$version" "$installed_at" || return 1
+    if [ -e "$INSTALL_METADATA_FILE" ] || [ -L "$INSTALL_METADATA_FILE" ]; then
+        install_metadata_read >/dev/null
+        return
+    fi
+
+    prepare_install_metadata_dir || return 1
+    if [ -e "$INSTALL_METADATA_FILE" ] || [ -L "$INSTALL_METADATA_FILE" ]; then
+        install_metadata_read >/dev/null
+        return
+    fi
+    command -v mktemp >/dev/null 2>&1 || return 1
+    tmp="$(mktemp "$VPSBOX_STATE_DIR/.install.env.XXXXXX")" || return 1
+    if ! printf '%s\n' \
+        "FIRST_INSTALLED_VERSION=$version" \
+        "FIRST_INSTALLED_AT=$installed_at" > "$tmp" ||
+        ! chown root:root "$tmp" ||
+        ! chmod 600 "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+
+    # 以同目录硬链接原子发布；目标若已出现则 ln 失败，不会覆盖已有记录。
+    if ! ln -- "$tmp" "$INSTALL_METADATA_FILE"; then
+        rm -f -- "$tmp"
+        if [ -e "$INSTALL_METADATA_FILE" ] || [ -L "$INSTALL_METADATA_FILE" ]; then
+            install_metadata_read >/dev/null
+            return
+        fi
+        return 1
+    fi
+    rm -f -- "$tmp" || return 1
+    install_metadata_read >/dev/null
+}
+
+record_install_metadata_after_install() {
+    local had_installed_command="$1"
+    local version installed_at
+
+    if [ -e "$INSTALL_METADATA_FILE" ] || [ -L "$INSTALL_METADATA_FILE" ]; then
+        install_metadata_read >/dev/null
+        return
+    fi
+    case "$had_installed_command" in
+        0)
+            version="$(vpsbox_script_version_from_file "$CMD_PATH")" || return 1
+            installed_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" || return 1
+            ;;
+        1)
+            # install.env 首次引入前没有可信历史；不得从当前版本、备份或文件时间推断。
+            version="unknown"
+            installed_at="unknown"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    install_metadata_write_once "$version" "$installed_at"
+}
+
 install_self_command() {
     local src
+    local had_installed_command=0
     src="${1:-${BASH_SOURCE[0]:-$0}}"
 
+    if [ -f "$CMD_PATH" ] && [ ! -L "$CMD_PATH" ]; then
+        had_installed_command=1
+    fi
     mkdir -p "$(dirname "$CMD_PATH")" || { err "无法创建管理命令目录。"; return 1; }
 
     case "$src" in
         /dev/fd/*|/proc/*)
             if download_vpsbox_script "$CMD_PATH"; then
-                install_command_alias || return 1
-                return 0
+                :
+            else
+                err "管理命令安装失败，请检查网络后重新运行安装命令。"
+                return 1
             fi
-            err "管理命令安装失败，请检查网络后重新运行安装命令。"
-            return 1
+            ;;
+        *)
+            [ -f "$src" ] && [ ! -L "$src" ] ||
+                { err "找不到当前 vpsbox 脚本，或脚本路径不安全：$src"; return 1; }
+
+            if [ "$(readlink -f "$src" 2>/dev/null || echo "$src")" != "$CMD_PATH" ]; then
+                if ! install_root_file_atomically "$src" "$CMD_PATH" 755; then
+                    err "无法安装管理命令到 $CMD_PATH。"
+                    return 1
+                fi
+            fi
             ;;
     esac
 
-    [ -f "$src" ] && [ ! -L "$src" ] ||
-        { err "找不到当前 vpsbox 脚本，或脚本路径不安全：$src"; return 1; }
-
-    if [ "$(readlink -f "$src" 2>/dev/null || echo "$src")" != "$CMD_PATH" ]; then
-        if ! install_root_file_atomically "$src" "$CMD_PATH" 755; then
-            err "无法安装管理命令到 $CMD_PATH。"
-            return 1
+    if ! install_command_alias; then
+        if [ "$had_installed_command" -eq 0 ]; then
+            if ! rm -f -- "$CMD_PATH"; then
+                warn "快捷入口安装失败，且无法清理未完成的管理命令：$CMD_PATH"
+            fi
         fi
-        install_command_alias || return 1
-    else
-        install_command_alias || return 1
+        return 1
     fi
+
+    if ! record_install_metadata_after_install "$had_installed_command"; then
+        warn "首次安装记录保存或校验异常，已保留现有文件（如有）：$INSTALL_METADATA_FILE"
+    fi
+    return 0
 }
 
 secure_config_dir() {
@@ -1673,6 +1819,25 @@ backup_change_file_once() {
     fi
 }
 
+change_backup_record_is_valid() {
+    local name="$1" state backup
+
+    [[ "$name" =~ ^[A-Z0-9_]+$ ]] || return 1
+    state="$(manifest_value "BACKUP_$name" 2>/dev/null || true)"
+    case "$state" in
+        file)
+            backup="$CHANGE_BACKUP_DIR/$name"
+            [ -f "$backup" ] && [ ! -L "$backup" ]
+            ;;
+        absent)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 mark_change_applied() {
     local name="$1"
 
@@ -1707,7 +1872,7 @@ change_restore_state() {
 
     if [ "$(manifest_value "PENDING_$name" 2>/dev/null || true)" = "1" ]; then
         printf '%s\n' pending
-    # 兼容 v1.0.26 及更早版本的变更清单：旧版本只记录 APPLIED，没有 PENDING。
+    # APPLIED 表示当前版本已经提交、仍可由恢复菜单处理的变更。
     elif [ "$(manifest_value "APPLIED_$name" 2>/dev/null || true)" = "1" ]; then
         printf '%s\n' applied
     else
@@ -5846,7 +6011,7 @@ mark_vpsbox_update_ready() {
 start_vpsbox_update_watchdog() {
     local backup="$1" dir ready owner_pid owner_start
 
-    # v1.0.22 起由旧进程先启动独立 watchdog，再 exec 新脚本。这样即使候选脚本
+    # 当前更新协议由旧进程先启动独立 watchdog，再 exec 新脚本。这样即使候选脚本
     # 在解析完毕后、进入 vpsbox_main 之前顶层退出，也能依据 PID 启动时间恢复 .previous。
     [ "$backup" = "${CMD_PATH}.previous" ] || return 1
     if [ ! -f "$backup" ] || [ -L "$backup" ] ||
@@ -5923,8 +6088,8 @@ rollback_pending_vpsbox_update() {
     unset VPSBOX_UPDATE_BACKUP || true
     unset VPSBOX_UPDATE_READY_FILE || true
 
-    # 兼容旧版本遗留的 .previous：旧备份本身不能证明本次启动来自更新，
-    # 因此没有一次性更新握手变量时绝不自动回退，避免普通启动误用陈旧备份。
+    # .previous 本身不能证明本次启动来自更新；没有一次性握手变量时绝不自动回退，
+    # 避免普通启动误用陈旧备份。
     [ "$backup" = "${CMD_PATH}.previous" ] || {
         err "拒绝使用非预期的 vpsbox 更新备份路径：$backup"
         return 1
@@ -7124,6 +7289,32 @@ settle_failed_ntp_change() {
     fi
 }
 
+ntp_restore_metadata_values_valid() {
+    [ "$#" -eq 8 ] || return 1
+    case "$1" in installed|absent) ;; *) return 1 ;; esac
+    case "$2" in installed|absent) ;; *) return 1 ;; esac
+    case "$3" in present|absent) ;; *) return 1 ;; esac
+    case "$4" in present|absent) ;; *) return 1 ;; esac
+    case "$5" in enabled|disabled) ;; *) return 1 ;; esac
+    case "$6" in active|inactive) ;; *) return 1 ;; esac
+    case "$7" in enabled|disabled) ;; *) return 1 ;; esac
+    case "$8" in active|inactive) ;; *) return 1 ;; esac
+}
+
+recorded_ntp_metadata_is_complete() {
+    ntp_restore_metadata_values_valid \
+        "$(manifest_value NTP_CHRONY_PACKAGE 2>/dev/null || true)" \
+        "$(manifest_value NTP_TIMESYNCD_PACKAGE 2>/dev/null || true)" \
+        "$(manifest_value NTP_CHRONY_UNIT 2>/dev/null || true)" \
+        "$(manifest_value NTP_TIMESYNCD_UNIT 2>/dev/null || true)" \
+        "$(manifest_value NTP_CHRONY_ENABLED 2>/dev/null || true)" \
+        "$(manifest_value NTP_CHRONY_ACTIVE 2>/dev/null || true)" \
+        "$(manifest_value NTP_TIMESYNCD_ENABLED 2>/dev/null || true)" \
+        "$(manifest_value NTP_TIMESYNCD_ACTIVE 2>/dev/null || true)" &&
+        change_backup_record_is_valid NTP_CONF &&
+        change_backup_record_is_valid NTP_SOURCES
+}
+
 restore_recorded_ntp_change() {
     local svc chrony_package timesyncd_package chrony_unit timesyncd_unit
     local chrony_enabled chrony_active timesyncd_enabled timesyncd_active failed=0
@@ -7139,39 +7330,25 @@ restore_recorded_ntp_change() {
     chrony_active="$(manifest_value NTP_CHRONY_ACTIVE 2>/dev/null || true)"
     timesyncd_enabled="$(manifest_value NTP_TIMESYNCD_ENABLED 2>/dev/null || true)"
     timesyncd_active="$(manifest_value NTP_TIMESYNCD_ACTIVE 2>/dev/null || true)"
+    if ! ntp_restore_metadata_values_valid \
+        "$chrony_package" "$timesyncd_package" "$chrony_unit" "$timesyncd_unit" \
+        "$chrony_enabled" "$chrony_active" "$timesyncd_enabled" "$timesyncd_active" ||
+        ! change_backup_record_is_valid NTP_CONF ||
+        ! change_backup_record_is_valid NTP_SOURCES; then
+        err "NTP 恢复记录不完整或格式不正确，已拒绝修改服务、软件包和配置。"
+        return 1
+    fi
 
     systemctl stop "$svc" >/dev/null 2>&1 || true
-    if [ -n "$chrony_package" ]; then
-        restore_ntp_packages_to_state "$chrony_package" "$timesyncd_package" ||
-            failed=1
-    else
-        # 兼容 v1.0.21 及更早的 NTP 清单：旧记录没有原包状态。
-        # 为避免猜测后卸载用户原有软件，只恢复可确认的文件和现存 unit 状态。
-        warn "旧版 NTP 恢复记录缺少包状态，将保留当前已安装的软件包。"
-    fi
+    restore_ntp_packages_to_state "$chrony_package" "$timesyncd_package" ||
+        failed=1
     restore_change_file NTP_CONF "$(chrony_conf_path)" || failed=1
     restore_change_file NTP_SOURCES "$CHRONY_SOURCE_FILE" || failed=1
 
-    if [ -n "$chrony_unit" ]; then
-        restore_ntp_unit_state "$svc" "$chrony_unit" "$chrony_enabled" "$chrony_active" ||
-            failed=1
-        restore_ntp_unit_state systemd-timesyncd "$timesyncd_unit" \
-            "$timesyncd_enabled" "$timesyncd_active" || failed=1
-    else
-        # 旧版只记录 active/enabled；unit 已不存在时无法安全重建，不能伪报恢复成功。
-        if systemd_unit_exists "${svc}.service"; then
-            restore_ntp_unit_state "$svc" present "$chrony_enabled" "$chrony_active" ||
-                failed=1
-        elif [ "$chrony_enabled" = "enabled" ] || [ "$chrony_active" = "active" ]; then
-            failed=1
-        fi
-        if systemd_unit_exists systemd-timesyncd.service; then
-            restore_ntp_unit_state systemd-timesyncd present \
-                "$timesyncd_enabled" "$timesyncd_active" || failed=1
-        elif [ "$timesyncd_enabled" = "enabled" ] || [ "$timesyncd_active" = "active" ]; then
-            failed=1
-        fi
-    fi
+    restore_ntp_unit_state "$svc" "$chrony_unit" "$chrony_enabled" "$chrony_active" ||
+        failed=1
+    restore_ntp_unit_state systemd-timesyncd "$timesyncd_unit" \
+        "$timesyncd_enabled" "$timesyncd_active" || failed=1
     return "$failed"
 }
 
@@ -7242,13 +7419,13 @@ enable_ntp_sync() {
             timesyncd_enabled="enabled"
     fi
 
-    backup_change_file_once NTP_CONF "$conf" ||
-        { err "记录 chrony 原配置失败，已取消修改。"; return 1; }
-    backup_change_file_once NTP_SOURCES "$source_file" ||
-        { err "记录 NTP 源原配置失败，已取消修改。"; return 1; }
     [ "$(manifest_value APPLIED_NTP_CONF 2>/dev/null || true)" = "1" ] &&
         applied_before=1
     if [ "$applied_before" -eq 0 ]; then
+        backup_change_file_once NTP_CONF "$conf" ||
+            { err "记录 chrony 原配置失败，已取消修改。"; return 1; }
+        backup_change_file_once NTP_SOURCES "$source_file" ||
+            { err "记录 NTP 源原配置失败，已取消修改。"; return 1; }
         manifest_set_once NTP_CHRONY_ACTIVE "$chrony_active" || return 1
         manifest_set_once NTP_CHRONY_ENABLED "$chrony_enabled" || return 1
         manifest_set_once NTP_CHRONY_PACKAGE "$chrony_package" || return 1
@@ -7263,9 +7440,11 @@ enable_ntp_sync() {
             return 1
         }
     else
-        # 兼容 v1.0.21 及更早已记录的 NTP 变更：旧清单没有包与 unit 字段，
-        # 不能用当前（修改后）状态反推原状态，因此这里绝不补写猜测值。
-        :
+        # 重复配置先验证首次操作前的完整恢复基线，且不得用当前状态覆盖它。
+        recorded_ntp_metadata_is_complete || {
+            err "现有 NTP 恢复记录不完整，已拒绝继续修改。"
+            return 1
+        }
     fi
 
     backup_dir="$(mktemp -d /tmp/vpsbox-chrony.XXXXXX)" || return 1
@@ -8456,8 +8635,8 @@ settle_stale_unapplied_ssh_tracking() {
         ! ssh_unapplied_tracking_present; then
         return 0
     fi
-    # v1.0.22 起 SSH 配置只会在 APPLIED_SSH_CONFIG 成功落盘后写入；
-    # 因此无 APPLIED 标记的残留仅是中断的首次基线，可安全清理后重新采集。
+    # SSH 配置只会在 APPLIED_SSH_CONFIG 成功落盘后写入；因此无 APPLIED 标记的
+    # 残留仅是中断的首次基线，可安全清理后重新采集。
     if cleanup_unapplied_ssh_tracking 0; then
         return 0
     fi
@@ -8500,7 +8679,7 @@ rollback_ssh_port_change() {
     fi
     if [ "$applied_before" != "1" ]; then
         # 首次 SSH 事务失败时必须同时清掉备份基线和端口记录；若此前已成功应用过，
-        # 则保留旧版本也会读取的 BACKUP_SSHD_* / SSH_PORTS，供恢复菜单继续回退。
+        # 则保留 BACKUP_SSHD_* / SSH_PORTS，供恢复菜单继续回退。
         if ! clear_ssh_change_tracking; then
             err "SSH 已回滚，但无法清理首次事务记录；恢复菜单仍会保留该项目。"
             return 1
@@ -8524,7 +8703,7 @@ rollback_ssh_hardening_change() {
         return 1
     fi
     if [ "$applied_before" != "1" ]; then
-        # 与端口修改共用同一份旧版恢复基线，首次加固失败也不能留下过期备份。
+        # 与端口修改共用同一份恢复基线，首次加固失败也不能留下过期备份。
         clear_ssh_change_tracking || return 1
     fi
 }
@@ -8762,10 +8941,6 @@ sync_fail2ban_sshd_port() {
             "Fail2ban 防护已验证，但无法记录已应用状态" "$backup" "$was_running" || true
         return 1
     fi
-    # 旧版本曾使用该文件名；新文件按字典序后加载并已验证生效，因此旧文件清理失败
-    # 只保留为兼容残留，不应把已成功应用的防护状态误报为失败。
-    rm -f "$FAIL2BAN_CONFIG_DIR/99-vpsbox-sshd-port.local" ||
-        warn "旧版 Fail2ban SSH 端口配置未能清理，可稍后手动删除。"
     prune_fail2ban_sshd_backups || warn "Fail2ban 历史备份清理不完整，最多保留 5 份的策略未完全执行。"
 }
 
@@ -9160,13 +9335,8 @@ ssh_restore_snapshot_path_allowed() {
     root="$(ssh_restore_snapshot_root)"
     parent="$(dirname -- "$snapshot_dir")"
     base="${snapshot_dir##*/}"
-    if [ "$parent" = "$root" ]; then
+    [ "$parent" = "$root" ] &&
         [[ "$base" == restore.* || "$base" == .building.* ]]
-    elif [ "$parent" = /tmp ]; then
-        [[ "$base" == vpsbox-ssh-restore.* ]]
-    else
-        return 1
-    fi
 }
 
 remove_ssh_restore_snapshot() {
@@ -9205,26 +9375,6 @@ ssh_restore_snapshot_dir_valid() {
     ssh_restore_snapshot_path_allowed "$snapshot_dir" &&
         [ -d "$snapshot_dir" ] && [ ! -L "$snapshot_dir" ] || return 1
     root="$(ssh_restore_snapshot_root)"
-    if [[ "$snapshot_dir" == /tmp/vpsbox-ssh-restore.* ]]; then
-        # 兼容 v1.0.32 及更早版本在 /tmp 创建、且没有完整性清单的 SSH 恢复快照。
-        ssh_restore_snapshot_path_is_secure "$snapshot_dir" 700 || return 1
-        for name in main port hardening; do
-            if [ -f "$snapshot_dir/$name" ] && [ ! -L "$snapshot_dir/$name" ] &&
-                [ ! -e "$snapshot_dir/$name.absent" ] && [ ! -L "$snapshot_dir/$name.absent" ]; then
-                if [ "${VPSBOX_TEST_MODE:-0}" != "1" ]; then
-                    mode="$(stat -c '%a' "$snapshot_dir/$name" 2>/dev/null)" || return 1
-                    [[ "$mode" =~ ^[0-7]{3,4}$ ]] &&
-                        [ $((8#$mode & 8#022)) -eq 0 ] || return 1
-                fi
-            elif [ -f "$snapshot_dir/$name.absent" ] && [ ! -L "$snapshot_dir/$name.absent" ] &&
-                [ ! -e "$snapshot_dir/$name" ] && [ ! -L "$snapshot_dir/$name" ]; then
-                :
-            else
-                return 1
-            fi
-        done
-        return 0
-    fi
     [[ "$snapshot_dir" == "$root"/restore.* ]] || return 1
     [ -d "$root" ] && [ ! -L "$root" ] &&
         ssh_restore_snapshot_path_is_secure "$root" 700 || return 1
@@ -9349,13 +9499,9 @@ restore_ssh_runtime_snapshot() {
             hardening) path="$SSHD_VPSBOX_HARDENING_CONF" ;;
         esac
         if [ -f "$snapshot_dir/$name" ]; then
-            if [[ "$snapshot_dir" == /tmp/vpsbox-ssh-restore.* ]]; then
-                mode="$(stat -c '%a' "$snapshot_dir/$name" 2>/dev/null)" || return 1
-            else
-                entry="$(ssh_restore_snapshot_manifest_entry "$snapshot_dir/manifest" "$name")" ||
-                    return 1
-                IFS='|' read -r _ _ mode _ <<< "$entry"
-            fi
+            entry="$(ssh_restore_snapshot_manifest_entry "$snapshot_dir/manifest" "$name")" ||
+                return 1
+            IFS='|' read -r _ _ mode _ <<< "$entry"
             install_ssh_config_atomically "$snapshot_dir/$name" "$path" "$mode" || return 1
         elif [ -f "$snapshot_dir/$name.absent" ]; then
             rm -f "$path" || return 1
@@ -11404,8 +11550,6 @@ firewall_rollback_dir_valid() {
 
     case "$dir" in
         "$FIREWALL_ROLLBACK_DIR"/firewall-rollback.*) ;;
-        # 兼容 v1.0.25 及更早版本在 /run/vpsbox 中留下、尚未完成的回滚快照。
-        "$RUNTIME_DIR"/firewall-rollback.*) ;;
         *) return 1 ;;
     esac
     [ -d "$dir" ] && [ ! -L "$dir" ]
@@ -11474,9 +11618,8 @@ firewall_sleep_process_matches() {
         sleep|*/sleep) ;;
         *) return 1 ;;
     esac
-    # 兼容 v1.0.16-v1.0.18 的一次性 sleep 90：脚本升级后仍需能终止旧快照留下的等待进程。
-    # 当前 watchdog 使用 sleep 1 轮询；这里只接受两种精确参数，避免误杀其他 sleep。
-    [ "${args[1]}" = "1" ] || [ "${args[1]}" = "$FIREWALL_ROLLBACK_SECONDS" ]
+    # 当前 watchdog 只使用 sleep 1 轮询，精确限制参数以避免误杀其他 sleep。
+    [ "${args[1]}" = "1" ]
 }
 
 firewall_watchdog_sleep_records() {
@@ -11588,8 +11731,8 @@ firewall_stop_rollback_watchdog() {
     if [ -e "$dir/watchdog.pid" ]; then
         IFS= read -r pid < "$dir/watchdog.pid" || pid=""
         if is_pid "$pid" && [ "$pid" -gt 1 ] && [ "$pid" -ne "$$" ]; then
-            # 兼容 v1.0.16-v1.0.18 仅写 watchdog.pid 的快照：升级后旧快照仍可能待回滚。
-            # 缺少身份字段时必须再核对精确脚本命令行，避免 PID 复用导致误杀；该分支也处理当前版本分步落盘中断。
+            # 当前版本分步写入 watchdog 元数据；中断后可能只留下 PID。
+            # 缺少身份字段时必须再核对精确脚本命令行，避免 PID 复用导致误杀。
             if [ -e "$dir/watchdog.start" ] && [ -e "$dir/watchdog.boot" ]; then
                 if firewall_watchdog_identity_matches "$dir" "$pid"; then
                     start="$(process_start_ticks "$pid")"
@@ -11611,7 +11754,7 @@ firewall_stop_rollback_watchdog() {
         fi
     fi
 
-    # 兼容旧快照的空 PID、陈旧 PID，以及当前版本在元数据落盘前中断的情况。
+    # 收敛空 PID、陈旧 PID，以及当前版本在元数据落盘前中断的情况。
     # PID 文件仅作快速定位，最终只扫描精确 rollback.sh 命令行，既能收敛遗留 watchdog 又避免误杀。
     while IFS= read -r found_pid; do
         [ -n "$found_pid" ] || continue
@@ -11637,43 +11780,38 @@ firewall_cleanup_finished_rollback() {
 }
 
 firewall_recover_pending_rollbacks() {
-    local dir decision owner root
+    local dir decision owner
 
-    prepare_runtime_dir
     firewall_prepare_rollback_store || return 1
-    for root in "$FIREWALL_ROLLBACK_DIR" "$RUNTIME_DIR"; do
-        for dir in "$root"/.firewall-rollback-build.*; do
-            [ -e "$dir" ] || continue
-            if [ ! -d "$dir" ] || [ -L "$dir" ]; then
-                err "检测到不安全的防火墙回滚构建目录：$dir"
-                return 1
-            fi
-            rm -rf "$dir" || return 1
-        done
+    for dir in "$FIREWALL_ROLLBACK_DIR"/.firewall-rollback-build.*; do
+        [ -e "$dir" ] || continue
+        if [ ! -d "$dir" ] || [ -L "$dir" ]; then
+            err "检测到不安全的防火墙回滚构建目录：$dir"
+            return 1
+        fi
+        rm -rf "$dir" || return 1
     done
-    for root in "$FIREWALL_ROLLBACK_DIR" "$RUNTIME_DIR"; do
-        for dir in "$root"/firewall-rollback.*; do
-            [ -e "$dir" ] || continue
-            if [ ! -d "$dir" ] || [ -L "$dir" ]; then
-                err "检测到不安全的防火墙回滚目录：$dir"
+    for dir in "$FIREWALL_ROLLBACK_DIR"/firewall-rollback.*; do
+        [ -e "$dir" ] || continue
+        if [ ! -d "$dir" ] || [ -L "$dir" ]; then
+            err "检测到不安全的防火墙回滚目录：$dir"
+            return 1
+        fi
+        if [ -e "$dir/completed" ] || [ -e "$dir/rolled-back" ]; then
+            if ! firewall_cleanup_finished_rollback "$dir"; then
+                err "已完成的防火墙快照清理失败，已拒绝开始新的防火墙操作：$dir"
                 return 1
             fi
-            if [ -e "$dir/completed" ] || [ -e "$dir/rolled-back" ]; then
-                if ! firewall_cleanup_finished_rollback "$dir"; then
-                    err "已完成的防火墙快照清理失败，已拒绝开始新的防火墙操作：$dir"
-                    return 1
-                fi
-                continue
-            fi
-            decision="$(cat "$dir/decision" 2>/dev/null || true)"
-            owner=0
-            [ "$decision" = "commit" ] && owner=1
-            warn "检测到未完成的防火墙操作，正在先恢复快照：$dir"
-            if ! firewall_restore_snapshot_now "$dir" "$owner"; then
-                err "旧防火墙快照尚未恢复，已拒绝开始新的防火墙操作。"
-                return 1
-            fi
-        done
+            continue
+        fi
+        decision="$(cat "$dir/decision" 2>/dev/null || true)"
+        owner=0
+        [ "$decision" = "commit" ] && owner=1
+        warn "检测到未完成的防火墙操作，正在先恢复快照：$dir"
+        if ! firewall_restore_snapshot_now "$dir" "$owner"; then
+            err "旧防火墙快照尚未恢复，已拒绝开始新的防火墙操作。"
+            return 1
+        fi
     done
 }
 
@@ -11786,23 +11924,16 @@ restore_lock_metadata_value() {
 
 restore_lock_metadata_ready() {
     lock_dir="\$dir/restore.lock"
-    [ -s "\$lock_dir/owner" ] ||
-        { [ -s "\$lock_dir/pid" ] && [ -s "\$lock_dir/start" ] && [ -s "\$lock_dir/boot" ]; }
+    [ -s "\$lock_dir/owner" ] && [ ! -L "\$lock_dir/owner" ]
 }
 
 restore_lock_owner_matches() {
     lock_dir="\$dir/restore.lock"
     [ -d "\$lock_dir" ] && [ ! -L "\$lock_dir" ] || return 1
-    if [ -s "\$lock_dir/owner" ] && [ ! -L "\$lock_dir/owner" ]; then
-        lock_pid="\$(restore_lock_metadata_value "\$lock_dir/owner" pid)" || return 1
-        lock_start="\$(restore_lock_metadata_value "\$lock_dir/owner" start)" || return 1
-        lock_boot="\$(restore_lock_metadata_value "\$lock_dir/owner" boot)" || return 1
-    else
-        # 兼容 v1.0.32 及更早版本生成的 pid/start/boot 三文件锁。
-        lock_pid="\$(cat "\$lock_dir/pid" 2>/dev/null)" || return 1
-        lock_start="\$(cat "\$lock_dir/start" 2>/dev/null)" || return 1
-        lock_boot="\$(cat "\$lock_dir/boot" 2>/dev/null)" || return 1
-    fi
+    [ -s "\$lock_dir/owner" ] && [ ! -L "\$lock_dir/owner" ] || return 1
+    lock_pid="\$(restore_lock_metadata_value "\$lock_dir/owner" pid)" || return 1
+    lock_start="\$(restore_lock_metadata_value "\$lock_dir/owner" start)" || return 1
+    lock_boot="\$(restore_lock_metadata_value "\$lock_dir/owner" boot)" || return 1
     case "\$lock_pid:\$lock_start" in
         *[!0-9:]*|:*|*:) return 1 ;;
     esac
@@ -11813,8 +11944,7 @@ restore_lock_owner_matches() {
 
 cleanup_restore_lock() {
     lock_dir="\$dir/restore.lock"
-    rm -f "\$lock_dir/owner" "\$lock_dir/pid" "\$lock_dir/start" "\$lock_dir/boot" \
-        "\$dir/.restore.lock.owner.\$\$"
+    rm -f "\$lock_dir/owner" "\$dir/.restore.lock.owner.\$\$"
     rmdir "\$lock_dir" >/dev/null 2>&1 || true
 }
 
@@ -11828,9 +11958,9 @@ acquire_restore_lock() {
             lock_wait=\$((lock_wait + 1))
         done
         restore_lock_owner_matches && return 2
-        # 旧回滚进程被 SIGKILL 后可能遗留 restore.lock。只有持有者身份已失效，
+        # 恢复进程被 SIGKILL 后可能遗留 restore.lock。只有持有者身份已失效，
         # 且目录中仅含 vpsbox 元数据时才回收，避免覆盖仍在执行的恢复。
-        rm -f "\$lock_dir/owner" "\$lock_dir/pid" "\$lock_dir/start" "\$lock_dir/boot"
+        rm -f "\$lock_dir/owner"
         rmdir "\$lock_dir" 2>/dev/null || return 1
         mkdir "\$lock_dir" 2>/dev/null || return 1
     fi
@@ -13642,6 +13772,7 @@ run_self_check() {
     local max_use
     local max_file
     local state node_protocols protocol label ips detail ports_report
+    local install_metadata installed_version installed_at
     local bbr_config_expected=0 ipv4_priority_expected=0 ssh_hardening_expected=0
     local singbox_available=0
     local CHECK_OK_COUNT=0
@@ -13668,6 +13799,19 @@ EOF
         check_ok "vpsbox 命令" "$CMD_PATH"
     else
         check_warn "vpsbox 命令" "未安装到 $CMD_PATH"
+    fi
+    if install_metadata="$(install_metadata_read 2>/dev/null)"; then
+        installed_version="${install_metadata%%$'\n'*}"
+        installed_at="${install_metadata#*$'\n'}"
+        if [ "$installed_version" = "unknown" ]; then
+            check_info "首次安装" "历史未记录"
+        else
+            check_ok "首次安装" "$installed_version / $installed_at"
+        fi
+    elif [ -e "$INSTALL_METADATA_FILE" ] || [ -L "$INSTALL_METADATA_FILE" ]; then
+        check_warn "首次安装" "记录异常"
+    else
+        check_info "首次安装" "历史未记录"
     fi
 
     if node_artifacts_present; then
@@ -14060,10 +14204,10 @@ uninstall_all() {
     fi
 
     info "正在删除 vpsbox 命令..."
-    if ! rm -f "$CMD_PATH" /usr/bin/vpsbox ||
+    if ! rm -f "$CMD_PATH" "$CMD_ALIAS_PATH" ||
         [ -e "$CMD_PATH" ] || [ -L "$CMD_PATH" ] ||
-        [ -e /usr/bin/vpsbox ] || [ -L /usr/bin/vpsbox ]; then
-        err "vpsbox 管理命令删除失败，请检查 $CMD_PATH 与 /usr/bin/vpsbox。"
+        [ -e "$CMD_ALIAS_PATH" ] || [ -L "$CMD_ALIAS_PATH" ]; then
+        err "vpsbox 管理命令删除失败，请检查 $CMD_PATH 与 $CMD_ALIAS_PATH。"
         return 1
     fi
 
@@ -14316,8 +14460,6 @@ cleanup_old_temp_dirs() {
         case "$path" in
             "${ACTIVE_NODE_BACKUP:-}") continue ;;
         esac
-        # 兼容 v1.0.32 及更早版本的 /tmp SSH 恢复快照：它可能是失败后仅存的
-        # 重试依据，因此不再由垃圾清理自动删除。
         case "$path" in
             "$base"/vpsbox-node-backup.*|\
             "$base"/vpsbox-sing-box-release.*|\
@@ -14437,7 +14579,7 @@ offer_restore_recorded_changes_before_uninstall() {
 restore_vpsbox_system_changes() {
     local skip_confirmation="${1:-0}"
     local confirm cc fq old failed=0
-    local fail2ban_active fail2ban_enabled
+    local fail2ban_active fail2ban_enabled fail2ban_metadata_valid=0
 
     if [ "$skip_confirmation" != "1" ]; then
         show_vpsbox_changes
@@ -14467,19 +14609,26 @@ restore_vpsbox_system_changes() {
     fi
     if change_needs_restore GAI_CONF && ! restore_change_file GAI_CONF "$GAI_CONF"; then failed=1; fi
     if change_needs_restore FAIL2BAN_SSHD; then
-        restore_change_file FAIL2BAN_SSHD "$FAIL2BAN_VPSBOX_SSHD_CONF" || failed=1
-        if fail2ban_installed; then
+        fail2ban_active="$(manifest_value FAIL2BAN_ACTIVE 2>/dev/null || true)"
+        fail2ban_enabled="$(manifest_value FAIL2BAN_ENABLED 2>/dev/null || true)"
+        case "$fail2ban_active:$fail2ban_enabled" in
+            active:enabled|active:disabled|inactive:enabled|inactive:disabled)
+                fail2ban_metadata_valid=1
+                restore_change_file FAIL2BAN_SSHD "$FAIL2BAN_VPSBOX_SSHD_CONF" || failed=1
+                ;;
+            *)
+                err "Fail2ban 恢复记录缺少有效的服务状态，已拒绝修改配置和服务。"
+                failed=1
+                ;;
+        esac
+        if [ "$fail2ban_metadata_valid" -eq 1 ] && fail2ban_installed; then
             fail2ban-client -t -c /etc/fail2ban >/dev/null 2>&1 || failed=1
-            fail2ban_active="$(manifest_value FAIL2BAN_ACTIVE 2>/dev/null || true)"
-            fail2ban_enabled="$(manifest_value FAIL2BAN_ENABLED 2>/dev/null || true)"
-            # 兼容 v1.0.0-v1.0.1 已记录 Fail2ban 配置但尚未记录服务状态的清单：
-            # 缺失状态时不猜测启用关系，仅在服务当前仍运行时重启以加载恢复后的配置。
             if is_systemd; then
                 if [ "$fail2ban_enabled" = "enabled" ]; then systemctl enable fail2ban || failed=1; elif [ "$fail2ban_enabled" = "disabled" ]; then systemctl disable fail2ban || failed=1; fi
-                if [ "$fail2ban_active" = "active" ]; then systemctl restart fail2ban || failed=1; elif [ "$fail2ban_active" = "inactive" ]; then systemctl stop fail2ban || failed=1; elif systemctl is-active --quiet fail2ban; then systemctl restart fail2ban || failed=1; fi
+                if [ "$fail2ban_active" = "active" ]; then systemctl restart fail2ban || failed=1; else systemctl stop fail2ban || failed=1; fi
             elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
                 if [ "$fail2ban_enabled" = "enabled" ]; then rc-update add fail2ban default || failed=1; elif [ "$fail2ban_enabled" = "disabled" ]; then rc-update del fail2ban default || failed=1; fi
-                if [ "$fail2ban_active" = "active" ]; then rc-service fail2ban restart || failed=1; elif [ "$fail2ban_active" = "inactive" ]; then rc-service fail2ban stop || failed=1; elif rc-service fail2ban status >/dev/null 2>&1; then rc-service fail2ban restart || failed=1; fi
+                if [ "$fail2ban_active" = "active" ]; then rc-service fail2ban restart || failed=1; else rc-service fail2ban stop || failed=1; fi
             fi
         fi
     fi
@@ -15113,8 +15262,8 @@ EOF
 main_loop() {
     while true; do
         show_menu
-        # 只有新版已完成初始化并成功渲染首个菜单，才确认本次自更新启动成功。
-        # v1.0.21 及更早版本不会传递握手变量，因此普通启动不会误用陈旧 .previous。
+        # 只有新版已完成初始化并成功渲染首个菜单，且收到本次更新的一次性握手变量，
+        # 才确认自更新启动成功；普通启动不会误用陈旧 .previous。
         confirm_pending_vpsbox_update
         read -r -p "请输入选项: " opt || exit 0
         echo ""

@@ -43,10 +43,47 @@ function Get-NextPatchVersion {
     if ($Version -notmatch '^v([0-9]+)\.([0-9]+)\.([0-9]+)$') {
         throw "版本号格式不正确：$Version"
     }
-    return 'v{0}.{1}.{2}' -f
-        [int]$Matches[1],
-        [int]$Matches[2],
-        ([int]$Matches[3] + 1)
+    $major = [int]$Matches[1]
+    $minor = [int]$Matches[2]
+    $patch = [int]$Matches[3]
+    if ($patch -gt 99) {
+        throw "补丁版本号必须在 0-99 范围内：$Version"
+    }
+    if ($patch -eq 99) {
+        $minor += 1
+        $patch = 0
+    }
+    else {
+        $patch += 1
+    }
+    return 'v{0}.{1}.{2}' -f $major, $minor, $patch
+}
+
+function Assert-NextPatchVersionRules {
+    foreach ($case in @(
+            [pscustomobject]@{ Current = 'v1.0.44'; Expected = 'v1.0.45' }
+            [pscustomobject]@{ Current = 'v1.0.99'; Expected = 'v1.1.0' }
+            [pscustomobject]@{ Current = 'v1.99.99'; Expected = 'v1.100.0' }
+        )) {
+        $actual = Get-NextPatchVersion -Version $case.Current
+        if ($actual -cne $case.Expected) {
+            throw (
+                "版本递增规则断言失败：$($case.Current) 应得到 " +
+                "$($case.Expected)，实际为 $actual"
+            )
+        }
+    }
+
+    $invalidRejected = $false
+    try {
+        [void](Get-NextPatchVersion -Version 'v1.0.100')
+    }
+    catch {
+        $invalidRejected = $true
+    }
+    if (-not $invalidRejected) {
+        throw '版本递增规则断言失败：补丁位大于 99 时必须拒绝。'
+    }
 }
 
 function Get-HeadVersion {
@@ -268,6 +305,8 @@ $scriptPath = Join-Path $repoRoot 'vpsbox.sh'
 $testsPath = Join-Path $repoRoot 'tests'
 $selfRelativePath = 'tools/release.ps1'
 $releaseScriptPath = Join-Path $repoRoot $selfRelativePath
+
+Assert-NextPatchVersionRules
 
 if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf) -or
     -not (Test-Path -LiteralPath $testsPath -PathType Container)) {

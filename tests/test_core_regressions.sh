@@ -1029,6 +1029,8 @@ test_self_check_classifies_and_summarizes_results() {
     (
         local first_output="$TEST_TMP/self-check-empty-first.out"
         local second_output="$TEST_TMP/self-check-empty-second.out"
+        local metadata_output="$TEST_TMP/self-check-install-metadata.out"
+        local metadata_invalid_output="$TEST_TMP/self-check-install-metadata-invalid.out"
         local external_output="$TEST_TMP/self-check-external-journald.out"
         local scan_fail_output="$TEST_TMP/self-check-scan-fail.out"
         local status count
@@ -1060,6 +1062,17 @@ test_self_check_classifies_and_summarizes_results() {
                 *) return 1 ;;
             esac
         }
+        install_metadata_read() {
+            [ -f "$INSTALL_METADATA_FILE" ] || return 1
+            case "$(cat "$INSTALL_METADATA_FILE")" in
+                $'FIRST_INSTALLED_VERSION=v1.0.44\nFIRST_INSTALLED_AT=2026-07-29T01:02:03Z')
+                    printf '%s\n' v1.0.44 2026-07-29T01:02:03Z
+                    ;;
+                *)
+                    return 1
+                    ;;
+            esac
+        }
         show_ports_security_group() {
             [ "$ports_ok" -eq 1 ] || return 1
             printf '%s\n' PORTS_MARKER
@@ -1068,6 +1081,8 @@ test_self_check_classifies_and_summarizes_results() {
         FIREWALL_STATE_FILE="$TEST_TMP/missing-firewall.env"
         BBR_CONF="$TEST_TMP/missing-bbr.conf"
         SSHD_VPSBOX_HARDENING_CONF="$TEST_TMP/missing-ssh-hardening.conf"
+        VPSBOX_STATE_DIR="$TEST_TMP/self-check-state"
+        INSTALL_METADATA_FILE="$VPSBOX_STATE_DIR/install.env"
         change_applied_recorded_readonly() { return 1; }
 
         run_self_check > "$first_output" 2>&1 ||
@@ -1110,6 +1125,26 @@ test_self_check_classifies_and_summarizes_results() {
         assert_file_contains "$first_output" 'INFO[[:space:]]+[|] SSH 基础加固[[:space:]]+[|] 未配置'
         assert_file_contains "$first_output" 'INFO[[:space:]]+[|] NTP 同步[[:space:]]+[|] 未安装'
         assert_file_contains "$first_output" 'INFO[[:space:]]+[|] 主机防火墙[[:space:]]+[|] 未启用'
+        assert_file_contains "$first_output" \
+            'INFO[[:space:]]+[|] 首次安装[[:space:]]+[|] 历史未记录'
+
+        mkdir -p "$VPSBOX_STATE_DIR"
+        chmod 700 "$VPSBOX_STATE_DIR"
+        printf '%s\n' \
+            'FIRST_INSTALLED_VERSION=v1.0.44' \
+            'FIRST_INSTALLED_AT=2026-07-29T01:02:03Z' \
+            > "$INSTALL_METADATA_FILE"
+        chmod 600 "$INSTALL_METADATA_FILE"
+        run_self_check > "$metadata_output" 2>&1 ||
+            fail "有首次安装记录时一键检测应正常完成"
+        assert_file_contains "$metadata_output" \
+            'OK[[:space:]]+[|] 首次安装[[:space:]]+[|] v1[.]0[.]44 / 2026-07-29T01:02:03Z'
+        printf '%s\n' 'MALFORMED=keep-me' > "$INSTALL_METADATA_FILE"
+        chmod 600 "$INSTALL_METADATA_FILE"
+        run_self_check > "$metadata_invalid_output" 2>&1 ||
+            fail "首次安装记录异常时一键检测仍应正常完成"
+        assert_file_contains "$metadata_invalid_output" \
+            'WARN[[:space:]]+[|] 首次安装[[:space:]]+[|] 记录异常'
 
         mock_ntp_state=运行中
         mock_journald_state=已配置
@@ -1166,6 +1201,8 @@ test_self_check_classifies_and_summarizes_results() {
         JOURNALD_VPSBOX_CONF="$TEST_TMP/damaged-journald.conf"
         BBR_CONF="$TEST_TMP/damaged-bbr.conf"
         SSHD_VPSBOX_HARDENING_CONF="$TEST_TMP/damaged-ssh-hardening.conf"
+        VPSBOX_STATE_DIR="$TEST_TMP/self-check-damaged-state"
+        INSTALL_METADATA_FILE="$VPSBOX_STATE_DIR/install.env"
         change_applied_recorded_readonly() { [ "$1" = GAI_CONF ]; }
         printf '%s\n' broken > "$JOURNALD_VPSBOX_CONF"
         printf '%s\n' broken > "$BBR_CONF"
@@ -1258,6 +1295,8 @@ test_self_check_classifies_and_summarizes_results() {
         JOURNALD_VPSBOX_CONF="$TEST_TMP/missing-node-case-journald.conf"
         FIREWALL_STATE_FILE="$TEST_TMP/missing-node-case-firewall.env"
         URI_FILE="$TEST_TMP/missing-node-uri.txt"
+        VPSBOX_STATE_DIR="$TEST_TMP/self-check-node-state"
+        INSTALL_METADATA_FILE="$VPSBOX_STATE_DIR/install.env"
 
         run_self_check > "$output" 2>&1 ||
             fail "节点监听和链接缺失时仍应完成状态报告"
@@ -1736,6 +1775,351 @@ test_install_self_reports_download_failure() {
             fail "进程替换首次安装下载失败时必须返回非零"
         fi
         [ ! -e "$CMD_PATH" ] || fail "下载失败不应留下管理命令"
+    )
+}
+
+test_install_metadata_parser_rejects_malformed_or_insecure_records() {
+    [ "$(id -u)" = "0" ] ||
+        { skip "需要 root 文件属主语义"; return "$?"; }
+    (
+        local root="$TEST_TMP/install-metadata-parser"
+        local values
+        VPSBOX_STATE_DIR="$root/state"
+        INSTALL_METADATA_FILE="$VPSBOX_STATE_DIR/install.env"
+        mkdir -p "$VPSBOX_STATE_DIR"
+        chmod 700 "$VPSBOX_STATE_DIR"
+
+        printf '%s\n' \
+            'FIRST_INSTALLED_VERSION=v1.2.3' \
+            'FIRST_INSTALLED_AT=2026-07-29T01:02:03Z' \
+            > "$INSTALL_METADATA_FILE"
+        chmod 600 "$INSTALL_METADATA_FILE"
+        values="$(install_metadata_read)" ||
+            fail "合法的首次安装记录必须可读取"
+        assert_eq $'v1.2.3\n2026-07-29T01:02:03Z' "$values"
+
+        chmod 755 "$VPSBOX_STATE_DIR"
+        if install_metadata_read >/dev/null 2>&1; then
+            fail "首次安装记录目录权限不安全时必须拒绝读取"
+        fi
+        chmod 700 "$VPSBOX_STATE_DIR"
+
+        chown 65534:65534 "$VPSBOX_STATE_DIR"
+        if install_metadata_read >/dev/null 2>&1; then
+            fail "首次安装记录目录不是 root 所有时必须拒绝读取"
+        fi
+        chown root:root "$VPSBOX_STATE_DIR"
+
+        chown 65534:65534 "$INSTALL_METADATA_FILE"
+        if install_metadata_read >/dev/null 2>&1; then
+            fail "首次安装记录文件不是 root 所有时必须拒绝读取"
+        fi
+        chown root:root "$INSTALL_METADATA_FILE"
+
+        printf '%s\n' \
+            'FIRST_INSTALLED_VERSION=v1.2.3' \
+            'FIRST_INSTALLED_AT=2026-07-29T01:02:03Z' \
+            'EXTRA_FIELD=unexpected' \
+            > "$INSTALL_METADATA_FILE"
+        chmod 600 "$INSTALL_METADATA_FILE"
+        if install_metadata_read >/dev/null 2>&1; then
+            fail "首次安装记录不得接受白名单外字段"
+        fi
+
+        printf '%s\n' \
+            'FIRST_INSTALLED_VERSION=v1.2.3' \
+            'FIRST_INSTALLED_VERSION=v9.9.9' \
+            'FIRST_INSTALLED_AT=2026-07-29T01:02:03Z' \
+            > "$INSTALL_METADATA_FILE"
+        chmod 600 "$INSTALL_METADATA_FILE"
+        if install_metadata_read >/dev/null 2>&1; then
+            fail "首次安装记录不得接受重复字段"
+        fi
+
+        printf '%s\n' \
+            'FIRST_INSTALLED_VERSION=1.2.3' \
+            'FIRST_INSTALLED_AT=2026-07-29 01:02:03' \
+            > "$INSTALL_METADATA_FILE"
+        chmod 600 "$INSTALL_METADATA_FILE"
+        if install_metadata_read >/dev/null 2>&1; then
+            fail "首次安装记录不得接受非规范版本或时间"
+        fi
+
+        printf '%s\n' \
+            'FIRST_INSTALLED_VERSION=unknown' \
+            'FIRST_INSTALLED_AT=2026-07-29T01:02:03Z' \
+            > "$INSTALL_METADATA_FILE"
+        chmod 600 "$INSTALL_METADATA_FILE"
+        if install_metadata_read >/dev/null 2>&1; then
+            fail "首次安装记录不得混用 unknown 与精确值"
+        fi
+
+        printf '%s\n' \
+            'FIRST_INSTALLED_VERSION=unknown' \
+            'FIRST_INSTALLED_AT=unknown' \
+            > "$INSTALL_METADATA_FILE"
+        chmod 666 "$INSTALL_METADATA_FILE"
+        if install_metadata_read >/dev/null 2>&1; then
+            fail "首次安装记录权限不安全时必须拒绝读取"
+        fi
+
+        require_real_symlink file || return "$?"
+        rm -f "$INSTALL_METADATA_FILE"
+        printf '%s\n' \
+            'FIRST_INSTALLED_VERSION=unknown' \
+            'FIRST_INSTALLED_AT=unknown' \
+            > "$root/linked-install.env"
+        chmod 600 "$root/linked-install.env"
+        ln -s "$root/linked-install.env" "$INSTALL_METADATA_FILE"
+        if install_metadata_read >/dev/null 2>&1; then
+            fail "首次安装记录为符号链接时必须拒绝读取"
+        fi
+
+        rm -f "$INSTALL_METADATA_FILE"
+        printf '%s\n' \
+            'FIRST_INSTALLED_VERSION=unknown' \
+            'FIRST_INSTALLED_AT=unknown' \
+            > "$VPSBOX_STATE_DIR/install.env"
+        chmod 600 "$VPSBOX_STATE_DIR/install.env"
+        mv "$VPSBOX_STATE_DIR" "$root/real-state"
+        ln -s "$root/real-state" "$VPSBOX_STATE_DIR"
+        if install_metadata_read >/dev/null 2>&1; then
+            fail "首次安装记录目录为符号链接时必须拒绝读取"
+        fi
+    )
+}
+
+test_install_self_records_fresh_or_unknown_metadata_once() {
+    [ "$(id -u)" = "0" ] ||
+        { skip "需要 root 文件属主语义"; return "$?"; }
+    (
+        local root="$TEST_TMP/install-metadata-fresh"
+        local source="$root/source.sh"
+        local alias_log="$root/alias.log"
+        local values
+        mkdir -p "$root"
+        printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'VPSBOX_VERSION="v9.8.7"' \
+            > "$source"
+        CMD_PATH="$root/bin/vpsbox"
+        VPSBOX_STATE_DIR="$root/state"
+        INSTALL_METADATA_FILE="$VPSBOX_STATE_DIR/install.env"
+        install_command_alias() { printf '%s\n' alias >> "$alias_log"; }
+
+        install_self_command "$source" ||
+            fail "全新安装完成命令文件与快捷入口后应成功"
+        assert_eq alias "$(cat "$alias_log")" "首次安装必须先完成快捷入口"
+        values="$(install_metadata_read)" ||
+            fail "全新安装必须生成可验证的首次安装记录"
+        assert_file_contains "$INSTALL_METADATA_FILE" '^FIRST_INSTALLED_VERSION=v9[.]8[.]7$'
+        assert_file_contains "$INSTALL_METADATA_FILE" \
+            '^FIRST_INSTALLED_AT=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
+        assert_eq '0:0 700' \
+            "$(stat -c '%u:%g %a' "$VPSBOX_STATE_DIR")" \
+            "首次安装记录目录必须为 root:root 700"
+        assert_eq '0:0 600' \
+            "$(stat -c '%u:%g %a' "$INSTALL_METADATA_FILE")" \
+            "首次安装记录必须为 root:root 600"
+        [ "${values%%$'\n'*}" = "v9.8.7" ] ||
+            fail "首次安装版本必须来自最终安装的脚本"
+    )
+    (
+        local root="$TEST_TMP/install-metadata-existing"
+        local source="$root/source.sh"
+        mkdir -p "$root/bin"
+        printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'VPSBOX_VERSION="v1.0.1"' \
+            > "$root/bin/vpsbox"
+        printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'VPSBOX_VERSION="v9.8.7"' \
+            > "$source"
+        CMD_PATH="$root/bin/vpsbox"
+        VPSBOX_STATE_DIR="$root/state"
+        INSTALL_METADATA_FILE="$VPSBOX_STATE_DIR/install.env"
+        install_command_alias() { :; }
+
+        install_self_command "$source" ||
+            fail "已有安装缺少历史记录时仍应完成更新"
+        assert_eq $'unknown\nunknown' "$(install_metadata_read)" \
+            "已有安装不得从当前版本、旧文件或时间戳推断首次安装信息"
+    )
+}
+
+test_install_metadata_is_preserved_and_failures_do_not_block_install() {
+    [ "$(id -u)" = "0" ] ||
+        { skip "需要 root 文件属主语义"; return "$?"; }
+    (
+        local root="$TEST_TMP/install-metadata-preserve"
+        local source="$root/source.sh"
+        local inode_before inode_after
+        mkdir -p "$root/bin" "$root/state"
+        chmod 700 "$root/state"
+        printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'VPSBOX_VERSION="v1.0.1"' \
+            > "$root/bin/vpsbox"
+        printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'VPSBOX_VERSION="v9.8.7"' \
+            > "$source"
+        printf '%s\n' \
+            'FIRST_INSTALLED_VERSION=v1.0.1' \
+            'FIRST_INSTALLED_AT=2026-07-01T00:00:00Z' \
+            > "$root/state/install.env"
+        chmod 600 "$root/state/install.env"
+        CMD_PATH="$root/bin/vpsbox"
+        VPSBOX_STATE_DIR="$root/state"
+        INSTALL_METADATA_FILE="$VPSBOX_STATE_DIR/install.env"
+        install_command_alias() { :; }
+        inode_before="$(stat -c '%i' "$INSTALL_METADATA_FILE")"
+
+        install_self_command "$source" ||
+            fail "已有有效首次安装记录时更新仍应成功"
+        inode_after="$(stat -c '%i' "$INSTALL_METADATA_FILE")"
+        assert_eq "$inode_before" "$inode_after" \
+            "已有有效首次安装记录不得被原子替换或覆盖"
+        assert_eq $'v1.0.1\n2026-07-01T00:00:00Z' "$(install_metadata_read)"
+    )
+    (
+        local root="$TEST_TMP/install-metadata-invalid"
+        local source="$root/source.sh"
+        local output="$root/install.out"
+        local content_before
+        mkdir -p "$root/bin" "$root/state"
+        chmod 700 "$root/state"
+        printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'VPSBOX_VERSION="v1.0.1"' \
+            > "$root/bin/vpsbox"
+        printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'VPSBOX_VERSION="v9.8.7"' \
+            > "$source"
+        printf '%s\n' 'MALFORMED=keep-me' > "$root/state/install.env"
+        chmod 600 "$root/state/install.env"
+        content_before="$(cat "$root/state/install.env")"
+        CMD_PATH="$root/bin/vpsbox"
+        VPSBOX_STATE_DIR="$root/state"
+        INSTALL_METADATA_FILE="$VPSBOX_STATE_DIR/install.env"
+        install_command_alias() { :; }
+
+        install_self_command "$source" > "$output" 2>&1 ||
+            fail "异常首次安装记录不得阻断脚本更新"
+        assert_eq "$content_before" "$(cat "$INSTALL_METADATA_FILE")" \
+            "异常的已有首次安装记录必须保留，不得擅自覆盖"
+        assert_file_contains "$output" '首次安装记录.*异常'
+    )
+    (
+        local root="$TEST_TMP/install-metadata-symlink"
+        local source="$root/source.sh"
+        local target="$root/linked-install.env"
+        local output="$root/install.out"
+        local content_before
+        mkdir -p "$root/bin" "$root/state"
+        chmod 700 "$root/state"
+        printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'VPSBOX_VERSION="v1.0.1"' \
+            > "$root/bin/vpsbox"
+        printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'VPSBOX_VERSION="v9.8.7"' \
+            > "$source"
+        printf '%s\n' 'MALFORMED=keep-linked' > "$target"
+        chmod 600 "$target"
+        ln -s "$target" "$root/state/install.env"
+        content_before="$(cat "$target")"
+        CMD_PATH="$root/bin/vpsbox"
+        VPSBOX_STATE_DIR="$root/state"
+        INSTALL_METADATA_FILE="$VPSBOX_STATE_DIR/install.env"
+        install_command_alias() { :; }
+
+        install_self_command "$source" > "$output" 2>&1 ||
+            fail "已有符号链接记录不得阻断脚本更新"
+        [ -L "$INSTALL_METADATA_FILE" ] ||
+            fail "已有首次安装记录符号链接必须原样保留"
+        assert_eq "$content_before" "$(cat "$target")" \
+            "已有首次安装记录符号链接的目标内容不得被覆盖"
+        assert_file_contains "$output" '首次安装记录.*异常'
+    )
+    (
+        local root="$TEST_TMP/install-metadata-alias-failure"
+        local source="$root/source.sh"
+        local alias_should_fail=1
+        mkdir -p "$root"
+        printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'VPSBOX_VERSION="v9.8.7"' \
+            > "$source"
+        CMD_PATH="$root/bin/vpsbox"
+        VPSBOX_STATE_DIR="$root/state"
+        INSTALL_METADATA_FILE="$VPSBOX_STATE_DIR/install.env"
+        install_command_alias() { [ "$alias_should_fail" -eq 0 ]; }
+
+        if install_self_command "$source" > "$root/install.out" 2>&1; then
+            fail "快捷入口失败时安装必须返回非零"
+        fi
+        [ ! -e "$INSTALL_METADATA_FILE" ] && [ ! -L "$INSTALL_METADATA_FILE" ] ||
+            fail "快捷入口成功前不得写入首次安装记录"
+        [ ! -e "$CMD_PATH" ] && [ ! -L "$CMD_PATH" ] ||
+            fail "全新安装的快捷入口失败后不得残留管理命令"
+
+        alias_should_fail=0
+        install_self_command "$source" || fail "清理未完成安装后必须允许成功重试"
+        assert_eq v9.8.7 "$(install_metadata_read | sed -n '1p')" \
+            "首次成功安装必须记录实际版本，不得误记为历史未知"
+    )
+}
+
+test_uninstall_preserves_install_metadata() {
+    (
+        local root="$TEST_TMP/install-metadata-uninstall"
+        local removed_log="$root/removed.log"
+        mkdir -p "$root/bin" "$root/state"
+        printf '%s\n' command > "$root/bin/vpsbox"
+        printf '%s\n' \
+            'FIRST_INSTALLED_VERSION=v1.0.44' \
+            'FIRST_INSTALLED_AT=2026-07-29T01:02:03Z' \
+            > "$root/state/install.env"
+        CMD_PATH="$root/bin/vpsbox"
+        CMD_ALIAS_PATH="$root/bin/vpsbox-alias"
+        VPSBOX_STATE_DIR="$root/state"
+        INSTALL_METADATA_FILE="$VPSBOX_STATE_DIR/install.env"
+        firewall_artifacts_present() { return 1; }
+        singbox_artifacts_present() { return 1; }
+        offer_restore_recorded_changes_before_uninstall() { :; }
+        rm() {
+            local arg
+            for arg in "$@"; do
+                case "$arg" in
+                    -*) ;;
+                    "$CMD_PATH")
+                        printf '%s\n' "$arg" >> "$removed_log"
+                        command rm -f -- "$arg"
+                        ;;
+                    "$CMD_ALIAS_PATH")
+                        printf '%s\n' "$arg" >> "$removed_log"
+                        command rm -f -- "$arg"
+                        ;;
+                    *)
+                        fail "卸载测试出现未预期删除目标：$arg"
+                        return 1
+                        ;;
+                esac
+            done
+        }
+        exit() { return 0; }
+
+        uninstall_all <<< 'YES' > "$root/uninstall.out" 2>&1 ||
+            fail "只卸载 vpsbox 管理命令时应成功"
+        [ -f "$INSTALL_METADATA_FILE" ] ||
+            fail "卸载 vpsbox 后必须保留首次安装记录"
+        assert_eq "$CMD_PATH" "$(
+            grep -Fx "$CMD_PATH" "$removed_log"
+        )"
     )
 }
 
@@ -2450,6 +2834,7 @@ main() {
         cleanup_vpsbox_runtime
         update_singbox
         install_self_command
+        install_metadata_read
         stop_service_action
         ssh_port_summary_line
         change_applied_recorded_readonly
@@ -2509,6 +2894,10 @@ main() {
         test_test_mode_blocks_real_service_mutation
         test_protocol_specific_listener_checks
         test_install_self_reports_download_failure
+        test_install_metadata_parser_rejects_malformed_or_insecure_records
+        test_install_self_records_fresh_or_unknown_metadata_once
+        test_install_metadata_is_preserved_and_failures_do_not_block_install
+        test_uninstall_preserves_install_metadata
         test_runtime_cleanup_traps_dispatch_recovery_handlers
         test_interrupted_singbox_update_rolls_back
         test_lockdir_metadata_window_is_waited
