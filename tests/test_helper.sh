@@ -200,6 +200,7 @@ run_test_case() {
     set +e
     (
         set -e
+        shopt -s inherit_errexit
         "$name"
     )
     status=$?

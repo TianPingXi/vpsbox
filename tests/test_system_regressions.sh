@@ -373,6 +373,105 @@ test_ntp_service_drift_uses_light_repair() {
     )
 }
 
+test_ntp_light_repair_reports_restore_outcome() {
+    local mode
+
+    for mode in restored incomplete masked; do
+        (
+            local output="$TEST_TMP/ntp-light-repair-$mode.out"
+            local mock_chrony_enabled_state=disabled
+            local mock_chrony_active_state=inactive
+            local mock_timesyncd_enabled_state=enabled
+            local mock_timesyncd_active_state=active
+
+            [ "$mode" != masked ] || mock_chrony_enabled_state=masked
+
+            systemd_unit_exists() { return 0; }
+            systemctl() {
+                case "$*" in
+                    'is-enabled --quiet chrony')
+                        [ "$mock_chrony_enabled_state" = enabled ]
+                        ;;
+                    'is-active --quiet chrony')
+                        [ "$mock_chrony_active_state" = active ]
+                        ;;
+                    'is-enabled --quiet systemd-timesyncd')
+                        [ "$mock_timesyncd_enabled_state" = enabled ]
+                        ;;
+                    'is-active --quiet systemd-timesyncd')
+                        [ "$mock_timesyncd_active_state" = active ]
+                        ;;
+                    'enable chrony')
+                        [ "$mock_chrony_enabled_state" != masked ] || return 23
+                        mock_chrony_enabled_state=enabled
+                        ;;
+                    'start chrony') mock_chrony_active_state=active ;;
+                    'disable --now systemd-timesyncd')
+                        mock_timesyncd_enabled_state=disabled
+                        mock_timesyncd_active_state=inactive
+                        return 23
+                        ;;
+                    'disable chrony')
+                        [ "$mock_chrony_enabled_state" = masked ] ||
+                            mock_chrony_enabled_state=disabled
+                        ;;
+                    'stop chrony')
+                        [ "$mode" = incomplete ] ||
+                            mock_chrony_active_state=inactive
+                        ;;
+                    'enable systemd-timesyncd')
+                        mock_timesyncd_enabled_state=enabled
+                        ;;
+                    'start systemd-timesyncd')
+                        mock_timesyncd_active_state=active
+                        ;;
+                    'is-enabled chrony')
+                        printf '%s\n' "$mock_chrony_enabled_state"
+                        [ "$mock_chrony_enabled_state" = enabled ]
+                        ;;
+                    'is-active chrony')
+                        printf '%s\n' "$mock_chrony_active_state"
+                        [ "$mock_chrony_active_state" = active ]
+                        ;;
+                    'is-enabled systemd-timesyncd')
+                        printf '%s\n' "$mock_timesyncd_enabled_state"
+                        [ "$mock_timesyncd_enabled_state" = enabled ]
+                        ;;
+                    'is-active systemd-timesyncd')
+                        printf '%s\n' "$mock_timesyncd_active_state"
+                        [ "$mock_timesyncd_active_state" = active ]
+                        ;;
+                    *) return 1 ;;
+                esac
+            }
+
+            if repair_ntp_service_state chrony > "$output" 2>&1; then
+                fail "NTP 轻量修复失败后不得报告成功"
+            fi
+            if [ "$mode" = restored ]; then
+                assert_eq disabled "$mock_chrony_enabled_state"
+                assert_eq inactive "$mock_chrony_active_state"
+                assert_eq enabled "$mock_timesyncd_enabled_state"
+                assert_eq active "$mock_timesyncd_active_state"
+                assert_file_contains "$output" '已恢复修改前状态'
+                assert_file_not_contains "$output" '未能完整恢复'
+            elif [ "$mode" = incomplete ]; then
+                assert_eq enabled "$mock_timesyncd_enabled_state"
+                assert_eq active "$mock_timesyncd_active_state"
+                assert_file_contains "$output" '未能完整恢复'
+                assert_file_not_contains "$output" '已恢复修改前状态'
+            else
+                assert_eq masked "$mock_chrony_enabled_state"
+                assert_eq inactive "$mock_chrony_active_state"
+                assert_eq enabled "$mock_timesyncd_enabled_state"
+                assert_eq active "$mock_timesyncd_active_state"
+                assert_file_contains "$output" '已恢复修改前状态'
+                assert_file_not_contains "$output" '未能完整恢复'
+            fi
+        )
+    done
+}
+
 test_enable_ntp_failure_stages_enter_runtime_rollback() {
     local stage
 
@@ -1441,6 +1540,41 @@ EOF
     )
 }
 
+test_hostname_managed_block_write_failure_rolls_back() {
+    (
+        local runtime_hostname="old.example" fail_managed_begin=1
+        local output="$TEST_TMP/hostname-managed-write.out"
+
+        reset_change_store hostname-managed-write
+        HOSTNAME_PATH="$TEST_TMP/hostname-managed-write/hostname"
+        HOSTS_PATH="$TEST_TMP/hostname-managed-write/hosts"
+        builtin printf '%s\n' old.example > "$HOSTNAME_PATH"
+        builtin printf '%s\n' \
+            '127.0.0.1 localhost' '192.0.2.10 user-entry' > "$HOSTS_PATH"
+        hostname_current_value() { builtin printf '%s\n' "$runtime_hostname"; }
+        set_system_hostname() { runtime_hostname="$1"; }
+        printf() {
+            if [ "$fail_managed_begin" -eq 1 ] &&
+                [ "${2:-}" = "$HOSTNAME_BEGIN" ]; then
+                fail_managed_begin=0
+                return 23
+            fi
+            builtin printf "$@"
+        }
+
+        if change_system_hostname <<< "new.example" > "$output" 2>&1; then
+            fail "主机名受管块写入不完整时不得报告成功"
+        fi
+
+        assert_eq old.example "$runtime_hostname"
+        assert_file_contains "$HOSTNAME_PATH" '^old[.]example$'
+        assert_file_contains "$HOSTS_PATH" '^192[.]0[.]2[.]10 user-entry$'
+        assert_file_not_contains "$HOSTS_PATH" '^# (BEGIN|END) VPSBOX HOSTNAME$'
+        assert_file_not_contains "$CHANGE_MANIFEST" '^PENDING_HOSTNAME='
+        assert_file_contains "$output" '更新 .*hosts 失败'
+    )
+}
+
 test_signal_traps_preserve_exit_status() {
     local signal expected status
 
@@ -1543,7 +1677,10 @@ main() {
         apply_ssh_port_change
         enable_ipv4_priority
         enable_ntp_sync
+        ntp_unit_state_matches
+        repair_ntp_service_state
         limit_systemd_journal
+        change_system_hostname
         restore_vpsbox_system_changes
         show_vpsbox_changes
         ssh_restore_snapshot_path_is_secure
@@ -1568,6 +1705,7 @@ main() {
         test_enable_ntp_healthy_is_noop
         test_ntp_unsynchronized_status_is_nonfatal
         test_ntp_service_drift_uses_light_repair
+        test_ntp_light_repair_reports_restore_outcome
         test_enable_ntp_failure_stages_enter_runtime_rollback
         test_bbr_fq_healthy_is_noop
         test_bbr_fq_runtime_drift_uses_light_repair
@@ -1604,6 +1742,7 @@ main() {
         test_chrony_source_file_is_service_readable
         test_dns_verification_uses_bounded_command
         test_hostname_failure_restores_current_operation_state
+        test_hostname_managed_block_write_failure_rolls_back
         test_signal_traps_preserve_exit_status
         test_restore_system_changes_failure_preserves_manifest_and_backup
         test_uninstall_restore_offer_runs_internal_restore

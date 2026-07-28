@@ -30,9 +30,8 @@ test_cleanup() {
 trap test_cleanup EXIT
 
 chown() { :; }
-# 多数用例只关心快照与 watchdog，因此下面会安装默认状态桩；OpenRC
-# 自启恢复用例需要生产判定，先保存从源码加载的真实实现。
-eval "production_firewall_persistence_enabled() $(declare -f firewall_persistence_enabled | sed '1d')"
+# 多数用例只关心快照与 watchdog，因此旧布尔状态入口使用默认桩；
+# 新的快照三态探测直接读取命令层的明确状态。
 firewall_runtime_enabled() { return 1; }
 firewall_persistence_enabled() { return 1; }
 firewall_service_active() { return 1; }
@@ -42,12 +41,14 @@ write_mock_commands() {
     printf '%s\n' \
         '#!/bin/sh' \
         'case "${1:-}" in' \
-        '  is-enabled|is-active) exit 1 ;;' \
+        '  is-enabled) printf "%s\n" disabled; exit 1 ;;' \
+        '  is-active) printf "%s\n" inactive; exit 3 ;;' \
         '  *) exit 0 ;;' \
         'esac' > "$TEST_TMP/bin/systemctl"
     printf '%s\n' \
         '#!/bin/sh' \
         'if [ "${1:-} ${2:-} ${3:-}" = "list table inet" ]; then exit 1; fi' \
+        'if [ "${1:-} ${2:-}" = "list tables" ]; then exit 0; fi' \
         'exit 0' > "$TEST_TMP/bin/nft"
     printf '%s\n' '#!/bin/sh' 'exit 0' > "$TEST_TMP/bin/rc-update"
     printf '%s\n' \
@@ -187,6 +188,115 @@ test_immediate_restore_stops_timed_watchdog() {
     trap - EXIT
 }
 
+test_snapshot_rejects_unknown_capture_states() {
+    local state
+
+    for state in runtime persistence service; do
+        (
+            local snapshot="" output="$TEST_TMP/snapshot-unknown-$state.out"
+
+            reset_firewall_case "snapshot-unknown-$state"
+            is_systemd() { return 0; }
+            case "$state" in
+                runtime)
+                    nft() { return 2; }
+                    ;;
+                persistence)
+                    systemctl() {
+                        case "${1:-}" in
+                            is-enabled) return 4 ;;
+                            is-active) printf '%s\n' inactive; return 3 ;;
+                            *) return 0 ;;
+                        esac
+                    }
+                    ;;
+                service)
+                    systemctl() {
+                        case "${1:-}" in
+                            is-enabled) printf '%s\n' disabled; return 1 ;;
+                            is-active) return 4 ;;
+                            *) return 0 ;;
+                        esac
+                    }
+                    ;;
+            esac
+
+            if firewall_create_rollback_snapshot snapshot "" > "$output" 2>&1; then
+                fail "防火墙 $state 状态未知时不得创建回滚快照"
+            fi
+            [ -z "$snapshot" ] || fail "失败时不得发布回滚快照路径"
+            [ -z "${ACTIVE_FIREWALL_ROLLBACK_DIR:-}" ] ||
+                fail "失败时不得留下活动回滚快照"
+            [ -z "$(find "$FIREWALL_ROLLBACK_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ] ||
+                fail "状态探测失败后必须清理快照构建目录"
+            assert_file_contains "$output" '无法确认防火墙.*状态'
+        )
+    done
+}
+
+test_snapshot_accepts_confirmed_negative_service_states() {
+    local backend
+
+    for backend in systemd openrc; do
+        (
+            local snapshot=""
+
+            reset_firewall_case "snapshot-negative-$backend"
+            if [ "$backend" = systemd ]; then
+                is_systemd() { return 0; }
+                systemctl() {
+                    case "${1:-}" in
+                        is-enabled) printf '%s\n' disabled; return 1 ;;
+                        is-active) printf '%s\n' inactive; return 3 ;;
+                        *) return 0 ;;
+                    esac
+                }
+            else
+                OS=alpine
+                is_systemd() { return 1; }
+                mkdir -p "$FIREWALL_OPENRC_RUNLEVELS_DIR/default"
+                rc-service() {
+                    [ "${2:-}" = status ] || return 1
+                    return 3
+                }
+            fi
+
+            firewall_create_rollback_snapshot snapshot "" ||
+                fail "$backend 已确认 disabled/inactive 时应能创建快照"
+            [ ! -e "$snapshot/service.enabled" ] ||
+                fail "$backend disabled 状态不得记录 enabled 标记"
+            [ ! -e "$snapshot/service.active" ] ||
+                fail "$backend inactive 状态不得记录 active 标记"
+        )
+    done
+}
+
+test_snapshot_runtime_probe_recognizes_partial_table() {
+    local runtime_result="" table_file
+
+    reset_firewall_case snapshot-partial-table
+    table_file="$CASE_DIR/partial-table.nft"
+    nft() {
+        case "$*" in
+            'list table inet vpsbox')
+                printf '%s\n' \
+                    'table inet vpsbox {' \
+                    '    chain partial {' \
+                    '    }' \
+                    '}'
+                ;;
+            'list tables') printf '%s\n' 'table inet vpsbox' ;;
+            *) return 1 ;;
+        esac
+    }
+
+    firewall_snapshot_runtime_state runtime_result "$table_file" ||
+        fail "缺少 input 链的既有 vpsbox 表仍应识别为 present"
+    assert_eq present "$runtime_result"
+    assert_file_contains "$table_file" '^table inet vpsbox \{$'
+    assert_file_contains "$table_file" 'chain partial'
+}
+
 test_natural_timeout_rolls_back_snapshot() {
     local snapshot="" watchdog original="$TEST_TMP/natural-timeout-original.nft"
 
@@ -267,14 +377,28 @@ case "${1:-}" in
     disable) rm -f "$MOCK_SYSTEMCTL_STATE_DIR/enabled"; exit 0 ;;
     restart|start) : > "$MOCK_SYSTEMCTL_STATE_DIR/active"; exit 0 ;;
     stop) rm -f "$MOCK_SYSTEMCTL_STATE_DIR/active"; exit 0 ;;
-    is-enabled) [ -e "$MOCK_SYSTEMCTL_STATE_DIR/enabled" ] ;;
-    is-active) [ -e "$MOCK_SYSTEMCTL_STATE_DIR/active" ] ;;
+    is-enabled)
+        if [ -e "$MOCK_SYSTEMCTL_STATE_DIR/enabled" ]; then
+            printf '%s\n' enabled
+        else
+            printf '%s\n' disabled
+            exit 1
+        fi
+        ;;
+    is-active)
+        if [ -e "$MOCK_SYSTEMCTL_STATE_DIR/active" ]; then
+            printf '%s\n' active
+        else
+            printf '%s\n' inactive
+            exit 3
+        fi
+        ;;
     *) exit 0 ;;
 esac
 EOF
     chmod 755 "$TEST_TMP/bin/systemctl"
-    firewall_persistence_enabled() { return 0; }
-    firewall_service_active() { return 0; }
+    : > "$state_dir/enabled"
+    : > "$state_dir/active"
 
     firewall_create_rollback_snapshot snapshot "" ||
         fail "服务状态恢复测试无法创建回滚快照"
@@ -339,15 +463,16 @@ case "${2:-}" in
     *) exit 1 ;;
 esac
 EOF
-    firewall_persistence_enabled() { production_firewall_persistence_enabled; }
     chmod 755 "$openrc_bin/rc-update" "$openrc_bin/rc-service"
     for command_name in awk cat chmod cp dirname ln mkdir mktemp mv rm rmdir sleep; do
         command_path="$(command -v "$command_name")" ||
             fail "OpenRC 回滚测试缺少命令：$command_name"
         ln -s "$command_path" "$openrc_bin/$command_name"
     done
-    firewall_service_active() { return 0; }
     : > "$FIREWALL_OPENRC_RUNLEVELS_DIR/default/$FIREWALL_SERVICE_NAME"
+    : > "$state_dir/active"
+    PATH="$openrc_bin:$PATH"
+    export PATH
 
     firewall_create_rollback_snapshot snapshot "" ||
         fail "OpenRC 服务状态恢复测试无法创建回滚快照"
@@ -572,6 +697,9 @@ main() {
     local name test status passed=0 skipped=0
     local -a required=(
         firewall_create_rollback_snapshot
+        firewall_snapshot_runtime_state
+        firewall_snapshot_persistence_state
+        firewall_snapshot_service_state
         firewall_persistence_enabled
         firewall_restore_snapshot_now
         firewall_start_rollback_watchdog
@@ -581,6 +709,9 @@ main() {
     local -a tests=(
         test_commit_stops_watchdog_and_sleep
         test_immediate_restore_stops_timed_watchdog
+        test_snapshot_rejects_unknown_capture_states
+        test_snapshot_accepts_confirmed_negative_service_states
+        test_snapshot_runtime_probe_recognizes_partial_table
         test_natural_timeout_rolls_back_snapshot
         test_hup_does_not_cancel_timeout_rollback
         test_enabled_active_service_state_is_restored

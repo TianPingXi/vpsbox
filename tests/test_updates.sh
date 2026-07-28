@@ -363,6 +363,38 @@ test_vpsbox_invalid_download_preserves_current() {
     assert_empty_file "$MOCK_EVENT_LOG" "下载校验失败不得触发替换后的副作用"
 }
 
+test_vpsbox_duplicate_version_declaration_preserves_current() {
+    local index output
+    local -a labels=(same export readonly declare)
+    local -a declarations=(
+        "VPSBOX_VERSION=\"$UPDATE_TEST_NEWER\""
+        "export VPSBOX_VERSION=\"$UPDATE_TEST_OLDER\""
+        "readonly VPSBOX_VERSION=\"$UPDATE_TEST_OLDER\""
+        "declare -g VPSBOX_VERSION=\"$UPDATE_TEST_OLDER\""
+    )
+
+    for index in "${!labels[@]}"; do
+        (
+            reset_update_case "duplicate-version-${labels[index]}"
+            output="$CASE_DIR/output"
+            write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
+            printf 'keep-backup\n' > "${CMD_PATH}.previous"
+            write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_NEWER" remote
+            printf '%s\n' "${declarations[index]}" >> "$MOCK_REMOTE_SCRIPT"
+
+            if update_vpsbox > "$output" 2>&1; then
+                fail "包含重复 VPSBOX_VERSION 声明的远程脚本必须被拒绝"
+            fi
+
+            assert_file_contains "$output" '版本声明不唯一或格式无效'
+            assert_file_contains "$CMD_PATH" 'installed'
+            assert_file_contains "${CMD_PATH}.previous" '^keep-backup$'
+            assert_empty_file "$MOCK_EVENT_LOG" \
+                "重复版本声明不得触发替换后的副作用"
+        )
+    done
+}
+
 test_vpsbox_wrong_project_preserves_current() {
     local output="$TEST_TMP/wrong-project.out"
     reset_update_case wrong-project
@@ -885,6 +917,7 @@ main() {
         test_vpsbox_never_fetches_old_owner_url
         test_primary_url_failure_preserves_current
         test_vpsbox_invalid_download_preserves_current
+        test_vpsbox_duplicate_version_declaration_preserves_current
         test_vpsbox_wrong_project_preserves_current
         test_vpsbox_reexec_failure_restores_previous
         test_real_reexec_failure_returns_without_option_or_env_leaks

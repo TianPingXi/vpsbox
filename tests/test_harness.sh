@@ -27,6 +27,34 @@ test_run_test_case_honors_errexit() {
     [ ! -e "$marker" ] || fail "用例失败后不应继续执行"
 }
 
+test_run_test_case_honors_errexit_in_command_substitution() {
+    local marker="$TEST_TMP/reached-inside-command-substitution" status
+
+    substitution_case() {
+        local value
+        value="$(false; : > "$marker"; printf ok)"
+        [ "$value" = ok ]
+    }
+
+    shopt -u inherit_errexit
+    set +e
+    run_test_case substitution_case
+    status=$?
+    set -e
+
+    [ "$status" -ne 0 ] ||
+        fail "命令替换中的前置失败不得被后续成功命令改写为通过"
+    [ ! -e "$marker" ] || fail "命令替换失败后不应继续执行"
+    if shopt -q inherit_errexit; then
+        fail "run_test_case 不得向调用方泄漏 inherit_errexit"
+    fi
+}
+
+test_harness_runner_enables_inherit_errexit() {
+    shopt -q inherit_errexit ||
+        fail "harness 自身的测试子 shell 必须启用 inherit_errexit"
+}
+
 test_run_test_case_preserves_caller_options() {
     local VPSBOX_TEST_STRICT=0 VPSBOX_TEST_SKIP_FILE="" status
 
@@ -469,6 +497,8 @@ main() {
     local test status passed=0 skipped=0
     local -a tests=(
         test_run_test_case_honors_errexit
+        test_run_test_case_honors_errexit_in_command_substitution
+        test_harness_runner_enables_inherit_errexit
         test_run_test_case_preserves_caller_options
         test_run_test_case_strict_mode_rejects_skip
         test_run_test_case_rejects_unexplained_skip
@@ -488,7 +518,12 @@ main() {
     for test in "${tests[@]}"; do
         : > "$SKIP_REASON_FILE" || return 1
         set +e
-        (set -e; "$test")
+        (
+            set -e
+            shopt -u inherit_errexit
+            shopt -s inherit_errexit
+            "$test"
+        )
         status=$?
         set -e
         case "$status" in

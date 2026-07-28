@@ -25,7 +25,7 @@ umask 077
 # ==============================================================================
 # 产品、版本、受管路径和超时均在加载时确定，业务函数只读取这些配置。
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.43"
+VPSBOX_VERSION="v1.0.44"
 # 只从当前仓库下载可执行脚本；旧地址仅用于识别本地 v1.0.23 及更早备份，绝不联网获取。
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 LEGACY_SCRIPT_URL="https://raw.githubusercontent.com/QXTianPing/vpsbox/main/vpsbox.sh"
@@ -1197,6 +1197,7 @@ download_vpsbox_script() {
     local require_newer="${2:-0}"
     local tmp
     local downloaded_version
+    local version_declaration
 
     ensure_curl || return 1
 
@@ -1219,9 +1220,22 @@ download_vpsbox_script() {
         return 1
     fi
 
-    if ! grep -Eq '^VPSBOX_VERSION="v[0-9]+([.][0-9]+){2}"$' "$tmp"; then
+    if ! version_declaration="$(
+        awk '
+            /^[[:space:]]*((export|readonly|local)[[:space:]]+|(declare|typeset)([[:space:]]+-[^[:space:]]+)*[[:space:]]+)?VPSBOX_VERSION[[:space:]]*=/ {
+                print
+            }
+        ' "$tmp"
+    )"; then
         rm -f "$tmp"
-        err "下载到的脚本缺少有效版本号，已保留当前版本。"
+        err "无法读取下载脚本的版本声明，已保留当前版本。"
+        return 1
+    fi
+    if [ -z "$version_declaration" ] ||
+        [[ "$version_declaration" == *$'\n'* ]] ||
+        ! [[ "$version_declaration" =~ ^VPSBOX_VERSION=\"v[0-9]+([.][0-9]+){2}\"$ ]]; then
+        rm -f "$tmp"
+        err "下载到的脚本版本声明不唯一或格式无效，已保留当前版本。"
         return 1
     fi
     if ! vpsbox_script_identity_valid "$tmp"; then
@@ -1229,7 +1243,8 @@ download_vpsbox_script() {
         err "下载到的脚本缺少 vpsbox 项目标识或必要入口，已保留当前版本。"
         return 1
     fi
-    downloaded_version="$(sed -n 's/^VPSBOX_VERSION="\([^"]*\)"$/\1/p' "$tmp" | head -n 1)"
+    downloaded_version="${version_declaration#VPSBOX_VERSION=\"}"
+    downloaded_version="${downloaded_version%\"}"
     if [ "$require_newer" = "1" ]; then
         case "$(version_relation "$downloaded_version" "$VPSBOX_VERSION")" in
             newer) ;;
@@ -6816,8 +6831,33 @@ ntp_service_state_is_healthy() {
     fi
 }
 
+ntp_unit_state_matches() {
+    local unit="$1" existed="$2" enabled="$3" active="$4"
+    local enabled_state active_state
+
+    if [ "$existed" = "absent" ]; then
+        ! systemd_unit_exists "${unit}.service"
+        return
+    fi
+    [ "$existed" = "present" ] || return 1
+    systemd_unit_exists "${unit}.service" || return 1
+    enabled_state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+    active_state="$(systemctl is-active "$unit" 2>/dev/null || true)"
+    case "$enabled:$enabled_state" in
+        enabled:enabled|enabled:enabled-runtime|enabled:linked|\
+            enabled:linked-runtime|enabled:alias|disabled:disabled|\
+            disabled:static|disabled:indirect|disabled:masked|\
+            disabled:masked-runtime|disabled:generated|disabled:transient) ;;
+        *) return 1 ;;
+    esac
+    case "$active:$active_state" in
+        active:active|active:reloading|inactive:inactive|inactive:failed) ;;
+        *) return 1 ;;
+    esac
+}
+
 repair_ntp_service_state() {
-    local svc="$1" failed=0 timesyncd_unit="absent"
+    local svc="$1" failed=0 restore_failed=0 timesyncd_unit="absent"
     local chrony_enabled="disabled" chrony_active="inactive"
     local timesyncd_enabled="disabled" timesyncd_active="inactive"
 
@@ -6846,9 +6886,27 @@ repair_ntp_service_state() {
     fi
 
     warn "NTP 服务状态轻量修复失败，正在恢复修改前状态。"
-    restore_ntp_unit_state "$svc" present "$chrony_enabled" "$chrony_active" || true
-    restore_ntp_unit_state systemd-timesyncd "$timesyncd_unit" \
-        "$timesyncd_enabled" "$timesyncd_active" || true
+    if ! restore_ntp_unit_state "$svc" present \
+        "$chrony_enabled" "$chrony_active"; then
+        restore_failed=1
+    fi
+    if ! restore_ntp_unit_state systemd-timesyncd "$timesyncd_unit" \
+        "$timesyncd_enabled" "$timesyncd_active"; then
+        restore_failed=1
+    fi
+    if ! ntp_unit_state_matches "$svc" present \
+        "$chrony_enabled" "$chrony_active"; then
+        restore_failed=1
+    fi
+    if ! ntp_unit_state_matches systemd-timesyncd "$timesyncd_unit" \
+        "$timesyncd_enabled" "$timesyncd_active"; then
+        restore_failed=1
+    fi
+    if [ "$restore_failed" -eq 0 ]; then
+        info "NTP 服务状态已恢复修改前状态。"
+    else
+        err "NTP 服务状态未能完整恢复，请检查 chrony 与 systemd-timesyncd。"
+    fi
     return 1
 }
 
@@ -10053,6 +10111,91 @@ firewall_service_active() {
     fi
 }
 
+firewall_snapshot_runtime_state() {
+    local output_var="$1" table_file="$2"
+    local state tables
+
+    if nft list table inet vpsbox > "$table_file" 2>/dev/null; then
+        state="present"
+    else
+        rm -f "$table_file" || return 1
+        tables="$(nft list tables 2>/dev/null)" || return 1
+        if awk '
+            $1 == "table" && $2 == "inet" && $3 == "vpsbox" {
+                found=1
+            }
+            END { exit !found }
+        ' <<< "$tables"; then
+            return 1
+        fi
+        state="absent"
+    fi
+    printf -v "$output_var" '%s' "$state"
+}
+
+firewall_snapshot_persistence_state() {
+    local output_var="$1"
+    local state probe
+
+    if is_systemd; then
+        if probe="$(systemctl is-enabled "$FIREWALL_SERVICE_NAME" 2>/dev/null)"; then
+            case "$probe" in
+                enabled|enabled-runtime|linked|linked-runtime|alias)
+                    state="enabled"
+                    ;;
+                *) return 1 ;;
+            esac
+        else
+            case "$probe" in
+                disabled|not-found) state="disabled" ;;
+                *) return 1 ;;
+            esac
+        fi
+    elif [ "$OS" = "alpine" ]; then
+        [ -d "$FIREWALL_OPENRC_RUNLEVELS_DIR/default" ] || return 1
+        if [ -e "$FIREWALL_OPENRC_RUNLEVELS_DIR/default/$FIREWALL_SERVICE_NAME" ] ||
+            [ -L "$FIREWALL_OPENRC_RUNLEVELS_DIR/default/$FIREWALL_SERVICE_NAME" ]; then
+            state="enabled"
+        else
+            state="disabled"
+        fi
+    else
+        return 1
+    fi
+    printf -v "$output_var" '%s' "$state"
+}
+
+firewall_snapshot_service_state() {
+    local output_var="$1"
+    local state status probe
+
+    if is_systemd; then
+        if probe="$(systemctl is-active "$FIREWALL_SERVICE_NAME" 2>/dev/null)"; then
+            case "$probe" in
+                active|reloading) state="active" ;;
+                *) return 1 ;;
+            esac
+        else
+            case "$probe" in
+                inactive|failed|unknown) state="inactive" ;;
+                *) return 1 ;;
+            esac
+        fi
+    elif [ "$OS" = "alpine" ]; then
+        command -v rc-service >/dev/null 2>&1 || return 1
+        if probe="$(rc-service "$FIREWALL_SERVICE_NAME" status 2>/dev/null)"; then
+            state="active"
+        else
+            status=$?
+            [ "$status" -eq 3 ] || return 1
+            state="inactive"
+        fi
+    else
+        return 1
+    fi
+    printf -v "$output_var" '%s' "$state"
+}
+
 firewall_control_plane_present() {
     firewall_runtime_enabled ||
         [ -e "$FIREWALL_CONFIG" ] ||
@@ -11536,6 +11679,7 @@ firewall_recover_pending_rollbacks() {
 
 firewall_create_rollback_snapshot() {
     local output_var="$1" ssh_ports="$2" dir build_dir final_dir suffix nft_path
+    local runtime_state persistence_state service_state
 
     if [ -n "${ACTIVE_FIREWALL_ROLLBACK_DIR:-}" ]; then
         err "已有未完成的防火墙回滚快照，已拒绝创建新快照。"
@@ -11564,9 +11708,26 @@ firewall_create_rollback_snapshot() {
             rm -rf "$build_dir"
             return 1
         }
-    if firewall_runtime_enabled; then
-        nft list table inet vpsbox > "$build_dir/table.nft" || { rm -rf "$build_dir"; return 1; }
-        : > "$build_dir/table.present"
+    if ! firewall_snapshot_runtime_state runtime_state "$build_dir/table.nft"; then
+        rm -rf "$build_dir"
+        err "无法确认防火墙运行状态，已拒绝创建回滚快照。"
+        return 1
+    fi
+    if ! firewall_snapshot_persistence_state persistence_state; then
+        rm -rf "$build_dir"
+        err "无法确认防火墙开机加载状态，已拒绝创建回滚快照。"
+        return 1
+    fi
+    if ! firewall_snapshot_service_state service_state; then
+        rm -rf "$build_dir"
+        err "无法确认防火墙服务状态，已拒绝创建回滚快照。"
+        return 1
+    fi
+    if [ "$runtime_state" = "present" ]; then
+        : > "$build_dir/table.present" || {
+            rm -rf "$build_dir"
+            return 1
+        }
     fi
     if [ -e "$build_dir/config.present" ] &&
         ! firewall_write_ssh_safe_snapshot "$build_dir/config" "$build_dir/config" "$ssh_ports"; then
@@ -11578,8 +11739,18 @@ firewall_create_rollback_snapshot() {
         rm -rf "$build_dir"
         return 1
     fi
-    firewall_persistence_enabled && : > "$build_dir/service.enabled"
-    firewall_service_active && : > "$build_dir/service.active"
+    if [ "$persistence_state" = "enabled" ]; then
+        : > "$build_dir/service.enabled" || {
+            rm -rf "$build_dir"
+            return 1
+        }
+    fi
+    if [ "$service_state" = "active" ]; then
+        : > "$build_dir/service.active" || {
+            rm -rf "$build_dir"
+            return 1
+        }
+    fi
 
     printf '%s\n' commit > "$build_dir/commit.token" || { rm -rf "$build_dir"; return 1; }
     printf '%s\n' rollback > "$build_dir/rollback.token" || { rm -rf "$build_dir"; return 1; }
@@ -14078,18 +14249,25 @@ change_system_hostname() {
         err "读取 $HOSTS_PATH 失败，已恢复原配置。"
         return 1
     fi
-    {
-        printf '%s\n' "$HOSTNAME_BEGIN"
-        printf '%s\n' "$hosts_entry"
-        printf '%s\n' "$HOSTNAME_END"
-    } >> "$tmp"
+    if ! {
+        printf '%s\n' "$HOSTNAME_BEGIN" &&
+            printf '%s\n' "$hosts_entry" &&
+            printf '%s\n' "$HOSTNAME_END"
+    } >> "$tmp"; then
+        rm -f "$tmp"
+        rollback_hostname_change "$operation_snapshot" || true
+        err "更新 $HOSTS_PATH 失败，已尝试恢复原配置。"
+        return 1
+    fi
     if ! chown root:root "$tmp" || ! chmod 644 "$tmp" || ! mv -f "$tmp" "$HOSTS_PATH"; then
         rm -f "$tmp"
         rollback_hostname_change "$operation_snapshot" || true
         err "更新 $HOSTS_PATH 失败，已恢复原配置。"
         return 1
     fi
-    if [ "$(tr -d '\r\n' <"$HOSTNAME_PATH")" != "$new" ] || [ "$(hostname_current_value)" != "$new" ] || ! grep -Fqx "$hosts_entry" "$HOSTS_PATH"; then
+    if [ "$(tr -d '\r\n' <"$HOSTNAME_PATH")" != "$new" ] ||
+        [ "$(hostname_current_value)" != "$new" ] ||
+        ! grep -Fqx "$hosts_entry" "$HOSTS_PATH"; then
         rollback_hostname_change "$operation_snapshot" || true
         err "主机名验证失败，已恢复原配置。"
         return 1
