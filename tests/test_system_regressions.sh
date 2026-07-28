@@ -25,6 +25,24 @@ reset_change_store() {
     : > "$CHANGE_MANIFEST"
 }
 
+require_root_permission_semantics() {
+    local probe="$TEST_TMP/root-permission-probe" owner group mode
+
+    mkdir -p "$probe" || return 1
+    : > "$probe/file" || return 1
+    if command chown root:root "$probe" "$probe/file" 2>/dev/null &&
+        command chmod 700 "$probe" && command chmod 600 "$probe/file"; then
+        owner="$(stat -c '%u' "$probe/file" 2>/dev/null || true)"
+        group="$(stat -c '%g' "$probe/file" 2>/dev/null || true)"
+        mode="$(stat -c '%a' "$probe/file" 2>/dev/null || true)"
+        rm -rf -- "$probe"
+        [ "$owner" = 0 ] && [ "$group" = 0 ] && [ "$mode" = 600 ] && return 0
+    else
+        rm -rf -- "$probe"
+    fi
+    skip "需要真实的 root 属主与 Unix 权限语义"
+}
+
 test_manifest_failure_preserves_existing_file() {
     reset_change_store manifest
     printf 'EXISTING=keep\n' > "$CHANGE_MANIFEST"
@@ -407,6 +425,76 @@ test_bbr_fq_runtime_drift_uses_light_repair() {
         assert_file_contains "$log" '^modprobe sch_fq$'
         assert_file_contains "$log" '^sysctl-p$'
         assert_file_not_contains "$log" '^backup$' "只修复运行参数时不得改写持久化配置"
+    )
+}
+
+test_unsupported_kernel_leaves_no_phantom_pending_change() {
+    (
+        local changes="$TEST_TMP/bbr-phantom.out"
+        local modprobe_log="$TEST_TMP/bbr-phantom.modprobe"
+        reset_change_store bbr-phantom
+        BBR_CONF="$TEST_TMP/bbr-phantom/99-vpsbox-bbr.conf"
+        mkdir -p "$(dirname "$BBR_CONF")"
+        : > "$modprobe_log"
+
+        bbr_fq_persistent_config_is_current() { return 1; }
+        sysctl() { case "$1" in -n) printf 'cubic\n' ;; *) return 1 ;; esac; }
+        modprobe() {
+            printf '%s\n' "$*" >> "$modprobe_log"
+            return 1
+        }
+
+        if enable_bbr_fq >/dev/null 2>&1; then
+            fail "内核不支持 tcp_bbr 时不得报告成功"
+        fi
+        assert_file_contains "$modprobe_log" '^tcp_bbr$' \
+            "测试必须实际执行到内核模块加载失败路径"
+        [ ! -e "$BBR_CONF" ] || fail "失败路径不得留下持久化配置"
+        [ ! -e "$CHANGE_BACKUP_DIR/BBR_CONF" ] || fail "失败路径不得留下陈旧 BBR 基线"
+        assert_file_not_contains "$CHANGE_MANIFEST" '^(BACKUP_BBR_CONF|PENDING_BBR_CONF|APPLIED_BBR_CONF|BBR_CC|BBR_FQ)='
+        assert_eq none "$(change_restore_state BBR_CONF)" \
+            "从未修改过的变更不得长期显示为待恢复"
+        show_vpsbox_changes > "$changes" 2>&1 ||
+            fail "无法读取 vpsbox 系统改动状态"
+        assert_file_not_contains "$changes" 'BBR_CONF：未完成' \
+            "查看系统改动里不得出现从未发生的改动"
+    )
+}
+
+test_failed_bbr_runtime_restore_keeps_recovery_transaction() {
+    (
+        local output="$TEST_TMP/bbr-runtime-restore.out"
+        local current_cc=cubic current_fq=fq_codel
+        reset_change_store bbr-runtime-restore
+        BBR_CONF="$TEST_TMP/bbr-runtime-restore/99-vpsbox-bbr.conf"
+        mkdir -p "$(dirname "$BBR_CONF")"
+
+        bbr_fq_persistent_config_is_current() { return 1; }
+        modprobe() { return 0; }
+        sysctl() {
+            case "$1:$2" in
+                -n:net.ipv4.tcp_congestion_control) printf '%s\n' "$current_cc" ;;
+                -n:net.core.default_qdisc) printf '%s\n' "$current_fq" ;;
+                -p:*)
+                    current_cc=bbr
+                    return 1
+                    ;;
+                -w:net.ipv4.tcp_congestion_control=cubic) return 1 ;;
+                -w:net.core.default_qdisc=fq_codel) current_fq=fq_codel ;;
+                *) return 1 ;;
+            esac
+        }
+
+        if enable_bbr_fq > "$output" 2>&1; then
+            fail "BBR 部分生效且恢复失败时不得报告成功"
+        fi
+        assert_eq bbr "$current_cc" "夹具必须模拟 BBR 运行参数恢复失败"
+        assert_eq pending "$(change_restore_state BBR_CONF)" \
+            "运行参数未完整恢复时必须保留 pending 事务"
+        assert_file_contains "$CHANGE_MANIFEST" '^BACKUP_BBR_CONF=absent$'
+        assert_file_contains "$CHANGE_MANIFEST" '^BBR_CC=cubic$'
+        assert_file_contains "$CHANGE_MANIFEST" '^BBR_FQ=fq_codel$'
+        assert_file_contains "$output" '已保留事务记录'
     )
 }
 
@@ -883,6 +971,103 @@ test_ssh_restore_snapshot_integrity_is_verified() {
     )
 }
 
+test_ssh_restore_snapshot_path_enforces_owner_and_mode() {
+    (
+        local file="$TEST_TMP/ssh-snapshot-security"
+
+        require_root_permission_semantics || return "$?"
+        : > "$file"
+        command chown root:root "$file"
+        chmod 600 "$file"
+        ssh_restore_snapshot_path_is_secure "$file" 600 ||
+            fail "root 属主且模式精确为 600 的 SSH 快照应被接受"
+
+        chmod 666 "$file"
+        if ssh_restore_snapshot_path_is_secure "$file" 600; then
+            fail "可被其他用户写入的 SSH 快照必须被拒绝"
+        fi
+        chmod 640 "$file"
+        if ssh_restore_snapshot_path_is_secure "$file" 600; then
+            fail "SSH 快照模式不是精确 600 时必须被拒绝"
+        fi
+        chmod 600 "$file"
+        command chown 65534:65534 "$file"
+        if ssh_restore_snapshot_path_is_secure "$file" 600; then
+            fail "非 root 属主的 SSH 快照必须被拒绝"
+        fi
+    )
+}
+
+test_public_config_dirs_are_repaired_only_for_managed_files() {
+    (
+        local base="$TEST_TMP/public-config-dir" new_dir managed_dir unmanaged_dir managed_file
+
+        require_root_permission_semantics || return "$?"
+        unset -f chown
+        new_dir="$base/new"
+        ensure_public_config_dir "$new_dir" "$new_dir/vpsbox.conf"
+        assert_eq '0:0 755' "$(stat -c '%u:%g %a' "$new_dir")" \
+            "新建的服务配置目录必须为 root:root 755"
+
+        managed_dir="$base/managed"
+        managed_file="$managed_dir/vpsbox.conf"
+        mkdir -p "$managed_dir"
+        : > "$managed_file"
+        command chown root:root "$managed_dir" "$managed_file"
+        chmod 700 "$managed_dir"
+        chmod 644 "$managed_file"
+        ensure_public_config_dir "$managed_dir" "$managed_file"
+        assert_eq 755 "$(stat -c '%a' "$managed_dir")" \
+            "确认由 vpsbox 管理的旧 700 目录应修复为服务可读"
+
+        unmanaged_dir="$base/unmanaged"
+        mkdir -p "$unmanaged_dir"
+        command chown root:root "$unmanaged_dir"
+        chmod 700 "$unmanaged_dir"
+        if ensure_public_config_dir "$unmanaged_dir" "$unmanaged_dir/vpsbox.conf" >/dev/null 2>&1; then
+            fail "不得擅自放宽没有 vpsbox 管理文件的既有目录"
+        fi
+        assert_eq 700 "$(stat -c '%a' "$unmanaged_dir")"
+    )
+}
+
+test_public_config_dir_rejects_symlink() {
+    (
+        local target="$TEST_TMP/public-config-target" link="$TEST_TMP/public-config-link"
+
+        require_real_symlink directory || return "$?"
+        mkdir -p "$target"
+        chmod 700 "$target"
+        ln -s "$target" "$link"
+        if ensure_public_config_dir "$link" "$link/vpsbox.conf" >/dev/null 2>&1; then
+            fail "服务配置目录为符号链接时必须拒绝"
+        fi
+        assert_eq 700 "$(stat -c '%a' "$target")" \
+            "拒绝符号链接时不得修改其目标目录"
+    )
+}
+
+test_chrony_source_file_is_service_readable() {
+    (
+        local base="$TEST_TMP/chrony-source-mode" fixture_conf
+
+        require_root_permission_semantics || return "$?"
+        unset -f chown
+        mkdir -p "$base/sources.d"
+        command chown root:root "$base/sources.d"
+        chmod 755 "$base/sources.d"
+        fixture_conf="$base/chrony.conf"
+        printf '%s\n' 'sourcedir /etc/chrony/sources.d' > "$fixture_conf"
+        CHRONY_SOURCE_FILE="$base/sources.d/vpsbox.sources"
+        chrony_conf_path() { printf '%s\n' "$fixture_conf"; }
+
+        write_chrony_sources >/dev/null
+        assert_eq '0:0 644' "$(stat -c '%u:%g %a' "$CHRONY_SOURCE_FILE")" \
+            "Chrony 管理源必须能被降权服务进程读取"
+        chrony_sources_are_current || fail "写入后的 Chrony 源必须通过内容校验"
+    )
+}
+
 test_dns_verification_uses_bounded_command() {
     (
         local log="$TEST_TMP/dns-verify-bounded.log" timeout
@@ -1048,11 +1233,19 @@ test_uninstall_restore_failure_aborts_offer() {
 main() {
     local name test status passed=0 skipped=0
     local -a required=(
+        cancel_unmodified_change_transaction
+        change_restore_state
+        chrony_sources_are_current
+        enable_bbr_fq
+        ensure_public_config_dir
         set_main_ssh_port_directives
         ensure_sshd_dropin_include
         apply_ssh_port_change
         enable_ipv4_priority
         enable_ntp_sync
+        show_vpsbox_changes
+        ssh_restore_snapshot_path_is_secure
+        write_chrony_sources
     )
     local -a tests=(
         test_manifest_failure_preserves_existing_file
@@ -1074,6 +1267,8 @@ main() {
         test_ntp_service_drift_uses_light_repair
         test_bbr_fq_healthy_is_noop
         test_bbr_fq_runtime_drift_uses_light_repair
+        test_unsupported_kernel_leaves_no_phantom_pending_change
+        test_failed_bbr_runtime_restore_keeps_recovery_transaction
         test_journald_healthy_is_noop
         test_first_ssh_port_rollback_clears_tracking
         test_first_ssh_hardening_rollback_clears_tracking
@@ -1095,6 +1290,10 @@ main() {
         test_failed_ssh_restore_preserves_retry_snapshot
         test_ssh_config_publish_failure_preserves_target
         test_ssh_restore_snapshot_integrity_is_verified
+        test_ssh_restore_snapshot_path_enforces_owner_and_mode
+        test_public_config_dirs_are_repaired_only_for_managed_files
+        test_public_config_dir_rejects_symlink
+        test_chrony_source_file_is_service_readable
         test_dns_verification_uses_bounded_command
         test_nexttrace_probe_uses_bounded_command
         test_nexttrace_help_uses_bounded_command_and_propagates_timeout

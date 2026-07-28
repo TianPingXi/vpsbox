@@ -30,6 +30,9 @@ test_cleanup() {
 trap test_cleanup EXIT
 
 chown() { :; }
+# 多数用例只关心快照与 watchdog，因此下面会安装默认状态桩；OpenRC
+# 自启恢复用例需要生产判定，先保存从源码加载的真实实现。
+eval "production_firewall_persistence_enabled() $(declare -f firewall_persistence_enabled | sed '1d')"
 firewall_runtime_enabled() { return 1; }
 firewall_persistence_enabled() { return 1; }
 firewall_service_active() { return 1; }
@@ -336,6 +339,7 @@ case "${2:-}" in
     *) exit 1 ;;
 esac
 EOF
+    firewall_persistence_enabled() { production_firewall_persistence_enabled; }
     chmod 755 "$openrc_bin/rc-update" "$openrc_bin/rc-service"
     for command_name in awk cat chmod cp dirname ln mkdir mktemp mv rm rmdir sleep; do
         command_path="$(command -v "$command_name")" ||
@@ -568,6 +572,8 @@ main() {
     local name test status passed=0 skipped=0
     local -a required=(
         firewall_create_rollback_snapshot
+        firewall_persistence_enabled
+        firewall_restore_snapshot_now
         firewall_start_rollback_watchdog
         firewall_stop_rollback_watchdog
         firewall_finish_commit

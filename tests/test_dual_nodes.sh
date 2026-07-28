@@ -717,6 +717,321 @@ test_cancel_eof_and_input_interrupt_have_no_mutation() {
     )
 }
 
+write_state_lines() {
+    local file="$1"
+    shift
+    printf '%s\n' "$@" > "$file"
+    chmod 600 "$file"
+    command chown root:root "$file" 2>/dev/null || true
+}
+
+test_failed_rollback_must_not_claim_state_was_restored() {
+    (
+        local out="$TEST_TMP/failed-rollback-message.out"
+
+        rollback_active_node_transaction() { return 1; }
+        if fail_after_node_rollback "配置写入失败" "创建前" > "$out" 2>&1; then
+            fail "回滚失败时原始操作不得报告成功"
+        fi
+        assert_file_not_contains "$out" '已恢复到创建前状态' \
+            "回滚失败后不得宣称节点已经恢复"
+        assert_file_contains "$out" '未能确认完整恢复'
+
+        rollback_active_node_transaction() { return 0; }
+        if fail_after_node_rollback "配置写入失败" "创建前" > "$out" 2>&1; then
+            fail "操作失败时即使回滚成功也必须返回失败"
+        fi
+        assert_file_contains "$out" '已恢复到创建前状态'
+    )
+}
+
+test_node_rollback_firewall_failure_is_partial_success() {
+    (
+        local output="$TEST_TMP/node-rollback-firewall-warning.out"
+        set_node_paths "$TEST_TMP/node-rollback-firewall-warning"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_uri_files
+        service_is_running() { return 1; }
+        service_is_enabled() { return 1; }
+        begin_node_transaction
+        mark_node_transaction_mutated
+        printf 'broken\n' > "$SS_CONFIG_PATH"
+
+        service_stop() { return 0; }
+        stop_singbox_config_processes() { return 0; }
+        service_manager_is_active() { return 1; }
+        singbox_config_pids() { return 0; }
+        service_disable() { return 0; }
+        is_systemd() { return 1; }
+        OS=unknown
+        : "$OS"
+        firewall_refresh_if_enabled() { return 1; }
+
+        rollback_active_node_transaction > "$output" 2>&1 ||
+            fail "节点已恢复时，单独的防火墙同步失败不得把节点回滚判成失败"
+        assert_file_contains "$SS_CONFIG_PATH" '"type": "shadowsocks"'
+        [ ! -e "$NODE_TRANSACTION_DIR" ] ||
+            fail "节点恢复成功后必须清理节点事务目录"
+        assert_file_contains "$output" '主机防火墙端口未能同步'
+        assert_file_not_contains "$output" '备份已保留'
+    )
+}
+
+test_node_backup_file_safety_enforces_owner_and_mode() {
+    (
+        local dir="$TEST_TMP/backup-file-safety" file
+
+        if [ "$DUAL_NODES_REAL_PERMISSIONS" -ne 1 ]; then
+            skip "需要真实的 root 属主与 Unix 权限语义"
+            return "$SKIP_STATUS"
+        fi
+        mkdir -p "$dir"
+        file="$dir/service-running"
+        : > "$file"
+        command chown root:root "$file"
+        chmod 600 "$file"
+        node_backup_file_is_safe "$file" ||
+            fail "root 属主且 600 的事务备份文件应被接受"
+
+        chmod 620 "$file"
+        if node_backup_file_is_safe "$file"; then
+            fail "组可写的事务备份文件必须被拒绝"
+        fi
+        chmod 602 "$file"
+        if node_backup_file_is_safe "$file"; then
+            fail "其他用户可写的事务备份文件必须被拒绝"
+        fi
+        chmod 600 "$file"
+        command chown 65534:65534 "$file"
+        if node_backup_file_is_safe "$file"; then
+            fail "属主不是 root 的事务备份文件必须被拒绝"
+        fi
+    )
+}
+
+test_interrupted_restore_leaves_node_config_dir_usable() {
+    (
+        local snapshot="$TEST_TMP/interrupted-restore-source"
+        set_node_paths "$TEST_TMP/interrupted-restore"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_uri_files
+        write_ss_config_fixture "$snapshot" 20009
+
+        node_config_dir_contents_valid ||
+            fail "夹具本身必须是一个合法的节点配置目录"
+        mv() { return 42; }
+        rm() { return 0; }
+        if restore_file_atomically_from_snapshot "$snapshot" "$SS_CONFIG_PATH"; then
+            fail "替换失败时原子恢复不得报告成功"
+        fi
+        unset -f mv rm
+
+        node_config_dir_contents_valid ||
+            fail "恢复中断后，节点配置目录不得被临时文件顶死"
+        assert_file_contains "$SS_CONFIG_PATH" '"listen_port": 20001' \
+            "替换失败时必须保留原节点配置"
+    )
+}
+
+test_atomic_staging_rejects_cross_device_node_directory() {
+    (
+        local target output="$TEST_TMP/cross-device-staging.out"
+        set_node_paths "$TEST_TMP/cross-device-staging"
+        mkdir -p "$NODE_CONFIG_DIR"
+        target="$SS_CONFIG_PATH"
+        stat() {
+            case "${*: -1}" in
+                "$CONFIG_DIR") printf '101\n' ;;
+                "$NODE_CONFIG_DIR") printf '202\n' ;;
+                *) command stat "$@" ;;
+            esac
+        }
+        if atomic_staging_dir "$target" > "$output" 2>&1; then
+            fail "节点目录跨文件系统时不得声称可以原子替换"
+        fi
+        assert_file_contains "$output" '不在同一文件系统'
+    )
+}
+
+test_state_file_field_validation_rejects_malformed_values() {
+    (
+        local dir="$TEST_TMP/state-validation" file case_name
+        local -a ss_valid vless_valid line_set
+
+        mkdir -p "$dir"
+        file="$dir/state.env"
+        ss_valid=(
+            'PROTOCOL=shadowsocks'
+            'CONFIG_ID=111111111111111111111111'
+            'DOMAIN=ss.example.com'
+            'NAME=ss-node'
+            'PORT=20001'
+            'PASSWORD=QUFBQUFBQUFBQUFBQUFBQQ=='
+            "METHOD=$SS_METHOD"
+        )
+        vless_valid=(
+            'PROTOCOL=vless-reality'
+            'CONFIG_ID=222222222222222222222222'
+            'DOMAIN=vless.example.com'
+            'NAME=vless-node'
+            'PORT=20002'
+            'UUID=11111111-2222-4333-8444-555555555555'
+            'FLOW=xtls-rprx-vision'
+            'REALITY_SERVER_NAME=addons.mozilla.org'
+            'REALITY_PRIVATE_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+            'REALITY_PUBLIC_KEY=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB'
+            'REALITY_SHORT_ID=0123456789abcdef'
+            'FINGERPRINT=chrome'
+        )
+
+        write_state_lines "$file" "${ss_valid[@]}"
+        load_state_file "$file" shadowsocks ||
+            fail "合法的 Shadowsocks 状态文件必须被接受"
+        assert_eq 20001 "$PORT" "接受后必须发布端口"
+        write_state_lines "$file" "${vless_valid[@]}"
+        load_state_file "$file" vless-reality ||
+            fail "合法的 VLESS Reality 状态文件必须被接受"
+        assert_eq addons.mozilla.org "$REALITY_SERVER_NAME" "接受后必须发布 Reality 域名"
+
+        reject_ss() {
+            case_name="$1"
+            shift
+            line_set=("${ss_valid[@]}")
+            write_state_lines "$file" "${line_set[@]/$1/$2}"
+            if load_state_file "$file" shadowsocks; then
+                fail "Shadowsocks 状态校验必须拒绝：$case_name"
+            fi
+        }
+        reject_vless() {
+            case_name="$1"
+            shift
+            line_set=("${vless_valid[@]}")
+            write_state_lines "$file" "${line_set[@]/$1/$2}"
+            if load_state_file "$file" vless-reality; then
+                fail "VLESS Reality 状态校验必须拒绝：$case_name"
+            fi
+        }
+
+        reject_ss '端口超出范围' 'PORT=20001' 'PORT=999999'
+        reject_ss '端口为零' 'PORT=20001' 'PORT=0'
+        reject_ss '端口非数字' 'PORT=20001' 'PORT=abc'
+        reject_ss '域名非法' 'DOMAIN=ss.example.com' 'DOMAIN=bad host'
+        reject_ss '名称含非法字符' 'NAME=ss-node' 'NAME=ss node;rm'
+        reject_ss 'CONFIG_ID 过短' 'CONFIG_ID=111111111111111111111111' 'CONFIG_ID=1111'
+        reject_ss 'CONFIG_ID 非十六进制' 'CONFIG_ID=111111111111111111111111' 'CONFIG_ID=zzzzzzzzzzzzzzzzzzzzzzzz'
+        reject_ss '密码含非法字符' 'PASSWORD=QUFBQUFBQUFBQUFBQUFBQQ==' 'PASSWORD=abc$(id)'
+        reject_ss '加密方式不受支持' "METHOD=$SS_METHOD" 'METHOD=rc4-md5'
+        reject_vless 'UUID 格式错误' 'UUID=11111111-2222-4333-8444-555555555555' 'UUID=not-a-uuid'
+        reject_vless 'flow 不受支持' 'FLOW=xtls-rprx-vision' 'FLOW=none'
+        reject_vless 'Reality 域名非法' 'REALITY_SERVER_NAME=addons.mozilla.org' 'REALITY_SERVER_NAME=-bad-'
+        reject_vless 'Reality 私钥格式错误' \
+            'REALITY_PRIVATE_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' 'REALITY_PRIVATE_KEY=short'
+        reject_vless 'Reality 公钥格式错误' \
+            'REALITY_PUBLIC_KEY=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB' 'REALITY_PUBLIC_KEY=short'
+        reject_vless 'Reality short_id 格式错误' \
+            'REALITY_SHORT_ID=0123456789abcdef' 'REALITY_SHORT_ID=xyz'
+        reject_vless 'fingerprint 不受支持' 'FINGERPRINT=chrome' 'FINGERPRINT=firefox'
+
+        write_state_lines "$file" "${ss_valid[@]}"
+        if load_state_file "$file" vless-reality; then
+            fail "状态校验必须拒绝：协议与期望不符"
+        fi
+        write_state_lines "$file" "${ss_valid[@]}" 'EXTRA=1'
+        if load_state_file "$file" shadowsocks; then
+            fail "状态校验必须拒绝：出现未知键"
+        fi
+        write_state_lines "$file" "${ss_valid[@]}" 'PORT=20002'
+        if load_state_file "$file" shadowsocks; then
+            fail "状态校验必须拒绝：同一个键出现两次"
+        fi
+
+        write_state_lines "$file" "${ss_valid[@]/PORT=20001/PORT=020001}"
+        load_state_file "$file" shadowsocks ||
+            fail "历史状态文件中的前导零端口必须继续被接受"
+        assert_eq 20001 "$(normalize_port_decimal "$PORT")" \
+            "前导零端口必须规范化为相同十进制值"
+    )
+}
+
+test_firewall_sync_failure_does_not_block_node_transaction_completion() {
+    (
+        local output="$TEST_TMP/firewall-not-blocking.out"
+        local order_log="$TEST_TMP/firewall-not-blocking.order"
+        set_node_paths "$TEST_TMP/firewall-not-blocking"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_uri_files
+        service_is_running() { return 1; }
+        service_is_enabled() { return 1; }
+
+        begin_node_transaction
+        mark_node_transaction_mutated
+        printf 'broken\n' > "$SS_CONFIG_PATH"
+        rm -f "$SS_STATE_FILE" "$URI_FILE" "$SS_URI_FILE"
+        ACTIVE_NODE_BACKUP=""
+
+        service_stop() { return 0; }
+        stop_singbox_config_processes() { return 0; }
+        service_manager_is_active() { return 1; }
+        singbox_config_pids() { return 0; }
+        service_disable() { return 0; }
+        is_systemd() { return 1; }
+        OS=unknown
+        : "$OS"
+        : > "$order_log"
+        firewall_refresh_if_enabled() {
+            [ -d "$NODE_TRANSACTION_DIR" ] || printf '%s\n' missing-transaction >> "$order_log"
+            printf '%s\n' firewall-refresh >> "$order_log"
+            return 1
+        }
+
+        recover_pending_node_transaction > "$output" 2>&1 ||
+            fail "节点文件已恢复时，防火墙同步失败不得阻断节点事务"
+        assert_file_contains "$SS_CONFIG_PATH" '"type": "shadowsocks"'
+        assert_file_contains "$SS_STATE_FILE" '^PROTOCOL=shadowsocks$'
+        [ ! -e "$NODE_TRANSACTION_DIR" ] ||
+            fail "节点已恢复后必须清理事务目录"
+        assert_file_not_contains "$order_log" '^missing-transaction$' \
+            "防火墙刷新完成前必须保留 pending 事务，以便硬中断后重试"
+        assert_file_contains "$output" '主机防火墙端口未能同步'
+        assert_file_not_contains "$output" '已完整恢复'
+    )
+}
+
+test_unrecovered_pending_transaction_blocks_new_operation() {
+    (
+        local output="$TEST_TMP/pending-blocks-new.out"
+        set_node_paths "$TEST_TMP/pending-blocks-new"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_uri_files
+        service_is_running() { return 1; }
+        service_is_enabled() { return 1; }
+
+        begin_node_transaction || fail "首次节点事务应能建立"
+        mark_node_transaction_mutated
+        printf 'broken\n' > "$SS_CONFIG_PATH"
+        ACTIVE_NODE_BACKUP=""
+
+        if begin_node_transaction > "$output" 2>&1; then
+            fail "存在未恢复的 pending 事务时不得开始新操作"
+        fi
+        assert_file_contains "$output" '尚未恢复的节点事务'
+        [ -f "$NODE_TRANSACTION_DIR/pending" ] ||
+            fail "被拒绝的新操作不得清除 pending 标记"
+        assert_file_contains \
+            "$NODE_TRANSACTION_BACKUP/vpsbox.d/${SS_CONFIG_PATH##*/}" \
+            '"type": "shadowsocks"' \
+            "被拒绝的新操作不得覆盖改动前的备份"
+    )
+}
+
 test_pending_transaction_recovers_after_hard_interruption() {
     (
         set_node_paths "$TEST_TMP/pending-recovery"
@@ -1120,12 +1435,21 @@ test_self_check_keeps_valid_sibling_visible() {
 main() {
     local name test status passed=0 skipped=0
     local -a required=(
+        atomic_staging_dir
+        fail_after_node_rollback
         node_file_is_secure
         node_dir_is_secure
+        node_backup_file_is_safe
         node_config_matches_loaded_state
+        node_config_dir_contents_valid
         require_valid_node_state_if_present
         begin_node_transaction
+        mark_node_transaction_mutated
         rollback_active_node_transaction
+        recover_pending_node_transaction
+        restore_file_atomically_from_snapshot
+        load_state_file
+        normalize_port_decimal
         delete_node
         write_uri_files
     )
@@ -1147,6 +1471,14 @@ main() {
         test_dual_node_backup_restore_round_trip
         test_verify_runtime_checks_both_protocols
         test_cancel_eof_and_input_interrupt_have_no_mutation
+        test_failed_rollback_must_not_claim_state_was_restored
+        test_node_rollback_firewall_failure_is_partial_success
+        test_node_backup_file_safety_enforces_owner_and_mode
+        test_interrupted_restore_leaves_node_config_dir_usable
+        test_atomic_staging_rejects_cross_device_node_directory
+        test_state_file_field_validation_rejects_malformed_values
+        test_firewall_sync_failure_does_not_block_node_transaction_completion
+        test_unrecovered_pending_transaction_blocks_new_operation
         test_absent_backup_entry_removes_target_and_invalid_entry_is_rejected
         test_pending_transaction_recovers_after_hard_interruption
         test_unmodified_pending_transaction_is_discarded_without_service_stop

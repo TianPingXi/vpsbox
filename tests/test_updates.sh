@@ -54,6 +54,24 @@ test_cleanup() {
 }
 trap test_cleanup EXIT
 
+require_root_permission_semantics() {
+    local probe="$TEST_TMP/update-root-permission-probe" owner group mode
+
+    mkdir -p "$probe" || return 1
+    : > "$probe/file" || return 1
+    if command chown root:root "$probe" "$probe/file" 2>/dev/null &&
+        command chmod 700 "$probe" && command chmod 600 "$probe/file"; then
+        owner="$(stat -c '%u' "$probe/file" 2>/dev/null || true)"
+        group="$(stat -c '%g' "$probe/file" 2>/dev/null || true)"
+        mode="$(stat -c '%a' "$probe/file" 2>/dev/null || true)"
+        rm -rf -- "$probe"
+        [ "$owner" = 0 ] && [ "$group" = 0 ] && [ "$mode" = 600 ] && return 0
+    else
+        rm -rf -- "$probe"
+    fi
+    skip "需要真实的 root 属主与 Unix 权限语义"
+}
+
 write_fixture() {
     local path="$1" version="$2" marker="$3"
     local script_url="${4:-$SCRIPT_URL}"
@@ -324,6 +342,104 @@ test_vpsbox_reexec_failure_restores_previous() {
     assert_file_contains "$output" '已从 .*previous 恢复旧版 vpsbox'
 }
 
+test_real_reexec_failure_returns_without_option_or_env_leaks() {
+    local case_dir="$TEST_TMP/real-reexec-failure" output status
+
+    mkdir -p "$case_dir/watchdog"
+    printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$case_dir/not-executable"
+    chmod 600 "$case_dir/not-executable"
+    set +e
+    REPO_DIR="$REPO_DIR" CASE_DIR="$case_dir" bash -c '
+        set -euo pipefail
+        source "$REPO_DIR/vpsbox.sh"
+        cleanup_test_watchdog() {
+            local pid="${VPSBOX_UPDATE_WATCHDOG_PID:-}"
+            [ -n "$pid" ] || return 0
+            kill -TERM "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+        }
+        trap cleanup_test_watchdog EXIT
+        declare -F reexec_updated_vpsbox >/dev/null || {
+            printf "missing:reexec_updated_vpsbox\n"
+            exit 97
+        }
+        CMD_PATH="$CASE_DIR/not-executable"
+        RUNTIME_DIR="$CASE_DIR"
+        start_vpsbox_update_watchdog() {
+            VPSBOX_UPDATE_WATCHDOG_DIR="$CASE_DIR/watchdog"
+            ( while :; do sleep 1; done ) &
+            # shellcheck disable=SC2034 # 被测函数通过动态全局读取 watchdog PID。
+            VPSBOX_UPDATE_WATCHDOG_PID=$!
+        }
+        shopt -u execfail
+        set +e
+        reexec_updated_vpsbox "$CASE_DIR/previous"
+        rc=$?
+        set -e
+        kill -TERM "$VPSBOX_UPDATE_WATCHDOG_PID" 2>/dev/null || true
+        wait "$VPSBOX_UPDATE_WATCHDOG_PID" 2>/dev/null || true
+        VPSBOX_UPDATE_WATCHDOG_PID=""
+        printf "reached:%s\n" "$rc"
+        shopt -q execfail && printf "execfail:on\n" || printf "execfail:off\n"
+        [ -z "${VPSBOX_UPDATE_BACKUP+x}" ] && printf "backup-env:clear\n"
+        [ -z "${VPSBOX_UPDATE_READY_FILE+x}" ] && printf "ready-env:clear\n"
+    ' > "$case_dir/output" 2>&1
+    status=$?
+    set -e
+    [ "$status" -eq 0 ] || fail "真实 reexec 失败夹具异常退出：$status"
+    output="$case_dir/output"
+    assert_file_contains "$output" '^reached:126$' \
+        "不可执行文件必须以 126 返回控制权"
+    assert_file_not_contains "$output" 'command not found|missing:reexec_updated_vpsbox'
+    assert_file_contains "$output" '^execfail:off$'
+    assert_file_contains "$output" '^backup-env:clear$'
+    assert_file_contains "$output" '^ready-env:clear$'
+}
+
+test_vpsbox_reexec_failure_restores_before_ready() {
+    (
+        local output="$TEST_TMP/reexec-order.out" ready order_watchdog_pid=""
+        cleanup_order_watchdog() {
+            [ -n "$order_watchdog_pid" ] || return 0
+            kill -TERM "$order_watchdog_pid" 2>/dev/null || true
+            wait "$order_watchdog_pid" 2>/dev/null || true
+        }
+        trap cleanup_order_watchdog EXIT
+        reset_update_case reexec-order
+        write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
+        write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_NEWER" remote
+
+        reexec_updated_vpsbox() {
+            VPSBOX_UPDATE_WATCHDOG_DIR="$RUNTIME_DIR/update-startup.order"
+            mkdir -p "$VPSBOX_UPDATE_WATCHDOG_DIR"
+            ready="$VPSBOX_UPDATE_WATCHDOG_DIR/ready"
+            (
+                while [ ! -e "$ready" ]; do sleep 0.01; done
+            ) &
+            order_watchdog_pid=$!
+            # shellcheck disable=SC2034 # update_vpsbox 的监护收尾 helper 动态读取。
+            VPSBOX_UPDATE_WATCHDOG_PID=$order_watchdog_pid
+            return 42
+        }
+        mark_vpsbox_update_ready() {
+            assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_CURRENT" || return "$?"
+            printf '%s\n' ready-after-restore >> "$MOCK_EVENT_LOG"
+            : > "$1"
+        }
+
+        if update_vpsbox > "$output" 2>&1; then
+            fail "新版重新执行失败时更新不得报告成功"
+        fi
+        assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_CURRENT"
+        assert_file_contains "$MOCK_EVENT_LOG" '^ready-after-restore$' \
+            "只有旧版安全落盘后才能解除 watchdog"
+        assert_file_contains "$MOCK_EVENT_LOG" '^acquire-lock$'
+        cleanup_order_watchdog
+        order_watchdog_pid=""
+        trap - EXIT
+    )
+}
+
 test_vpsbox_alias_failure_restores_previous_without_reexec() {
     local output
     reset_update_case alias-failure
@@ -539,6 +655,89 @@ reset_singbox_case() {
     VPSBOX_TEST_MODE=1
 }
 
+write_singbox_cleanup_residual() {
+    local binary_path="$1"
+
+    mkdir -p "$SINGBOX_UPDATE_TRANSACTION_DIR"
+    chmod 700 "$SINGBOX_UPDATE_TRANSACTION_DIR"
+    cat > "$SINGBOX_UPDATE_TRANSACTION_STATE" <<EOF
+version=1
+binary_path=$binary_path
+old_version=1.13.13
+was_enabled=0
+was_active=0
+package_name=none
+binary_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+package_sha256=none
+EOF
+    : > "$SINGBOX_UPDATE_TRANSACTION_DIR/pending"
+    chmod 600 "$SINGBOX_UPDATE_TRANSACTION_STATE" "$SINGBOX_UPDATE_TRANSACTION_DIR/pending"
+    command chown root:root "$SINGBOX_UPDATE_TRANSACTION_DIR" \
+        "$SINGBOX_UPDATE_TRANSACTION_STATE" "$SINGBOX_UPDATE_TRANSACTION_DIR/pending"
+}
+
+test_interrupted_singbox_cleanup_validates_current_binary() {
+    (
+        local binary output="$TEST_TMP/singbox-cleanup-valid.out"
+
+        require_root_permission_semantics || return "$?"
+        reset_singbox_case cleanup-valid
+        binary="$TEST_TMP/singbox-cleanup-valid/sing-box"
+        mkdir -p "$(dirname "$binary")" "$VPSBOX_STATE_DIR"
+        printf '%s\n' '#!/bin/sh' 'printf "sing-box version 1.13.14\n"' > "$binary"
+        chmod 755 "$binary"
+        command chown root:root "$binary" "$VPSBOX_STATE_DIR"
+        write_singbox_cleanup_residual "$binary"
+        : > "$VPSBOX_STATE_DIR/keep-sibling"
+
+        recover_pending_singbox_update > "$output" 2>&1 ||
+            fail "当前 sing-box 可信可用时应清理无恢复价值的事务残留"
+        [ ! -e "$SINGBOX_UPDATE_TRANSACTION_DIR" ] ||
+            fail "有效当前二进制确认后应清理事务残留"
+        [ -f "$VPSBOX_STATE_DIR/keep-sibling" ] ||
+            fail "自愈不得删除 sing-box 事务目录以外的状态"
+        assert_file_contains "$output" '更新或回滚清理曾中断'
+        assert_file_not_contains "$output" '更新完成'
+    )
+    (
+        local binary output="$TEST_TMP/singbox-cleanup-invalid.out"
+
+        require_root_permission_semantics || return "$?"
+        reset_singbox_case cleanup-invalid
+        binary="$TEST_TMP/singbox-cleanup-invalid/sing-box"
+        mkdir -p "$(dirname "$binary")" "$VPSBOX_STATE_DIR"
+        printf '%s\n' '#!/bin/sh' 'printf "sing-box version 1.13.14\n"' > "$binary"
+        chmod 775 "$binary"
+        command chown root:root "$binary" "$VPSBOX_STATE_DIR"
+        write_singbox_cleanup_residual "$binary"
+
+        if recover_pending_singbox_update > "$output" 2>&1; then
+            fail "当前二进制可被非 root 写入时不得自动清理事务"
+        fi
+        [ -f "$SINGBOX_UPDATE_TRANSACTION_DIR/pending" ] ||
+            fail "无法安全判定时必须保留事务记录"
+        assert_file_contains "$output" '当前二进制或事务元数据不可用'
+    )
+}
+
+test_singbox_commit_removes_pending_then_syncs_before_cleanup() {
+    (
+        local log="$TEST_TMP/singbox-pending-first.log"
+        reset_singbox_case pending-first
+        mkdir -p "$SINGBOX_UPDATE_TRANSACTION_DIR"
+        : > "$SINGBOX_UPDATE_TRANSACTION_DIR/pending"
+        : > "$log"
+        rm() { printf 'rm:%s\n' "$*" >> "$log"; }
+        sync_node_transaction_store() { printf '%s\n' sync >> "$log"; }
+
+        remove_singbox_update_transaction_dir
+        assert_eq "rm:-f -- $SINGBOX_UPDATE_TRANSACTION_DIR/pending
+sync
+rm:-rf -- $SINGBOX_UPDATE_TRANSACTION_DIR" "$(cat "$log")" \
+            "事务提交清理必须先移除 pending、持久化，再删除其余恢复材料"
+    )
+}
+
 test_singbox_version_guards() {
     local fake_bin="$TEST_TMP/bin"
     mkdir -p "$fake_bin"
@@ -601,6 +800,11 @@ main() {
         update_vpsbox
         auto_update_vpsbox_on_start
         rollback_pending_vpsbox_update
+        reexec_updated_vpsbox
+        settle_vpsbox_update_watchdog_after_safe_restore
+        recover_pending_singbox_update
+        remove_singbox_update_transaction_dir
+        current_singbox_update_binary_usable
     )
     local -a tests=(
         test_version_relation
@@ -613,6 +817,8 @@ main() {
         test_vpsbox_invalid_download_preserves_current
         test_vpsbox_wrong_project_preserves_current
         test_vpsbox_reexec_failure_restores_previous
+        test_real_reexec_failure_returns_without_option_or_env_leaks
+        test_vpsbox_reexec_failure_restores_before_ready
         test_vpsbox_alias_failure_restores_previous_without_reexec
         test_pending_update_startup_failure_restores_previous
         test_top_level_startup_failure_restores_previous
@@ -620,6 +826,8 @@ main() {
         test_stale_previous_without_handshake_is_ignored
         test_pending_update_rejects_unexpected_backup_path
         test_singbox_version_guards
+        test_interrupted_singbox_cleanup_validates_current_binary
+        test_singbox_commit_removes_pending_then_syncs_before_cleanup
         test_singbox_redhat_release_arch_mapping
     )
 

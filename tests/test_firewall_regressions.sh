@@ -832,6 +832,61 @@ test_adding_port_uses_lightweight_commit_path() {
     )
 }
 
+test_apply_without_rollback_watchdog_must_not_touch_firewall() {
+    (
+        local case_dir="$TEST_TMP/apply-watchdog-guard"
+        local log="$TEST_TMP/apply-watchdog-guard.log"
+
+        forbid_init
+        mkdir -p "$case_dir"
+        RUNTIME_DIR="$case_dir/run"
+        mkdir -p "$RUNTIME_DIR"
+        FIREWALL_CONFIG="$case_dir/firewall.nft"
+        FIREWALL_STATE_FILE="$case_dir/firewall.env"
+        # shellcheck disable=SC2034 # 被测的完整更新流程动态读取。
+        FIREWALL_SYSTEMD_UNIT="$case_dir/vpsbox-firewall.service"
+        # shellcheck disable=SC2034 # 被测的完整更新流程动态读取。
+        FIREWALL_OPENRC_SERVICE="$case_dir/vpsbox-firewall"
+        : > "$log"
+
+        detect_os() { OS=debian; : "$OS"; }
+        firewall_settle_pending_port_transition() { :; }
+        firewall_recover_pending_rollbacks() { :; }
+        firewall_check_conflicts() { :; }
+        ensure_nftables() { :; }
+        firewall_detect_allowed_ports() { FW_SSH_PORTS=22; }
+        firewall_show_port_summary() { :; }
+        ensure_change_store() { :; }
+        firewall_write_state_file() { printf '%s\n' state > "$1"; }
+        firewall_write_config() { printf '%s\n' config > "$1"; }
+        firewall_write_service_definition() { printf '%s\n' service > "$1"; }
+        firewall_create_rollback_snapshot() {
+            mkdir -p "$case_dir/snapshot"
+            printf -v "$1" '%s' "$case_dir/snapshot"
+        }
+        firewall_start_rollback_watchdog() {
+            printf '%s\n' watchdog-failed >> "$log"
+            return 1
+        }
+        firewall_restore_snapshot_now() {
+            assert_eq "$case_dir/snapshot" "$1" "必须恢复刚创建的快照" || return "$?"
+            printf '%s\n' restored >> "$log"
+        }
+        firewall_apply_config_file() { forbid "未获得自动回滚保护时应用了防火墙规则"; }
+        firewall_install_managed_file() { forbid "未获得自动回滚保护时写入了受管配置"; }
+        firewall_begin_commit() { forbid "未获得自动回滚保护时进入了提交阶段"; }
+
+        if firewall_apply_desired_state <<< "YES" >/dev/null 2>&1; then
+            fail "自动回滚保护启动失败时防火墙更新不得报告成功"
+        fi
+        assert_file_contains "$log" '^watchdog-failed$' \
+            "应用规则前必须先启动自动回滚保护"
+        assert_file_contains "$log" '^restored$' \
+            "保护启动失败后必须恢复应用前状态"
+        assert_no_forbidden "在没有自动回滚保护的情况下改动了防火墙"
+    )
+}
+
 test_lightweight_add_does_not_rescan_docker_or_ssh() {
     (
         local case_dir="$TEST_TMP/additive-apply" log="$TEST_TMP/additive-apply.log"
@@ -952,6 +1007,7 @@ main() {
         run_bounded_in_new_session
         run_bounded_with_timeout
         firewall_start_rollback_watchdog
+        firewall_apply_desired_state
         firewall_detect_docker_ports
         firewall_detect_public_listeners
         firewall_detect_allowed_ports
@@ -984,6 +1040,7 @@ main() {
         test_additive_config_builder_adds_tcp_without_rebuilding_other_rules
         test_additive_config_builder_creates_first_udp_rule_and_set
         test_adding_port_uses_lightweight_commit_path
+        test_apply_without_rollback_watchdog_must_not_touch_firewall
         test_lightweight_add_does_not_rescan_docker_or_ssh
         test_internal_port_transition_preserves_unrelated_public_ports
     )

@@ -1039,6 +1039,64 @@ is_systemd() {
     command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
 }
 
+ensure_public_config_dir() {
+    local dir="$1" managed_file="${2:-}" mode owner group
+
+    [ ! -L "$dir" ] || {
+        err "服务配置目录是符号链接，已拒绝修改：$dir"
+        return 1
+    }
+    if [ ! -e "$dir" ]; then
+        mkdir -p -- "$dir" || return 1
+        chown root:root "$dir" || return 1
+        chmod 755 "$dir" || return 1
+        return 0
+    fi
+    [ -d "$dir" ] || return 1
+    owner="$(stat -c '%u' "$dir" 2>/dev/null)" || return 1
+    group="$(stat -c '%g' "$dir" 2>/dev/null)" || return 1
+    mode="$(stat -c '%a' "$dir" 2>/dev/null)" || return 1
+    [ "$owner" = "0" ] && [ "$group" = "0" ] || {
+        err "服务配置目录不是 root:root，已拒绝修改：$dir"
+        return 1
+    }
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    [ $((8#$mode & 8#022)) -eq 0 ] || {
+        err "服务配置目录允许非 root 用户写入，已拒绝使用：$dir"
+        return 1
+    }
+    if [ $((8#$mode & 8#005)) -eq 5 ]; then
+        return 0
+    fi
+    [ -n "$managed_file" ] && [ -f "$managed_file" ] && [ ! -L "$managed_file" ] &&
+        [ "$(stat -c '%u:%g' "$managed_file" 2>/dev/null || true)" = "0:0" ] || {
+        err "既有服务配置目录不可公开读取，且无法确认由 vpsbox 创建：$dir"
+        return 1
+    }
+    chmod 755 "$dir"
+}
+
+atomic_staging_dir() {
+    local target="$1" staging_dir target_parent staging_device target_device
+
+    target_parent="$(dirname "$target")" || return 1
+    staging_dir="$target_parent"
+    case "$target" in
+        "$NODE_CONFIG_DIR"/*)
+            staging_dir="$CONFIG_DIR"
+            [ -d "$NODE_CONFIG_DIR" ] && [ ! -L "$NODE_CONFIG_DIR" ] || return 1
+            [ -d "$staging_dir" ] && [ ! -L "$staging_dir" ] || return 1
+            staging_device="$(stat -c '%d' "$staging_dir" 2>/dev/null)" || return 1
+            target_device="$(stat -c '%d' "$NODE_CONFIG_DIR" 2>/dev/null)" || return 1
+            [ "$staging_device" = "$target_device" ] || {
+                err "节点配置目录与安全临时目录不在同一文件系统，已拒绝非原子替换。"
+                return 1
+            }
+            ;;
+    esac
+    printf '%s\n' "$staging_dir"
+}
+
 install_root_file_atomically() {
     local source="$1" target="$2" mode="${3:-644}"
     local parent tmp
@@ -1049,7 +1107,7 @@ install_root_file_atomically() {
     if [ -e "$target" ] && [ ! -f "$target" ]; then
         return 1
     fi
-    parent="$(dirname "$target")"
+    parent="$(atomic_staging_dir "$target")" || return 1
     [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
     command -v mktemp >/dev/null 2>&1 || return 1
     tmp="$(mktemp "$parent/.vpsbox-publish.XXXXXX")" || return 1
@@ -1073,11 +1131,11 @@ restore_file_atomically_from_snapshot() {
     elif [ -e "$target" ] && [ ! -f "$target" ]; then
         return 1
     fi
-    parent="$(dirname "$target")"
+    parent="$(atomic_staging_dir "$target")" || return 1
     [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
     command -v mktemp >/dev/null 2>&1 || return 1
     tmp="$(mktemp "$parent/.vpsbox-restore.XXXXXX")" || return 1
-    # 在目标目录中准备副本再 rename，恢复过程中不会把目标文件直接截断。
+    # 在同一文件系统的安全目录中准备副本再 rename，恢复过程中不会把目标文件直接截断。
     if ! cp -a -- "$snapshot" "$tmp" ||
         ! mv -f -- "$tmp" "$target"; then
         rm -f -- "$tmp"
@@ -1643,6 +1701,24 @@ mark_change_applied() {
 
 begin_change_transaction() {
     manifest_set "PENDING_$1" 1
+}
+
+cancel_unmodified_change_transaction() {
+    local name="$1" key failed=0
+    shift
+
+    if [ "$(manifest_value "APPLIED_$name" 2>/dev/null || true)" = "1" ]; then
+        manifest_remove "PENDING_$name"
+        return
+    fi
+    rm -f -- "$CHANGE_BACKUP_DIR/$name" || failed=1
+    manifest_remove "BACKUP_$name" || failed=1
+    manifest_remove "PENDING_$name" || failed=1
+    manifest_remove "APPLIED_$name" || failed=1
+    for key in "$@"; do
+        manifest_remove "$key" || failed=1
+    done
+    return "$failed"
 }
 
 change_restore_state() {
@@ -3235,9 +3311,6 @@ node_backup_file_is_safe() {
     local file="$1" owner group mode
 
     [ -f "$file" ] && [ ! -L "$file" ] || return 1
-    if [ "${VPSBOX_TEST_MODE:-0}" = "1" ]; then
-        return 0
-    fi
     owner="$(stat -c '%u' "$file" 2>/dev/null)" || return 1
     group="$(stat -c '%g' "$file" 2>/dev/null)" || return 1
     mode="$(stat -c '%a' "$file" 2>/dev/null)" || return 1
@@ -3695,9 +3768,20 @@ rollback_node_files_transaction() {
     remove_node_transaction_dir "$transaction_dir"
 }
 
+fail_after_node_rollback() {
+    local reason="$1" previous_state="$2"
+
+    if rollback_active_node_transaction; then
+        err "$reason；节点配置与 sing-box 已恢复到${previous_state}状态。"
+    else
+        err "$reason；节点状态未能确认完整恢复，请检查上方错误和事务目录。"
+    fi
+    return 1
+}
+
 rollback_active_node_transaction() {
     local transaction_dir="${ACTIVE_NODE_BACKUP:-}"
-    local failed=0 had_firewall_transition=0
+    local had_firewall_transition=0
 
     [ -n "$transaction_dir" ] || return 0
     node_transaction_dir_valid "$transaction_dir" || return 1
@@ -3715,22 +3799,19 @@ rollback_active_node_transaction() {
     if [ "$had_firewall_transition" -eq 1 ] &&
         declare -F firewall_abort_port_transition >/dev/null 2>&1; then
         firewall_abort_port_transition || {
-            warn "节点已回滚，但主机防火墙临时规则恢复失败，请手动更新。"
-            failed=1
+            warn "节点已恢复，但主机防火墙临时规则未能同步；请进入 [4] 主机防火墙执行一键开启/更新。"
         }
     elif declare -F firewall_refresh_if_enabled >/dev/null 2>&1; then
         firewall_refresh_if_enabled || {
-            warn "节点已回滚，但主机防火墙端口重新同步失败，请手动更新。"
-            failed=1
+            warn "节点已恢复，但主机防火墙端口未能同步；请进入 [4] 主机防火墙执行一键开启/更新。"
         }
     fi
     ACTIVE_NODE_BACKUP=""
     ACTIVE_NODE_TRANSACTION_MUTATED=0
-    if [ "$failed" -ne 0 ]; then
-        err "节点文件已恢复，但事务未完整结束；备份已保留：$transaction_dir"
+    if ! remove_node_transaction_dir "$transaction_dir"; then
+        err "节点已经恢复，但事务目录未能清理：$transaction_dir"
         return 1
     fi
-    remove_node_transaction_dir "$transaction_dir"
 }
 
 recover_pending_node_transaction() {
@@ -3787,15 +3868,15 @@ recover_pending_node_transaction() {
     fi
     if declare -F firewall_refresh_if_enabled >/dev/null 2>&1 &&
         ! firewall_refresh_if_enabled; then
-        ACTIVE_NODE_BACKUP=""
-        ACTIVE_NODE_TRANSACTION_MUTATED=0
-        err "原节点已恢复，但主机防火墙同步失败；事务备份已保留。"
-        return 1
+        warn "节点配置与服务状态已恢复，但主机防火墙端口未能同步；请进入 [4] 主机防火墙执行一键开启/更新。"
     fi
     ACTIVE_NODE_BACKUP=""
     ACTIVE_NODE_TRANSACTION_MUTATED=0
-    remove_node_transaction_dir || return 1
-    info "未提交节点事务已完整恢复。"
+    if ! remove_node_transaction_dir; then
+        err "节点已经恢复，但事务目录未能清理：$NODE_TRANSACTION_DIR"
+        return 1
+    fi
+    info "未提交节点事务的节点配置与服务状态已恢复。"
 }
 
 port_in_use_tcp() {
@@ -4390,12 +4471,9 @@ publish_staged_node_file() {
     local tmp publish_dir
 
     [ -f "$source" ] && [ ! -L "$source" ] || return 1
-    # 节点配置目录只允许存在两份正式 JSON。临时文件必须建在同一文件系统的
-    # 上级 CONFIG_DIR，避免发布中被 SIGKILL 后，残留文件反过来阻止事务恢复。
-    case "$dest" in
-        "$NODE_CONFIG_DIR"/*) publish_dir="$CONFIG_DIR" ;;
-        *) publish_dir="$(dirname "$dest")" ;;
-    esac
+    # 节点配置目录只允许存在两份正式 JSON；受检查的 staging 目录既要避开
+    # sing-box 的 -C 扫描范围，也必须与目标位于同一文件系统。
+    publish_dir="$(atomic_staging_dir "$dest")" || return 1
     [ -d "$publish_dir" ] && [ ! -L "$publish_dir" ] || return 1
     tmp="$(mktemp "$publish_dir/.vpsbox-node-publish.XXXXXX")" || return 1
     if ! cp -- "$source" "$tmp" ||
@@ -4710,8 +4788,7 @@ EOF
     fi
     if ! mark_node_transaction_mutated ||
         ! firewall_prepare_port_transition "$port" "$port" "$existing_port" "$existing_port"; then
-        rollback_active_node_transaction || true
-        err "主机防火墙无法临时放行新节点端口，未创建 Shadowsocks 节点。"
+        fail_after_node_rollback "主机防火墙无法临时放行新节点端口，未创建 Shadowsocks 节点" "创建前" || true
         return 1
     fi
     info "加密方式：$SS_METHOD"
@@ -4719,25 +4796,21 @@ EOF
     if ! publish_staged_node ss ||
         ! check_node_config_set ||
         ! setup_service; then
-        rollback_active_node_transaction || true
-        err "Shadowsocks 配置、状态、链接或服务写入失败，已恢复创建前状态。"
+        fail_after_node_rollback "Shadowsocks 配置、状态、链接或服务写入失败" "创建前" || true
         return 1
     fi
     info "正在启动 sing-box 服务..."
     if ! restart_singbox_cleanly || ! verify_all_node_runtime; then
-        rollback_active_node_transaction || true
-        err "sing-box 未保持运行或节点端口未完整监听，已恢复创建前状态。"
+        fail_after_node_rollback "sing-box 未保持运行或节点端口未完整监听" "创建前" || true
         return 1
     fi
     if ! firewall_complete_port_transition; then
-        rollback_active_node_transaction || true
-        err "主机防火墙未能同步节点端口，已恢复创建前状态。"
+        fail_after_node_rollback "主机防火墙未能同步节点端口" "创建前" || true
         return 1
     fi
 
     if ! commit_node_transaction; then
-        rollback_active_node_transaction || true
-        err "节点事务提交失败，已尝试恢复创建前状态。"
+        fail_after_node_rollback "节点事务提交失败" "创建前" || true
         return 1
     fi
     info "Shadowsocks 节点创建完成，当前节点链接如下："
@@ -4894,33 +4967,28 @@ EOF
     fi
     if ! mark_node_transaction_mutated ||
         ! firewall_prepare_port_transition "$port" "" "$existing_port" ""; then
-        rollback_active_node_transaction || true
-        err "主机防火墙无法临时放行新节点端口，未创建 VLESS Reality 节点。"
+        fail_after_node_rollback "主机防火墙无法临时放行新节点端口，未创建 VLESS Reality 节点" "创建前" || true
         return 1
     fi
     info "正在写入 VLESS Reality 配置..."
     if ! publish_staged_node vless ||
         ! check_node_config_set ||
         ! setup_service; then
-        rollback_active_node_transaction || true
-        err "VLESS Reality 配置、状态、链接或服务写入失败，已恢复创建前状态。"
+        fail_after_node_rollback "VLESS Reality 配置、状态、链接或服务写入失败" "创建前" || true
         return 1
     fi
     info "正在启动 sing-box 服务..."
     if ! restart_singbox_cleanly || ! verify_all_node_runtime; then
-        rollback_active_node_transaction || true
-        err "sing-box 未保持运行或节点端口未完整监听，已恢复创建前状态。"
+        fail_after_node_rollback "sing-box 未保持运行或节点端口未完整监听" "创建前" || true
         return 1
     fi
     if ! firewall_complete_port_transition; then
-        rollback_active_node_transaction || true
-        err "主机防火墙未能同步节点端口，已恢复创建前状态。"
+        fail_after_node_rollback "主机防火墙未能同步节点端口" "创建前" || true
         return 1
     fi
 
     if ! commit_node_transaction; then
-        rollback_active_node_transaction || true
-        err "节点事务提交失败，已尝试恢复创建前状态。"
+        fail_after_node_rollback "节点事务提交失败" "创建前" || true
         return 1
     fi
     info "VLESS Reality 节点创建完成，当前节点链接如下："
@@ -5040,8 +5108,7 @@ delete_node_protocol() {
     if ! mark_node_transaction_mutated ||
         ! firewall_prepare_port_transition \
             "" "" "$node_port" "$firewall_drop_udp"; then
-        rollback_active_node_transaction || true
-        err "主机防火墙无法开始节点删除事务，已取消删除。"
+        fail_after_node_rollback "主机防火墙无法开始节点删除事务，已取消删除" "删除前" || true
         return 1
     fi
 
@@ -5049,27 +5116,23 @@ delete_node_protocol() {
         service_stop 2>/dev/null ||
             warn "服务管理器未能正常停止 sing-box，将继续检查 vpsbox 配置对应的进程。"
         if ! stop_singbox_config_processes; then
-            rollback_active_node_transaction || true
-            err "残留 sing-box 进程无法停止，已保留节点配置。"
+            fail_after_node_rollback "残留 sing-box 进程无法停止" "删除前" || true
             return 1
         fi
         sleep 1
     fi
     if service_manager_is_active || [ -n "$(singbox_config_pids)" ]; then
-        rollback_active_node_transaction || true
-        err "sing-box 服务仍在运行，已保留节点配置。"
+        fail_after_node_rollback "sing-box 服务仍在运行" "删除前" || true
         return 1
     fi
     if [ "$singbox_available" -eq 1 ]; then
         if port_in_use_for_protocols "$node_port" "$node_protocols"; then
-            rollback_active_node_transaction || true
-            err "节点端口 $node_port 仍被其他进程监听，已保留节点配置。"
+            fail_after_node_rollback "节点端口 $node_port 仍被其他进程监听" "删除前" || true
             return 1
         else
             port_status=$?
             if [ "$port_status" -ne 1 ]; then
-                rollback_active_node_transaction || true
-                err "无法确认节点端口 $node_port 是否已释放，已保留节点配置。"
+                fail_after_node_rollback "无法确认节点端口 $node_port 是否已释放" "删除前" || true
                 return 1
             fi
         fi
@@ -5079,13 +5142,11 @@ delete_node_protocol() {
     state="$(node_state_path "$protocol")" || return 1
     uri="$(node_uri_path "$protocol")" || return 1
     rm -f -- "$config" "$state" "$uri" || {
-        rollback_active_node_transaction || true
-        err "$label 节点文件删除失败，已尝试恢复。"
+        fail_after_node_rollback "$label 节点文件删除失败" "删除前" || true
         return 1
     }
     write_uri_files || {
-        rollback_active_node_transaction || true
-        err "剩余节点链接更新失败，已尝试恢复。"
+        fail_after_node_rollback "剩余节点链接更新失败" "删除前" || true
         return 1
     }
 
@@ -5095,20 +5156,17 @@ delete_node_protocol() {
                 ! setup_service ||
                 ! restart_singbox_cleanly ||
                 ! verify_all_node_runtime; then
-                rollback_active_node_transaction || true
-                err "剩余节点恢复运行失败，已恢复删除前状态。"
+                fail_after_node_rollback "剩余节点恢复运行失败" "删除前" || true
                 return 1
             fi
         elif ! require_valid_node_state_if_present; then
-            rollback_active_node_transaction || true
-            err "剩余节点静态完整性校验失败，已恢复删除前状态。"
+            fail_after_node_rollback "剩余节点静态完整性校验失败" "删除前" || true
             return 1
         fi
     else
         if [ "$singbox_available" -eq 1 ] || service_is_enabled; then
             if ! service_disable || service_is_enabled; then
-                rollback_active_node_transaction || true
-                err "无法禁用 sing-box 开机启动，已恢复删除前状态。"
+                fail_after_node_rollback "无法禁用 sing-box 开机启动" "删除前" || true
                 return 1
             fi
         fi
@@ -5116,14 +5174,12 @@ delete_node_protocol() {
             rmdir "$NODE_CONFIG_DIR" 2>/dev/null || true
     fi
     if ! firewall_complete_port_transition; then
-        rollback_active_node_transaction || true
-        err "主机防火墙端口同步失败，已恢复删除前状态。"
+        fail_after_node_rollback "主机防火墙端口同步失败" "删除前" || true
         return 1
     fi
 
     if ! commit_node_transaction; then
-        rollback_active_node_transaction || true
-        err "节点删除事务提交失败，已尝试恢复删除前状态。"
+        fail_after_node_rollback "节点删除事务提交失败" "删除前" || true
         return 1
     fi
     if node_exists; then
@@ -5189,6 +5245,11 @@ remove_singbox_update_transaction_dir() {
 
     singbox_update_transaction_dir_valid "$dir" || return 1
     [ ! -L "$dir" ] || return 1
+    if [ -e "$dir/pending" ] || [ -L "$dir/pending" ]; then
+        [ -f "$dir/pending" ] && [ ! -L "$dir/pending" ] || return 1
+        rm -f -- "$dir/pending" || return 1
+        sync_node_transaction_store || return 1
+    fi
     rm -rf -- "$dir"
 }
 
@@ -5201,6 +5262,75 @@ singbox_update_state_value() {
         END { if (!found) exit 1 }' "$SINGBOX_UPDATE_TRANSACTION_STATE"
 }
 
+singbox_update_binary_path_allowed() {
+    local binary_path="$1"
+
+    if [ "${VPSBOX_TEST_MODE:-0}" = "1" ]; then
+        [[ "$binary_path" == /tmp/vpsbox-test.*/sing-box ||
+            "$binary_path" == /tmp/vpsbox-test.*/*/sing-box ]]
+    else
+        case "$binary_path" in
+            /usr/bin/sing-box|/usr/local/bin/sing-box) return 0 ;;
+            *) return 1 ;;
+        esac
+    fi
+}
+
+singbox_update_metadata_without_backup_valid() {
+    local binary_path old_version was_enabled was_active package_name
+    local binary_hash package_hash mode
+
+    singbox_update_transaction_dir_valid "$SINGBOX_UPDATE_TRANSACTION_DIR" || return 1
+    [ -d "$SINGBOX_UPDATE_TRANSACTION_DIR" ] &&
+        [ ! -L "$SINGBOX_UPDATE_TRANSACTION_DIR" ] || return 1
+    [ -f "$SINGBOX_UPDATE_TRANSACTION_DIR/pending" ] &&
+        [ ! -L "$SINGBOX_UPDATE_TRANSACTION_DIR/pending" ] || return 1
+    [ -f "$SINGBOX_UPDATE_TRANSACTION_STATE" ] &&
+        [ ! -L "$SINGBOX_UPDATE_TRANSACTION_STATE" ] || return 1
+    mode="$(stat -c '%a' "$SINGBOX_UPDATE_TRANSACTION_DIR" 2>/dev/null || true)"
+    [ "$mode" = "700" ] || return 1
+    [ "$(stat -c '%u:%g %a' "$SINGBOX_UPDATE_TRANSACTION_STATE" 2>/dev/null || true)" = "0:0 600" ] ||
+        return 1
+    [ "$(stat -c '%u:%g %a' "$SINGBOX_UPDATE_TRANSACTION_DIR/pending" 2>/dev/null || true)" = "0:0 600" ] ||
+        return 1
+    [ "$(stat -c '%u:%g' "$SINGBOX_UPDATE_TRANSACTION_DIR" 2>/dev/null || true)" = "0:0" ] ||
+        return 1
+
+    [ "$(singbox_update_state_value version 2>/dev/null || true)" = "1" ] || return 1
+    binary_path="$(singbox_update_state_value binary_path 2>/dev/null || true)"
+    old_version="$(singbox_update_state_value old_version 2>/dev/null || true)"
+    was_enabled="$(singbox_update_state_value was_enabled 2>/dev/null || true)"
+    was_active="$(singbox_update_state_value was_active 2>/dev/null || true)"
+    package_name="$(singbox_update_state_value package_name 2>/dev/null || true)"
+    binary_hash="$(singbox_update_state_value binary_sha256 2>/dev/null || true)"
+    package_hash="$(singbox_update_state_value package_sha256 2>/dev/null || true)"
+    singbox_update_binary_path_allowed "$binary_path" || return 1
+    [[ "$old_version" =~ ^[0-9]+([.][0-9]+){2}$ ]] || return 1
+    [[ "$was_enabled" =~ ^[01]$ && "$was_active" =~ ^[01]$ ]] || return 1
+    [[ "$binary_hash" =~ ^[0-9a-f]{64}$ ]] || return 1
+    case "$package_name" in
+        rollback-package.deb|rollback-package.apk|rollback-package.rpm)
+            [[ "$package_hash" =~ ^[0-9a-f]{64}$ ]]
+            ;;
+        none) [ "$package_hash" = "none" ] ;;
+        *) return 1 ;;
+    esac
+}
+
+current_singbox_update_binary_usable() {
+    local binary_path mode version
+
+    singbox_update_metadata_without_backup_valid || return 1
+    binary_path="$(singbox_update_state_value binary_path 2>/dev/null || true)"
+    [ -f "$binary_path" ] && [ ! -L "$binary_path" ] && [ -x "$binary_path" ] || return 1
+    [ "$(stat -c '%u:%g' "$binary_path" 2>/dev/null || true)" = "0:0" ] || return 1
+    mode="$(stat -c '%a' "$binary_path" 2>/dev/null || true)"
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    [ $((8#$mode & 8#022)) -eq 0 ] || return 1
+    version="$(singbox_binary_version_at "$binary_path" 2>/dev/null || true)"
+    [[ "$version" =~ ^[0-9]+([.][0-9]+){2}$ ]]
+}
+
 singbox_update_transaction_valid() {
     local binary_path old_version was_enabled was_active package_name
     local binary_hash package_hash current_hash mode
@@ -5210,17 +5340,17 @@ singbox_update_transaction_valid() {
         [ ! -L "$SINGBOX_UPDATE_TRANSACTION_DIR" ] || return 1
     [ -f "$SINGBOX_UPDATE_TRANSACTION_DIR/pending" ] &&
         [ ! -L "$SINGBOX_UPDATE_TRANSACTION_DIR/pending" ] || return 1
+    [ -f "$SINGBOX_UPDATE_TRANSACTION_STATE" ] &&
+        [ ! -L "$SINGBOX_UPDATE_TRANSACTION_STATE" ] || return 1
     [ -f "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary" ] &&
         [ ! -L "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary" ] || return 1
     mode="$(stat -c '%a' "$SINGBOX_UPDATE_TRANSACTION_DIR" 2>/dev/null || true)"
     [ "$mode" = "700" ] || return 1
     mode="$(stat -c '%a' "$SINGBOX_UPDATE_TRANSACTION_STATE" 2>/dev/null || true)"
     [ "$mode" = "600" ] || return 1
-    if [ "${VPSBOX_TEST_MODE:-0}" != "1" ]; then
-        [ "$(stat -c '%U:%G' "$SINGBOX_UPDATE_TRANSACTION_DIR" "$SINGBOX_UPDATE_TRANSACTION_STATE" \
-            "$SINGBOX_UPDATE_TRANSACTION_DIR/pending" "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary" \
-            2>/dev/null | sort -u)" = "root:root" ] || return 1
-    fi
+    [ "$(stat -c '%u:%g' "$SINGBOX_UPDATE_TRANSACTION_DIR" "$SINGBOX_UPDATE_TRANSACTION_STATE" \
+        "$SINGBOX_UPDATE_TRANSACTION_DIR/pending" "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary" \
+        2>/dev/null | sort -u)" = "0:0" ] || return 1
     mode="$(stat -c '%a' "$SINGBOX_UPDATE_TRANSACTION_DIR/pending" 2>/dev/null || true)"
     [ "$mode" = "600" ] || return 1
     mode="$(stat -c '%a' "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary" 2>/dev/null || true)"
@@ -5234,15 +5364,7 @@ singbox_update_transaction_valid() {
     package_name="$(singbox_update_state_value package_name 2>/dev/null || true)"
     binary_hash="$(singbox_update_state_value binary_sha256 2>/dev/null || true)"
     package_hash="$(singbox_update_state_value package_sha256 2>/dev/null || true)"
-    if [ "${VPSBOX_TEST_MODE:-0}" = "1" ]; then
-        [[ "$binary_path" == /tmp/vpsbox-test.*/sing-box ||
-            "$binary_path" == /tmp/vpsbox-test.*/*/sing-box ]] || return 1
-    else
-        case "$binary_path" in
-            /usr/bin/sing-box|/usr/local/bin/sing-box) ;;
-            *) return 1 ;;
-        esac
-    fi
+    singbox_update_binary_path_allowed "$binary_path" || return 1
     [[ "$old_version" =~ ^[0-9]+([.][0-9]+){2}$ ]] || return 1
     [[ "$was_enabled" =~ ^[01]$ && "$was_active" =~ ^[01]$ ]] || return 1
     [[ "$binary_hash" =~ ^[0-9a-f]{64}$ ]] || return 1
@@ -5254,13 +5376,8 @@ singbox_update_transaction_valid() {
         rollback-package.deb|rollback-package.apk|rollback-package.rpm)
             [ -f "$SINGBOX_UPDATE_TRANSACTION_DIR/$package_name" ] &&
                 [ ! -L "$SINGBOX_UPDATE_TRANSACTION_DIR/$package_name" ] || return 1
-            if [ "${VPSBOX_TEST_MODE:-0}" != "1" ]; then
-                [ "$(stat -c '%U:%G %a' "$SINGBOX_UPDATE_TRANSACTION_DIR/$package_name" 2>/dev/null || true)" = "root:root 600" ] ||
-                    return 1
-            else
-                [ "$(stat -c '%a' "$SINGBOX_UPDATE_TRANSACTION_DIR/$package_name" 2>/dev/null || true)" = "600" ] ||
-                    return 1
-            fi
+            [ "$(stat -c '%u:%g %a' "$SINGBOX_UPDATE_TRANSACTION_DIR/$package_name" 2>/dev/null || true)" = "0:0 600" ] ||
+                return 1
             [[ "$package_hash" =~ ^[0-9a-f]{64}$ ]] || return 1
             current_hash="$(sha256sum "$SINGBOX_UPDATE_TRANSACTION_DIR/$package_name" 2>/dev/null | awk '{print $1}')"
             [ "$current_hash" = "$package_hash" ]
@@ -5280,9 +5397,7 @@ persist_singbox_update_transaction() {
     command -v sha256sum >/dev/null 2>&1 || return 1
     [ ! -L "$VPSBOX_STATE_DIR" ] && [ ! -L "$SINGBOX_UPDATE_TRANSACTION_DIR" ] || return 1
     mkdir -p "$VPSBOX_STATE_DIR" || return 1
-    if [ "${VPSBOX_TEST_MODE:-0}" != "1" ]; then
-        chown root:root "$VPSBOX_STATE_DIR" || return 1
-    fi
+    chown root:root "$VPSBOX_STATE_DIR" || return 1
     chmod 700 "$VPSBOX_STATE_DIR" || return 1
     if [ -e "$SINGBOX_UPDATE_TRANSACTION_DIR" ]; then
         [ ! -e "$SINGBOX_UPDATE_TRANSACTION_DIR/pending" ] || return 1
@@ -5396,7 +5511,7 @@ restore_singbox_update_backup() {
 }
 
 recover_pending_singbox_update() {
-    local binary_path old_version was_enabled was_active package_name rollback_package=""
+    local binary_path current_version old_version was_enabled was_active package_name rollback_package=""
 
     [ -e "$SINGBOX_UPDATE_TRANSACTION_DIR" ] || return 0
     [ -d "$SINGBOX_UPDATE_TRANSACTION_DIR" ] &&
@@ -5405,6 +5520,28 @@ recover_pending_singbox_update() {
             return 1
         }
     if [ ! -e "$SINGBOX_UPDATE_TRANSACTION_DIR/pending" ]; then
+        remove_singbox_update_transaction_dir || return 1
+        return 0
+    fi
+    if [ ! -e "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary" ] &&
+        [ ! -L "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary" ]; then
+        if ! current_singbox_update_binary_usable; then
+            err "sing-box 旧二进制恢复材料缺失，且当前二进制或事务元数据不可用；已保留记录：$SINGBOX_UPDATE_TRANSACTION_DIR"
+            return 1
+        fi
+        binary_path="$(singbox_update_state_value binary_path)"
+        current_version="$(singbox_binary_version_at "$binary_path")"
+        if node_exists; then
+            require_valid_node_state_if_present || {
+                err "当前节点状态未通过校验，sing-box 更新事务记录已保留。"
+                return 1
+            }
+            "$binary_path" check -C "$NODE_CONFIG_DIR" >/dev/null 2>&1 || {
+                err "当前 sing-box 无法加载节点配置，更新事务记录已保留。"
+                return 1
+            }
+        fi
+        warn "检测到 sing-box 更新或回滚清理曾中断；当前 sing-box v$current_version 可用，正在清理无恢复价值的事务残留。"
         remove_singbox_update_transaction_dir || return 1
         return 0
     fi
@@ -5828,6 +5965,31 @@ confirm_pending_vpsbox_update() {
     unset VPSBOX_UPDATE_READY_FILE || true
 }
 
+settle_vpsbox_update_watchdog_after_safe_restore() {
+    local ready watchdog_pid watchdog_dir status=0
+
+    watchdog_pid="${VPSBOX_UPDATE_WATCHDOG_PID:-}"
+    watchdog_dir="${VPSBOX_UPDATE_WATCHDOG_DIR:-}"
+    [ -n "$watchdog_pid$watchdog_dir" ] || return 0
+    [ -n "$watchdog_pid" ] && [ -n "$watchdog_dir" ] || return 1
+    ready="$watchdog_dir/ready"
+    if mark_vpsbox_update_ready "$ready"; then
+        wait "$watchdog_pid" 2>/dev/null || true
+    else
+        status=1
+        warn "旧版脚本已经恢复，但无法确认更新监护状态；正在终止本次监护进程。"
+        kill -TERM "$watchdog_pid" 2>/dev/null || true
+        wait "$watchdog_pid" 2>/dev/null || true
+        if [[ "$watchdog_dir" == "$RUNTIME_DIR"/update-startup.* ]] &&
+            [ -d "$watchdog_dir" ] && [ ! -L "$watchdog_dir" ]; then
+            rm -rf -- "$watchdog_dir" || status=1
+        fi
+    fi
+    VPSBOX_UPDATE_WATCHDOG_PID=""
+    VPSBOX_UPDATE_WATCHDOG_DIR=""
+    return "$status"
+}
+
 update_vpsbox() {
     local backup="${CMD_PATH}.previous"
     local candidate
@@ -5883,8 +6045,19 @@ update_vpsbox() {
     reexec_updated_vpsbox "$backup" || {
         status=$?
         err "无法重新打开新版管理面板，正在恢复旧版脚本。"
-        if ! restore_previous_vpsbox "$backup"; then
-            err "自动恢复失败；请使用备份手动恢复：$backup"
+        if restore_previous_vpsbox "$backup"; then
+            if settle_vpsbox_update_watchdog_after_safe_restore; then
+                warn "已恢复更新前的 vpsbox 脚本。"
+            else
+                err "旧版脚本已恢复，但更新监护清理失败。"
+            fi
+            acquire_lock || true
+            return "$status"
+        fi
+        err "自动恢复失败；请使用备份手动恢复：$backup"
+        if [ -n "${VPSBOX_UPDATE_WATCHDOG_PID:-}" ]; then
+            err "当前 vpsbox 将退出，并由更新监护再次尝试恢复旧版。"
+            exit "$status"
         fi
         acquire_lock || true
         return "$status"
@@ -5892,20 +6065,20 @@ update_vpsbox() {
 }
 
 reexec_updated_vpsbox() {
-    local backup="$1" ready status watchdog_pid
+    local backup="$1" ready status execfail_was_set=0
 
     start_vpsbox_update_watchdog "$backup" || {
         err "无法启动新版 vpsbox 启动监护，已取消切换。"
         return 1
     }
     ready="$VPSBOX_UPDATE_WATCHDOG_DIR/ready"
-    watchdog_pid="$VPSBOX_UPDATE_WATCHDOG_PID"
+    shopt -q execfail && execfail_was_set=1
+    shopt -s execfail
     VPSBOX_UPDATE_BACKUP="$backup" VPSBOX_UPDATE_READY_FILE="$ready" exec "$CMD_PATH"
     status=$?
-    mark_vpsbox_update_ready "$ready" || true
-    wait "$watchdog_pid" 2>/dev/null || true
-    VPSBOX_UPDATE_WATCHDOG_PID=""
-    VPSBOX_UPDATE_WATCHDOG_DIR=""
+    [ "$execfail_was_set" -eq 1 ] || shopt -u execfail
+    unset VPSBOX_UPDATE_BACKUP || true
+    unset VPSBOX_UPDATE_READY_FILE || true
     return "$status"
 }
 
@@ -6573,7 +6746,7 @@ remove_vpsbox_ntp_block() {
 }
 
 write_chrony_sources() {
-    local conf
+    local conf tmp
     local source_file="$CHRONY_SOURCE_FILE"
 
     conf="$(chrony_conf_path)"
@@ -6583,14 +6756,21 @@ write_chrony_sources() {
     fi
 
     if grep -Eq '^[[:space:]]*sourcedir[[:space:]]+/etc/chrony/sources\.d([[:space:]]|$)' "$conf"; then
-        mkdir -p /etc/chrony/sources.d || return 1
+        ensure_public_config_dir "$(dirname "$source_file")" "$source_file" || return 1
+        tmp="$(mktemp "$(dirname "$source_file")/.vpsbox.sources.XXXXXX")" || return 1
         # --- BEGIN GENERATED TEMPLATE: chrony source file ---
-        if ! cat > "$source_file" <<EOF
+        if ! cat > "$tmp" <<EOF
 pool time.cloudflare.com iburst maxsources 4
 pool pool.ntp.org iburst maxsources 4
 EOF
         # --- END GENERATED TEMPLATE: chrony source file ---
         then
+            rm -f -- "$tmp"
+            return 1
+        fi
+        if ! chown root:root "$tmp" || ! chmod 644 "$tmp" ||
+            ! mv -f -- "$tmp" "$source_file"; then
+            rm -f -- "$tmp"
             return 1
         fi
         remove_vpsbox_ntp_block "$conf" || return 1
@@ -7414,7 +7594,7 @@ write_systemd_resolved_dns() {
         return 1
     }
 
-    mkdir -p "$conf_dir" || return 1
+    ensure_public_config_dir "$conf_dir" "$conf_file" || return 1
     backup_change_file_once DNS_RESOLVED "$conf_file" || { err "记录 DNS 原配置失败，已取消修改。"; return 1; }
     if [ -e "$conf_file" ]; then
         backup="${conf_file}.bak.$(date +%Y%m%d%H%M%S)"
@@ -8967,7 +9147,6 @@ ssh_restore_snapshot_path_is_secure() {
     local path="$1" expected_mode="$2" owner group mode
 
     [ ! -L "$path" ] || return 1
-    [ "${VPSBOX_TEST_MODE:-0}" = "1" ] && return 0
     owner="$(stat -c '%u' "$path" 2>/dev/null)" || return 1
     group="$(stat -c '%g' "$path" 2>/dev/null)" || return 1
     mode="$(stat -c '%a' "$path" 2>/dev/null)" || return 1
@@ -9442,8 +9621,39 @@ repair_bbr_fq_runtime() {
     fi
 }
 
+bbr_runtime_matches_values() {
+    local expected_cc="$1" expected_fq="$2" current_cc current_fq
+
+    current_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" || return 1
+    current_fq="$(sysctl -n net.core.default_qdisc 2>/dev/null)" || return 1
+    [ "$current_cc" = "$expected_cc" ] && [ "$current_fq" = "$expected_fq" ]
+}
+
+restore_bbr_runtime_values() {
+    local old_cc="$1" old_fq="$2" failed=0
+
+    if [ -n "$old_cc" ]; then
+        sysctl -w "net.ipv4.tcp_congestion_control=$old_cc" >/dev/null 2>&1 || failed=1
+    else
+        failed=1
+    fi
+    if [ -n "$old_fq" ]; then
+        sysctl -w "net.core.default_qdisc=$old_fq" >/dev/null 2>&1 || failed=1
+    else
+        failed=1
+    fi
+    [ "$failed" -eq 0 ] && bbr_runtime_matches_values "$old_cc" "$old_fq"
+}
+
+cancel_unmodified_bbr_change() {
+    if ! cancel_unmodified_change_transaction BBR_CONF BBR_CC BBR_FQ; then
+        err "清理尚未应用的 BBR 修改记录失败，请先使用恢复菜单检查系统改动。"
+        return 1
+    fi
+}
+
 enable_bbr_fq() {
-    local old_cc old_fq tmp
+    local old_cc old_fq tmp parent tracking_state
 
     if bbr_fq_persistent_config_is_current; then
         if bbr_fq_runtime_is_current; then
@@ -9460,39 +9670,75 @@ enable_bbr_fq() {
         return 0
     fi
 
+    tracking_state="$(change_restore_state BBR_CONF)" || return 1
+    if [ "$tracking_state" = "pending" ]; then
+        err "检测到尚未处理的 BBR 修改事务，请先在恢复菜单中检查或恢复。"
+        return 1
+    fi
+    if [ "$tracking_state" = "none" ] && {
+        [ -n "$(manifest_value BACKUP_BBR_CONF 2>/dev/null || true)" ] ||
+            [ -n "$(manifest_value BBR_CC 2>/dev/null || true)" ] ||
+            [ -n "$(manifest_value BBR_FQ 2>/dev/null || true)" ];
+    }; then
+        cancel_unmodified_bbr_change || return 1
+    fi
+
     old_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
     old_fq="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
-    backup_change_file_once BBR_CONF "$BBR_CONF" || { err "记录 BBR 原配置失败，已取消修改。"; return 1; }
-    manifest_set_once BBR_CC "${old_cc:-unknown}" || return 1
-    manifest_set_once BBR_FQ "${old_fq:-unknown}" || return 1
     if [ -e "$BBR_CONF" ] || [ -L "$BBR_CONF" ]; then
         [ ! -L "$BBR_CONF" ] || { err "$BBR_CONF 是符号链接，已拒绝覆盖。"; return 1; }
     fi
-    begin_change_transaction BBR_CONF || { err "记录 BBR 修改事务失败，已取消修改。"; return 1; }
-    tmp="$(mktemp /etc/sysctl.d/.vpsbox-bbr.XXXXXX)" || return 1
-    render_bbr_fq_config > "$tmp" || {
-        rm -f "$tmp"
-        return 1
-    }
-
     if ! modprobe tcp_bbr >/dev/null 2>&1 || ! modprobe sch_fq >/dev/null 2>&1; then
-        rm -f "$tmp"
         err "内核不支持 tcp_bbr 或 sch_fq，未写入持久化配置。"
         return 1
     fi
+    if ! backup_change_file_once BBR_CONF "$BBR_CONF" ||
+        ! manifest_set_once BBR_CC "${old_cc:-unknown}" ||
+        ! manifest_set_once BBR_FQ "${old_fq:-unknown}"; then
+        cancel_unmodified_bbr_change || true
+        err "记录 BBR 原配置失败，已取消修改。"
+        return 1
+    fi
+    if ! begin_change_transaction BBR_CONF; then
+        cancel_unmodified_bbr_change || true
+        err "记录 BBR 修改事务失败，已取消修改。"
+        return 1
+    fi
+    parent="$(dirname "$BBR_CONF")"
+    if [ ! -d "$parent" ] || [ -L "$parent" ]; then
+        cancel_unmodified_bbr_change || true
+        err "BBR 配置目录不存在或不安全：$parent"
+        return 1
+    fi
+    tmp="$(mktemp "$parent/.vpsbox-bbr.XXXXXX")" || {
+        cancel_unmodified_bbr_change || true
+        return 1
+    }
+    render_bbr_fq_config > "$tmp" || {
+        rm -f -- "$tmp"
+        cancel_unmodified_bbr_change || true
+        return 1
+    }
+
     if ! sysctl -p "$tmp" >/dev/null 2>&1 || [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" != "bbr" ] || [ "$(sysctl -n net.core.default_qdisc 2>/dev/null || true)" != "fq" ]; then
-        [ -n "$old_cc" ] && sysctl -w "net.ipv4.tcp_congestion_control=$old_cc" >/dev/null 2>&1 || true
-        [ -n "$old_fq" ] && sysctl -w "net.core.default_qdisc=$old_fq" >/dev/null 2>&1 || true
-        rm -f "$tmp"
-        err "BBR + fq 未能同时生效，已恢复运行时内核参数，未写入持久化配置。"
+        rm -f -- "$tmp"
+        if restore_bbr_runtime_values "$old_cc" "$old_fq"; then
+            cancel_unmodified_bbr_change || true
+            err "BBR + fq 未能同时生效；运行时内核参数已恢复，未写入持久化配置。"
+        else
+            err "BBR + fq 未能同时生效，且运行时内核参数未能确认完整恢复；已保留事务记录，请使用恢复菜单处理。"
+        fi
         return 1
     fi
 
     if ! chown root:root "$tmp" || ! chmod 644 "$tmp" || ! mv -f "$tmp" "$BBR_CONF"; then
-        [ -n "$old_cc" ] && sysctl -w "net.ipv4.tcp_congestion_control=$old_cc" >/dev/null 2>&1 || true
-        [ -n "$old_fq" ] && sysctl -w "net.core.default_qdisc=$old_fq" >/dev/null 2>&1 || true
-        rm -f "$tmp"
-        err "保存 BBR 配置失败；原持久化配置未被替换，运行时参数已尝试恢复。"
+        rm -f -- "$tmp"
+        if restore_bbr_runtime_values "$old_cc" "$old_fq"; then
+            cancel_unmodified_bbr_change || true
+            err "保存 BBR 配置失败；原持久化配置未被替换，运行时参数已恢复。"
+        else
+            err "保存 BBR 配置失败，且运行时参数未能确认完整恢复；已保留事务记录，请使用恢复菜单处理。"
+        fi
         return 1
     fi
     mark_change_applied BBR_CONF || return 1
