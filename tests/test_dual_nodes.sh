@@ -15,9 +15,49 @@ missing_node_commands() { printf '\n'; }
 mkdir -p "$TEST_TMP/bin"
 cat > "$TEST_TMP/bin/sing-box" <<'EOF'
 #!/bin/sh
+validate_config() {
+    jq -e '
+        (.inbounds | type == "array" and length > 0) and
+        (all(.inbounds[];
+            if .type == "shadowsocks" then
+                (.listen_port | type == "number") and
+                (.method == "2022-blake3-aes-128-gcm") and
+                (.password | type == "string" and length > 0)
+            elif .type == "vless" then
+                (.listen_port | type == "number") and
+                (.users | type == "array" and length > 0) and
+                (.tls.enabled == true) and
+                (.tls.reality.enabled == true) and
+                (.tls.reality.handshake.server_port == 443)
+            else
+                false
+            end
+        )) and
+        (.outbounds | type == "array" and length == 1) and
+        (.outbounds[0].type == "direct") and
+        (.outbounds[0].tag | type == "string" and startswith("direct-"))
+    ' "$1" >/dev/null
+}
+
 case "${1:-}" in
     version) printf 'sing-box version 1.13.14\n' ;;
-    check) exit 0 ;;
+    check)
+        case "${2:-}" in
+            -c)
+                [ -f "${3:-}" ] && validate_config "$3"
+                ;;
+            -C)
+                found=0
+                for file in "${3:-}"/*.json; do
+                    [ -f "$file" ] || continue
+                    found=1
+                    validate_config "$file" || exit 1
+                done
+                [ "$found" -eq 1 ]
+                ;;
+            *) exit 2 ;;
+        esac
+        ;;
     *) exit 0 ;;
 esac
 EOF
@@ -167,15 +207,33 @@ EOF
     chmod 600 "$file"
 }
 
+test_fake_singbox_rejects_invalid_config_schema() {
+    local config="$TEST_TMP/invalid-singbox-schema.json"
+
+    cat > "$config" <<'EOF'
+{
+  "log": { "level": "info" },
+  "inbounds": [
+    {
+      "type": "shadowsocks",
+      "listen_port": 20001,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "QUFBQUFBQUFBQUFBQUFBQQ=="
+    }
+  ],
+  "outbounds": [ { "type": "invalid", "tag": "direct-test" } ]
+}
+EOF
+    if sing-box check -c "$config" >/dev/null 2>&1; then
+        fail "测试用 sing-box 不得无条件接受无效 outbound 类型"
+    fi
+}
+
 test_complete_configs_merge_with_unique_tags() {
     (
         local vless_before
         set_node_paths "$TEST_TMP/config-pair"
         listen_mode() { printf '%s\n' ipv4; }
-        sing-box() {
-            [ "${1:-}" = check ] || return 1
-            return 0
-        }
 
         write_vless_reality_config \
             20002 11111111-2222-4333-8444-555555555555 addons.mozilla.org \
@@ -220,7 +278,7 @@ test_create_shadowsocks_preserves_vless_node() {
         sing-box() {
             case "${1:-} ${2:-} ${3:-} ${4:-}" in
                 "generate rand 12 --hex") printf '%s\n' 111111111111111111111111 ;;
-                "check "*) return 0 ;;
+                "check "*) command sing-box "$@" ;;
                 *) return 1 ;;
             esac
         }
@@ -266,7 +324,7 @@ test_create_vless_preserves_shadowsocks_node() {
                 "generate uuid  ") printf '%s\n' 11111111-2222-4333-8444-555555555555 ;;
                 "generate rand 8 --hex") printf '%s\n' 0123456789abcdef ;;
                 "generate rand 12 --hex") printf '%s\n' 222222222222222222222222 ;;
-                "check "*) return 0 ;;
+                "check "*) command sing-box "$@" ;;
                 *) return 1 ;;
             esac
         }
@@ -1458,6 +1516,7 @@ main() {
         run_self_check
     )
     local -a tests=(
+        test_fake_singbox_rejects_invalid_config_schema
         test_complete_configs_merge_with_unique_tags
         test_create_shadowsocks_preserves_vless_node
         test_create_vless_preserves_shadowsocks_node

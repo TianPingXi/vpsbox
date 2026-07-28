@@ -8,12 +8,16 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/test_helper.sh"
 # shellcheck source=../vpsbox.sh
 source "$REPO_DIR/vpsbox.sh"
 
+# 更新用例会用事件桩替换命令入口安装；先保留生产实现，避免成功路径永久被桩遮蔽。
+eval "production_install_command_alias() $(declare -f install_command_alias | sed '1d')"
+
 # 更新夹具通过 install_deps 记录依赖阶段，不访问测试宿主机的软件源。
 ensure_node_dependencies() { install_deps; }
 
 MOCK_REMOTE_SCRIPT=""
 MOCK_EVENT_LOG="$TEST_TMP/update-events.log"
 MOCK_CURL_LOG="$TEST_TMP/update-curl.log"
+MOCK_CURL_OPTIONS_LOG="$TEST_TMP/update-curl-options.log"
 MOCK_CURL_FAIL_URLS=""
 UPDATE_TEST_CURRENT=""
 UPDATE_TEST_OLDER=""
@@ -99,12 +103,20 @@ assert_fixture_version() {
 }
 
 curl() {
-    local output="" url=""
+    local output="" url="" connect_timeout="" max_time=""
 
     while [ "$#" -gt 0 ]; do
         case "$1" in
             -o)
                 output="${2:-}"
+                shift 2
+                ;;
+            --connect-timeout)
+                connect_timeout="${2:-}"
+                shift 2
+                ;;
+            --max-time)
+                max_time="${2:-}"
                 shift 2
                 ;;
             https://*)
@@ -116,6 +128,7 @@ curl() {
     done
     [ -n "$output" ] && [ -n "$url" ] || return 2
     printf '%s\n' "$url" >> "$MOCK_CURL_LOG"
+    printf '%s|%s|%s\n' "$url" "$connect_timeout" "$max_time" >> "$MOCK_CURL_OPTIONS_LOG"
     if [ -n "$MOCK_CURL_FAIL_URLS" ] &&
         grep -Fqx -- "$url" <<< "$MOCK_CURL_FAIL_URLS"; then
         return 22
@@ -148,13 +161,66 @@ reset_update_case() {
     MOCK_REMOTE_SCRIPT="$CASE_DIR/remote.sh"
     MOCK_EVENT_LOG="$CASE_DIR/events.log"
     MOCK_CURL_LOG="$CASE_DIR/curl.log"
+    MOCK_CURL_OPTIONS_LOG="$CASE_DIR/curl-options.log"
     MOCK_CURL_FAIL_URLS=""
     : > "$MOCK_EVENT_LOG"
     : > "$MOCK_CURL_LOG"
+    : > "$MOCK_CURL_OPTIONS_LOG"
     RUNTIME_DIR="$CASE_DIR/run"
     mkdir -p "$RUNTIME_DIR"
     REMOTE_VERSION="v9.9.9"
     UPDATE_AVAILABLE=1
+}
+
+test_production_install_command_alias_wires_target() {
+    (
+        local log="$TEST_TMP/install-command-alias.log"
+        local output="$TEST_TMP/install-command-alias.out"
+        CMD_PATH="$TEST_TMP/install-command-alias/vpsbox.sh"
+        mkdir -p "${CMD_PATH%/*}"
+        printf '%s\n' '#!/usr/bin/env bash' > "$CMD_PATH"
+        : > "$log"
+        chmod() { printf 'chmod:%s\n' "$*" >> "$log"; }
+        ln() { printf 'ln:%s\n' "$*" >> "$log"; }
+
+        production_install_command_alias > "$output" 2>&1
+        assert_eq "chmod:755 $CMD_PATH
+ln:-sf $CMD_PATH /usr/bin/vpsbox" "$(cat "$log")" \
+            "生产命令入口安装必须设置脚本权限并把固定入口指向 CMD_PATH"
+
+        : > "$log"
+        chmod() {
+            printf 'chmod-failed:%s\n' "$*" >> "$log"
+            return 23
+        }
+        ln() { printf 'unexpected-ln:%s\n' "$*" >> "$log"; }
+        if production_install_command_alias > "$output" 2>&1; then
+            fail "管理脚本权限设置失败时命令入口安装不得成功"
+        fi
+        assert_file_contains "$log" '^chmod-failed:'
+        assert_file_not_contains "$log" '^unexpected-ln:' \
+            "权限设置失败后不得继续替换 /usr/bin/vpsbox"
+    )
+}
+
+test_vpsbox_download_uses_bounded_curl_timeouts() {
+    local dest line url connect_timeout max_time
+
+    reset_update_case bounded-curl
+    write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_CURRENT" remote
+    dest="$CASE_DIR/downloaded.sh"
+
+    download_vpsbox_script "$dest"
+    line="$(cat "$MOCK_CURL_OPTIONS_LOG")"
+    IFS='|' read -r url connect_timeout max_time <<< "$line"
+
+    assert_eq "$SCRIPT_URL" "$url" "下载超时记录必须对应主脚本地址"
+    [[ "$connect_timeout" =~ ^[0-9]+$ ]] && [ "$connect_timeout" -gt 0 ] &&
+        [ "$connect_timeout" -le 30 ] ||
+        fail "curl 连接超时必须是 1-30 秒的有界正整数：$connect_timeout"
+    [[ "$max_time" =~ ^[0-9]+$ ]] && [ "$max_time" -ge "$connect_timeout" ] &&
+        [ "$max_time" -le 300 ] ||
+        fail "curl 总超时必须不小于连接超时且不超过 300 秒：$max_time"
 }
 
 test_version_relation() {
@@ -796,6 +862,7 @@ main() {
     local -a required=(
         version_is_newer
         version_relation
+        fetch_vpsbox_script_once
         download_vpsbox_script
         update_vpsbox
         auto_update_vpsbox_on_start
@@ -805,8 +872,11 @@ main() {
         recover_pending_singbox_update
         remove_singbox_update_transaction_dir
         current_singbox_update_binary_usable
+        production_install_command_alias
     )
     local -a tests=(
+        test_production_install_command_alias_wires_target
+        test_vpsbox_download_uses_bounded_curl_timeouts
         test_version_relation
         test_username_migration_identity_compatibility
         test_vpsbox_same_is_noop

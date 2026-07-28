@@ -197,6 +197,32 @@ test_debian_dependency_install_uses_bounds() {
     done
 }
 
+test_alpine_dependency_install_uses_bounds() {
+    local log="$TEST_TMP/install-deps-alpine.log" install_line dependency
+
+    detect_os() {
+        # Consumed by the sourced install_deps function.
+        # shellcheck disable=SC2034
+        OS=alpine
+    }
+    apk_bounded() { printf '%s\n' "$*" >> "$log"; }
+    install_deps
+
+    assert_file_contains "$log" "^${PACKAGE_UPDATE_TIMEOUT} update$"
+    install_line="$(
+        awk -v timeout="$PACKAGE_INSTALL_TIMEOUT" \
+            '$1 == timeout && $2 == "add" && $3 == "--no-cache" { print; exit }' "$log"
+    )"
+    [ -n "$install_line" ] ||
+        fail "Alpine 依赖安装必须使用 PACKAGE_INSTALL_TIMEOUT 和 --no-cache"
+    for dependency in bash curl ca-certificates openssl jq iproute2 coreutils; do
+        case " $install_line " in
+            *" $dependency "*) ;;
+            *) fail "Alpine 依赖安装缺少必要软件包：$dependency" ;;
+        esac
+    done
+}
+
 test_missing_timeout_fails_fast() {
     local empty_path="$TEST_TMP/empty-path" status
 
@@ -234,6 +260,7 @@ main() {
         test_nonzero_exit_cleans_descendants
         test_apt_options_are_bounded
         test_debian_dependency_install_uses_bounds
+        test_alpine_dependency_install_uses_bounds
         test_missing_timeout_fails_fast
         test_old_busybox_timeout_compatibility
     )

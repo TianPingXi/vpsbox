@@ -8,6 +8,10 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/test_helper.sh"
 # shellcheck source=../vpsbox.sh
 source "$REPO_DIR/vpsbox.sh"
 
+# 文件级依赖桩会让多数节点用例不访问宿主机软件环境；先保留生产组合谓词，
+# 供专项测试验证命令清单与 CA 信任检查确实接在一起。
+eval "production_node_dependencies_available() $(declare -f node_dependencies_available | sed '1d')"
+
 # 单元测试不访问软件源；需要验证依赖修复时在对应测试内覆盖此探测函数。
 node_dependencies_available() { return 0; }
 missing_node_commands() { printf '\n'; }
@@ -775,6 +779,49 @@ test_lockdir_first_acquisition_uses_reclaim_guard() {
     )
 }
 
+test_lock_acquisition_installs_runtime_cleanup_traps() {
+    local log="$TEST_TMP/lock-cleanup-trap.log"
+
+    : > "$log"
+    (
+        RUNTIME_DIR="$TEST_TMP/lock-cleanup-trap-flock"
+        # shellcheck disable=SC2034 # 由已 source 的 acquire_lock 动态读取。
+        LOCK_FILE="$RUNTIME_DIR/menu.lock"
+        mkdir -p "$RUNTIME_DIR"
+        prepare_runtime_dir() { :; }
+        flock() { return 0; }
+        write_flock_metadata() { :; }
+        install_lock_cleanup_traps() { printf '%s\n' trap >> "$log"; }
+
+        acquire_lock
+        exec 200>&-
+    )
+    assert_eq trap "$(cat "$log")" \
+        "flock 锁成功后必须安装运行时清理 trap"
+
+    : > "$log"
+    (
+        RUNTIME_DIR="$TEST_TMP/lock-cleanup-trap-dir"
+        LOCK_DIR="$RUNTIME_DIR/menu.lock.d"
+        mkdir -p "$RUNTIME_DIR"
+        prepare_runtime_dir() { :; }
+        command() {
+            if [ "${1:-}" = -v ] && [ "${2:-}" = flock ]; then
+                return 1
+            fi
+            builtin command "$@"
+        }
+        acquire_lockdir_reclaim_guard() { return 0; }
+        release_lockdir_reclaim_guard() { return 0; }
+        write_lockdir_metadata() { return 0; }
+        install_lock_cleanup_traps() { printf '%s\n' trap >> "$log"; }
+
+        acquire_lock
+    )
+    assert_eq trap "$(cat "$log")" \
+        "无 flock 锁成功后必须安装运行时清理 trap"
+}
+
 test_reality_checks_require_bounded_dns_and_openssl() {
     (
         local log="$TEST_TMP/dns-bounded.log" timeout
@@ -1268,8 +1315,86 @@ test_main_menu_update_notice_spacing_and_entries() {
     )
 }
 
+test_vpsbox_main_orchestration_and_recovery_short_circuit() {
+    local log="$TEST_TMP/vpsbox-main.log"
+    local output="$TEST_TMP/vpsbox-main.out"
+
+    : > "$log"
+    (
+        export PENDING_VPSBOX_UPDATE_BACKUP=""
+        export PENDING_VPSBOX_UPDATE_READY_FILE=""
+        need_root() { printf '%s\n' root >> "$log"; }
+        detect_os() { printf '%s\n' os >> "$log"; }
+        acquire_lock() { printf '%s\n' lock >> "$log"; }
+        recover_pending_singbox_update() { printf '%s\n' recover-singbox >> "$log"; }
+        recover_pending_node_transaction() { printf '%s\n' recover-node >> "$log"; }
+        install_self_command() { printf '%s\n' install-self >> "$log"; }
+        check_vpsbox_update_on_start() { printf '%s\n' check-update >> "$log"; }
+        auto_update_vpsbox_on_start() { printf '%s\n' auto-update >> "$log"; }
+        main_loop() { printf '%s\n' menu >> "$log"; }
+
+        vpsbox_main
+    )
+    assert_eq $'root\nos\nlock\nrecover-singbox\nrecover-node\ninstall-self\ncheck-update\nauto-update\nmenu' \
+        "$(cat "$log")" "vpsbox_main 必须按恢复、安装、更新、菜单的顺序完成启动"
+
+    : > "$log"
+    (
+        export PENDING_VPSBOX_UPDATE_BACKUP=""
+        export PENDING_VPSBOX_UPDATE_READY_FILE=""
+        need_root() { printf '%s\n' root >> "$log"; }
+        detect_os() { printf '%s\n' os >> "$log"; }
+        acquire_lock() { printf '%s\n' lock >> "$log"; }
+        recover_pending_singbox_update() {
+            printf '%s\n' recover-singbox >> "$log"
+            return 23
+        }
+        recover_pending_node_transaction() { printf '%s\n' unexpected-node >> "$log"; }
+        install_self_command() { printf '%s\n' unexpected-install >> "$log"; }
+        main_loop() { printf '%s\n' unexpected-menu >> "$log"; }
+
+        if vpsbox_main > "$output" 2>&1; then
+            fail "sing-box 更新恢复失败时 vpsbox_main 不得继续"
+        fi
+    )
+    assert_eq $'root\nos\nlock\nrecover-singbox' "$(cat "$log")" \
+        "sing-box 更新恢复失败后必须立即停止启动"
+
+    : > "$log"
+    (
+        export PENDING_VPSBOX_UPDATE_BACKUP=""
+        export PENDING_VPSBOX_UPDATE_READY_FILE=""
+        need_root() { printf '%s\n' root >> "$log"; }
+        detect_os() { printf '%s\n' os >> "$log"; }
+        acquire_lock() { printf '%s\n' lock >> "$log"; }
+        recover_pending_singbox_update() { printf '%s\n' recover-singbox >> "$log"; }
+        recover_pending_node_transaction() {
+            printf '%s\n' recover-node >> "$log"
+            return 24
+        }
+        install_self_command() { printf '%s\n' unexpected-install >> "$log"; }
+        main_loop() { printf '%s\n' unexpected-menu >> "$log"; }
+
+        if vpsbox_main > "$output" 2>&1; then
+            fail "节点事务恢复失败时 vpsbox_main 不得继续"
+        fi
+    )
+    assert_eq $'root\nos\nlock\nrecover-singbox\nrecover-node' "$(cat "$log")" \
+        "节点事务恢复失败后必须立即停止启动"
+}
+
 test_menu_dispatch_and_system_status_wiring() {
     local dispatch_log="$TEST_TMP/main-menu-dispatch.log"
+    local handshake_log="$TEST_TMP/main-menu-handshake.log"
+    local submenu_log="$TEST_TMP/submenu-dispatch.log"
+    local entry choice action
+    local -a third_party_cases=(
+        '1 show_ip_quality_script_info'
+        '2 show_network_quality_script_info'
+        '3 show_tcp_quality_script_info'
+        '4 show_node_quality_script_info'
+        '5 show_reinstall_script_info'
+    )
 
     : > "$dispatch_log"
     (
@@ -1278,11 +1403,21 @@ test_menu_dispatch_and_system_status_wiring() {
         pause() { :; }
         run_menu_action() { printf '%s\n' "$1" >> "$dispatch_log"; }
 
-        main_loop <<< $'5\n6\n7\n0' >/dev/null
+        main_loop <<< $'1\n2\n3\n4\n5\n6\n7\n00\n88\n0' >/dev/null
     )
-    assert_eq $'run_self_check\nother_scripts_menu' \
+    assert_eq $'node_menu\nsingbox_menu\nsystem_menu\nfirewall_menu\nrun_self_check\nother_scripts_menu\nupdate_vpsbox\nuninstall_all' \
         "$(cat "$dispatch_log")" \
-        "主菜单检测和第三方脚本选项必须分发到对应功能，旧编号 7 不再执行功能"
+        "主菜单全部功能编号必须分发到对应操作，旧编号 7 不得执行功能"
+
+    : > "$handshake_log"
+    (
+        show_menu() { printf '%s\n' menu >> "$handshake_log"; }
+        confirm_pending_vpsbox_update() { printf '%s\n' ready >> "$handshake_log"; }
+
+        main_loop <<< "0" >/dev/null
+    )
+    assert_eq $'menu\nready' "$(cat "$handshake_log")" \
+        "主菜单首次渲染后、读取选项前必须确认新版启动握手"
 
     (
         local uninstall_log="$TEST_TMP/uninstall-menu-dispatch.log"
@@ -1299,6 +1434,70 @@ test_menu_dispatch_and_system_status_wiring() {
         assert_eq $'uninstall\npause' "$(cat "$uninstall_log")" \
             "卸载失败后必须保留菜单并执行返回暂停"
     )
+
+    : > "$submenu_log"
+    (
+        clear() { :; }
+        singbox_summary_line() { :; }
+        node_summary() { :; }
+        pause() { :; }
+        run_menu_action() { printf '%s\n' "$1" >> "$submenu_log"; }
+
+        node_menu <<< $'1\n2\n3\n4\n5\n0' >/dev/null
+    )
+    assert_eq $'create_vless_reality_node\ncreate_or_rebuild_node\nview_node_link\ndelete_vless_reality_node\ndelete_node' \
+        "$(cat "$submenu_log")" "节点菜单全部编号必须分发到对应操作"
+
+    : > "$submenu_log"
+    (
+        clear() { :; }
+        singbox_summary_line() { :; }
+        pause() { :; }
+        run_menu_action() { printf '%s\n' "$1" >> "$submenu_log"; }
+
+        singbox_menu <<< $'1\n2\n3\n4\n0' >/dev/null
+    )
+    assert_eq $'start_service_action\nstop_service_action\nrestart_service_action\nupdate_singbox' \
+        "$(cat "$submenu_log")" "sing-box 菜单全部编号必须分发到对应操作"
+
+    : > "$submenu_log"
+    (
+        clear() { :; }
+        detect_os() { OS=debian; }
+        bbr_fq_summary_state() { :; }
+        ipv4_priority_state() { :; }
+        ssh_port_state() { :; }
+        ssh_hardening_state() { :; }
+        fail2ban_service_state() { :; }
+        fail2ban_sshd_state() { :; }
+        ntp_sync_state() { :; }
+        reboot_required_state() { :; }
+        pause() { :; }
+        run_menu_action() { printf '%s\n' "$1" >> "$submenu_log"; }
+        ssh_port_change_menu() { printf '%s\n' ssh_port_change_menu >> "$submenu_log"; }
+        ssh_basic_hardening_menu() { printf '%s\n' ssh_basic_hardening_menu >> "$submenu_log"; }
+
+        system_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n0' >/dev/null
+    )
+    assert_eq $'update_system_packages\ncleanup_system_garbage\nchange_system_hostname\nenable_ntp_sync\nchange_ipv4_dns\nenable_ipv4_priority\nenable_bbr_fq\nssh_port_change_menu\nssh_basic_hardening_menu\nshow_current_ssh_config\ninstall_fail2ban\nlimit_systemd_journal\nrestore_vpsbox_system_changes' \
+        "$(cat "$submenu_log")" "系统菜单全部编号必须分发到对应操作"
+
+    for entry in "${third_party_cases[@]}"; do
+        read -r choice action <<< "$entry"
+        : > "$submenu_log"
+        (
+            clear() { :; }
+            show_ip_quality_script_info() { printf '%s\n' show_ip_quality_script_info >> "$submenu_log"; }
+            show_network_quality_script_info() { printf '%s\n' show_network_quality_script_info >> "$submenu_log"; }
+            show_tcp_quality_script_info() { printf '%s\n' show_tcp_quality_script_info >> "$submenu_log"; }
+            show_node_quality_script_info() { printf '%s\n' show_node_quality_script_info >> "$submenu_log"; }
+            show_reinstall_script_info() { printf '%s\n' show_reinstall_script_info >> "$submenu_log"; }
+
+            other_scripts_menu <<< "$choice" >/dev/null
+        )
+        assert_eq "$action" "$(cat "$submenu_log")" \
+            "第三方脚本菜单编号 $choice 必须分发到 $action"
+    done
 
     (
         local system_output="$TEST_TMP/system-menu.out"
@@ -1446,6 +1645,57 @@ test_restart_service_action_keeps_full_restart() {
     )
 }
 
+test_stop_service_action_reports_final_state() {
+    (
+        local log="$TEST_TMP/stop-service-normal.log"
+        local output="$TEST_TMP/stop-service-normal.out"
+        : > "$log"
+        service_stop() { printf '%s\n' service-stop >> "$log"; }
+        stop_singbox_config_processes() { printf '%s\n' process-stop >> "$log"; }
+        service_manager_is_active() { return 1; }
+        singbox_config_pids() { :; }
+
+        stop_service_action > "$output" 2>&1
+        assert_eq $'service-stop\nprocess-stop' "$(cat "$log")" \
+            "正常停止必须同时处理服务管理器与配置残留进程"
+        assert_file_contains "$output" 'sing-box 服务已停止'
+    )
+
+    (
+        local output="$TEST_TMP/stop-service-residual.out"
+        service_stop() { return 0; }
+        stop_singbox_config_processes() { return 0; }
+        service_manager_is_active() { return 1; }
+        singbox_config_pids() { printf '%s\n' 4242; }
+
+        if stop_service_action > "$output" 2>&1; then
+            fail "配置残留进程仍在时停止操作不得成功"
+        fi
+        assert_file_contains "$output" '残留进程仍在运行'
+        assert_file_not_contains "$output" '服务已停止。'
+    )
+
+    (
+        local log="$TEST_TMP/stop-service-command-failure.log"
+        local output="$TEST_TMP/stop-service-command-failure.out"
+        : > "$log"
+        service_stop() {
+            printf '%s\n' service-stop-failed >> "$log"
+            return 23
+        }
+        stop_singbox_config_processes() { printf '%s\n' process-stop >> "$log"; }
+        service_manager_is_active() { return 1; }
+        singbox_config_pids() { :; }
+
+        if stop_service_action > "$output" 2>&1; then
+            fail "服务命令失败时即使最终已停止也必须返回失败"
+        fi
+        assert_eq $'service-stop-failed\nprocess-stop' "$(cat "$log")"
+        assert_file_contains "$output" 'sing-box 已停止，但服务管理命令执行失败'
+        assert_file_not_contains "$output" 'sing-box 服务已停止。'
+    )
+}
+
 test_test_mode_blocks_real_service_mutation() {
     if service_start >"$TEST_TMP/service-guard.out" 2>&1; then
         fail "测试模式不得调用真实服务启动命令"
@@ -1487,6 +1737,67 @@ test_install_self_reports_download_failure() {
         fi
         [ ! -e "$CMD_PATH" ] || fail "下载失败不应留下管理命令"
     )
+}
+
+test_runtime_cleanup_traps_dispatch_recovery_handlers() {
+    local runner="$TEST_TMP/runtime-cleanup-runner.sh"
+    local entry mode expected_status status event_log case_dir
+    local -a cases=(
+        'EXIT 23'
+        'INT 130'
+        'TERM 143'
+    )
+
+    cat > "$runner" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+source "$REPO_DIR/vpsbox.sh"
+
+NODE_TRANSACTION_DIR="$NODE_DIR"
+ACTIVE_NODE_BACKUP="$NODE_TRANSACTION_DIR"
+ACTIVE_FIREWALL_ROLLBACK_DIR="$FW_DIR"
+mkdir -p "$NODE_TRANSACTION_DIR" "$FW_DIR"
+
+cleanup_active_bounded_command() { :; }
+rollback_active_singbox_update() { :; }
+rollback_active_node_transaction() { printf '%s\n' node >> "$EVENT_LOG"; }
+ssh_firewall_transition_reconcile() { :; }
+firewall_abort_port_transition() { :; }
+firewall_rollback_dir_valid() { return 0; }
+firewall_restore_snapshot_now() { printf 'firewall:%s\n' "$2" >> "$EVENT_LOG"; }
+cleanup_active_fail2ban_test() { :; }
+cleanup_unapplied_ssh_tracking() { :; }
+cleanup_vpsbox_lock() { printf '%s\n' lock >> "$EVENT_LOG"; }
+rollback_pending_vpsbox_update() { printf '%s\n' update >> "$EVENT_LOG"; }
+
+install_lock_cleanup_traps
+case "$1" in
+    EXIT) exit 23 ;;
+    INT) kill -s INT "$$" ;;
+    TERM) kill -s TERM "$$" ;;
+    *) exit 99 ;;
+esac
+EOF
+    chmod 755 "$runner"
+
+    for entry in "${cases[@]}"; do
+        read -r mode expected_status <<< "$entry"
+        case_dir="$TEST_TMP/runtime-cleanup-$mode"
+        event_log="$case_dir/events.log"
+        mkdir -p "$case_dir/node" "$case_dir/firewall"
+        : > "$event_log"
+
+        set +e
+        REPO_DIR="$REPO_DIR" EVENT_LOG="$event_log" \
+            NODE_DIR="$case_dir/node" FW_DIR="$case_dir/firewall" \
+            bash "$runner" "$mode" > "$case_dir/output.log" 2>&1
+        status=$?
+        set -e
+
+        assert_eq "$expected_status" "$status" "$mode 必须保留原始退出状态"
+        assert_eq $'node\nfirewall:0\nlock\nupdate' "$(cat "$event_log")" \
+            "$mode 必须通过真实 cleanup coordinator 调用节点、防火墙和更新恢复"
+    done
 }
 
 test_interrupted_singbox_update_rolls_back() {
@@ -1919,6 +2230,47 @@ test_node_ca_trust_detection() {
     )
 }
 
+test_node_dependency_predicate_combines_commands_and_ca_trust() {
+    (
+        local commands_ok=1 ca_ok=1
+        local log="$TEST_TMP/node-dependency-predicate.log"
+        : > "$log"
+        node_commands_available() {
+            printf 'commands:%s\n' "$*" >> "$log"
+            [ "$commands_ok" -eq 1 ]
+        }
+        node_ca_trust_available() {
+            printf 'ca:%s\n' "$*" >> "$log"
+            [ "$ca_ok" -eq 1 ]
+        }
+
+        production_node_dependencies_available ||
+            fail "命令与 CA 信任均可用时生产依赖谓词应成功"
+        assert_file_contains "$log" '^commands:curl openssl jq ss sha256sum base64$' \
+            "生产依赖谓词必须检查完整命令集合"
+        assert_file_contains "$log" '^ca:/etc/ssl/certs/ca-certificates[.]crt /etc/pki/tls/certs/ca-bundle[.]crt /etc/ssl/ca-bundle[.]pem /etc/pki/ca-trust/extracted/pem/tls-ca-bundle[.]pem$' \
+            "生产依赖谓词必须检查受支持的 CA 证书路径"
+
+        : > "$log"
+        commands_ok=0
+        if production_node_dependencies_available; then
+            fail "命令集合不完整时生产依赖谓词不得成功"
+        fi
+        assert_file_contains "$log" '^commands:'
+        assert_file_not_contains "$log" '^ca:' \
+            "命令集合已失败时不应误报已检查 CA 信任"
+
+        : > "$log"
+        commands_ok=1
+        ca_ok=0
+        if production_node_dependencies_available; then
+            fail "CA 信任不可用时生产依赖谓词不得成功"
+        fi
+        assert_file_contains "$log" '^commands:'
+        assert_file_contains "$log" '^ca:'
+    )
+}
+
 test_first_singbox_install_prepares_dependencies_once() {
     (
         local dependencies_ready=0 installed=0 dependency_runs=0
@@ -2091,17 +2443,25 @@ test_dangling_node_symlink_is_not_treated_as_no_node() {
 main() {
     local name test status passed=0 skipped=0
     local -a required=(
+        acquire_lock
+        install_lock_cleanup_traps
         prompt_node_host
         create_or_rebuild_node
         cleanup_vpsbox_runtime
         update_singbox
         install_self_command
+        stop_service_action
         ssh_port_summary_line
         change_applied_recorded_readonly
         run_self_check
         show_menu
         main_loop
+        node_menu
+        singbox_menu
         system_menu
+        other_scripts_menu
+        vpsbox_main
+        production_node_dependencies_available
     )
     local -a tests=(
         test_address_fallback_validation
@@ -2127,6 +2487,7 @@ main() {
         test_firewall_sync_restore_failure_preserves_backup
         test_runtime_dir_permission_failure_is_fatal
         test_lockdir_first_acquisition_uses_reclaim_guard
+        test_lock_acquisition_installs_runtime_cleanup_traps
         test_reality_checks_require_bounded_dns_and_openssl
         test_view_node_propagates_uri_failure
         test_node_state_writes_are_atomic
@@ -2137,15 +2498,18 @@ main() {
         test_bbr_fq_summary_preserves_partial_state
         test_self_check_classifies_and_summarizes_results
         test_main_menu_update_notice_spacing_and_entries
+        test_vpsbox_main_orchestration_and_recovery_short_circuit
         test_menu_dispatch_and_system_status_wiring
         test_third_party_entries_keep_attribution_and_commands
         test_service_restore_checks_final_state
         test_start_service_action_healthy_is_noop
         test_start_service_action_uses_light_start
         test_restart_service_action_keeps_full_restart
+        test_stop_service_action_reports_final_state
         test_test_mode_blocks_real_service_mutation
         test_protocol_specific_listener_checks
         test_install_self_reports_download_failure
+        test_runtime_cleanup_traps_dispatch_recovery_handlers
         test_interrupted_singbox_update_rolls_back
         test_lockdir_metadata_window_is_waited
         test_same_second_timestamp_is_not_after
@@ -2162,6 +2526,7 @@ main() {
         test_existing_singbox_still_repairs_node_dependencies
         test_node_dependency_repair_requires_complete_result
         test_node_ca_trust_detection
+        test_node_dependency_predicate_combines_commands_and_ca_trust
         test_first_singbox_install_prepares_dependencies_once
         test_node_dependency_install_is_automatic
         test_read_only_node_actions_do_not_install_dependencies

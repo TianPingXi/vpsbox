@@ -29,9 +29,23 @@ assert_eq() {
 
 assert_empty_file() {
     local file="$1" message="${2:-文件应为空}"
+
+    [ -f "$file" ] && [ ! -L "$file" ] || {
+        fail "$message：目标不是已存在的普通文件：$file"
+        return 1
+    }
     if [ -s "$file" ]; then
         fail "$message：$(tr '\n' ' ' < "$file")"
     fi
+}
+
+assert_missing_or_empty_file() {
+    local file="$1" message="${2:-文件应不存在或为空}"
+
+    if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+        return 0
+    fi
+    assert_empty_file "$file" "$message"
 }
 
 assert_file_contains() {
@@ -42,10 +56,30 @@ assert_file_contains() {
 }
 
 assert_file_not_contains() {
-    local file="$1" pattern="$2" message="${3:-文件包含非预期内容}"
+    local file="$1" pattern="$2" message="${3:-文件包含非预期内容}" status
+
+    [ -f "$file" ] && [ ! -L "$file" ] || {
+        fail "$message：目标不是已存在的普通文件：$file"
+        return 1
+    }
     if grep -Eq -- "$pattern" "$file"; then
         fail "$message（模式：$pattern）"
+    else
+        status=$?
+        [ "$status" -eq 1 ] || {
+            fail "$message：无法检查文件内容：$file"
+            return 1
+        }
     fi
+}
+
+assert_missing_or_file_not_contains() {
+    local file="$1" pattern="$2" message="${3:-文件包含非预期内容}"
+
+    if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+        return 0
+    fi
+    assert_file_not_contains "$file" "$pattern" "$message"
 }
 
 require_function() {
@@ -169,9 +203,23 @@ run_test_case() {
         "$name"
     )
     status=$?
-    if [ "$status" -eq "$SKIP_STATUS" ] && [ "${VPSBOX_TEST_STRICT:-0}" = "1" ]; then
-        printf '严格模式不允许跳过：%s\n' "$(test_skip_reason)" >&2
-        return 1
+    if [ "$status" -eq "$SKIP_STATUS" ]; then
+        if [ ! -s "$SKIP_REASON_FILE" ]; then
+            printf '测试返回 SKIP 状态但未记录原因：%s\n' "$name" >&2
+            return 1
+        fi
+        if [ -n "${VPSBOX_TEST_SKIP_FILE:-}" ]; then
+            [ -f "$VPSBOX_TEST_SKIP_FILE" ] && [ ! -L "$VPSBOX_TEST_SKIP_FILE" ] || {
+                printf 'SKIP 汇总文件不安全或不存在：%s\n' "$VPSBOX_TEST_SKIP_FILE" >&2
+                return 1
+            }
+            printf '%s\t%s\n' "$name" "$(test_skip_reason)" >> "$VPSBOX_TEST_SKIP_FILE" ||
+                return 1
+        fi
+        if [ "${VPSBOX_TEST_STRICT:-0}" = "1" ]; then
+            printf '严格模式不允许跳过：%s\n' "$(test_skip_reason)" >&2
+            return 1
+        fi
     fi
     return "$status"
 }
@@ -188,7 +236,35 @@ assert_all_tests_registered() {
     }
     definitions="$(mktemp "$TEST_TMP/defined-tests.XXXXXX")" || return 1
     registered="$(mktemp "$TEST_TMP/registered-tests.XXXXXX")" || return 1
-    if ! sed -nE 's/^(test_[A-Za-z0-9_]+)\(\).*/\1/p' "$file" |
+    if ! awk '
+        function test_name(line, name) {
+            name = line
+            sub(/^[[:space:]]*function[[:space:]]+/, "", name)
+            sub(/^[[:space:]]*/, "", name)
+            sub(/[[:space:](].*$/, "", name)
+            return name
+        }
+        {
+            line = $0
+            if (pending != "") {
+                if (line ~ /^[[:space:]]*($|#)/) {
+                    next
+                }
+                if (line ~ /^[[:space:]]*\{([[:space:]]*#.*)?$/) {
+                    print pending
+                }
+                pending = ""
+            }
+            if (line ~ /^[[:space:]]*test_[A-Za-z0-9_]+[[:space:]]*\(\)[[:space:]]*\{/) {
+                print test_name(line)
+            } else if (line ~ /^[[:space:]]*function[[:space:]]+test_[A-Za-z0-9_]+([[:space:]]*\(\))?[[:space:]]*\{/) {
+                print test_name(line)
+            } else if (line ~ /^[[:space:]]*test_[A-Za-z0-9_]+[[:space:]]*\(\)[[:space:]]*$/ ||
+                line ~ /^[[:space:]]*function[[:space:]]+test_[A-Za-z0-9_]+([[:space:]]*\(\))?[[:space:]]*$/) {
+                pending = test_name(line)
+            }
+        }
+    ' "$file" |
         grep -vx 'test_cleanup' | sort > "$definitions"; then
         fail "无法读取测试定义：$file"
         return 1

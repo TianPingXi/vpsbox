@@ -9,6 +9,10 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/test_helper.sh"
 # shellcheck disable=SC1091
 source "$REPO_DIR/vpsbox.sh"
 
+# 多数封禁用例需要固定本机地址夹具，但仍要保留并直接验证生产实现，
+# 防止文件级 mock 让 fail2ban_local_ipv4_text 的回归永久不可见。
+eval "production_fail2ban_local_ipv4_text() $(declare -f fail2ban_local_ipv4_text | sed '1d')"
+
 MOCK_CALL_LOG="$TEST_TMP/fail2ban-calls.log"
 MOCK_JAIL_STATE="$TEST_TMP/fail2ban-jail.state"
 MOCK_BACKEND_STATE="$TEST_TMP/fail2ban-backend.state"
@@ -38,6 +42,9 @@ reset_mock() {
     # Read by the production cleanup function through shared global state.
     # shellcheck disable=SC2034
     ACTIVE_FAIL2BAN_TEST_BACKENDS=""
+    fail2ban_local_ipv4_text() {
+        printf '%s\n' 10.0.0.1
+    }
 }
 
 remove_mock_ip() {
@@ -130,18 +137,44 @@ sleep() {
     :
 }
 
-# 封禁逻辑仍通过生产选择器挑选 TEST-NET 地址；仅把本机地址枚举固定为
-# 受控夹具，避免单元测试依赖宿主机是否提供 iproute2 或 GNU hostname。
-fail2ban_local_ipv4_text() {
-    printf '%s\n' 10.0.0.1
-}
-
 test_action_parser() {
     local -a actions=()
     reset_mock
     mapfile -t actions < <(fail2ban_action_names)
     assert_eq "1" "${#actions[@]}" "应只解析实际 action 名称"
     assert_eq "nftables-multiport" "${actions[0]}" "action 名称解析错误"
+}
+
+test_real_local_ipv4_text_prefers_ip_and_falls_back_to_hostname() {
+    local bin="$TEST_TMP/local-ipv4-bin" output="$TEST_TMP/local-ipv4.out"
+
+    mkdir -p "$bin"
+    cat > "$bin/ip" <<'EOF'
+#!/bin/sh
+[ "$*" = "-o -4 addr show" ] || exit 2
+printf '%s\n' '2: eth0    inet 192.0.2.10/24 scope global eth0'
+EOF
+    cat > "$bin/hostname" <<'EOF'
+#!/bin/sh
+exit 99
+EOF
+    chmod 755 "$bin/ip" "$bin/hostname"
+
+    PATH="$bin" production_fail2ban_local_ipv4_text > "$output" ||
+        fail "存在 ip 命令时生产地址枚举应成功"
+    assert_file_contains "$output" '192[.]0[.]2[.]10/24'
+
+    rm -f "$bin/ip"
+    cat > "$bin/hostname" <<'EOF'
+#!/bin/sh
+[ "${1:-}" = "-I" ] || exit 2
+printf '%s\n' '198.51.100.20 2001:db8::20'
+EOF
+    chmod 755 "$bin/hostname"
+
+    PATH="$bin" production_fail2ban_local_ipv4_text > "$output" ||
+        fail "缺少 ip 时生产地址枚举应回退到 hostname -I"
+    assert_file_contains "$output" '^198[.]51[.]100[.]20 2001:db8::20$'
 }
 
 test_sshd_config_forces_nftables_banaction() {
@@ -697,6 +730,7 @@ main() {
     local -a required=(
         fail2ban_action_names
         fail2ban_ipv4_in_text
+        production_fail2ban_local_ipv4_text
         ensure_fail2ban_nftables_dependency
         verify_fail2ban_real_ban
         cleanup_active_fail2ban_test
@@ -704,6 +738,7 @@ main() {
     local name test status passed=0 skipped=0
     local -a tests=(
         test_action_parser
+        test_real_local_ipv4_text_prefers_ip_and_falls_back_to_hostname
         test_sshd_config_forces_nftables_banaction
         test_missing_nftables_dependency_is_installed_automatically
         test_nftables_dependency_install_requires_nft_command

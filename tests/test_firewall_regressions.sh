@@ -9,17 +9,48 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/test_helper.sh"
 source "$REPO_DIR/vpsbox.sh"
 
 CASE_PIDS=""
+CASE_PID_FILE="$TEST_TMP/firewall-case-pids"
+: > "$CASE_PID_FILE"
+
+record_case_pid() {
+    local pid="$1" start_ticks
+
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    start_ticks="$(process_start_ticks "$pid" 2>/dev/null)" || return 1
+    [[ "$start_ticks" =~ ^[0-9]+$ ]] || return 1
+    CASE_PIDS="$CASE_PIDS $pid"
+    printf '%s %s\n' "$pid" "$start_ticks" >> "$CASE_PID_FILE"
+}
+
+case_pid_list() {
+    [ -f "$CASE_PID_FILE" ] && [ ! -L "$CASE_PID_FILE" ] || return 1
+    awk '
+        $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && NF == 2 {
+            key = $1 ":" $2
+            if (!seen[key]++) print $1, $2
+        }
+    ' "$CASE_PID_FILE"
+}
 
 cleanup_case_pids() {
-    local pid
+    local pid recorded_ticks current_ticks entries killed=""
 
-    for pid in $CASE_PIDS; do
-        kill -KILL "$pid" 2>/dev/null || true
-    done
-    for pid in $CASE_PIDS; do
+    entries="$(case_pid_list 2>/dev/null || true)"
+    while read -r pid recorded_ticks; do
+        [ -n "$pid" ] || continue
+        current_ticks="$(process_start_ticks "$pid" 2>/dev/null || true)"
+        [ -n "$current_ticks" ] && [ "$current_ticks" = "$recorded_ticks" ] || continue
+        if kill -KILL "$pid" 2>/dev/null; then
+            killed="$killed $pid"
+        fi
+    done <<< "$entries"
+    for pid in $killed; do
         wait "$pid" 2>/dev/null || true
     done
     CASE_PIDS=""
+    if [ -f "$CASE_PID_FILE" ] && [ ! -L "$CASE_PID_FILE" ]; then
+        : > "$CASE_PID_FILE"
+    fi
 }
 
 test_cleanup() {
@@ -52,7 +83,7 @@ remember_process_tree() {
     local pid="$1" child
 
     for child in $(process_children "$pid"); do
-        CASE_PIDS="$CASE_PIDS $child"
+        record_case_pid "$child"
         remember_process_tree "$child"
     done
 }
@@ -545,6 +576,35 @@ test_openrc_enabled_inactive_firewalld_conflict() {
     )
 }
 
+test_case_pid_registry_survives_nested_subshell() {
+    local pid start_ticks
+
+    cleanup_case_pids
+    sleep 30 &
+    pid=$!
+    (
+        record_case_pid "$pid"
+    )
+
+    [ -z "$CASE_PIDS" ] ||
+        fail "嵌套子 Shell 的变量不应被误认为已回传父 Shell"
+    kill -0 "$pid" 2>/dev/null || fail "清理验证前测试进程应仍在运行"
+    cleanup_case_pids
+    if kill -0 "$pid" 2>/dev/null; then
+        fail "共享 PID 文件必须允许父 Shell 清理子 Shell 登记的进程"
+    fi
+
+    sleep 30 &
+    pid=$!
+    start_ticks="$(process_start_ticks "$pid")"
+    printf '%s %s\n' "$pid" "$((start_ticks + 1))" >> "$CASE_PID_FILE"
+    cleanup_case_pids
+    kill -0 "$pid" 2>/dev/null ||
+        fail "清理器不得终止启动时间不匹配的复用 PID"
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
 test_bounded_background_processes_release_lock() {
     local case_dir="$TEST_TMP/bounded-lock" driver ready lock child_count=0
     local driver_pid descendants pid
@@ -568,7 +628,7 @@ EOF
 
     REPO_DIR="$REPO_DIR" LOCK_TARGET="$lock" READY_FILE="$ready" bash "$driver" &
     driver_pid=$!
-    CASE_PIDS="$driver_pid"
+    record_case_pid "$driver_pid"
     wait_for_file "$ready"
     for _ in {1..50}; do
         descendants="$(process_children "$driver_pid")"
@@ -624,7 +684,7 @@ EOF
     REPO_DIR="$REPO_DIR" LOCK_TARGET="$lock" READY_FILE="$ready" \
         REAL_TIMEOUT="${real_timeout:-}" PATH="$test_path" bash "$driver" &
     driver_pid=$!
-    CASE_PIDS="$driver_pid"
+    record_case_pid "$driver_pid"
     wait_for_file "$ready"
     remember_process_tree "$driver_pid"
     [ "$(wc -w <<< "$CASE_PIDS")" -ge 3 ] ||
@@ -685,17 +745,17 @@ EOF
     REPO_DIR="$REPO_DIR" RUNTIME_TARGET="$runtime" LOCK_TARGET="$lock" \
         WATCHDOG_FILE="$case_dir/watchdog.pid" READY_FILE="$ready" bash "$driver" &
     driver_pid=$!
-    CASE_PIDS="$driver_pid"
+    record_case_pid "$driver_pid"
     wait_for_file "$ready"
     watchdog="$(cat "$case_dir/watchdog.pid")"
-    CASE_PIDS="$CASE_PIDS $watchdog"
+    record_case_pid "$watchdog"
     for _ in {1..50}; do
         child="$(process_children "$watchdog" | awk '{print $1}')"
         [ -n "$child" ] && break
         sleep 0.1
     done
     [ -n "$child" ] || fail "watchdog 未创建等待子进程"
-    CASE_PIDS="$CASE_PIDS $child"
+    record_case_pid "$child"
     assert_fd_closed "$watchdog" 200 "防火墙 watchdog 继承了菜单锁"
     assert_fd_closed "$child" 200 "watchdog 的等待子进程继承了菜单锁"
 
@@ -1071,6 +1131,179 @@ test_firewall_noop_requires_complete_managed_state() {
     )
 }
 
+test_firewall_disable_internal_verifies_service_and_live_table() {
+    (
+        local case_dir="$TEST_TMP/firewall-disable-systemd" log="$TEST_TMP/firewall-disable-systemd.log"
+        mkdir -p "$case_dir"
+        FIREWALL_CONFIG="$case_dir/firewall.nft"
+        FIREWALL_STATE_FILE="$case_dir/firewall.env"
+        FIREWALL_SYSTEMD_UNIT="$case_dir/vpsbox-firewall.service"
+        FIREWALL_OPENRC_SERVICE="$case_dir/vpsbox-firewall"
+        printf '%s\n' managed > "$FIREWALL_CONFIG"
+        printf '%s\n' managed > "$FIREWALL_STATE_FILE"
+        printf '%s\n' managed > "$FIREWALL_SYSTEMD_UNIT"
+        : > "$log"
+
+        firewall_settle_pending_port_transition() { :; }
+        firewall_recover_pending_rollbacks() { :; }
+        firewall_control_plane_present() { return 0; }
+        is_systemd() { return 0; }
+        systemctl() {
+            printf 'systemctl:%s\n' "$*" >> "$log"
+            case "$1" in
+                is-active|is-enabled) return 1 ;;
+                *) return 0 ;;
+            esac
+        }
+        nft() {
+            printf 'nft:%s\n' "$*" >> "$log"
+            [ "$1" != "list" ]
+        }
+
+        firewall_disable_internal
+        assert_file_contains "$log" '^systemctl:disable --now '
+        assert_file_contains "$log" '^systemctl:is-active --quiet '
+        assert_file_contains "$log" '^systemctl:is-enabled --quiet '
+        assert_file_contains "$log" '^nft:delete table inet vpsbox$'
+        assert_file_contains "$log" '^nft:list table inet vpsbox$'
+        [ ! -e "$FIREWALL_CONFIG" ] && [ ! -e "$FIREWALL_STATE_FILE" ] &&
+            [ ! -e "$FIREWALL_SYSTEMD_UNIT" ] ||
+            fail "systemd 防火墙确认停用后应删除受管文件"
+    )
+    (
+        local case_dir="$TEST_TMP/firewall-disable-verification-failure"
+        mkdir -p "$case_dir"
+        FIREWALL_CONFIG="$case_dir/firewall.nft"
+        FIREWALL_STATE_FILE="$case_dir/firewall.env"
+        FIREWALL_SYSTEMD_UNIT="$case_dir/vpsbox-firewall.service"
+        FIREWALL_OPENRC_SERVICE="$case_dir/vpsbox-firewall"
+        printf '%s\n' managed > "$FIREWALL_CONFIG"
+        printf '%s\n' managed > "$FIREWALL_STATE_FILE"
+        printf '%s\n' managed > "$FIREWALL_SYSTEMD_UNIT"
+
+        firewall_settle_pending_port_transition() { :; }
+        firewall_recover_pending_rollbacks() { :; }
+        firewall_control_plane_present() { return 0; }
+        is_systemd() { return 0; }
+        systemctl() {
+            [ "$1" != "is-active" ]
+        }
+        nft() { [ "$1" != "list" ]; }
+
+        if firewall_disable_internal >/dev/null 2>&1; then
+            fail "服务仍 active 时防火墙关闭不得报告成功"
+        fi
+        [ -e "$FIREWALL_CONFIG" ] && [ -e "$FIREWALL_STATE_FILE" ] &&
+            [ -e "$FIREWALL_SYSTEMD_UNIT" ] ||
+            fail "停用验收失败时必须保留受管文件供重试"
+    )
+    (
+        local case_dir="$TEST_TMP/firewall-disable-openrc" link
+        local log="$TEST_TMP/firewall-disable-openrc.log"
+        local service_active=1 service_enabled=1
+        mkdir -p "$case_dir/runlevels/default"
+        : > "$log"
+        FIREWALL_CONFIG="$case_dir/firewall.nft"
+        FIREWALL_STATE_FILE="$case_dir/firewall.env"
+        FIREWALL_SYSTEMD_UNIT="$case_dir/vpsbox-firewall.service"
+        FIREWALL_OPENRC_SERVICE="$case_dir/vpsbox-firewall"
+        FIREWALL_OPENRC_RUNLEVELS_DIR="$case_dir/runlevels"
+        OS=alpine
+        link="$FIREWALL_OPENRC_RUNLEVELS_DIR/default/$FIREWALL_SERVICE_NAME"
+        printf '%s\n' managed > "$FIREWALL_CONFIG"
+        printf '%s\n' managed > "$FIREWALL_STATE_FILE"
+        printf '%s\n' managed > "$FIREWALL_OPENRC_SERVICE"
+        ln -s "$FIREWALL_OPENRC_SERVICE" "$link"
+
+        firewall_settle_pending_port_transition() { :; }
+        firewall_recover_pending_rollbacks() { :; }
+        firewall_control_plane_present() { return 0; }
+        is_systemd() { return 1; }
+        rc-service() {
+            printf 'rc-service:%s\n' "$*" >> "$log"
+            case "$*" in
+                "$FIREWALL_SERVICE_NAME stop")
+                    service_active=0
+                    ;;
+                "$FIREWALL_SERVICE_NAME status")
+                    [ "$service_active" -eq 1 ]
+                    ;;
+                *) return 2 ;;
+            esac
+        }
+        rc-update() {
+            printf 'rc-update:%s\n' "$*" >> "$log"
+            [ "$*" = "del $FIREWALL_SERVICE_NAME default" ] || return 2
+            service_enabled=0
+            rm -f -- "$link"
+        }
+        nft() { [ "$1" != "list" ]; }
+
+        firewall_disable_internal
+        assert_file_contains "$log" \
+            "^rc-service:${FIREWALL_SERVICE_NAME} stop$"
+        assert_file_contains "$log" \
+            "^rc-update:del ${FIREWALL_SERVICE_NAME} default$"
+        assert_file_contains "$log" \
+            "^rc-service:${FIREWALL_SERVICE_NAME} status$"
+        assert_eq 0 "$service_active" "OpenRC 防火墙服务必须先停止"
+        assert_eq 0 "$service_enabled" "OpenRC 防火墙服务必须移出 default runlevel"
+        [ ! -e "$link" ] && [ ! -L "$link" ] ||
+            fail "OpenRC 防火墙关闭后不得残留 default 自启链接"
+        [ ! -e "$FIREWALL_OPENRC_SERVICE" ] ||
+            fail "OpenRC 防火墙确认停用后应删除受管服务脚本"
+    )
+}
+
+test_extra_port_remove_and_clear_commit_expected_state() {
+    (
+        local log="$TEST_TMP/firewall-extra-remove.log" prompt_port=443
+        : > "$log"
+        FW_EXTRA_TCP="80,443"
+        FW_EXTRA_UDP="53,443"
+
+        firewall_settle_pending_port_transition() { :; }
+        firewall_load_state() { :; }
+        firewall_prompt_port() { printf '%s\n' "$prompt_port"; }
+        firewall_commit_port_state() {
+            printf '%s|%s\n' "$FW_EXTRA_TCP" "$FW_EXTRA_UDP" >> "$log"
+        }
+
+        firewall_remove_extra_port tcp
+        assert_eq "80" "$FW_EXTRA_TCP" "删除 TCP 端口必须只更新 TCP 额外列表"
+        assert_eq "53,443" "$FW_EXTRA_UDP" "删除 TCP 端口不得改动 UDP 列表"
+        assert_file_contains "$log" '^80[|]53,443$'
+
+        prompt_port=53
+        firewall_remove_extra_port udp
+        assert_eq "443" "$FW_EXTRA_UDP" "删除 UDP 端口必须更新 UDP 额外列表"
+        assert_file_contains "$log" '^80[|]443$'
+
+        : > "$log"
+        prompt_port=9999
+        firewall_remove_extra_port tcp >/dev/null
+        assert_empty_file "$log" "删除不存在的额外端口不得提交状态"
+
+        firewall_clear_extra_ports <<< "YES"
+        assert_eq "" "$FW_EXTRA_TCP" "确认清空后 TCP 额外列表应为空"
+        assert_eq "" "$FW_EXTRA_UDP" "确认清空后 UDP 额外列表应为空"
+        assert_file_contains "$log" '^[|]$'
+    )
+    (
+        local commit_calls=0
+        FW_EXTRA_TCP="80"
+        FW_EXTRA_UDP="53"
+        firewall_settle_pending_port_transition() { :; }
+        firewall_load_state() { :; }
+        firewall_commit_port_state() { commit_calls=$((commit_calls + 1)); }
+
+        firewall_clear_extra_ports <<< "no" >/dev/null
+        assert_eq "80" "$FW_EXTRA_TCP" "取消清空必须保留 TCP 额外端口"
+        assert_eq "53" "$FW_EXTRA_UDP" "取消清空必须保留 UDP 额外端口"
+        assert_eq 0 "$commit_calls" "取消清空不得提交防火墙状态"
+    )
+}
+
 test_lightweight_add_does_not_rescan_docker_or_ssh() {
     (
         local case_dir="$TEST_TMP/additive-apply" log="$TEST_TMP/additive-apply.log"
@@ -1182,6 +1415,7 @@ test_internal_port_transition_preserves_unrelated_public_ports() {
 main() {
     local name test status passed=0 skipped=0
     local -a required=(
+        process_start_ticks
         normalize_port_decimal
         normalize_port_csv
         is_public_listen_addr
@@ -1218,6 +1452,7 @@ main() {
         test_firewall_table_parsers_consume_large_trailing_input
         test_systemd_enabled_inactive_firewalld_conflict
         test_openrc_enabled_inactive_firewalld_conflict
+        test_case_pid_registry_survives_nested_subshell
         test_bounded_background_processes_release_lock
         test_timeout_processes_release_lock
         test_busybox_timeout_fallback_releases_lock
@@ -1230,6 +1465,8 @@ main() {
         test_unchanged_firewall_skips_confirmation_and_mutation
         test_second_firewall_scan_can_become_noop_before_mutation
         test_firewall_noop_requires_complete_managed_state
+        test_firewall_disable_internal_verifies_service_and_live_table
+        test_extra_port_remove_and_clear_commit_expected_state
         test_lightweight_add_does_not_rescan_docker_or_ssh
         test_internal_port_transition_preserves_unrelated_public_ports
     )
