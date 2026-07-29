@@ -97,8 +97,15 @@ else
     node_file_is_secure() {
         [ -f "$1" ] && [ ! -L "$1" ]
     }
+    node_uri_file_is_safe() {
+        [ -f "$1" ] && [ ! -L "$1" ] &&
+            [ "$(stat -c '%a' "$1" 2>/dev/null)" = "600" ]
+    }
     node_dir_is_secure() {
         [ -d "$1" ] && [ ! -L "$1" ]
+    }
+    node_backup_file_is_safe() {
+        [ -f "$1" ] && [ ! -L "$1" ]
     }
 fi
 
@@ -1463,6 +1470,132 @@ test_config_state_identity_and_credentials_must_match() {
     )
 }
 
+test_protocol_status_distinguishes_template_drift_from_damage() {
+    (
+        set_node_paths "$TEST_TMP/status-normal"
+        listen_mode() { printf '%s\n' ipv4; }
+        write_config \
+            20001 QUFBQUFBQUFBQUFBQUFBQQ== 111111111111111111111111 \
+            "$SS_CONFIG_PATH" >/dev/null
+        write_ss_state_fixture "$SS_STATE_FILE"
+
+        validate_protocol_node_core ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" ||
+            fail "vpsbox 当前生成模板必须通过核心完整性校验"
+        node_config_matches_vpsbox_template ss "$SS_CONFIG_PATH" ||
+            fail "vpsbox 当前生成模板必须被识别为标准模板"
+        assert_eq normal "$(protocol_node_status ss)" \
+            "vpsbox 当前生成模板的节点状态应为 normal"
+    )
+    (
+        local output="$TEST_TMP/status-vless-template.out"
+
+        set_node_paths "$TEST_TMP/status-vless-template"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_vless_config_fixture "$VLESS_CONFIG_PATH"
+        write_vless_state_fixture "$VLESS_STATE_FILE"
+
+        assert_eq normal "$(protocol_node_status vless)" \
+            "VLESS 当前生成模板的节点状态应为 normal"
+        sed -i 's/"listen": "0.0.0.0"/"listen": "::1"/' "$VLESS_CONFIG_PATH"
+        assert_eq deviated "$(protocol_node_status vless)" \
+            "VLESS 自定义监听地址应标记为 deviated，而不是损坏"
+        node_summary > "$output"
+        assert_file_contains "$output" \
+            '状态：已创建（配置已偏离 VPSBox 管理模板）' \
+            "主界面必须把合法自定义 VLESS 配置显示为偏离模板"
+
+        write_vless_config_fixture "$VLESS_CONFIG_PATH"
+        jq '.outbounds[0].type = "block"' \
+            "$VLESS_CONFIG_PATH" > "$VLESS_CONFIG_PATH.tmp"
+        mv "$VLESS_CONFIG_PATH.tmp" "$VLESS_CONFIG_PATH"
+        chmod 600 "$VLESS_CONFIG_PATH"
+        assert_eq deviated "$(protocol_node_status vless)" \
+            "VLESS 自定义出站应标记为 deviated，而不是损坏"
+    )
+    (
+        set_node_paths "$TEST_TMP/status-custom-listen"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        sed -i 's/"listen": "0.0.0.0"/"listen": "127.0.0.1"/' "$SS_CONFIG_PATH"
+
+        validate_protocol_node_core ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" ||
+            fail "自定义监听地址不应破坏配置与状态的一致性"
+        if node_config_matches_vpsbox_template ss "$SS_CONFIG_PATH"; then
+            fail "自定义监听地址不应继续被识别为 vpsbox 管理模板"
+        fi
+        assert_eq deviated "$(protocol_node_status ss)" \
+            "自定义监听地址应标记为 deviated，而不是损坏"
+    )
+    (
+        set_node_paths "$TEST_TMP/status-custom-outbound"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        jq '
+            .outbounds[0] = {
+                "type": "socks",
+                "tag": "custom-proxy",
+                "server": "127.0.0.1",
+                "server_port": 1080
+            }
+        ' "$SS_CONFIG_PATH" > "$SS_CONFIG_PATH.tmp"
+        mv "$SS_CONFIG_PATH.tmp" "$SS_CONFIG_PATH"
+        chmod 600 "$SS_CONFIG_PATH"
+
+        validate_protocol_node_core ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" ||
+            fail "自定义出站不应破坏配置与状态的一致性"
+        if node_config_matches_vpsbox_template ss "$SS_CONFIG_PATH"; then
+            fail "自定义出站不应继续被识别为 vpsbox 管理模板"
+        fi
+        assert_eq deviated "$(protocol_node_status ss)" \
+            "自定义出站应标记为 deviated，而不是损坏"
+    )
+    (
+        set_node_paths "$TEST_TMP/status-damaged-credentials"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        sed -i 's/^PASSWORD=.*/PASSWORD=TkVXTkVXTkVXTkVXTkVXQQ==/' "$SS_STATE_FILE"
+
+        assert_eq damaged "$(protocol_node_status ss)" \
+            "配置与状态的凭据错配必须标记为 damaged"
+    )
+}
+
+test_self_check_warns_for_template_drift_without_integrity_failure() {
+    (
+        local output="$TEST_TMP/self-check-template-drift.out"
+
+        set_node_paths "$TEST_TMP/self-check-template-drift"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        sed -i 's/"listen": "0.0.0.0"/"listen": "127.0.0.1"/' "$SS_CONFIG_PATH"
+        singbox_installed() { return 0; }
+        singbox_version() { printf '%s\n' 1.13.14; }
+        port_listener_ready() { return 0; }
+        resolve_host_ips() { printf '%s\n' 192.0.2.1; }
+        check_active_node_config() { return 0; }
+        service_status_short() { printf '%s\n' 运行中; }
+        node_uri_cache_status() { printf '%s\n' stale; }
+        public_ipv4() { return 1; }
+        firewall_control_plane_present() { return 1; }
+
+        run_self_check > "$output" 2>&1
+
+        assert_file_contains "$output" \
+            'WARN[[:space:]]+[|] Shadowsocks 模板[[:space:]]+[|] 已偏离 VPSBox 管理模板' \
+            "偏离管理模板应明确显示 WARN"
+        assert_file_not_contains "$output" \
+            'FAIL[[:space:]]+[|] Shadowsocks 模板' \
+            "偏离管理模板不得被标记为 FAIL"
+        assert_file_not_contains "$output" \
+            'FAIL[[:space:]]+[|] 配置完整性[[:space:]]+[|] 未通过' \
+            "仅偏离管理模板时核心配置完整性仍应通过"
+    )
+}
+
 test_full_artifact_validation_keeps_uri_strict() {
     (
         set_node_paths "$TEST_TMP/strict-uri-artifacts"
@@ -1474,12 +1607,14 @@ test_full_artifact_validation_keeps_uri_strict() {
         validate_protocol_node_artifacts \
             ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$SS_URI_FILE" ||
             fail "新生成的完整节点产物必须通过严格校验"
-        chmod 400 "$SS_URI_FILE"
-        if validate_protocol_node_artifacts \
-            ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$SS_URI_FILE"; then
-            fail "创建与发布边界必须坚持 URI 使用标准 0600 权限"
+        if [ "$DUAL_NODES_REAL_PERMISSIONS" -eq 1 ]; then
+            chmod 400 "$SS_URI_FILE"
+            if validate_protocol_node_artifacts \
+                ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$SS_URI_FILE"; then
+                fail "创建与发布边界必须坚持 URI 使用标准 0600 权限"
+            fi
+            chmod 600 "$SS_URI_FILE"
         fi
-        chmod 600 "$SS_URI_FILE"
         printf 'tampered-uri\n' > "$SS_URI_FILE"
         if validate_protocol_node_artifacts \
             ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$SS_URI_FILE"; then
@@ -1708,11 +1843,13 @@ test_node_security_predicates_reject_symlinks() {
 
 test_self_check_keeps_valid_sibling_visible() {
     (
+        local summary_output="$TEST_TMP/node-summary-sibling.out"
+
         set_node_paths "$TEST_TMP/self-check-sibling"
         mkdir -p "$NODE_CONFIG_DIR"
         write_ss_config_fixture "$SS_CONFIG_PATH"
         write_ss_state_fixture "$SS_STATE_FILE"
-        write_vless_config_fixture "$VLESS_CONFIG_PATH"
+        mkdir "$VLESS_CONFIG_PATH"
         write_vless_state_fixture "$VLESS_STATE_FILE" 29999
         singbox_installed() { return 1; }
         port_listener_ready() { return 1; }
@@ -1725,9 +1862,32 @@ test_self_check_keeps_valid_sibling_visible() {
         assert_eq 1 "$(grep -Ec 'FAIL[[:space:]]+[|] 配置完整性[[:space:]]+[|] 未通过' "$TEST_TMP/self-check-sibling.out")" \
             "残缺节点只能产生一条配置完整性失败"
         assert_file_contains "$TEST_TMP/self-check-sibling.out" 'Shadowsocks 节点'
+        assert_file_not_contains "$TEST_TMP/self-check-sibling.out" 'VLESS Reality 模板.*已偏离' \
+            "损坏节点不得再被误报为仅偏离管理模板"
         assert_file_not_contains "$TEST_TMP/self-check-sibling.out" '配置文件.*不存在'
         assert_file_not_contains "$TEST_TMP/self-check-sibling.out" '配置语法.*配置完整性未通过' \
             "已有完整性失败时不得重复报告配置语法失败"
+
+        node_summary > "$summary_output"
+        awk '
+            /VLESS Reality 节点/ { section = "vless"; next }
+            /Shadowsocks 节点/ { section = "ss"; next }
+            section == "vless" && /状态：损坏，请进入节点管理检查/ { vless_damaged = 1 }
+            section == "ss" && /状态：已创建/ { ss_created = 1 }
+            section == "ss" && /名称：ss-node/ { ss_name = 1 }
+            END { exit(vless_damaged && ss_created && ss_name ? 0 : 1) }
+        ' "$summary_output" ||
+            fail "主界面必须分别显示损坏的 VLESS 与有效的 Shadowsocks"
+        assert_file_not_contains "$summary_output" '^ 节点状态：异常' \
+            "一个受管协议损坏时不得遮住另一个有效协议"
+
+        : > "$NODE_CONFIG_DIR/unknown.json"
+        chmod 600 "$NODE_CONFIG_DIR/unknown.json"
+        node_summary > "$summary_output"
+        assert_file_contains "$summary_output" '^ 节点状态：异常' \
+            "未知配置会参与 sing-box 目录加载，主界面必须整体告警"
+        assert_file_not_contains "$summary_output" 'Shadowsocks 节点|VLESS Reality 节点' \
+            "存在未知配置时不得把局部状态误报为完整视图"
     )
 }
 
@@ -1746,7 +1906,10 @@ main() {
         validate_staged_uri_group
         validate_staged_node
         node_config_matches_loaded_state
+        node_config_matches_vpsbox_template
+        protocol_node_status
         node_config_dir_contents_valid
+        node_config_dir_layout_valid
         node_uri_cache_status
         repair_node_uri_cache
         require_valid_node_state_if_present
@@ -1760,6 +1923,7 @@ main() {
         delete_node
         write_uri_files
         run_self_check
+        node_summary
     )
     local -a tests=(
         test_fake_singbox_rejects_invalid_config_schema
@@ -1798,6 +1962,8 @@ main() {
         test_failed_recovery_keeps_transaction_backup
         test_committed_transaction_is_not_rolled_back
         test_config_state_identity_and_credentials_must_match
+        test_protocol_status_distinguishes_template_drift_from_damage
+        test_self_check_warns_for_template_drift_without_integrity_failure
         test_full_artifact_validation_keeps_uri_strict
         test_staged_uri_group_rejects_sibling_and_aggregate_drift
         test_aggregate_uri_drift_does_not_invalidate_core_node
@@ -1809,10 +1975,7 @@ main() {
         test_self_check_keeps_valid_sibling_visible
     )
 
-    command -v jq >/dev/null 2>&1 || {
-        fail "缺少测试依赖：jq"
-        return 1
-    }
+    require_command jq || return "$?"
     for name in "${required[@]}"; do
         require_function "$name"
     done

@@ -25,24 +25,6 @@ reset_change_store() {
     : > "$CHANGE_MANIFEST"
 }
 
-require_root_permission_semantics() {
-    local probe="$TEST_TMP/root-permission-probe" owner group mode
-
-    mkdir -p "$probe" || return 1
-    : > "$probe/file" || return 1
-    if command chown root:root "$probe" "$probe/file" 2>/dev/null &&
-        command chmod 700 "$probe" && command chmod 600 "$probe/file"; then
-        owner="$(stat -c '%u' "$probe/file" 2>/dev/null || true)"
-        group="$(stat -c '%g' "$probe/file" 2>/dev/null || true)"
-        mode="$(stat -c '%a' "$probe/file" 2>/dev/null || true)"
-        rm -rf -- "$probe"
-        [ "$owner" = 0 ] && [ "$group" = 0 ] && [ "$mode" = 600 ] && return 0
-    else
-        rm -rf -- "$probe"
-    fi
-    skip "需要真实的 root 属主与 Unix 权限语义"
-}
-
 test_manifest_failure_preserves_existing_file() {
     reset_change_store manifest
     printf 'EXISTING=keep\n' > "$CHANGE_MANIFEST"
@@ -1301,6 +1283,7 @@ test_multiple_ssh_socket_streams_are_parsed() {
 }
 
 test_ssh_restore_does_not_require_current_config_to_parse() {
+    require_root_permission_semantics || return "$?"
     (
         local ssh_dir="$TEST_TMP/ssh-invalid-current" transition_log="$TEST_TMP/ssh-invalid-transition"
         forbid_init
@@ -1340,6 +1323,7 @@ test_ssh_restore_does_not_require_current_config_to_parse() {
 }
 
 test_failed_ssh_restore_preserves_retry_snapshot() {
+    require_root_permission_semantics || return "$?"
     (
         local ssh_dir="$TEST_TMP/ssh-restore-snapshot/etc/ssh"
         local snapshot
@@ -1391,6 +1375,7 @@ test_ssh_config_publish_failure_preserves_target() {
 }
 
 test_ssh_restore_snapshot_integrity_is_verified() {
+    require_root_permission_semantics || return "$?"
     (
         local ssh_dir="$TEST_TMP/ssh-snapshot-integrity/etc/ssh" snapshot=""
         reset_change_store ssh-snapshot-integrity

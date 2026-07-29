@@ -64,24 +64,6 @@ test_cleanup() {
 }
 trap test_cleanup EXIT
 
-require_root_permission_semantics() {
-    local probe="$TEST_TMP/update-root-permission-probe" owner group mode
-
-    mkdir -p "$probe" || return 1
-    : > "$probe/file" || return 1
-    if command chown root:root "$probe" "$probe/file" 2>/dev/null &&
-        command chmod 700 "$probe" && command chmod 600 "$probe/file"; then
-        owner="$(stat -c '%u' "$probe/file" 2>/dev/null || true)"
-        group="$(stat -c '%g' "$probe/file" 2>/dev/null || true)"
-        mode="$(stat -c '%a' "$probe/file" 2>/dev/null || true)"
-        rm -rf -- "$probe"
-        [ "$owner" = 0 ] && [ "$group" = 0 ] && [ "$mode" = 600 ] && return 0
-    else
-        rm -rf -- "$probe"
-    fi
-    skip "需要真实的 root 属主与 Unix 权限语义"
-}
-
 write_fixture() {
     local path="$1" version="$2" marker="$3"
     local script_url="${4:-$SCRIPT_URL}"
@@ -152,6 +134,14 @@ cleanup_vpsbox_lock() {
 
 reexec_updated_vpsbox() {
     printf 'reexec:%s\n' "${1:-}" >> "$MOCK_EVENT_LOG"
+}
+
+start_vpsbox_update_watchdog() {
+    # update_vpsbox 的单元夹具只验证接线顺序；真实 watchdog 由独立子进程用例覆盖。
+    assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_CURRENT" || return "$?"
+    printf 'watchdog-start:%s\n' "${1:-}" >> "$MOCK_EVENT_LOG"
+    VPSBOX_UPDATE_WATCHDOG_PID=""
+    VPSBOX_UPDATE_WATCHDOG_DIR=""
 }
 
 acquire_lock() {
@@ -303,12 +293,35 @@ test_vpsbox_newer_updates_once() {
     assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_NEWER"
     assert_file_contains "$CMD_PATH" 'remote'
     assert_file_contains "${CMD_PATH}.previous" 'installed'
-    assert_file_contains "$MOCK_EVENT_LOG" '^alias$'
-    assert_file_contains "$MOCK_EVENT_LOG" '^cleanup-lock$'
-    grep -Fqx -- "reexec:${CMD_PATH}.previous" "$MOCK_EVENT_LOG" ||
-        fail "更新后重新执行必须携带本次 .previous 备份路径"
+    assert_eq "watchdog-start:${CMD_PATH}.previous
+alias
+cleanup-lock
+reexec:${CMD_PATH}.previous" "$(cat "$MOCK_EVENT_LOG")" \
+        "更新必须在替换主脚本前启动 watchdog，再安装入口并重新执行"
     assert_eq "$SCRIPT_URL" "$(cat "$MOCK_CURL_LOG")" \
         "新地址可用时只应访问当前官方地址"
+}
+
+test_vpsbox_watchdog_start_failure_preserves_current() {
+    local output="$TEST_TMP/watchdog-start-failure.out"
+
+    reset_update_case watchdog-start-failure
+    write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
+    write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_NEWER" remote
+    start_vpsbox_update_watchdog() {
+        printf '%s\n' watchdog-start-failed >> "$MOCK_EVENT_LOG"
+        return 23
+    }
+
+    if update_vpsbox > "$output" 2>&1; then
+        fail "watchdog 启动失败时更新不得继续"
+    fi
+    assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_CURRENT"
+    assert_file_contains "$CMD_PATH" 'installed'
+    assert_fixture_version "${CMD_PATH}.previous" "$UPDATE_TEST_CURRENT"
+    assert_eq watchdog-start-failed "$(cat "$MOCK_EVENT_LOG")" \
+        "watchdog 启动失败后不得安装入口或执行候选脚本"
+    assert_file_contains "$output" '无法启动新版 vpsbox 启动监护'
 }
 
 test_vpsbox_never_fetches_old_owner_url() {
@@ -473,7 +486,8 @@ test_real_reexec_failure_returns_without_option_or_env_leaks() {
         CMD_PATH="$CASE_DIR/not-executable"
         RUNTIME_DIR="$CASE_DIR"
         start_vpsbox_update_watchdog() {
-            VPSBOX_UPDATE_WATCHDOG_DIR="$CASE_DIR/watchdog"
+            VPSBOX_UPDATE_WATCHDOG_DIR="$CASE_DIR/update-startup.test"
+            mkdir -p "$VPSBOX_UPDATE_WATCHDOG_DIR"
             ( while :; do sleep 1; done ) &
             # shellcheck disable=SC2034 # 被测函数通过动态全局读取 watchdog PID。
             VPSBOX_UPDATE_WATCHDOG_PID=$!
@@ -745,7 +759,7 @@ run_singbox_installer() {
     MOCK_SINGBOX_VERSION="${1:-$SINGBOX_RELEASE_VERSION}"
 }
 restore_singbox_service_state() {
-    printf 'restore:%s:%s\n' "$1" "$2" \
+    printf 'restore:%s:%s:%s\n' "$1" "$2" "${3:-1}" \
         >> "${MOCK_SINGBOX_EVENT_LOG:?先调用 reset_singbox_case}"
 }
 
@@ -845,7 +859,7 @@ rm:-rf -- $SINGBOX_UPDATE_TRANSACTION_DIR" "$(cat "$log")" \
     )
 }
 
-test_singbox_version_guards() {
+test_singbox_version_noop_guards() {
     local fake_bin="$TEST_TMP/bin"
     mkdir -p "$fake_bin"
     printf '#!/usr/bin/env bash\nprintf \"sing-box version 1.13.13\\n\"\n' > "$fake_bin/sing-box"
@@ -862,6 +876,16 @@ test_singbox_version_guards() {
     update_singbox > "$TEST_TMP/singbox-higher.out" 2>&1 || fail "较高 sing-box 版本应拒绝降级并正常返回"
     assert_empty_file "$MOCK_SINGBOX_EVENT_LOG" "较高版本不得隐式降级"
     assert_file_contains "$TEST_TMP/singbox-higher.out" '已拒绝隐式降级'
+}
+
+test_singbox_lower_version_updates() {
+    local fake_bin="$TEST_TMP/bin-lower"
+
+    require_root_permission_semantics || return "$?"
+    mkdir -p "$fake_bin"
+    printf '#!/usr/bin/env bash\nprintf \"sing-box version 1.13.13\\n\"\n' > "$fake_bin/sing-box"
+    chmod 755 "$fake_bin/sing-box"
+    PATH="$fake_bin:$PATH"
 
     reset_singbox_case lower
     MOCK_SINGBOX_VERSION="1.13.13"
@@ -913,7 +937,9 @@ test_singbox_update_without_package_rolls_back_binary_and_service() {
         MOCK_SINGBOX_VERSION=1.13.13
 
         node_core_artifacts_present() { return 1; }
-        service_is_running() { return 0; }
+        # 服务管理器 active，但没有精确匹配 vpsbox 配置目录的进程。
+        service_is_running() { return 1; }
+        service_manager_is_active() { return 0; }
         service_is_enabled() { return 0; }
         prepare_singbox_rollback_package() { return 23; }
         install_singbox_package_file() {
@@ -933,7 +959,8 @@ test_singbox_update_without_package_rolls_back_binary_and_service() {
         fi
         assert_file_contains "$MOCK_SINGBOX_EVENT_LOG" '^installer-failed$'
         assert_file_not_contains "$MOCK_SINGBOX_EVENT_LOG" '^package-install:'
-        assert_file_contains "$MOCK_SINGBOX_EVENT_LOG" '^restore:1:1$'
+        assert_file_contains "$MOCK_SINGBOX_EVENT_LOG" '^restore:1:1:0$' \
+            "无节点更新应按服务管理器状态恢复，不要求匹配 vpsbox 节点进程"
         assert_eq 1.13.13 "$(singbox_binary_version_at "$fake_bin/sing-box")" \
             "无旧包时必须恢复经过版本校验的旧二进制"
         assert_file_contains "$output" '软件包管理记录可能不一致'
@@ -970,7 +997,7 @@ test_pending_singbox_update_without_package_recovers_on_startup() {
             fail "无旧包的未完成更新应使用持久化旧二进制恢复"
 
         assert_eq 1.13.13 "$(singbox_binary_version_at "$binary")"
-        assert_file_contains "$MOCK_SINGBOX_EVENT_LOG" '^restore:1:1$'
+        assert_file_contains "$MOCK_SINGBOX_EVENT_LOG" '^restore:1:1:0$'
         assert_file_contains "$output" '软件包管理记录可能不一致'
         [ ! -e "$SINGBOX_UPDATE_TRANSACTION_DIR" ] ||
             fail "无旧包事务完整恢复后必须清理"
@@ -1030,6 +1057,7 @@ main() {
         test_vpsbox_same_is_noop
         test_vpsbox_older_is_noop
         test_vpsbox_newer_updates_once
+        test_vpsbox_watchdog_start_failure_preserves_current
         test_vpsbox_never_fetches_old_owner_url
         test_primary_url_failure_preserves_current
         test_vpsbox_invalid_download_preserves_current
@@ -1044,7 +1072,8 @@ main() {
         test_pending_update_confirmation_prevents_rollback
         test_stale_previous_without_handshake_is_ignored
         test_pending_update_rejects_unexpected_backup_path
-        test_singbox_version_guards
+        test_singbox_version_noop_guards
+        test_singbox_lower_version_updates
         test_singbox_update_continues_without_rollback_package
         test_singbox_update_without_package_rolls_back_binary_and_service
         test_pending_singbox_update_without_package_recovers_on_startup

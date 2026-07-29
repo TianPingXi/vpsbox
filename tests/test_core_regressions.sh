@@ -661,7 +661,9 @@ test_singbox_package_removal_failure_preserves_files() {
             service_active=1
         }
         stop_singbox_config_processes() { return 0; }
-        singbox_config_pids() { return 0; }
+        singbox_config_pids() {
+            [ "$service_active" -eq 1 ] && printf '%s\n' 123
+        }
         sleep() { return 0; }
         service_is_running() { [ "$service_active" -eq 1 ]; }
         service_manager_is_active() { [ "$service_active" -eq 1 ]; }
@@ -1072,6 +1074,13 @@ test_node_summary_orders_only_existing_protocols() {
     (
         local mock_vless=0 mock_ss=0 output="$TEST_TMP/node-summary.out"
         node_core_artifacts_present() { return 1; }
+        node_config_dir_layout_valid() { return 0; }
+        protocol_node_status() {
+            case "$1" in
+                vless) [ "$mock_vless" -eq 1 ] && printf '%s\n' normal || printf '%s\n' absent ;;
+                ss) [ "$mock_ss" -eq 1 ] && printf '%s\n' normal || printf '%s\n' absent ;;
+            esac
+        }
         load_protocol_state() {
             case "$1" in
                 vless)
@@ -1383,6 +1392,9 @@ test_self_check_classifies_and_summarizes_results() {
         node_uri_artifacts_present() { return 1; }
         require_valid_node_state_if_present() { return 0; }
         node_uri_cache_status() { printf '%s\n' "$mock_uri_cache_state"; }
+        protocol_node_status() {
+            [ "$1" = vless ] && printf '%s\n' normal || printf '%s\n' absent
+        }
         load_protocol_state() {
             [ "$1" = vless ] || return 1
             DOMAIN=192.0.2.10
@@ -1769,6 +1781,8 @@ test_third_party_entries_keep_attribution_and_commands() {
 
 test_service_restore_checks_final_state() {
     (
+        local log="$TEST_TMP/service-restore-strictness.log"
+
         service_disable() { return 23; }
         service_is_enabled() { return 1; }
         service_stop() { return 23; }
@@ -1780,11 +1794,24 @@ test_service_restore_checks_final_state() {
             fail "服务命令报错但禁用/停止目标状态已满足时应允许恢复完成"
 
         service_start() { return 0; }
-        service_is_running() { return 1; }
         service_stop() { return 0; }
+        service_manager_is_active() { return 0; }
+        restart_singbox_cleanly 0 ||
+            fail "仅恢复服务管理器 active 状态时不应要求匹配 vpsbox 节点进程"
         if restart_singbox_cleanly; then
             fail "服务启动命令成功但实际进程未运行时不得报告重启成功"
         fi
+
+        service_enable() { return 0; }
+        service_is_enabled() { return 0; }
+        restart_singbox_cleanly() { printf '%s\n' "$1" >> "$log"; }
+        : > "$log"
+        restore_singbox_service_state 1 1 0 ||
+            fail "服务恢复必须接受仅校验服务管理器 active 的模式"
+        restore_singbox_service_state 1 1 ||
+            fail "服务恢复默认必须严格校验 vpsbox 节点进程"
+        assert_eq $'0\n1' "$(cat "$log")" \
+            "服务恢复必须把宽松与严格进程校验模式传给重启函数"
     )
 }
 
@@ -2446,6 +2473,7 @@ test_singbox_dependency_failure_does_not_touch_service() {
 }
 
 test_failed_singbox_update_restores_binary_and_state() {
+    require_root_permission_semantics || return "$?"
     (
         local fake_bin="$TEST_TMP/singbox-bin"
         local output="$TEST_TMP/singbox-update.out"
@@ -2479,10 +2507,12 @@ test_failed_singbox_update_restores_binary_and_state() {
             return 1
         }
         service_stop() { return 0; }
+        service_manager_is_active() { return 0; }
+        service_is_running() { return 1; }
         stop_singbox_config_processes() { return 0; }
         setup_service() { return 0; }
         restore_singbox_service_state() {
-            printf '%s %s\n' "$1" "$2" > "$TEST_TMP/restored-service-state"
+            printf '%s %s %s\n' "$1" "$2" "${3:-1}" > "$TEST_TMP/restored-service-state"
         }
         mktemp() {
             if [ "${1:-}" = "-d" ] && [[ "${2:-}" == /tmp/vpsbox-sing-box-update.* ]]; then
@@ -2497,7 +2527,7 @@ test_failed_singbox_update_restores_binary_and_state() {
             fail "安装器失败时 update_singbox 应返回失败"
         fi
         assert_file_contains "$fake_bin/sing-box" '^#!/bin/sh$'
-        assert_file_contains "$TEST_TMP/restored-service-state" '^1 1$'
+        assert_file_contains "$TEST_TMP/restored-service-state" '^1 1 0$'
         [ ! -e "$SINGBOX_UPDATE_TRANSACTION_DIR" ] ||
             fail "旧二进制和服务状态完整恢复后应清理持久事务"
     )
@@ -2627,6 +2657,7 @@ test_openrc_service_does_not_inherit_menu_lock_fd() {
 }
 
 test_singbox_pending_update_recovers_on_next_start() {
+    require_root_permission_semantics || return "$?"
     (
         local fake_bin="$TEST_TMP/singbox-recovery/bin" backup="$TEST_TMP/singbox-recovery/old"
         local package="$TEST_TMP/singbox-recovery/old.deb" state_log="$TEST_TMP/singbox-recovery/service"
@@ -2651,11 +2682,13 @@ test_singbox_pending_update_recovers_on_next_start() {
         install_singbox_package_file() {
             cp -a "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary" "$fake_bin/sing-box"
         }
-        restore_singbox_service_state() { printf '%s %s\n' "$1" "$2" > "$state_log"; }
+        restore_singbox_service_state() {
+            printf '%s %s %s\n' "$1" "$2" "${3:-1}" > "$state_log"
+        }
 
         recover_pending_singbox_update >/dev/null
         assert_eq 1.13.13 "$(singbox_version)"
-        assert_file_contains "$state_log" '^1 1$'
+        assert_file_contains "$state_log" '^1 1 0$'
         [ ! -e "$SINGBOX_UPDATE_TRANSACTION_DIR" ] ||
             fail "完整恢复后必须删除 sing-box 更新事务"
     )
@@ -2681,6 +2714,7 @@ test_singbox_atomic_restore_preserves_current_on_replace_failure() {
 }
 
 test_singbox_recovery_rejects_corrupted_backup() {
+    require_root_permission_semantics || return "$?"
     (
         local fake_bin="$TEST_TMP/singbox-corrupt/bin" backup="$TEST_TMP/singbox-corrupt/old"
         local package="$TEST_TMP/singbox-corrupt/old.deb"

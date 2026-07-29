@@ -2276,7 +2276,10 @@ stop_singbox_config_processes() {
 }
 
 restart_singbox_cleanly() {
+    local require_vpsbox_process="${1:-1}"
     local stop_failed=0
+
+    [[ "$require_vpsbox_process" =~ ^[01]$ ]] || return 2
 
     service_stop 2>/dev/null || stop_failed=1
     stop_singbox_config_processes || {
@@ -2288,11 +2291,14 @@ restart_singbox_cleanly() {
         return 1
     fi
     service_start || return 1
-    service_is_running
+    service_manager_is_active || return 1
+    [ "$require_vpsbox_process" = "0" ] || [ -n "$(singbox_config_pids)" ]
 }
 
 restore_singbox_service_state() {
-    local was_enabled="$1" was_active="$2"
+    local was_enabled="$1" was_active="$2" require_vpsbox_process="${3:-1}"
+
+    [[ "$require_vpsbox_process" =~ ^[01]$ ]] || return 2
 
     if [ "$was_enabled" = "1" ]; then
         service_enable || return 1
@@ -2304,7 +2310,7 @@ restore_singbox_service_state() {
         service_is_enabled && return 1
     fi
     if [ "$was_active" = "1" ]; then
-        restart_singbox_cleanly && service_is_running
+        restart_singbox_cleanly "$require_vpsbox_process"
     else
         if ! service_stop && service_manager_is_active; then
             return 1
@@ -2439,6 +2445,14 @@ ipv6_listen_addr_is_public() {
         fi
     fi
 
+    # 64:ff9b::/96 是 IANA 登记的全球可达 IPv4/IPv6 转换前缀；
+    # 其余普通全球单播地址必须先落在当前分配的 2000::/3 中。
+    if (( h0 == 0x0064 && h1 == 0xff9b && h2 == 0 && h3 == 0 &&
+        h4 == 0 && h5 == 0 )); then
+        return 0
+    fi
+    (( (h0 & 0xe000) == 0x2000 )) || return 1
+
     # 精确按 IANA 前缀判断，避免用字符串通配把 /64、/48 或 /20 扩大成 /16。
     (( h0 == 0x0100 && h1 == 0 && h2 == 0 && (h3 == 0 || h3 == 1) )) && return 1
     (( (h0 & 0xfe00) == 0xfc00 )) && return 1
@@ -2446,7 +2460,6 @@ ipv6_listen_addr_is_public() {
     (( (h0 & 0xff00) == 0xff00 )) && return 1
     (( h0 == 0x2001 && h1 == 0x0002 && h2 == 0 )) && return 1
     (( h0 == 0x2001 && (h1 & 0xfff0) == 0x0010 )) && return 1
-    (( h0 == 0x2001 && (h1 & 0xfff0) == 0x0020 )) && return 1
     (( h0 == 0x2001 && h1 == 0x0db8 )) && return 1
     (( h0 == 0x2002 )) && return 1
     (( h0 == 0x3fff && (h1 & 0xf000) == 0 )) && return 1
@@ -2522,9 +2535,20 @@ show_ports_security_group() {
     local public_file local_file suggest_file records
     local scope protocol port _addr proc_name proto_upper
 
-    public_file="$(mktemp)"
-    local_file="$(mktemp)"
-    suggest_file="$(mktemp)"
+    public_file="$(mktemp)" || {
+        err "无法创建端口检测临时文件。"
+        return 1
+    }
+    local_file="$(mktemp)" || {
+        rm -f -- "$public_file"
+        err "无法创建端口检测临时文件。"
+        return 1
+    }
+    suggest_file="$(mktemp)" || {
+        rm -f -- "$public_file" "$local_file"
+        err "无法创建端口检测临时文件。"
+        return 1
+    }
     records="$(collect_listening_sockets)" || {
         rm -f "$public_file" "$local_file" "$suggest_file"
         return 1
@@ -2765,9 +2789,7 @@ node_config_matches_loaded_state() {
                     .method == $method and
                     .password == $password and
                     (.tag | type == "string" and contains($config_id))
-                ) and
-                ((.outbounds | type == "array" and length > 0) and
-                 all(.outbounds[]; .tag | type == "string" and contains($config_id)))
+                )
             ' "$config" >/dev/null 2>&1
             ;;
         vless)
@@ -2791,9 +2813,50 @@ node_config_matches_loaded_state() {
                     .tls.reality.private_key == $private_key and
                     any(.tls.reality.short_id[]?; . == $short_id) and
                     (.tag | type == "string" and contains($config_id))
-                ) and
-                ((.outbounds | type == "array" and length > 0) and
-                 all(.outbounds[]; .tag | type == "string" and contains($config_id)))
+                )
+            ' "$config" >/dev/null 2>&1
+            ;;
+        *) return 2 ;;
+    esac
+}
+
+# 这里只判断配置是否仍符合 vpsbox 当前生成模板，不代表 sing-box 的通用配置规范。
+# 合法的自定义监听地址或出站类型仍可通过核心完整性检查，但会在状态界面提示已偏离模板。
+node_config_matches_vpsbox_template() {
+    local protocol="$1"
+    local config="$2"
+
+    command -v jq >/dev/null 2>&1 || return 1
+    node_file_is_secure "$config" || return 1
+    case "$protocol" in
+        ss)
+            jq -e --arg config_id "$CONFIG_ID" '
+                (.inbounds | type == "array" and (length == 1 or length == 2)) and
+                (all(.inbounds[];
+                    (.listen == "0.0.0.0" or .listen == "::") and
+                    (.tag | type == "string" and contains($config_id))
+                )) and
+                (if (.inbounds | length) == 2 then
+                    ([.inbounds[].listen] | sort | unique) == ["0.0.0.0", "::"]
+                 else true end) and
+                (.outbounds | type == "array" and length == 1) and
+                (.outbounds[0].type == "direct") and
+                (.outbounds[0].tag == ("direct-" + $config_id + "-ss"))
+            ' "$config" >/dev/null 2>&1
+            ;;
+        vless)
+            jq -e --arg config_id "$CONFIG_ID" '
+                (.inbounds | type == "array" and (length == 1 or length == 2)) and
+                (all(.inbounds[];
+                    (.listen == "0.0.0.0" or .listen == "::") and
+                    (.tag | type == "string" and contains($config_id))
+                )) and
+                (if (.inbounds | length) == 2 then
+                    ([.inbounds[].listen] | sort | unique) == ["0.0.0.0", "::"]
+                 else true end) and
+                (.outbounds | type == "array" and length == 1) and
+                (.outbounds[0].type == "direct") and
+                (.outbounds[0].tag == ("direct-" + $config_id + "-vless"))
             ' "$config" >/dev/null 2>&1
             ;;
         *) return 2 ;;
@@ -2855,6 +2918,29 @@ protocol_node_exists() {
         validate_protocol_node_core "$protocol" "$config" "$state" >/dev/null 2>&1
 }
 
+protocol_node_status() {
+    local protocol="$1" config state
+
+    config="$(node_config_path "$protocol")" || return 2
+    state="$(node_state_path "$protocol")" || return 2
+    if [ ! -e "$config" ] && [ ! -L "$config" ] &&
+        [ ! -e "$state" ] && [ ! -L "$state" ]; then
+        printf '%s\n' absent
+        return 0
+    fi
+    if [ ! -f "$config" ] || [ -L "$config" ] ||
+        [ ! -f "$state" ] || [ -L "$state" ] ||
+        ! validate_protocol_node_core "$protocol" "$config" "$state"; then
+        printf '%s\n' damaged
+        return 0
+    fi
+    if node_config_matches_vpsbox_template "$protocol" "$config"; then
+        printf '%s\n' normal
+    else
+        printf '%s\n' deviated
+    fi
+}
+
 protocol_visible_exists() {
     protocol_node_exists "$1"
 }
@@ -2905,6 +2991,23 @@ node_config_dir_contents_valid() {
             *) return 1 ;;
         esac
         node_file_is_secure "$path" || return 1
+    done <<< "$entries"
+}
+
+node_config_dir_layout_valid() {
+    local path entries
+
+    if [ ! -e "$NODE_CONFIG_DIR" ] && [ ! -L "$NODE_CONFIG_DIR" ]; then
+        return 0
+    fi
+    node_dir_is_secure "$NODE_CONFIG_DIR" || return 1
+    entries="$(find "$NODE_CONFIG_DIR" -mindepth 1 -maxdepth 1 -print 2>/dev/null)" || return 1
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        case "$path" in
+            "$SS_CONFIG_PATH"|"$VLESS_CONFIG_PATH") ;;
+            *) return 1 ;;
+        esac
     done <<< "$entries"
 }
 
@@ -5733,7 +5836,7 @@ restore_singbox_update_backup() {
     local binary_path="$1" backup_binary="$2" backup_dir="$3"
     local was_enabled="$4" was_active="$5"
     local rollback_package="${6:-}" old_version="${7:-}"
-    local failed=0 package_state_may_differ=0
+    local failed=0 package_state_may_differ=0 require_vpsbox_process=0
     local package_restored=0 binary_ready=0 service_ready=1
 
     if ! service_stop 2>/dev/null && service_manager_is_active; then
@@ -5771,13 +5874,16 @@ restore_singbox_update_backup() {
         fi
     fi
     hash -r
-    if [ "$binary_ready" -eq 1 ] && node_exists && ! setup_service; then
-        err "旧 sing-box 服务配置恢复失败。"
-        failed=1
-        service_ready=0
+    if [ "$binary_ready" -eq 1 ] && node_exists; then
+        require_vpsbox_process=1
+        if ! setup_service; then
+            err "旧 sing-box 服务配置恢复失败。"
+            failed=1
+            service_ready=0
+        fi
     fi
     if [ "$binary_ready" -eq 1 ] && [ "$service_ready" -eq 1 ] &&
-        ! restore_singbox_service_state "$was_enabled" "$was_active"; then
+        ! restore_singbox_service_state "$was_enabled" "$was_active" "$require_vpsbox_process"; then
         err "旧 sing-box 二进制已恢复，但原服务状态恢复失败。"
         failed=1
     fi
@@ -6010,7 +6116,9 @@ update_singbox() {
     backup_binary="$backup_dir/sing-box"
     cp -a "$binary_path" "$backup_binary" || { rm -rf "$backup_dir"; err "备份当前 sing-box 二进制失败，已取消更新。"; return 1; }
 
-    if service_is_running; then
+    # 更新回滚需要恢复服务管理器的原始 active 状态；精确的 vpsbox 进程匹配
+    # 只用于节点运行检查，不能把 active 的自定义/旧布局服务误记为未运行。
+    if service_manager_is_active; then
         was_active=1
     fi
     if service_is_enabled; then
@@ -6070,12 +6178,12 @@ update_singbox() {
             rollback_active_singbox_update || true
             return 1
         fi
-        if ! setup_service || ! restore_singbox_service_state "$was_enabled" "$was_active"; then
+        if ! setup_service || ! restore_singbox_service_state "$was_enabled" "$was_active" 1; then
             err "新版 sing-box 未能恢复原服务状态，正在恢复旧二进制。"
             rollback_active_singbox_update || true
             return 1
         fi
-    elif ! restore_singbox_service_state "$was_enabled" "$was_active"; then
+    elif ! restore_singbox_service_state "$was_enabled" "$was_active" 0; then
         err "新版 sing-box 未能恢复原服务状态，正在恢复旧二进制。"
         rollback_active_singbox_update || true
         return 1
@@ -6303,26 +6411,48 @@ update_vpsbox() {
         esac
     fi
 
-    if [ -f "$CMD_PATH" ]; then
-        cp -a "$CMD_PATH" "$backup" || {
-            rm -f "$candidate"
-            err "备份当前 vpsbox 脚本失败，已取消更新。"
-            return 1
-        }
-        chmod 700 "$backup" || { rm -f "$candidate"; return 1; }
-    fi
+    [ -f "$CMD_PATH" ] && [ ! -L "$CMD_PATH" ] || {
+        rm -f "$candidate"
+        err "未找到可备份的当前 vpsbox 主脚本，已取消更新。"
+        return 1
+    }
+    cp -a "$CMD_PATH" "$backup" || {
+        rm -f "$candidate"
+        err "备份当前 vpsbox 脚本失败，已取消更新。"
+        return 1
+    }
+    chmod 700 "$backup" || { rm -f "$candidate"; return 1; }
+    start_vpsbox_update_watchdog "$backup" || {
+        rm -f "$candidate"
+        err "无法启动新版 vpsbox 启动监护，已取消更新。"
+        return 1
+    }
     if ! mv -f "$candidate" "$CMD_PATH"; then
         rm -f "$candidate"
         err "替换 vpsbox 脚本失败，正在从备份恢复。"
-        [ ! -f "$backup" ] || restore_previous_vpsbox "$backup" || true
+        if restore_previous_vpsbox "$backup"; then
+            settle_vpsbox_update_watchdog_after_safe_restore ||
+                warn "旧版脚本已恢复，但更新监护清理失败。"
+        else
+            err "自动恢复失败；当前进程将退出，并由更新监护再次尝试恢复：$backup"
+            exit 1
+        fi
         return 1
     fi
     if ! install_command_alias; then
         err "新版 vpsbox 管理命令入口安装失败，正在恢复旧版脚本。"
         if [ -f "$backup" ] && restore_previous_vpsbox "$backup"; then
-            warn "已恢复更新前的 vpsbox 脚本。"
+            if settle_vpsbox_update_watchdog_after_safe_restore; then
+                warn "已恢复更新前的 vpsbox 脚本。"
+            else
+                err "旧版脚本已恢复，但更新监护清理失败。"
+            fi
         else
             err "自动恢复失败；请使用备份手动恢复：$backup"
+            if [ -n "${VPSBOX_UPDATE_WATCHDOG_PID:-}" ]; then
+                err "当前 vpsbox 将退出，并由更新监护再次尝试恢复旧版。"
+                exit 1
+            fi
         fi
         return 1
     fi
@@ -6355,11 +6485,16 @@ update_vpsbox() {
 reexec_updated_vpsbox() {
     local backup="$1" ready status execfail_was_set=0
 
-    start_vpsbox_update_watchdog "$backup" || {
-        err "无法启动新版 vpsbox 启动监护，已取消切换。"
-        return 1
-    }
+    # 正常更新路径会在替换正式脚本前启动监护。保留此降级分支供独立调用与旧测试夹具使用。
+    if [ -z "${VPSBOX_UPDATE_WATCHDOG_PID:-}" ] ||
+        [ -z "${VPSBOX_UPDATE_WATCHDOG_DIR:-}" ]; then
+        start_vpsbox_update_watchdog "$backup" || {
+            err "无法启动新版 vpsbox 启动监护，已取消切换。"
+            return 1
+        }
+    fi
     ready="$VPSBOX_UPDATE_WATCHDOG_DIR/ready"
+    vpsbox_update_ready_path_valid "$ready" || return 1
     shopt -q execfail && execfail_was_set=1
     shopt -s execfail
     VPSBOX_UPDATE_BACKUP="$backup" VPSBOX_UPDATE_READY_FILE="$ready" exec "$CMD_PATH"
@@ -10929,7 +11064,7 @@ firewall_detect_docker_ports() {
     local network_id network_name network_driver bridge_name swarm_state
     local docker_host context endpoint effective_endpoint security_options container_list network_list
     local bindings running publish_all port_mappings network_data gateway_v4 gateway_v6 trusted_interfaces
-    local container_dynamic
+    local container_dynamic container_unresolved_fixed
     local connected_count
 
     FW_DOCKER_TCP=""
@@ -11019,6 +11154,7 @@ firewall_detect_docker_ports() {
     while IFS= read -r container; do
         [ -n "$container" ] || continue
         container_dynamic=0
+        container_unresolved_fixed=0
         mode="$(docker_with_timeout inspect --format '{{.HostConfig.NetworkMode}}' "$container" 2>/dev/null)" || {
             err "无法读取 Docker 容器网络模式：$container"
             return 1
@@ -11063,11 +11199,11 @@ firewall_detect_docker_ports() {
             case "$protocol" in
                 tcp)
                     FW_DOCKER_TCP="$(csv_add_port "$FW_DOCKER_TCP" "$host_port")"
-                    [ -n "$host_ip" ] || container_dynamic=1
+                    [ -n "$host_ip" ] || container_unresolved_fixed=1
                     ;;
                 udp)
                     FW_DOCKER_UDP="$(csv_add_port "$FW_DOCKER_UDP" "$host_port")"
-                    [ -n "$host_ip" ] || container_dynamic=1
+                    [ -n "$host_ip" ] || container_unresolved_fixed=1
                     ;;
                 *)
                     err "检测到不受支持的 Docker 发布协议：$protocol"
@@ -11084,6 +11220,11 @@ firewall_detect_docker_ports() {
             return 1
         }
         if [ "$running" != "true" ]; then
+            if [ "$container_unresolved_fixed" = "1" ]; then
+                err "Docker 容器 $container 使用固定宿主机端口但未指定绑定地址；容器停止时无法确认实际绑定范围。"
+                info "请启动该容器后重试，或为端口映射显式指定宿主机绑定地址。"
+                return 1
+            fi
             [ "$container_dynamic" = "0" ] || FW_DOCKER_DYNAMIC_PORT=1
             continue
         fi
@@ -11091,7 +11232,10 @@ firewall_detect_docker_ports() {
             err "无法读取运行中 Docker 容器的实际发布端口：$container"
             return 1
         }
-        [ -z "$port_mappings" ] || container_dynamic=0
+        if [ -n "$port_mappings" ]; then
+            container_dynamic=0
+            container_unresolved_fixed=0
+        fi
         while IFS= read -r mapping; do
             [ -n "$mapping" ] || continue
             container_port="${mapping%% -> *}"
@@ -11120,6 +11264,10 @@ firewall_detect_docker_ports() {
                     ;;
             esac
         done <<< "$port_mappings"
+        if [ "$container_unresolved_fixed" = "1" ]; then
+            err "无法确认 Docker 容器 $container 固定端口的实际绑定地址。"
+            return 1
+        fi
         [ "$container_dynamic" = "0" ] || FW_DOCKER_DYNAMIC_PORT=1
     done <<< "$container_list"
 
@@ -13747,16 +13895,16 @@ firewall_add_extra_port() {
     old_udp="$FW_EXTRA_UDP"
     case "$protocol" in
         tcp)
-            csv_contains_port "$FW_EXTRA_TCP" "$port" && { info "额外 TCP 已放行端口：$port"; return 0; }
+            csv_contains_port "$FW_EXTRA_TCP" "$port" && { info "额外 TCP 列表已包含端口：$port"; return 0; }
             FW_EXTRA_TCP="$(csv_add_port "$FW_EXTRA_TCP" "$port")"
             ;;
         udp)
-            csv_contains_port "$FW_EXTRA_UDP" "$port" && { info "额外 UDP 已放行端口：$port"; return 0; }
+            csv_contains_port "$FW_EXTRA_UDP" "$port" && { info "额外 UDP 列表已包含端口：$port"; return 0; }
             FW_EXTRA_UDP="$(csv_add_port "$FW_EXTRA_UDP" "$port")"
             ;;
         both)
             if csv_contains_port "$FW_EXTRA_TCP" "$port" && csv_contains_port "$FW_EXTRA_UDP" "$port"; then
-                info "额外 TCP/UDP 已放行端口：$port"
+                info "额外 TCP/UDP 列表已包含端口：$port"
                 return 0
             fi
             FW_EXTRA_TCP="$(csv_add_port "$FW_EXTRA_TCP" "$port")"
@@ -14073,7 +14221,7 @@ run_self_check() {
     local node_integrity_failed="0"
     local max_use
     local max_file
-    local state node_protocols protocol label ips detail ports_report uri_cache_state
+    local state node_protocols protocol protocol_status label ips detail ports_report uri_cache_state
     local install_metadata installed_version installed_at
     local bbr_config_expected=0 ipv4_priority_expected=0 ssh_hardening_expected=0
     local singbox_available=0
@@ -14132,10 +14280,18 @@ EOF
         check_info "sing-box" "未安装"
     fi
     for protocol in vless ss; do
+        protocol_status="$(protocol_node_status "$protocol" 2>/dev/null || true)"
+        case "$protocol_status" in
+            normal|deviated) ;;
+            *) continue ;;
+        esac
         load_protocol_state "$protocol" >/dev/null 2>&1 || continue
         has_node="1"
         [ "$protocol" = "vless" ] && label="VLESS Reality" || label="Shadowsocks"
         check_ok "$label 节点" "${DOMAIN:-未知}:${PORT:-未知}"
+        if [ "$protocol_status" = "deviated" ]; then
+            check_warn "$label 模板" "已偏离 VPSBox 管理模板"
+        fi
         if [ "$protocol" = "vless" ]; then
             check_ok "Reality SNI" "${REALITY_SERVER_NAME:-未知}"
             node_protocols=tcp
@@ -15347,19 +15503,32 @@ node_address() {
 }
 
 node_summary() {
-    local protocol label
+    local protocol label status
 
-    if node_core_artifacts_present &&
-        ! require_valid_node_state_if_present >/dev/null 2>&1; then
+    # 未知配置会参与 sing-box -C 加载，必须整体告警；两个受管协议文件自身的
+    # 权限、类型与内容则由 protocol_node_status 分别判断，避免一个损坏遮住另一个。
+    if ! node_config_dir_layout_valid >/dev/null 2>&1; then
         printf '%s\n 节点状态：异常，请进入节点管理检查\n' '----------------------------------------'
         return 0
     fi
     for protocol in vless ss; do
-        load_protocol_state "$protocol" >/dev/null 2>&1 || continue
+        status="$(protocol_node_status "$protocol" 2>/dev/null || printf '%s\n' damaged)"
         [ "$protocol" = "vless" ] && label="VLESS Reality" || label="Shadowsocks"
-        printf '%s\n' '----------------------------------------'
-        printf ' %s 节点\n 状态：已创建\n 名称：%s\n 地址：%s\n 端口：%s\n' \
-            "$label" "$NAME" "$DOMAIN" "$PORT"
+        case "$status" in
+            absent) continue ;;
+            damaged)
+                printf '%s\n' '----------------------------------------'
+                printf ' %s 节点\n 状态：损坏，请进入节点管理检查\n' "$label"
+                ;;
+            normal|deviated)
+                load_protocol_state "$protocol" >/dev/null 2>&1 || continue
+                [ "$status" = "normal" ] && status="已创建" ||
+                    status="已创建（配置已偏离 VPSBox 管理模板）"
+                printf '%s\n' '----------------------------------------'
+                printf ' %s 节点\n 状态：%s\n 名称：%s\n 地址：%s\n 端口：%s\n' \
+                    "$label" "$status" "$NAME" "$DOMAIN" "$PORT"
+                ;;
+        esac
     done
 }
 

@@ -162,14 +162,17 @@ test_public_listener_address_classification() {
     local addr
 
     for addr in 0.0.0.0 '*' :: '[::]' 1.1.1.1 192.0.0.9 192.0.0.10 192.0.1.1 \
-        2606:4700:4700::1111 100:1::1 2001:3::1 3fff:1000::1 ::ffff:0808:0808; do
+        2606:4700:4700::1111 64:ff9b::808:808 2001:3::1 \
+        2001:20::1 2001:2f::1 \
+        3fff:1000::1 ::ffff:0808:0808; do
         is_public_listen_addr "$addr" || fail "应识别为公网监听地址：$addr"
     done
     for addr in 127.0.0.1 ::1 10.0.0.1 100.64.1.2 169.254.1.1 172.16.0.1 \
         192.0.0.1 192.0.2.1 192.168.1.1 198.18.0.1 203.0.113.1 \
-        fe80::1%ens3 '[fe80::1]%ens3' fd00::1 ff02::1 100::1 100:0:0:1::1 \
-        2001:2::1 2001:10::1 2001:1f::1 2001:20::1 2001:2f::1 \
-        2001:db8::1 3fff:0fff::1 ::ffff:c0a8:101; do
+        fe80::1%ens3 '[fe80::1]%ens3' fd00::1 ff02::1 fe00::1 \
+        100::1 100:0:0:1::1 100:1::1 64:ff9b:1::1 \
+        2001:2::1 2001:10::1 2001:1f::1 \
+        2001:db8::1 3fff:0fff::1 4000::1 8000::1 ::ffff:c0a8:101; do
         if is_public_listen_addr "$addr"; then
             fail "不应识别为公网监听地址：$addr"
         fi
@@ -201,6 +204,48 @@ test_security_group_suggestions_exclude_dhcp_clients() {
     fi
     printf '%s\n' "$output" | grep -Eq '^UDP[[:space:]]+68[[:space:]]+dhcpcd$' ||
         fail "DHCP 客户端监听仍应显示在非公网列表"
+}
+
+test_security_group_report_handles_each_mktemp_failure() {
+    local failure
+
+    for failure in 1 2 3; do
+        (
+            local case_dir="$TEST_TMP/security-group-mktemp-$failure"
+            local output="$case_dir/output" status count path prior
+
+            mkdir -p "$case_dir"
+            printf '0\n' >"$case_dir/count"
+            : >"$case_dir/listener-scan"
+            mktemp() {
+                count="$(cat "$case_dir/count")"
+                count=$((count + 1))
+                printf '%s\n' "$count" >"$case_dir/count"
+                [ "$count" -ne "$failure" ] || return 1
+                path="$case_dir/tmp.$count"
+                : >"$path"
+                printf '%s\n' "$path"
+            }
+            collect_listening_sockets() {
+                printf 'called\n' >>"$case_dir/listener-scan"
+                return 0
+            }
+
+            set +e
+            show_ports_security_group >"$output" 2>&1
+            status=$?
+            set -e
+
+            assert_eq 1 "$status" "第 $failure 次 mktemp 失败时端口报告必须返回失败"
+            assert_file_contains "$output" '无法创建端口检测临时文件'
+            assert_empty_file "$case_dir/listener-scan" \
+                "临时文件未全部就绪时不得扫描监听端口"
+            for ((prior = 1; prior < failure; prior++)); do
+                [ ! -e "$case_dir/tmp.$prior" ] ||
+                    fail "第 $failure 次 mktemp 失败后未清理先前的临时文件：tmp.$prior"
+            done
+        )
+    done
 }
 
 test_allowed_ports_merge_known_public_docker_and_extra_sources() {
@@ -820,6 +865,43 @@ test_stopped_docker_fixed_binding_is_public() {
     )
 }
 
+test_stopped_docker_fixed_binding_without_host_ip_is_rejected() {
+    (
+        local output="$TEST_TMP/docker-stopped-empty-host-ip.out"
+
+        docker() { :; }
+        firewall_docker_available() { return 0; }
+        firewall_validate_docker_daemon_mode() { return 0; }
+        firewall_detect_docker_proxy_ports() { return 0; }
+        firewall_docker_daemon_identity_unchanged() { return 0; }
+        docker_with_timeout() {
+            case "$*" in
+                "context show") printf '%s\n' default ;;
+                "context inspect --format {{.Endpoints.docker.Host}} default") printf '%s\n' unix:///var/run/docker.sock ;;
+                "info --format {{json .SecurityOptions}}") printf '%s\n' '[]' ;;
+                "info --format {{.Swarm.LocalNodeState}}") printf '%s\n' inactive ;;
+                "ps -aq") printf '%s\n' stopped-container ;;
+                "inspect --format {{.HostConfig.NetworkMode}} stopped-container") printf '%s\n' bridge ;;
+                "inspect --format {{.HostConfig.PublishAllPorts}} stopped-container") printf '%s\n' false ;;
+                "inspect --format {{range \$port, \$bindings := .HostConfig.PortBindings}}{{range \$bindings}}{{printf \"%s|%s|%s\\n\" \$port .HostIp .HostPort}}{{end}}{{end}} stopped-container")
+                    printf '%s\n' '80/tcp||8080'
+                    ;;
+                "inspect --format {{.State.Running}} stopped-container") printf '%s\n' false ;;
+                *)
+                    printf 'unexpected docker call: %s\n' "$*" >&2
+                    return 1
+                    ;;
+            esac
+        }
+
+        if firewall_detect_docker_ports >"$output" 2>&1; then
+            fail "停止容器的固定 HostPort 缺少 HostIp 时不得猜测公网绑定范围"
+        fi
+        assert_file_contains "$output" '固定宿主机端口但未指定绑定地址'
+        assert_file_contains "$output" '请启动该容器后重试'
+    )
+}
+
 test_stopped_docker_requires_explicit_ignore_for_full_update() {
     (
         local output="$TEST_TMP/docker-stopped-ignore.out"
@@ -948,6 +1030,39 @@ test_adding_port_uses_lightweight_commit_path() {
         assert_file_contains "$log" '^tcp\|8443\|8080\|8080,8443\|$'
         assert_no_forbidden "新增端口调用了完整防火墙更新"
     )
+}
+
+test_duplicate_extra_ports_are_noop_with_clear_message() {
+    local protocol expected
+
+    for protocol in tcp udp both; do
+        (
+            local output="$TEST_TMP/firewall-extra-duplicate-$protocol.out"
+            local old_tcp="80,443" old_udp="53,443"
+
+            forbid_init
+            FW_EXTRA_TCP="$old_tcp"
+            FW_EXTRA_UDP="$old_udp"
+            firewall_settle_pending_port_transition() { :; }
+            firewall_load_state() { :; }
+            firewall_prompt_port() { printf '%s\n' 443; }
+            firewall_control_plane_present() { forbid "重复端口不得检查或修改实时防火墙"; }
+            firewall_apply_added_ports() { forbid "重复端口不得应用实时规则"; }
+            firewall_save_inactive_state() { forbid "重复端口不得写入状态文件"; }
+
+            firewall_add_extra_port "$protocol" >"$output" 2>&1 ||
+                fail "重复 $protocol 端口应作为无变化成功返回"
+            case "$protocol" in
+                tcp) expected='额外 TCP 列表已包含端口：443' ;;
+                udp) expected='额外 UDP 列表已包含端口：443' ;;
+                both) expected='额外 TCP/UDP 列表已包含端口：443' ;;
+            esac
+            assert_file_contains "$output" "$expected"
+            assert_eq "$old_tcp" "$FW_EXTRA_TCP" "重复 $protocol 端口不得改动 TCP 状态"
+            assert_eq "$old_udp" "$FW_EXTRA_UDP" "重复 $protocol 端口不得改动 UDP 状态"
+            assert_no_forbidden "重复 $protocol 端口触发了状态或实时规则修改"
+        )
+    done
 }
 
 test_apply_without_rollback_watchdog_must_not_touch_firewall() {
@@ -1580,6 +1695,7 @@ main() {
         test_public_listener_address_classification
         test_listener_sample_collects_expected_public_ports
         test_security_group_suggestions_exclude_dhcp_clients
+        test_security_group_report_handles_each_mktemp_failure
         test_allowed_ports_merge_known_public_docker_and_extra_sources
         test_stopped_public_service_is_removed_unless_extra
         test_live_config_match_accepts_numeric_nft_snapshot
@@ -1597,10 +1713,12 @@ main() {
         test_busybox_timeout_fallback_releases_lock
         test_watchdog_survives_parent_without_holding_lock
         test_stopped_docker_fixed_binding_is_public
+        test_stopped_docker_fixed_binding_without_host_ip_is_rejected
         test_stopped_docker_requires_explicit_ignore_for_full_update
         test_additive_config_builder_adds_tcp_without_rebuilding_other_rules
         test_additive_config_builder_creates_first_udp_rule_and_set
         test_adding_port_uses_lightweight_commit_path
+        test_duplicate_extra_ports_are_noop_with_clear_message
         test_apply_without_rollback_watchdog_must_not_touch_firewall
         test_unchanged_firewall_skips_confirmation_and_mutation
         test_second_firewall_scan_can_become_noop_before_mutation

@@ -67,6 +67,97 @@ function Assert-VersionDeclarationRules {
     }
 }
 
+function Get-ReadmeVersionFromText {
+    param([Parameter(Mandatory)][string]$Text)
+
+    $summaryMatches = [regex]::Matches(
+        $Text,
+        '(?m)^当前版本：`(v[0-9]+\.[0-9]+\.[0-9]+)`\r?$'
+    )
+    $menuMatches = [regex]::Matches(
+        $Text,
+        '(?m)^ 版本：(v[0-9]+\.[0-9]+\.[0-9]+)\r?$'
+    )
+    if ($summaryMatches.Count -ne 1 -or $menuMatches.Count -ne 1) {
+        throw (
+            'README.md 必须且只能包含一个规范的当前版本和一个主菜单版本。'
+        )
+    }
+
+    $summaryVersion = $summaryMatches[0].Groups[1].Value
+    $menuVersion = $menuMatches[0].Groups[1].Value
+    if ($summaryVersion -cne $menuVersion) {
+        throw (
+            "README.md 两处版本不一致：当前版本为 $summaryVersion，" +
+            "主菜单示例为 $menuVersion。"
+        )
+    }
+    return $summaryVersion
+}
+
+function Set-ReadmeVersionInText {
+    param(
+        [Parameter(Mandatory)][string]$Text,
+        [Parameter(Mandatory)][string]$Version
+    )
+
+    [void](Get-ReadmeVersionFromText -Text $Text)
+    if ($Version -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+        throw "README.md 目标版本号格式不正确：$Version"
+    }
+
+    $updated = [regex]::Replace(
+        $Text,
+        '(?m)^当前版本：`v[0-9]+\.[0-9]+\.[0-9]+`(\r?)$',
+        ('当前版本：`{0}`$1' -f $Version)
+    )
+    $updated = [regex]::Replace(
+        $updated,
+        '(?m)^ 版本：v[0-9]+\.[0-9]+\.[0-9]+(\r?)$',
+        (' 版本：{0}$1' -f $Version)
+    )
+    return $updated
+}
+
+function Assert-ReadmeVersionRules {
+    $sample = @'
+# vpsbox
+
+当前版本：`v1.0.44`
+
+```text
+ 版本：v1.0.44
+```
+'@
+    $parsed = Get-ReadmeVersionFromText -Text $sample
+    if ($parsed -cne 'v1.0.44') {
+        throw "README.md 版本规则断言失败：规范内容解析为 $parsed。"
+    }
+
+    $updated = Set-ReadmeVersionInText -Text $sample -Version 'v1.0.45'
+    if ((Get-ReadmeVersionFromText -Text $updated) -cne 'v1.0.45' -or
+        $updated -notmatch '(?m)^# vpsbox$') {
+        throw 'README.md 版本规则断言失败：未能只同步两处规范版本。'
+    }
+
+    foreach ($invalidText in @(
+            $sample.Replace(' 版本：v1.0.44', ' 版本：v9.9.9')
+            ($sample + "`n当前版本：``v1.0.44``")
+            $sample.Replace('当前版本：`v1.0.44`', '当前版本：v1.0.44')
+        )) {
+        $rejected = $false
+        try {
+            [void](Get-ReadmeVersionFromText -Text $invalidText)
+        }
+        catch {
+            $rejected = $true
+        }
+        if (-not $rejected) {
+            throw 'README.md 版本规则断言失败：必须拒绝缺失、重复或不一致的版本位置。'
+        }
+    }
+}
+
 function Get-NextPatchVersion {
     param([Parameter(Mandatory)][string]$Version)
 
@@ -160,7 +251,7 @@ function Read-OpenFileBytes {
     param([Parameter(Mandatory)][IO.FileStream]$Stream)
 
     if ($Stream.Length -gt [int]::MaxValue) {
-        throw 'vpsbox.sh 过大，无法安全读取。'
+        throw '受管版本文件过大，无法安全读取。'
     }
     [byte[]]$bytes = New-Object byte[] ([int]$Stream.Length)
     $Stream.Position = 0
@@ -168,7 +259,7 @@ function Read-OpenFileBytes {
     while ($offset -lt $bytes.Length) {
         $read = $Stream.Read($bytes, $offset, $bytes.Length - $offset)
         if ($read -le 0) {
-            throw '读取 vpsbox.sh 时意外到达文件末尾。'
+            throw '读取受管版本文件时意外到达文件末尾。'
         }
         $offset += $read
     }
@@ -211,12 +302,17 @@ function Get-GitTextForFingerprint {
 function Get-RepositoryStateFingerprint {
     param(
         [Parameter(Mandatory)][string]$ReleaseScriptPath,
-        [switch]$ExcludeVpsbox
+        [switch]$ExcludeVersionFiles
     )
 
     [string[]]$pathspec = @('--')
-    if ($ExcludeVpsbox) {
-        $pathspec = @('--', '.', ':(exclude)vpsbox.sh')
+    if ($ExcludeVersionFiles) {
+        $pathspec = @(
+            '--',
+            '.',
+            ':(exclude)vpsbox.sh',
+            ':(exclude)README.md'
+        )
     }
 
     $head = Get-GitTextForFingerprint `
@@ -248,6 +344,9 @@ function Get-RepositoryIndexFingerprint {
     $vpsboxIndexEntry = Get-GitTextForFingerprint `
         -Description 'vpsbox.sh 暂存区条目' `
         -Arguments @('ls-files', '--stage', '--', 'vpsbox.sh')
+    $readmeIndexEntry = Get-GitTextForFingerprint `
+        -Description 'README.md 暂存区条目' `
+        -Arguments @('ls-files', '--stage', '--', 'README.md')
     $repositoryIndexFlags = Get-GitTextForFingerprint `
         -Description '仓库暂存区标志' `
         -Arguments @('ls-files', '-v', '--')
@@ -258,6 +357,15 @@ function Get-RepositoryIndexFingerprint {
             '^(100644|100755) [0-9a-f]+ 0\tvpsbox\.sh$') {
         throw (
             'vpsbox.sh 存在异常索引类型。' +
+            '请先恢复普通 Git 跟踪状态。'
+        )
+    }
+    [array]$readmeIndexEntryLines = @($readmeIndexEntry -split "`n")
+    if ($readmeIndexEntryLines.Count -ne 1 -or
+        $readmeIndexEntryLines[0] -notmatch
+            '^100644 [0-9a-f]+ 0\tREADME\.md$') {
+        throw (
+            'README.md 存在异常索引类型。' +
             '请先恢复普通 Git 跟踪状态。'
         )
     }
@@ -276,7 +384,7 @@ function Get-RepositoryIndexFingerprint {
     $utf8NoBom = [Text.UTF8Encoding]::new($false)
     return Get-Sha256Hex -Bytes (
         $utf8NoBom.GetBytes(
-            "$vpsboxIndexEntry`n$repositoryIndexFlags"
+            "$vpsboxIndexEntry`n$readmeIndexEntry`n$repositoryIndexFlags"
         )
     )
 }
@@ -326,25 +434,58 @@ function Update-VersionIfNeeded {
     Write-OpenFileBytes `
         -Stream $ScriptStream `
         -Bytes ($utf8NoBom.GetBytes($updatedText))
-    Write-Info "版本已更新：$CurrentVersion -> $expectedVersion"
+    return $updatedText
+}
+
+function Update-ReadmeVersionIfNeeded {
+    param(
+        [Parameter(Mandatory)][IO.FileStream]$ReadmeStream,
+        [Parameter(Mandatory)][string]$CurrentText,
+        [Parameter(Mandatory)][string]$CurrentVersion,
+        [Parameter(Mandatory)][string]$HeadVersion
+    )
+
+    $expectedVersion = Get-NextPatchVersion -Version $HeadVersion
+
+    if ($CurrentVersion -eq $expectedVersion) {
+        return $CurrentText
+    }
+    if ($CurrentVersion -ne $HeadVersion) {
+        throw (
+            "README.md 当前版本 $CurrentVersion 既不等于 HEAD 的 " +
+            "$HeadVersion，也不是下一版本 $expectedVersion。"
+        )
+    }
+
+    $updatedText = Set-ReadmeVersionInText `
+        -Text $CurrentText `
+        -Version $expectedVersion
+    $utf8NoBom = [Text.UTF8Encoding]::new($false)
+    Write-OpenFileBytes `
+        -Stream $ReadmeStream `
+        -Bytes ($utf8NoBom.GetBytes($updatedText))
     return $updatedText
 }
 
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $scriptPath = Join-Path $repoRoot 'vpsbox.sh'
+$readmePath = Join-Path $repoRoot 'README.md'
 $testsPath = Join-Path $repoRoot 'tests'
 $selfRelativePath = 'tools/release.ps1'
 $releaseScriptPath = Join-Path $repoRoot $selfRelativePath
 
 Assert-NextPatchVersionRules
 Assert-VersionDeclarationRules
+Assert-ReadmeVersionRules
 
 if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $readmePath -PathType Leaf) -or
     -not (Test-Path -LiteralPath $testsPath -PathType Container)) {
-    throw '仓库结构不完整，找不到 vpsbox.sh 或 tests 目录。'
+    throw '仓库结构不完整，找不到 vpsbox.sh、README.md 或 tests 目录。'
 }
 
 $scriptStream = $null
+$readmeStream = $null
 Push-Location $repoRoot
 try {
     foreach ($commandName in 'git', 'shellcheck') {
@@ -363,18 +504,33 @@ try {
         $scriptAccess,
         [IO.FileShare]::Read
     )
+    $readmeStream = [IO.File]::Open(
+        $readmePath,
+        [IO.FileMode]::Open,
+        $scriptAccess,
+        [IO.FileShare]::Read
+    )
 
     [byte[]]$scriptBytesBeforeChecks = Read-OpenFileBytes -Stream $scriptStream
+    [byte[]]$readmeBytesBeforeChecks = Read-OpenFileBytes -Stream $readmeStream
     $scriptEncoding = [Text.UTF8Encoding]::new($false)
     $scriptText = $scriptEncoding.GetString($scriptBytesBeforeChecks)
+    $readmeText = $scriptEncoding.GetString($readmeBytesBeforeChecks)
     $repositoryStateBeforeChecks = Get-RepositoryStateFingerprint `
         -ReleaseScriptPath $releaseScriptPath
-    $repositoryStateWithoutVpsboxBeforeChecks = Get-RepositoryStateFingerprint `
+    $repositoryStateWithoutVersionFilesBeforeChecks = Get-RepositoryStateFingerprint `
         -ReleaseScriptPath $releaseScriptPath `
-        -ExcludeVpsbox
+        -ExcludeVersionFiles
     $repositoryIndexBeforeChecks = Get-RepositoryIndexFingerprint
     $currentVersion = Get-VersionFromText -Text $scriptText
+    $currentReadmeVersion = Get-ReadmeVersionFromText -Text $readmeText
     $headVersion = Get-HeadVersion
+    if ($currentReadmeVersion -cne $currentVersion) {
+        throw (
+            "当前版本不一致：vpsbox.sh 为 $currentVersion，" +
+            "README.md 为 $currentReadmeVersion。"
+        )
+    }
     if ($Bump) {
         $expectedVersion = Get-NextPatchVersion -Version $headVersion
         if ($currentVersion -notin $headVersion, $expectedVersion) {
@@ -521,11 +677,21 @@ try {
             '脚本没有覆盖当前文件，请重试。'
         )
     }
+    [byte[]]$readmeBytesAfterChecks = Read-OpenFileBytes -Stream $readmeStream
+    if (-not (Test-ByteArrayEqual `
+            -Left $readmeBytesBeforeChecks `
+            -Right $readmeBytesAfterChecks)) {
+        throw (
+            '发布检查期间 README.md 发生变化，检查结果已失效。' +
+            '脚本没有覆盖当前文件，请重试。'
+        )
+    }
 
     if ($Bump) {
         $restoreVersionOnFailure = $currentVersion -eq $headVersion
         $versionWriteAttempted = $false
         [byte[]]$scriptBytesAfterBump = @()
+        [byte[]]$readmeBytesAfterBump = @()
         try {
             $repositoryStateBeforeVersionWrite = Get-RepositoryStateFingerprint `
                 -ReleaseScriptPath $releaseScriptPath
@@ -544,6 +710,15 @@ try {
                     '脚本没有覆盖当前文件，请重试。'
                 )
             }
+            [byte[]]$readmeBytesBeforeWrite = Read-OpenFileBytes -Stream $readmeStream
+            if (-not (Test-ByteArrayEqual `
+                    -Left $readmeBytesBeforeChecks `
+                    -Right $readmeBytesBeforeWrite)) {
+                throw (
+                    '预检完成后 README.md 又发生变化，已停止改号。' +
+                    '脚本没有覆盖当前文件，请重试。'
+                )
+            }
 
             $expectedVersion = Get-NextPatchVersion -Version $headVersion
             $expectedScriptText = [regex]::Replace(
@@ -552,6 +727,10 @@ try {
                 "VPSBOX_VERSION=`"$expectedVersion`""
             )
             $scriptBytesAfterBump = $scriptEncoding.GetBytes($expectedScriptText)
+            $expectedReadmeText = Set-ReadmeVersionInText `
+                -Text ($scriptEncoding.GetString($readmeBytesBeforeWrite)) `
+                -Version $expectedVersion
+            $readmeBytesAfterBump = $scriptEncoding.GetBytes($expectedReadmeText)
             $versionWriteAttempted = $true
             $scriptText = Update-VersionIfNeeded `
                 -ScriptStream $scriptStream `
@@ -559,23 +738,40 @@ try {
                 -CurrentVersion $currentVersion `
                 -HeadVersion $headVersion
             $currentVersion = Get-VersionFromText -Text $scriptText
+            $readmeText = Update-ReadmeVersionIfNeeded `
+                -ReadmeStream $readmeStream `
+                -CurrentText ($scriptEncoding.GetString($readmeBytesBeforeWrite)) `
+                -CurrentVersion $currentReadmeVersion `
+                -HeadVersion $headVersion
+            $currentReadmeVersion = Get-ReadmeVersionFromText -Text $readmeText
 
-            if ($currentVersion -ne $expectedVersion) {
-                throw "改号后的版本不正确：预期 $expectedVersion，实际 $currentVersion。"
+            if ($currentVersion -ne $expectedVersion -or
+                $currentReadmeVersion -ne $expectedVersion) {
+                throw (
+                    "改号后的版本不正确：预期 $expectedVersion，vpsbox.sh 为 " +
+                    "$currentVersion，README.md 为 $currentReadmeVersion。"
+                )
             }
             if ($restoreVersionOnFailure) {
+                Write-Info "版本已同步更新：$headVersion -> $expectedVersion"
                 [byte[]]$currentScriptBytes = Read-OpenFileBytes -Stream $scriptStream
                 if (-not (Test-ByteArrayEqual `
                         -Left $scriptBytesAfterBump `
                         -Right $currentScriptBytes)) {
                     throw '改号后的 vpsbox.sh 与预期内容不一致。'
                 }
-                $repositoryStateWithoutVpsboxAfterWrite = Get-RepositoryStateFingerprint `
+                [byte[]]$currentReadmeBytes = Read-OpenFileBytes -Stream $readmeStream
+                if (-not (Test-ByteArrayEqual `
+                        -Left $readmeBytesAfterBump `
+                        -Right $currentReadmeBytes)) {
+                    throw '改号后的 README.md 与预期内容不一致。'
+                }
+                $repositoryStateWithoutVersionFilesAfterWrite = Get-RepositoryStateFingerprint `
                     -ReleaseScriptPath $releaseScriptPath `
-                    -ExcludeVpsbox
+                    -ExcludeVersionFiles
                 $repositoryIndexAfterWrite = Get-RepositoryIndexFingerprint
-                if ($repositoryStateWithoutVpsboxAfterWrite -cne
-                        $repositoryStateWithoutVpsboxBeforeChecks -or
+                if ($repositoryStateWithoutVersionFilesAfterWrite -cne
+                        $repositoryStateWithoutVersionFilesBeforeChecks -or
                     $repositoryIndexAfterWrite -cne
                         $repositoryIndexBeforeChecks) {
                     throw '改号期间仓库中的其他状态发生变化，检查结果已失效。'
@@ -588,8 +784,8 @@ try {
                 Invoke-Native -Name '复验改号后的 vpsbox.sh Bash 语法' -Command {
                     & $gitBash -lc $postBumpBashCommand
                 }
-                Invoke-Native -Name '复验改号后的 vpsbox.sh 差异格式' -Command {
-                    & git diff --check -- vpsbox.sh
+                Invoke-Native -Name '复验改号后的版本文件差异格式' -Command {
+                    & git diff --check -- vpsbox.sh README.md
                 }
 
                 [byte[]]$currentScriptBytes = Read-OpenFileBytes -Stream $scriptStream
@@ -598,12 +794,18 @@ try {
                         -Right $currentScriptBytes)) {
                     throw '改号后的复验期间 vpsbox.sh 发生变化，检查结果已失效。'
                 }
-                $repositoryStateWithoutVpsboxAfterChecks = Get-RepositoryStateFingerprint `
+                [byte[]]$currentReadmeBytes = Read-OpenFileBytes -Stream $readmeStream
+                if (-not (Test-ByteArrayEqual `
+                        -Left $readmeBytesAfterBump `
+                        -Right $currentReadmeBytes)) {
+                    throw '改号后的复验期间 README.md 发生变化，检查结果已失效。'
+                }
+                $repositoryStateWithoutVersionFilesAfterChecks = Get-RepositoryStateFingerprint `
                     -ReleaseScriptPath $releaseScriptPath `
-                    -ExcludeVpsbox
+                    -ExcludeVersionFiles
                 $repositoryIndexAfterChecks = Get-RepositoryIndexFingerprint
-                if ($repositoryStateWithoutVpsboxAfterChecks -cne
-                        $repositoryStateWithoutVpsboxBeforeChecks -or
+                if ($repositoryStateWithoutVersionFilesAfterChecks -cne
+                        $repositoryStateWithoutVersionFilesBeforeChecks -or
                     $repositoryIndexAfterChecks -cne
                         $repositoryIndexBeforeChecks) {
                     throw '改号后的复验期间仓库中的其他状态发生变化，检查结果已失效。'
@@ -614,16 +816,8 @@ try {
             $bumpError = $_
             if ($restoreVersionOnFailure -and $versionWriteAttempted) {
                 try {
-                    [byte[]]$currentScriptBytes = Read-OpenFileBytes -Stream $scriptStream
-                    if (Test-ByteArrayEqual `
-                            -Left $scriptBytesBeforeChecks `
-                            -Right $currentScriptBytes) {
-                        Write-Info '改号或复验失败，vpsbox.sh 仍为原文件，无需恢复。'
-                    }
-                    else {
-                        $versionWriteWasComplete = Test-ByteArrayEqual `
-                            -Left $scriptBytesAfterBump `
-                            -Right $currentScriptBytes
+                    [System.Collections.Generic.List[string]]$restoreErrors = @()
+                    try {
                         Write-OpenFileBytes `
                             -Stream $scriptStream `
                             -Bytes $scriptBytesBeforeChecks
@@ -632,19 +826,35 @@ try {
                         if (-not (Test-ByteArrayEqual `
                                 -Left $scriptBytesBeforeChecks `
                                 -Right $restoredScriptBytes)) {
-                            throw '恢复后 vpsbox.sh 与原始内容不一致。'
-                        }
-                        if ($versionWriteWasComplete) {
-                            Write-Info "改号后的复验失败，已恢复原版本：$headVersion"
-                        }
-                        else {
-                            Write-Info "改号写入不完整，已恢复原版本：$headVersion"
+                            throw '恢复后的内容与原始内容不一致。'
                         }
                     }
+                    catch {
+                        $restoreErrors.Add("vpsbox.sh：$($_.Exception.Message)")
+                    }
+                    try {
+                        Write-OpenFileBytes `
+                            -Stream $readmeStream `
+                            -Bytes $readmeBytesBeforeChecks
+                        [byte[]]$restoredReadmeBytes =
+                            Read-OpenFileBytes -Stream $readmeStream
+                        if (-not (Test-ByteArrayEqual `
+                                -Left $readmeBytesBeforeChecks `
+                                -Right $restoredReadmeBytes)) {
+                            throw '恢复后的内容与原始内容不一致。'
+                        }
+                    }
+                    catch {
+                        $restoreErrors.Add("README.md：$($_.Exception.Message)")
+                    }
+                    if ($restoreErrors.Count -gt 0) {
+                        throw ($restoreErrors -join '；')
+                    }
+                    Write-Info "改号或复验失败，已恢复 vpsbox.sh 与 README.md：$headVersion"
                 }
                 catch {
                     throw (
-                        "改号或复验失败，且无法恢复原 vpsbox.sh：$($_.Exception.Message)" +
+                        "改号或复验失败，且无法完整恢复版本文件：$($_.Exception.Message)" +
                         "；原错误：$($bumpError.Exception.Message)"
                     )
                 }
@@ -670,6 +880,12 @@ try {
                 -Right $scriptBytesBeforeSuccess)) {
             throw '最终确认前 vpsbox.sh 发生变化，检查结果已失效。'
         }
+        [byte[]]$readmeBytesBeforeSuccess = Read-OpenFileBytes -Stream $readmeStream
+        if (-not (Test-ByteArrayEqual `
+                -Left $readmeBytesBeforeChecks `
+                -Right $readmeBytesBeforeSuccess)) {
+            throw '最终确认前 README.md 发生变化，检查结果已失效。'
+        }
     }
 
     if ($Bump -and $restoreVersionOnFailure) {
@@ -683,6 +899,9 @@ try {
     Write-Info '本脚本没有执行提交或推送。'
 }
 finally {
+    if ($null -ne $readmeStream) {
+        $readmeStream.Dispose()
+    }
     if ($null -ne $scriptStream) {
         $scriptStream.Dispose()
     }
