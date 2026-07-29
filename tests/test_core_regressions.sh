@@ -372,10 +372,10 @@ test_sensitive_interaction_eof_cancels_before_mutation() {
     (
         local event_log="$TEST_TMP/restore-eof-events"
         : > "$event_log"
+        recorded_system_changes_present() { return 0; }
         show_vpsbox_changes() { return 0; }
-        change_needs_restore() {
+        restore_vpsbox_system_change() {
             printf '%s\n' restore >> "$event_log"
-            return 1
         }
 
         restore_vpsbox_system_changes </dev/null >"$TEST_TMP/restore-eof.out" 2>&1
@@ -1655,11 +1655,24 @@ test_menu_dispatch_and_system_status_wiring() {
         run_menu_action() { printf '%s\n' "$1" >> "$submenu_log"; }
         ssh_port_change_menu() { printf '%s\n' ssh_port_change_menu >> "$submenu_log"; }
         ssh_basic_hardening_menu() { printf '%s\n' ssh_basic_hardening_menu >> "$submenu_log"; }
+        system_changes_menu() { printf '%s\n' system_changes_menu >> "$submenu_log"; }
 
         system_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n0' >/dev/null
     )
-    assert_eq $'update_system_packages\ncleanup_system_garbage\nchange_system_hostname\nenable_ntp_sync\nchange_ipv4_dns\nenable_ipv4_priority\nenable_bbr_fq\nssh_port_change_menu\nssh_basic_hardening_menu\nshow_current_ssh_config\ninstall_fail2ban\nlimit_systemd_journal\nrestore_vpsbox_system_changes' \
+    assert_eq $'update_system_packages\ncleanup_system_garbage\nchange_system_hostname\nenable_ntp_sync\nchange_ipv4_dns\nenable_ipv4_priority\nenable_bbr_fq\nssh_port_change_menu\nssh_basic_hardening_menu\nshow_current_ssh_config\ninstall_fail2ban\nlimit_systemd_journal\nsystem_changes_menu' \
         "$(cat "$submenu_log")" "系统菜单全部编号必须分发到对应操作"
+
+    : > "$submenu_log"
+    (
+        clear() { :; }
+        pause() { :; }
+        system_change_state_text() { printf '%s\n' "无记录"; }
+        run_menu_action() { printf '%s\n' "$*" >> "$submenu_log"; }
+
+        system_changes_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n0' >/dev/null
+    )
+    assert_eq $'restore_vpsbox_system_changes\nrestore_vpsbox_system_change_interactive hostname\nrestore_vpsbox_system_change_interactive dns\nrestore_vpsbox_system_change_interactive bbr\nrestore_vpsbox_system_change_interactive ipv4_priority\nrestore_vpsbox_system_change_interactive fail2ban\nrestore_vpsbox_system_change_interactive journald\nrestore_vpsbox_system_change_interactive ntp' \
+        "$(cat "$submenu_log")" "系统改动菜单必须把恢复全部和七个单项分发到对应操作"
 
     for entry in "${third_party_cases[@]}"; do
         read -r choice action <<< "$entry"
@@ -2994,6 +3007,7 @@ main() {
         node_menu
         singbox_menu
         system_menu
+        system_changes_menu
         other_scripts_menu
         vpsbox_main
         production_node_dependencies_available

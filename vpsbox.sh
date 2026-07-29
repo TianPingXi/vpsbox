@@ -14943,27 +14943,326 @@ cleanup_system_garbage() {
     cleanup_preview
 }
 
-show_vpsbox_changes() {
-    local name state found=0
-    echo "vpsbox 已记录的系统变更："
-    for name in HOSTNAME DNS_RESOLV DNS_RESOLVED BBR_CONF GAI_CONF FAIL2BAN_SSHD NTP_CONF JOURNALD_CONF; do
+system_change_items() {
+    printf '%s\n' hostname dns bbr ipv4_priority fail2ban journald ntp
+}
+
+system_change_label() {
+    case "$1" in
+        hostname) printf '%s\n' "主机名" ;;
+        dns) printf '%s\n' "IPv4 DNS" ;;
+        bbr) printf '%s\n' "BBR + fq" ;;
+        ipv4_priority) printf '%s\n' "IPv4 优先" ;;
+        fail2ban) printf '%s\n' "Fail2ban" ;;
+        journald) printf '%s\n' "journald 日志限制" ;;
+        ntp) printf '%s\n' "NTP 时间同步" ;;
+        *) return 2 ;;
+    esac
+}
+
+system_change_members() {
+    case "$1" in
+        hostname) printf '%s\n' HOSTNAME ;;
+        dns) printf '%s\n' DNS_RESOLV DNS_RESOLVED ;;
+        bbr) printf '%s\n' BBR_CONF ;;
+        ipv4_priority) printf '%s\n' GAI_CONF ;;
+        fail2ban) printf '%s\n' FAIL2BAN_SSHD ;;
+        journald) printf '%s\n' JOURNALD_CONF ;;
+        ntp) printf '%s\n' NTP_CONF ;;
+        *) return 2 ;;
+    esac
+}
+
+system_change_state() {
+    local item="$1" members name state result=none
+
+    members="$(system_change_members "$item")" || return $?
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
         state="$(change_restore_state "$name")"
         case "$state" in
-            pending) printf ' - %s：未完成，可恢复\n' "$name"; found=1 ;;
-            applied) printf ' - %s：可恢复\n' "$name"; found=1 ;;
+            pending)
+                printf '%s\n' pending
+                return 0
+                ;;
+            applied) result=applied ;;
         esac
-    done
+    done <<< "$members"
+    printf '%s\n' "$result"
+}
+
+system_change_state_text() {
+    case "$(system_change_state "$1")" in
+        pending) printf '%s\n' "未完成，可恢复" ;;
+        applied) printf '%s\n' "可恢复" ;;
+        none) printf '%s\n' "无记录" ;;
+        *) return 1 ;;
+    esac
+}
+
+show_vpsbox_changes() {
+    local item state found=0
+
+    echo "vpsbox 已记录的系统变更："
+    while IFS= read -r item; do
+        state="$(system_change_state "$item")" || return 1
+        [ "$state" != none ] || continue
+        printf ' - %s：%s\n' "$(system_change_label "$item")" \
+            "$(system_change_state_text "$item")"
+        found=1
+    done < <(system_change_items)
     [ "$found" -eq 1 ] || echo " - 无"
     echo "SSH 配置不会由此功能自动恢复，请保持当前连接并手动核验后处理。"
 }
 
 recorded_system_changes_present() {
-    local name
+    local item
 
-    for name in HOSTNAME DNS_RESOLV DNS_RESOLVED BBR_CONF GAI_CONF FAIL2BAN_SSHD NTP_CONF JOURNALD_CONF; do
-        change_needs_restore "$name" && return 0
-    done
+    while IFS= read -r item; do
+        [ "$(system_change_state "$item")" = none ] || return 0
+    done < <(system_change_items)
     return 1
+}
+
+restore_hostname_system_change() {
+    local old failed=0
+
+    old="$(manifest_value HOSTNAME_VALUE 2>/dev/null || true)"
+    [ -n "$old" ] &&
+        change_backup_record_is_valid HOSTNAME_FILE &&
+        change_backup_record_is_valid HOSTS_FILE || {
+        err "主机名恢复记录不完整，已拒绝修改系统。"
+        return 1
+    }
+    restore_change_file HOSTNAME_FILE "$HOSTNAME_PATH" || failed=1
+    restore_change_file HOSTS_FILE "$HOSTS_PATH" || failed=1
+    [ "$failed" -eq 0 ] && set_system_hostname "$old" 2>/dev/null || failed=1
+    [ "$failed" -eq 0 ] || return 1
+
+    clear_change_tracking HOSTNAME_FILE || failed=1
+    clear_change_tracking HOSTS_FILE || failed=1
+    manifest_remove APPLIED_HOSTNAME || failed=1
+    manifest_remove PENDING_HOSTNAME || failed=1
+    manifest_remove HOSTNAME_VALUE || failed=1
+    return "$failed"
+}
+
+restore_dns_system_change() {
+    local restore_resolv=0 restore_resolved=0 failed=0
+
+    change_needs_restore DNS_RESOLV && restore_resolv=1
+    change_needs_restore DNS_RESOLVED && restore_resolved=1
+    if { [ "$restore_resolv" -eq 1 ] && ! change_backup_record_is_valid DNS_RESOLV; } ||
+        { [ "$restore_resolved" -eq 1 ] && ! change_backup_record_is_valid DNS_RESOLVED; }; then
+        err "IPv4 DNS 恢复记录不完整，已拒绝修改系统。"
+        return 1
+    fi
+    [ "$restore_resolv" -eq 0 ] ||
+        restore_change_file DNS_RESOLV "$RESOLV_CONF" || failed=1
+    [ "$restore_resolved" -eq 0 ] ||
+        restore_change_file DNS_RESOLVED /etc/systemd/resolved.conf.d/vpsbox.conf || failed=1
+    [ "$failed" -eq 0 ] || return 1
+    if resolv_conf_managed_by_systemd_resolved &&
+        ! systemctl restart systemd-resolved; then
+        return 1
+    fi
+
+    [ "$restore_resolv" -eq 0 ] || clear_change_tracking DNS_RESOLV || failed=1
+    [ "$restore_resolved" -eq 0 ] || clear_change_tracking DNS_RESOLVED || failed=1
+    return "$failed"
+}
+
+restore_bbr_system_change() {
+    local cc fq failed=0
+
+    cc="$(manifest_value BBR_CC 2>/dev/null || true)"
+    fq="$(manifest_value BBR_FQ 2>/dev/null || true)"
+    change_backup_record_is_valid BBR_CONF &&
+        [ -n "$cc" ] && [ -n "$fq" ] || {
+        err "BBR + fq 恢复记录不完整，已拒绝修改系统。"
+        return 1
+    }
+    restore_change_file BBR_CONF "$BBR_CONF" || return 1
+    if [ "$cc" != "unknown" ]; then
+        sysctl -w "net.ipv4.tcp_congestion_control=$cc" >/dev/null 2>&1 || return 1
+    fi
+    if [ "$fq" != "unknown" ]; then
+        sysctl -w "net.core.default_qdisc=$fq" >/dev/null 2>&1 || return 1
+    fi
+
+    clear_change_tracking BBR_CONF || failed=1
+    manifest_remove BBR_CC || failed=1
+    manifest_remove BBR_FQ || failed=1
+    return "$failed"
+}
+
+restore_ipv4_priority_system_change() {
+    change_backup_record_is_valid GAI_CONF || {
+        err "IPv4 优先恢复记录不完整，已拒绝修改系统。"
+        return 1
+    }
+    restore_change_file GAI_CONF "$GAI_CONF" || return 1
+    clear_change_tracking GAI_CONF
+}
+
+restore_fail2ban_system_change() {
+    local fail2ban_active fail2ban_enabled failed=0
+
+    fail2ban_active="$(manifest_value FAIL2BAN_ACTIVE 2>/dev/null || true)"
+    fail2ban_enabled="$(manifest_value FAIL2BAN_ENABLED 2>/dev/null || true)"
+    case "$fail2ban_active:$fail2ban_enabled" in
+        active:enabled|active:disabled|inactive:enabled|inactive:disabled) ;;
+        *)
+            err "Fail2ban 恢复记录缺少有效的服务状态，已拒绝修改配置和服务。"
+            return 1
+            ;;
+    esac
+    change_backup_record_is_valid FAIL2BAN_SSHD || {
+        err "Fail2ban 配置备份不完整，已拒绝修改配置和服务。"
+        return 1
+    }
+    restore_change_file FAIL2BAN_SSHD "$FAIL2BAN_VPSBOX_SSHD_CONF" || return 1
+    if fail2ban_installed; then
+        fail2ban-client -t -c /etc/fail2ban >/dev/null 2>&1 || return 1
+        detect_os
+        if is_systemd; then
+            if [ "$fail2ban_enabled" = "enabled" ]; then
+                systemctl enable fail2ban || return 1
+            else
+                systemctl disable fail2ban || return 1
+            fi
+            if [ "$fail2ban_active" = "active" ]; then
+                systemctl restart fail2ban || return 1
+            else
+                systemctl stop fail2ban || return 1
+            fi
+        elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
+            if [ "$fail2ban_enabled" = "enabled" ]; then
+                rc-update add fail2ban default || return 1
+            else
+                rc-update del fail2ban default || return 1
+            fi
+            if [ "$fail2ban_active" = "active" ]; then
+                rc-service fail2ban restart || return 1
+            else
+                rc-service fail2ban stop || return 1
+            fi
+        else
+            err "当前环境无法恢复 Fail2ban 服务状态。"
+            return 1
+        fi
+    fi
+
+    clear_change_tracking FAIL2BAN_SSHD || failed=1
+    manifest_remove FAIL2BAN_ACTIVE || failed=1
+    manifest_remove FAIL2BAN_ENABLED || failed=1
+    return "$failed"
+}
+
+restore_journald_system_change() {
+    change_backup_record_is_valid JOURNALD_CONF || {
+        err "journald 恢复记录不完整，已拒绝修改系统。"
+        return 1
+    }
+    is_systemd || {
+        err "当前环境无法恢复 systemd 管理的 journald 状态。"
+        return 1
+    }
+    restore_change_file JOURNALD_CONF "$JOURNALD_VPSBOX_CONF" || return 1
+    systemctl restart systemd-journald &&
+        systemctl is-active --quiet systemd-journald || return 1
+    clear_change_tracking JOURNALD_CONF
+}
+
+restore_ntp_system_change() {
+    restore_recorded_ntp_change || {
+        err "当前环境无法恢复 systemd 管理的 NTP 状态。"
+        return 1
+    }
+    clear_ntp_change_tracking
+}
+
+restore_vpsbox_system_change() {
+    local item="$1" label
+
+    [ "$(system_change_state "$item")" != none ] || return 2
+    label="$(system_change_label "$item")" || return 2
+    case "$item" in
+        hostname) restore_hostname_system_change ;;
+        dns) restore_dns_system_change ;;
+        bbr) restore_bbr_system_change ;;
+        ipv4_priority) restore_ipv4_priority_system_change ;;
+        fail2ban) restore_fail2ban_system_change ;;
+        journald) restore_journald_system_change ;;
+        ntp) restore_ntp_system_change ;;
+        *) return 2 ;;
+    esac || {
+        err "$label 未能完整恢复；未清理的记录已保留，请检查后重试。"
+        return 1
+    }
+    info "$label 已恢复。"
+}
+
+restore_vpsbox_system_change_interactive() {
+    local item="$1" label state confirm
+
+    label="$(system_change_label "$item")" || return 2
+    state="$(system_change_state "$item")" || return 1
+    if [ "$state" = none ]; then
+        info "$label 没有可恢复记录。"
+        return 0
+    fi
+    if ! read -r -p "恢复 $label？请输入 YES：" confirm; then
+        info "输入已结束，已取消恢复。"
+        return 0
+    fi
+    [ "$confirm" = "YES" ] || { info "已取消恢复。"; return 0; }
+    restore_vpsbox_system_change "$item"
+}
+
+restore_vpsbox_system_changes() {
+    local skip_confirmation="${1:-0}" confirm item state
+    local restored=0 failed=0 absent=0
+
+    if ! recorded_system_changes_present; then
+        info "当前没有可恢复的 vpsbox 系统改动。"
+        return 0
+    fi
+    if [ "$skip_confirmation" != "1" ]; then
+        show_vpsbox_changes
+        if ! read -r -p "恢复上述 vpsbox 已记录的系统设置？请输入 YES：" confirm; then
+            info "输入已结束，已取消恢复。"
+            return 0
+        fi
+        [ "$confirm" = "YES" ] || { info "已取消恢复。"; return 0; }
+    fi
+
+    while IFS= read -r item; do
+        state="$(system_change_state "$item")" || {
+            failed=$((failed + 1))
+            continue
+        }
+        if [ "$state" = none ]; then
+            absent=$((absent + 1))
+            continue
+        fi
+        if restore_vpsbox_system_change "$item"; then
+            restored=$((restored + 1))
+        else
+            failed=$((failed + 1))
+        fi
+    done < <(system_change_items)
+
+    echo "----------------------------------------"
+    echo " 恢复成功：$restored 项"
+    echo " 恢复失败：$failed 项"
+    echo " 无记录：$absent 项"
+    echo "----------------------------------------"
+    if [ "$failed" -ne 0 ]; then
+        err "部分项目恢复失败；失败项目的剩余记录未清理，请检查后重试。"
+        return 1
+    fi
+    info "已恢复全部记录项目；请使用自检和对应服务状态确认结果。"
 }
 
 offer_restore_recorded_changes_before_uninstall() {
@@ -14983,103 +15282,43 @@ offer_restore_recorded_changes_before_uninstall() {
     fi
 }
 
-restore_vpsbox_system_changes() {
-    local skip_confirmation="${1:-0}"
-    local confirm cc fq old failed=0
-    local fail2ban_active fail2ban_enabled fail2ban_metadata_valid=0
+system_changes_menu() {
+    local opt
 
-    if [ "$skip_confirmation" != "1" ]; then
-        show_vpsbox_changes
-        if ! read -r -p "恢复上述 vpsbox 已记录的系统设置？请输入 YES：" confirm; then
-            info "输入已结束，已取消恢复。"
-            return 0
-        fi
-        [ "$confirm" = "YES" ] || { info "已取消恢复。"; return 0; }
-    fi
+    while true; do
+        clear 2>/dev/null || true
+        cat <<EOF
+========================================
+ vpsbox 系统改动
+========================================
+ [1] 恢复全部已记录项目
+ [2] 主机名：$(system_change_state_text hostname)
+ [3] IPv4 DNS：$(system_change_state_text dns)
+ [4] BBR + fq：$(system_change_state_text bbr)
+ [5] IPv4 优先：$(system_change_state_text ipv4_priority)
+ [6] Fail2ban：$(system_change_state_text fail2ban)
+ [7] journald 日志限制：$(system_change_state_text journald)
+ [8] NTP 时间同步：$(system_change_state_text ntp)
+----------------------------------------
+ [0] 返回系统优化菜单
+========================================
+EOF
+        read -r -p "请输入选项: " opt || return 0
+        echo ""
 
-    if change_needs_restore HOSTNAME; then
-        restore_change_file HOSTNAME_FILE "$HOSTNAME_PATH" || failed=1
-        restore_change_file HOSTS_FILE "$HOSTS_PATH" || failed=1
-        old="$(manifest_value HOSTNAME_VALUE 2>/dev/null || true)"
-        [ -n "$old" ] && set_system_hostname "$old" 2>/dev/null || failed=1
-    fi
-
-    if change_needs_restore DNS_RESOLV && ! restore_change_file DNS_RESOLV "$RESOLV_CONF"; then failed=1; fi
-    if change_needs_restore DNS_RESOLVED && ! restore_change_file DNS_RESOLVED /etc/systemd/resolved.conf.d/vpsbox.conf; then failed=1; fi
-    if resolv_conf_managed_by_systemd_resolved && ! systemctl restart systemd-resolved; then failed=1; fi
-
-    if change_needs_restore BBR_CONF; then
-        restore_change_file BBR_CONF "$BBR_CONF" || failed=1
-        cc="$(manifest_value BBR_CC 2>/dev/null || true)"; fq="$(manifest_value BBR_FQ 2>/dev/null || true)"
-        if [ -n "$cc" ] && [ "$cc" != "unknown" ]; then sysctl -w "net.ipv4.tcp_congestion_control=$cc" >/dev/null 2>&1 || failed=1; fi
-        if [ -n "$fq" ] && [ "$fq" != "unknown" ]; then sysctl -w "net.core.default_qdisc=$fq" >/dev/null 2>&1 || failed=1; fi
-    fi
-    if change_needs_restore GAI_CONF && ! restore_change_file GAI_CONF "$GAI_CONF"; then failed=1; fi
-    if change_needs_restore FAIL2BAN_SSHD; then
-        fail2ban_active="$(manifest_value FAIL2BAN_ACTIVE 2>/dev/null || true)"
-        fail2ban_enabled="$(manifest_value FAIL2BAN_ENABLED 2>/dev/null || true)"
-        case "$fail2ban_active:$fail2ban_enabled" in
-            active:enabled|active:disabled|inactive:enabled|inactive:disabled)
-                fail2ban_metadata_valid=1
-                restore_change_file FAIL2BAN_SSHD "$FAIL2BAN_VPSBOX_SSHD_CONF" || failed=1
-                ;;
-            *)
-                err "Fail2ban 恢复记录缺少有效的服务状态，已拒绝修改配置和服务。"
-                failed=1
-                ;;
+        case "$opt" in
+            1) run_menu_action restore_vpsbox_system_changes; pause ;;
+            2) run_menu_action restore_vpsbox_system_change_interactive hostname; pause ;;
+            3) run_menu_action restore_vpsbox_system_change_interactive dns; pause ;;
+            4) run_menu_action restore_vpsbox_system_change_interactive bbr; pause ;;
+            5) run_menu_action restore_vpsbox_system_change_interactive ipv4_priority; pause ;;
+            6) run_menu_action restore_vpsbox_system_change_interactive fail2ban; pause ;;
+            7) run_menu_action restore_vpsbox_system_change_interactive journald; pause ;;
+            8) run_menu_action restore_vpsbox_system_change_interactive ntp; pause ;;
+            0) return 0 ;;
+            *) warn "无效选项：$opt"; pause ;;
         esac
-        if [ "$fail2ban_metadata_valid" -eq 1 ] && fail2ban_installed; then
-            fail2ban-client -t -c /etc/fail2ban >/dev/null 2>&1 || failed=1
-            if is_systemd; then
-                if [ "$fail2ban_enabled" = "enabled" ]; then systemctl enable fail2ban || failed=1; elif [ "$fail2ban_enabled" = "disabled" ]; then systemctl disable fail2ban || failed=1; fi
-                if [ "$fail2ban_active" = "active" ]; then systemctl restart fail2ban || failed=1; else systemctl stop fail2ban || failed=1; fi
-            elif [ "$OS" = "alpine" ] && command -v rc-service >/dev/null 2>&1; then
-                if [ "$fail2ban_enabled" = "enabled" ]; then rc-update add fail2ban default || failed=1; elif [ "$fail2ban_enabled" = "disabled" ]; then rc-update del fail2ban default || failed=1; fi
-                if [ "$fail2ban_active" = "active" ]; then rc-service fail2ban restart || failed=1; else rc-service fail2ban stop || failed=1; fi
-            fi
-        fi
-    fi
-    if change_needs_restore JOURNALD_CONF; then
-        restore_change_file JOURNALD_CONF "$JOURNALD_VPSBOX_CONF" || failed=1
-        is_systemd && systemctl restart systemd-journald && systemctl is-active --quiet systemd-journald || failed=1
-    fi
-    if change_needs_restore NTP_CONF; then
-        if ! restore_recorded_ntp_change; then
-            err "当前环境无法恢复 systemd 管理的 NTP 状态。"
-            failed=1
-        fi
-    fi
-    if [ "$failed" -eq 1 ]; then
-        err "部分文件恢复失败；已保留变更清单和备份，请修复权限或路径后重试。"
-        return 1
-    fi
-    if change_needs_restore HOSTNAME; then
-        clear_change_tracking HOSTNAME_FILE || failed=1
-        clear_change_tracking HOSTS_FILE || failed=1
-        manifest_remove APPLIED_HOSTNAME || failed=1
-        manifest_remove PENDING_HOSTNAME || failed=1
-        manifest_remove HOSTNAME_VALUE || failed=1
-    fi
-    if change_needs_restore BBR_CONF; then
-        clear_change_tracking BBR_CONF || failed=1
-        manifest_remove BBR_CC || failed=1
-        manifest_remove BBR_FQ || failed=1
-    fi
-    if change_needs_restore NTP_CONF; then
-        clear_ntp_change_tracking || failed=1
-    fi
-    for name in DNS_RESOLV DNS_RESOLVED GAI_CONF FAIL2BAN_SSHD JOURNALD_CONF; do
-        if change_needs_restore "$name"; then
-            clear_change_tracking "$name" || failed=1
-        fi
     done
-    manifest_remove FAIL2BAN_ACTIVE || failed=1
-    manifest_remove FAIL2BAN_ENABLED || failed=1
-    if [ "$failed" -eq 1 ]; then
-        err "恢复已完成部分步骤，但清单或备份清理失败，已保留剩余状态供人工核验。"
-        return 1
-    fi
-    info "已恢复已记录项目；请使用自检和对应服务状态确认结果。"
 }
 
 verify_current_node_runtime() {
@@ -15522,7 +15761,7 @@ EOF
             10) run_menu_action show_current_ssh_config; pause ;;
             11) run_menu_action install_fail2ban; pause ;;
             12) run_menu_action limit_systemd_journal; pause ;;
-            13) run_menu_action restore_vpsbox_system_changes; pause ;;
+            13) system_changes_menu ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac

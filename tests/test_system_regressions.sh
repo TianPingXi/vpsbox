@@ -1762,7 +1762,6 @@ test_fail2ban_restore_requires_complete_service_metadata() {
         forbid_init
         # shellcheck disable=SC2034 # 被测恢复函数动态读取。
         OS=debian
-        change_needs_restore() { [ "$1" = FAIL2BAN_SSHD ]; }
         manifest_value() {
             case "$1" in
                 FAIL2BAN_ACTIVE) printf '%s\n' active ;;
@@ -1776,7 +1775,7 @@ test_fail2ban_restore_requires_complete_service_metadata() {
         resolv_conf_managed_by_systemd_resolved() { return 1; }
         systemctl() { forbid "Fail2ban 恢复元数据不完整时不得修改服务"; }
 
-        if restore_vpsbox_system_changes 1 >/dev/null 2>&1; then
+        if restore_fail2ban_system_change >/dev/null 2>&1; then
             fail "缺少当前格式的 Fail2ban 服务状态时恢复必须失败"
         fi
         assert_no_forbidden "Fail2ban 元数据校验必须发生在配置和服务恢复之前"
@@ -1788,7 +1787,6 @@ test_fail2ban_restore_rejects_invalid_service_metadata() {
         forbid_init
         # shellcheck disable=SC2034 # 被测恢复函数动态读取。
         OS=debian
-        change_needs_restore() { [ "$1" = FAIL2BAN_SSHD ]; }
         manifest_value() {
             case "$1" in
                 FAIL2BAN_ACTIVE) printf '%s\n' active ;;
@@ -1802,7 +1800,7 @@ test_fail2ban_restore_rejects_invalid_service_metadata() {
         resolv_conf_managed_by_systemd_resolved() { return 1; }
         systemctl() { forbid "Fail2ban 恢复枚举值非法时不得修改服务"; }
 
-        if restore_vpsbox_system_changes 1 >/dev/null 2>&1; then
+        if restore_fail2ban_system_change >/dev/null 2>&1; then
             fail "Fail2ban 恢复记录包含非法枚举值时必须失败"
         fi
         assert_no_forbidden "Fail2ban 非法枚举值校验必须发生在配置和服务恢复之前"
@@ -1813,9 +1811,10 @@ test_fail2ban_restore_accepts_complete_service_metadata() {
     (
         local log="$TEST_TMP/fail2ban-current-metadata.log"
         : > "$log"
-        # shellcheck disable=SC2034 # 被测恢复函数动态读取。
-        OS=debian
-        change_needs_restore() { [ "$1" = FAIL2BAN_SSHD ]; }
+        detect_os() {
+            # shellcheck disable=SC2034 # 被测恢复函数动态读取。
+            OS=debian
+        }
         manifest_value() {
             case "$1" in
                 FAIL2BAN_ACTIVE) printf '%s\n' active ;;
@@ -1823,6 +1822,7 @@ test_fail2ban_restore_accepts_complete_service_metadata() {
                 *) return 1 ;;
             esac
         }
+        change_backup_record_is_valid() { return 0; }
         restore_change_file() { printf 'restore:%s\n' "$1" >> "$log"; }
         fail2ban_installed() { return 0; }
         fail2ban-client() { printf 'client:%s\n' "$*" >> "$log"; }
@@ -1832,7 +1832,7 @@ test_fail2ban_restore_accepts_complete_service_metadata() {
         clear_change_tracking() { return 0; }
         manifest_remove() { return 0; }
 
-        restore_vpsbox_system_changes 1 ||
+        restore_fail2ban_system_change ||
             fail "字段完整的 v1.0.43+ Fail2ban 恢复记录必须继续可用"
         assert_file_contains "$log" '^restore:FAIL2BAN_SSHD$'
         assert_file_contains "$log" '^client:-t -c /etc/fail2ban$'
@@ -1841,33 +1841,109 @@ test_fail2ban_restore_accepts_complete_service_metadata() {
     )
 }
 
-test_restore_system_changes_failure_preserves_manifest_and_backup() {
+test_restore_system_changes_clears_success_and_preserves_failed_group() {
     (
-        local target="$TEST_TMP/restore-entry/gai.conf"
+        local case_dir="$TEST_TMP/restore-groups"
+        local dns_target="$case_dir/resolv.conf" gai_target="$case_dir/gai.conf"
+        local output="$case_dir/restore.out" status_output="$case_dir/status.out"
 
         forbid_init
-        reset_change_store restore-entry
-        mkdir -p "$(dirname "$target")"
+        reset_change_store restore-groups
+        mkdir -p "$case_dir"
         # shellcheck disable=SC2034 # 被测系统恢复入口动态读取。
-        GAI_CONF="$target"
-        printf '%s\n' original > "$target"
-        backup_change_file_once GAI_CONF "$target"
+        RESOLV_CONF="$dns_target"
+        # shellcheck disable=SC2034 # 被测系统恢复入口动态读取。
+        GAI_CONF="$gai_target"
+        printf '%s\n' dns-original > "$dns_target"
+        printf '%s\n' gai-original > "$gai_target"
+        backup_change_file_once DNS_RESOLV "$dns_target"
+        mark_change_applied DNS_RESOLV
+        begin_change_transaction DNS_RESOLVED
+        backup_change_file_once GAI_CONF "$gai_target"
         mark_change_applied GAI_CONF
-        printf '%s\n' modified > "$target"
+        printf '%s\n' dns-modified > "$dns_target"
+        printf '%s\n' gai-modified > "$gai_target"
+        systemctl() { forbid "DNS 组预检失败时不得修改服务"; }
 
-        restore_change_file() { return 23; }
-        clear_change_tracking() { forbid "恢复失败后不得清理变更清单或备份"; }
+        show_vpsbox_changes > "$status_output"
+        assert_file_contains "$status_output" 'IPv4 DNS：未完成，可恢复'
+        assert_file_contains "$status_output" 'IPv4 优先：可恢复'
+        assert_file_not_contains "$status_output" 'DNS_RESOLV|GAI_CONF' \
+            "系统改动状态不得暴露内部清单键"
 
-        if restore_vpsbox_system_changes 1 > "$TEST_TMP/restore-entry.out" 2>&1; then
-            fail "任一系统项目恢复失败时总入口不得报告成功"
+        if restore_vpsbox_system_changes 1 > "$output" 2>&1; then
+            fail "存在失败项目时恢复全部不得报告成功"
         fi
-        assert_file_contains "$CHANGE_MANIFEST" '^BACKUP_GAI_CONF=file$'
-        assert_file_contains "$CHANGE_MANIFEST" '^APPLIED_GAI_CONF=1$'
-        [ -f "$CHANGE_BACKUP_DIR/GAI_CONF" ] ||
-            fail "系统恢复失败后必须保留原始备份供重试"
-        assert_file_contains "$TEST_TMP/restore-entry.out" \
-            '已保留变更清单和备份'
-        assert_no_forbidden "系统恢复失败后仍清理了恢复依据"
+        assert_file_contains "$dns_target" '^dns-modified$' \
+            "组合项目预检失败时不得先恢复其中一部分"
+        assert_file_contains "$CHANGE_MANIFEST" '^BACKUP_DNS_RESOLV=file$'
+        assert_file_contains "$CHANGE_MANIFEST" '^APPLIED_DNS_RESOLV=1$'
+        assert_file_contains "$CHANGE_MANIFEST" '^PENDING_DNS_RESOLVED=1$'
+        [ -f "$CHANGE_BACKUP_DIR/DNS_RESOLV" ] ||
+            fail "失败的 DNS 组必须保留原始备份"
+
+        assert_file_contains "$gai_target" '^gai-original$' \
+            "前一项目失败后仍必须继续恢复后续项目"
+        assert_file_not_contains "$CHANGE_MANIFEST" \
+            '^(BACKUP_GAI_CONF|APPLIED_GAI_CONF|PENDING_GAI_CONF)='
+        [ ! -e "$CHANGE_BACKUP_DIR/GAI_CONF" ] ||
+            fail "成功项目必须立即清理自己的备份"
+        assert_file_contains "$output" '恢复成功：1 项'
+        assert_file_contains "$output" '恢复失败：1 项'
+        assert_file_contains "$output" '无记录：5 项'
+        assert_no_forbidden "失败组预检后仍执行了系统服务修改"
+    )
+}
+
+test_single_system_change_restore_is_isolated() {
+    (
+        local case_dir="$TEST_TMP/restore-single"
+        local dns_target="$case_dir/resolv.conf" gai_target="$case_dir/gai.conf"
+
+        reset_change_store restore-single
+        mkdir -p "$case_dir"
+        # shellcheck disable=SC2034 # 被测单项恢复函数动态读取。
+        RESOLV_CONF="$dns_target"
+        # shellcheck disable=SC2034 # 被测单项恢复函数动态读取。
+        GAI_CONF="$gai_target"
+        printf '%s\n' dns-original > "$dns_target"
+        printf '%s\n' gai-original > "$gai_target"
+        backup_change_file_once DNS_RESOLV "$dns_target"
+        mark_change_applied DNS_RESOLV
+        backup_change_file_once GAI_CONF "$gai_target"
+        mark_change_applied GAI_CONF
+        printf '%s\n' dns-modified > "$dns_target"
+        printf '%s\n' gai-modified > "$gai_target"
+
+        restore_vpsbox_system_change_interactive ipv4_priority <<< "YES" >/dev/null
+
+        assert_file_contains "$gai_target" '^gai-original$'
+        assert_file_not_contains "$CHANGE_MANIFEST" \
+            '^(BACKUP_GAI_CONF|APPLIED_GAI_CONF|PENDING_GAI_CONF)='
+        [ ! -e "$CHANGE_BACKUP_DIR/GAI_CONF" ] ||
+            fail "单项恢复成功后必须清理目标项目备份"
+        assert_file_contains "$dns_target" '^dns-modified$' \
+            "单项恢复不得修改其他项目"
+        assert_file_contains "$CHANGE_MANIFEST" '^APPLIED_DNS_RESOLV=1$'
+        [ -f "$CHANGE_BACKUP_DIR/DNS_RESOLV" ] ||
+            fail "单项恢复不得清理其他项目备份"
+    )
+}
+
+test_system_change_without_record_is_noop() {
+    (
+        local output="$TEST_TMP/restore-no-record.out"
+
+        forbid_init
+        reset_change_store restore-no-record
+        restore_change_file() { forbid "无记录项目不得恢复文件"; }
+        clear_change_tracking() { forbid "无记录项目不得清理清单"; }
+        systemctl() { forbid "无记录项目不得修改服务"; }
+        sysctl() { forbid "无记录项目不得修改运行参数"; }
+
+        restore_vpsbox_system_change_interactive dns > "$output"
+        assert_file_contains "$output" '没有可恢复记录'
+        assert_no_forbidden "无记录项目仍产生了恢复副作用"
     )
 }
 
@@ -1926,6 +2002,9 @@ main() {
         repair_ntp_service_state
         limit_systemd_journal
         change_system_hostname
+        system_change_state
+        restore_vpsbox_system_change
+        restore_vpsbox_system_change_interactive
         restore_vpsbox_system_changes
         show_vpsbox_changes
         restore_recorded_ntp_change
@@ -1999,7 +2078,9 @@ main() {
         test_fail2ban_restore_requires_complete_service_metadata
         test_fail2ban_restore_rejects_invalid_service_metadata
         test_fail2ban_restore_accepts_complete_service_metadata
-        test_restore_system_changes_failure_preserves_manifest_and_backup
+        test_restore_system_changes_clears_success_and_preserves_failed_group
+        test_single_system_change_restore_is_isolated
+        test_system_change_without_record_is_noop
         test_uninstall_restore_offer_runs_internal_restore
         test_uninstall_restore_offer_can_preserve_changes
         test_uninstall_restore_failure_aborts_offer

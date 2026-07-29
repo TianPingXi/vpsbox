@@ -100,7 +100,7 @@ test_failed_atomic_replace_preserves_original_and_is_recoverable() {
     assert_file_contains "$CHANGE_MANIFEST" '^PENDING_GAI_CONF=1$'
     assert_file_not_contains "$CHANGE_MANIFEST" '^APPLIED_GAI_CONF='
     show_vpsbox_changes > "$changes"
-    assert_file_contains "$changes" 'GAI_CONF：未完成，可恢复'
+    assert_file_contains "$changes" 'IPv4 优先：未完成，可恢复'
 }
 
 test_symlink_target_is_rejected() {
