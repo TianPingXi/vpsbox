@@ -18,6 +18,8 @@ MOCK_JAIL_STATE="$TEST_TMP/fail2ban-jail.state"
 MOCK_BACKEND_STATE="$TEST_TMP/fail2ban-backend.state"
 MOCK_ACTION_NAME="nftables-multiport"
 MOCK_ACTIONBAN="/usr/sbin/nft add element inet f2b-table addr-set-sshd { <ip> }"
+MOCK_SECOND_ACTION_NAME=""
+MOCK_SECOND_ACTIONBAN=""
 MOCK_ACTION_PORTS="6384"
 MOCK_ACTION_PORT_QUERY_FAIL=0
 MOCK_BAN_MODE="normal"
@@ -38,6 +40,8 @@ reset_mock() {
     : > "$MOCK_BACKEND_STATE"
     MOCK_ACTION_NAME="nftables-multiport"
     MOCK_ACTIONBAN="/usr/sbin/nft add element inet f2b-table addr-set-sshd { <ip> }"
+    MOCK_SECOND_ACTION_NAME=""
+    MOCK_SECOND_ACTIONBAN=""
     MOCK_ACTION_PORTS="6384"
     MOCK_ACTION_PORT_QUERY_FAIL=0
     MOCK_BAN_MODE="normal"
@@ -67,11 +71,17 @@ fail2ban-client() {
     case "${1:-} ${2:-} ${3:-}" in
         "get sshd actions")
             printf 'The jail sshd has the following actions:\n%s\n' "$MOCK_ACTION_NAME"
+            [ -z "$MOCK_SECOND_ACTION_NAME" ] || printf '%s\n' "$MOCK_SECOND_ACTION_NAME"
             ;;
         "get sshd action")
             case "${5:-}" in
                 actionban)
-                    printf '%s\n' "$MOCK_ACTIONBAN"
+                    if [ -n "$MOCK_SECOND_ACTION_NAME" ] &&
+                        [ "${4:-}" = "$MOCK_SECOND_ACTION_NAME" ]; then
+                        printf '%s\n' "$MOCK_SECOND_ACTIONBAN"
+                    else
+                        printf '%s\n' "$MOCK_ACTIONBAN"
+                    fi
                     ;;
                 port)
                     [ "$MOCK_ACTION_PORT_QUERY_FAIL" -eq 0 ] || return 1
@@ -120,28 +130,6 @@ nft() {
     printf '  set addr-set-sshd { type ipv4_addr; elements = { '
     paste -sd ', ' "$MOCK_BACKEND_STATE"
     printf ' } }\n}\n'
-}
-
-iptables-save() {
-    cat "$MOCK_BACKEND_STATE"
-}
-
-ipset() {
-    [ "${1:-}" = "save" ] || return 2
-    cat "$MOCK_BACKEND_STATE"
-}
-
-ufw() {
-    [ "${1:-} ${2:-}" = "show raw" ] || return 2
-    cat "$MOCK_BACKEND_STATE"
-}
-
-firewall-cmd() {
-    case "$*" in
-        "--direct --get-all-rules") cat "$MOCK_BACKEND_STATE" ;;
-        "--list-all-zones"|"--get-ipsets") return 0 ;;
-        *) return 2 ;;
-    esac
 }
 
 # 重试等待在本地 mock 中无需真实耗时。
@@ -255,44 +243,6 @@ test_exact_ipv4_match() {
         fail "精确匹配应识别带 /32 的 IPv4"
 }
 
-test_supported_backend_snapshots() {
-    local backend
-    reset_mock
-    printf 'rule contains 192.0.2.254/32\n' > "$MOCK_BACKEND_STATE"
-
-    for backend in nftables iptables ipset ufw firewalld; do
-        fail2ban_backend_has_ip "$backend" 192.0.2.254 ||
-            fail "$backend 后端快照应能找到精确测试地址"
-    done
-}
-
-assert_action_round_trip() {
-    local label="$1" action="$2" actionban="$3" output
-
-    output="$TEST_TMP/action-$label.out"
-
-    reset_mock
-    MOCK_ACTION_NAME="$action"
-    MOCK_ACTIONBAN="$actionban"
-    if ! verify_fail2ban_real_ban > "$output" 2>&1; then
-        sed -n '1,120p' "$output" >&2
-        fail "$label 官方防火墙动作应完成封禁往返验证"
-    fi
-    assert_empty_file "$MOCK_JAIL_STATE" "$label 验证后 jail 不应有残留"
-    assert_empty_file "$MOCK_BACKEND_STATE" "$label 验证后后端不应有残留"
-}
-
-test_supported_action_round_trips() {
-    assert_action_round_trip iptables iptables-multiport \
-        '/usr/sbin/iptables -w -I f2b-sshd 1 -s <ip> -j REJECT'
-    assert_action_round_trip ipset iptables-ipset-proto4 \
-        'ipset --test f2b-sshd <ip> || ipset --add f2b-sshd <ip>'
-    assert_action_round_trip ufw ufw \
-        $'if [ -n "" ] && ufw app info ""\nthen\n  ufw prepend reject from <ip> to any comment "by Fail2Ban"\nelse\n  ufw prepend reject from <ip> to any comment "by Fail2Ban"\nfi'
-    assert_action_round_trip firewalld firewallcmd-multiport \
-        'firewall-cmd --direct --add-rule ipv4 filter f2b-sshd 0 -s <ip> -j REJECT'
-}
-
 test_successful_real_ban_round_trip() {
     local output="$TEST_TMP/success.out"
     reset_mock
@@ -325,6 +275,15 @@ test_unknown_action_is_rejected_before_ban() {
         "拒绝未知 action 后不得执行手动封禁"
     assert_empty_file "$MOCK_JAIL_STATE"
     assert_empty_file "$MOCK_BACKEND_STATE"
+
+    reset_mock
+    MOCK_SECOND_ACTION_NAME="sendmail-whois"
+    MOCK_SECOND_ACTIONBAN="/usr/sbin/sendmail root"
+    if verify_fail2ban_real_ban > "$output" 2>&1; then
+        fail "nftables 与外部副作用 action 并存时必须拒绝测试"
+    fi
+    assert_file_not_contains "$MOCK_CALL_LOG" '^set sshd banip ' \
+        "混合 action 未完全验证前不得执行手动封禁"
 }
 
 test_missing_backend_rule_is_cleaned() {
@@ -979,7 +938,7 @@ main() {
         verify_fail2ban_real_ban_advisory
         cleanup_active_fail2ban_test
     )
-    local name test status passed=0 skipped=0
+    local name
     local -a tests=(
         test_action_parser
         test_real_local_ipv4_text_prefers_ip_and_falls_back_to_hostname
@@ -987,8 +946,6 @@ main() {
         test_missing_nftables_dependency_is_installed_automatically
         test_nftables_dependency_install_requires_nft_command
         test_exact_ipv4_match
-        test_supported_backend_snapshots
-        test_supported_action_round_trips
         test_successful_real_ban_round_trip
         test_unknown_action_is_rejected_before_ban
         test_missing_backend_rule_is_cleaned
@@ -1019,30 +976,8 @@ main() {
         require_function "$name"
     done
 
-    assert_all_tests_registered "${BASH_SOURCE[0]}" "${tests[@]}" || return 1
-    for test in "${tests[@]}"; do
-        set +e
-        run_test_case "$test"
-        status=$?
-        set -e
-        case "$status" in
-            0)
-                printf 'ok - %s\n' "$test"
-                passed=$((passed + 1))
-                ;;
-            "$SKIP_STATUS")
-                printf 'ok - %s # SKIP %s\n' "$test" "$(test_skip_reason)"
-                skipped=$((skipped + 1))
-                ;;
-            *)
-                printf 'not ok - %s\n' "$test" >&2
-                return 1
-                ;;
-        esac
-    done
-
-    printf '%s Fail2Ban mock tests passed, %s skipped, %s registered.\n' \
-        "$passed" "$skipped" "${#tests[@]}"
+    run_registered_test_suite \
+        "${BASH_SOURCE[0]}" "Fail2Ban mock tests" "${tests[@]}"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

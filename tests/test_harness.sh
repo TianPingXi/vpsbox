@@ -250,227 +250,104 @@ test_registration_check_rejects_missing_extra_and_duplicates() {
     fi
 }
 
-suite_runner_shape_valid() {
-    local file="$1"
+test_shared_suite_runner_preserves_failure_semantics() {
+    local marker="$TEST_TMP/suite-reached-after-failure"
+    local after="$TEST_TMP/suite-ran-after-failure"
+    local output="$TEST_TMP/suite-failure.out" status
 
-    awk '
-        {
-            lines[NR] = $0
-            text = $0
-            sub(/^[[:space:]]*/, "", text)
-            if (text ~ /^#/) next
+    fixture_case_failure() {
+        false
+        : > "$marker"
+    }
+    fixture_case_after_failure() {
+        : > "$after"
+    }
 
-            if ($0 ~ /^[[:space:]]*main\(\)[[:space:]]*\{[[:space:]]*$/) {
-                main_count++
-                if (!main_line) {
-                    main_line = NR
-                    main_depth = 1
-                    in_main = 1
-                }
-            } else if (in_main) {
-                open_count = gsub(/(^|[[:space:];|&])\{([[:space:];|&]|$)/, "&", text)
-                close_count = gsub(/(^|[[:space:];|&])\}([[:space:];|&]|$)/, "&", text)
-                main_depth += open_count - close_count
-                if (main_depth == 0) {
-                    main_end = NR
-                    in_main = 0
-                }
-            }
-            if ($0 ~ /^[[:space:]]*if \[\[ "\$\{BASH_SOURCE\[0\]\}" == "\$0" \]\]; then[[:space:]]*$/) {
-                guard_count++
-                guard_line = NR
-            }
-            if ($0 ~ /^[[:space:]]*for[[:space:]]+test[[:space:]]+in[[:space:]]+"\$\{tests\[@\]\}";[[:space:]]+do[[:space:]]*$/) {
-                runner_loops++
-                runner_loop_line = NR
-                in_runner_loop = 1
-            }
-            if ($0 ~ /(^|[[:space:];|&!()])run_test_case([[:space:]]|$)/) {
-                calls++
-                call_line = NR
-                exact_call = ($0 ~ /^[[:space:]]*run_test_case[[:space:]]+"\$test"[[:space:]]*$/)
-                call_in_runner_loop = in_runner_loop
-            }
-            if (in_runner_loop && text ~ /^done[[:space:]]*$/) {
-                in_runner_loop = 0
-            }
-        }
-        END {
-            bad = 0
-            if (calls != 1) {
-                printf "run_test_case 调用次数必须为 1，实际为 %d\n", calls > "/dev/stderr"
-                bad = 1
-            }
-            if (runner_loops != 1) {
-                printf "标准测试循环数量必须为 1，实际为 %d\n", runner_loops > "/dev/stderr"
-                bad = 1
-            }
-            if (main_count != 1 || !main_end) {
-                printf "main 定义必须唯一且可确定结束位置，实际为 %d\n", main_count > "/dev/stderr"
-                bad = 1
-            }
-            if (guard_count != 1) {
-                printf "脚本执行入口守卫数量必须为 1，实际为 %d\n", guard_count > "/dev/stderr"
-                bad = 1
-            }
-            if (calls == 1) {
-                if (!exact_call) {
-                    print "run_test_case 必须作为独立命令执行" > "/dev/stderr"
-                    bad = 1
-                }
-                if (!call_in_runner_loop) {
-                    print "run_test_case 不在标准 tests 数组循环内" > "/dev/stderr"
-                    bad = 1
-                }
-                if (!main_line || !main_end || !guard_line ||
-                    runner_loop_line <= main_line || runner_loop_line >= main_end ||
-                    call_line <= runner_loop_line || call_line >= main_end ||
-                    guard_line <= main_end) {
-                    print "run_test_case 不在 main 入口范围内" > "/dev/stderr"
-                    bad = 1
-                }
-                if (lines[call_line - 1] !~ /^[[:space:]]*set \+e[[:space:]]*$/ ||
-                    lines[call_line + 1] !~ /^[[:space:]]*status=\$\?[[:space:]]*$/ ||
-                    lines[call_line + 2] !~ /^[[:space:]]*set -e[[:space:]]*$/) {
-                    print "run_test_case 必须使用 set +e / 调用 / $? / set -e 四行序列" > "/dev/stderr"
-                    bad = 1
-                }
-                if (lines[call_line + 3] !~ /^[[:space:]]*case[[:space:]]+"\$status"[[:space:]]+in[[:space:]]*$/) {
-                    print "run_test_case 状态必须立即进入统一 case 分支" > "/dev/stderr"
-                    bad = 1
-                }
-            }
-            exit bad
-        }
-    ' "$file"
+    set +e
+    run_test_suite \
+        "fixture tests" fixture_case_failure fixture_case_after_failure \
+        >"$output" 2>&1
+    status=$?
+    case "$-" in
+        *e*) fail "统一 runner 不得向禁用 errexit 的调用方泄漏选项" ;;
+    esac
+    set -e
+
+    assert_eq 1 "$status" "用例失败必须使统一 runner 失败"
+    [ ! -e "$marker" ] || fail "失败用例不得继续执行后续命令"
+    [ ! -e "$after" ] || fail "统一 runner 必须在首个失败处停止"
+    assert_file_contains "$output" '^not ok - fixture_case_failure$'
 }
 
-write_runner_fixture() {
-    local file="$1" call="$2" side_fixture="${3:-0}" override_status="${4:-0}"
+test_shared_suite_runner_preserves_skip_and_strict_mode() {
+    local VPSBOX_TEST_STRICT=0 VPSBOX_TEST_SKIP_FILE=""
+    local output="$TEST_TMP/suite-skip.out" strict_output="$TEST_TMP/suite-strict.out"
+    local after="$TEST_TMP/suite-ran-after-strict-skip" status
 
-    {
-        printf '%s\n' '#!/usr/bin/env bash'
-        if [ "$side_fixture" -eq 1 ]; then
-            printf '%s\n' \
-                'unused_fixture() {' \
-                '    set +e' \
-                '    run_test_case "$test"' \
-                '    status=$?' \
-                '    set -e' \
-                '}'
-        fi
-        printf '%s\n' \
-            'main() {' \
-            '    local test status' \
-            '    local -a tests=(test_alpha)' \
-            '    for test in "${tests[@]}"; do' \
-            '        set +e'
-        printf '        %s\n' "$call"
-        printf '%s\n' \
-            '        status=$?' \
-            '        set -e'
-        if [ "$override_status" -eq 1 ]; then
-            printf '%s\n' '        status=0'
-        fi
-        printf '%s\n' \
-            '        case "$status" in' \
-            '            0) : ;;' \
-            '            "$SKIP_STATUS") : ;;' \
-            '            *) return 1 ;;' \
-            '        esac' \
-            '    done' \
-            '}' \
-            'if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then' \
-            '    main "$@"' \
-            'fi'
-    } > "$file"
+    fixture_case_pass() { :; }
+    fixture_case_skip() { skip "统一 runner 跳过夹具"; }
+    fixture_case_after_skip() { : > "$after"; }
+
+    set +e
+    run_test_suite "fixture tests" fixture_case_pass fixture_case_skip >"$output" 2>&1
+    status=$?
+    set -e
+    assert_eq 0 "$status" "非严格模式必须接受有原因的 SKIP"
+    assert_file_contains "$output" '^ok - fixture_case_pass$'
+    assert_file_contains "$output" '^ok - fixture_case_skip # SKIP 统一 runner 跳过夹具$'
+    assert_file_contains "$output" '^1 fixture tests passed, 1 skipped, 2 registered\.$'
+
+    VPSBOX_TEST_STRICT=1
+    set +e
+    run_test_suite \
+        "strict fixture tests" fixture_case_skip fixture_case_after_skip \
+        >"$strict_output" 2>&1
+    status=$?
+    set -e
+    assert_eq 1 "$status" "严格模式必须把统一 runner 中的 SKIP 转为失败"
+    [ ! -e "$after" ] || fail "严格模式遇到 SKIP 后不得继续运行其他用例"
+    assert_file_contains "$strict_output" '严格模式不允许跳过：统一 runner 跳过夹具'
 }
 
-write_out_of_main_runner_fixture() {
-    local file="$1"
+test_shared_suite_runner_rejects_conditional_context() {
+    local marker="$TEST_TMP/suite-conditional-marker"
+    local output="$TEST_TMP/suite-conditional.out" status
 
-    printf '%s\n' \
-        '#!/usr/bin/env bash' \
-        'main() {' \
-        '    :' \
-        '}' \
-        'run_tests() {' \
-        '    local test status' \
-        '    local -a tests=(test_alpha)' \
-        '    for test in "${tests[@]}"; do' \
-        '        set +e' \
-        '        run_test_case "$test"' \
-        '        status=$?' \
-        '        set -e' \
-        '        case "$status" in' \
-        '            0) : ;;' \
-        '            "$SKIP_STATUS") : ;;' \
-        '            *) return 1 ;;' \
-        '        esac' \
-        '    done' \
-        '}' \
-        'if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then' \
-        '    main "$@"' \
-        'fi' > "$file"
+    fixture_conditional_case() {
+        false
+        : > "$marker"
+    }
+
+    set +e
+    if run_test_suite "conditional fixture tests" fixture_conditional_case \
+        >"$output" 2>&1; then
+        status=0
+    else
+        status=$?
+    fi
+    set -e
+
+    assert_eq 2 "$status" "条件上下文中的统一 runner 必须明确拒绝执行"
+    [ ! -e "$marker" ] || fail "条件上下文探测失败后不得进入测试用例"
+    assert_file_contains "$output" '不能在 if、!、&& 或 [|][|] 条件上下文中调用'
 }
 
-test_suite_runners_keep_test_case_out_of_conditionals() {
-    local path file
-    local -a suites=()
+test_business_suites_use_registered_runner() {
+    local path file count
 
     for path in "$TEST_DIR"/test_*.sh; do
         file="${path##*/}"
-        # helper 没有 runner；harness 自身故意直接执行用例，以验证 runner。
         case "$file" in
             test_helper.sh|test_harness.sh) continue ;;
         esac
-        suites+=("$file")
-    done
-    [ "${#suites[@]}" -gt 0 ] || fail "未发现任何待检查的测试套件"
-
-    for file in "${suites[@]}"; do
-        suite_runner_shape_valid "$TEST_DIR/$file" ||
-            fail "$file 的 run_test_case 调用不符合独立四行序列"
+        count="$(grep -Ec \
+            '^[[:space:]]*run_registered_test_suite([[:space:]]|$)' "$path")"
+        assert_eq 1 "$count" \
+            "$file 必须且只能通过统一注册 runner 执行测试数组"
     done
 }
 
-test_suite_runner_linter_rejects_conditional_pipeline_and_side_fixture() {
-    local fixture="$TEST_TMP/runner-shape.sh" call
-    local -a invalid_calls=(
-        'if run_test_case "$test"; then :; fi'
-        '! run_test_case "$test"'
-        'run_test_case "$test" | tee /dev/null'
-        'run_test_case "$test" && :'
-        'run_test_case "$test" || :'
-    )
-
-    write_runner_fixture "$fixture" 'run_test_case "$test"'
-    suite_runner_shape_valid "$fixture" || fail "合法的独立 runner 序列被拒绝"
-
-    for call in "${invalid_calls[@]}"; do
-        write_runner_fixture "$fixture" "$call"
-        if suite_runner_shape_valid "$fixture" >/dev/null 2>&1; then
-            fail "runner linter 未拒绝条件或管道上下文：$call"
-        fi
-    done
-
-    write_runner_fixture "$fixture" 'if run_test_case "$test"; then :; fi' 1
-    if suite_runner_shape_valid "$fixture" >/dev/null 2>&1; then
-        fail "旁置的合法夹具不得掩盖 main 中的错误 runner"
-    fi
-
-    write_out_of_main_runner_fixture "$fixture"
-    if suite_runner_shape_valid "$fixture" >/dev/null 2>&1; then
-        fail "main 外部的标准 runner 不得通过作用域检查"
-    fi
-
-    write_runner_fixture "$fixture" 'run_test_case "$test"' 0 1
-    if suite_runner_shape_valid "$fixture" >/dev/null 2>&1; then
-        fail "捕获后覆盖 run_test_case 状态不得通过 runner 检查"
-    fi
-}
-
-test_capability_preconditions_propagate_exact_status() {
+test_capability_preconditions_do_not_mask_failure_status() {
     local path file violations
     local -a suites=()
 
@@ -485,12 +362,13 @@ test_capability_preconditions_propagate_exact_status() {
 
     violations="$(awk '
         /^[[:space:]]*require_(command|linux_proc|real_symlink)[[:space:]]/ &&
+            $0 ~ /\|\|/ &&
             $0 !~ /\|\|[[:space:]]*return[[:space:]]+"\$\?"[[:space:]]*$/ {
             print FILENAME ":" FNR ":" $0
         }
     ' "${suites[@]}")"
     [ -z "$violations" ] ||
-        fail "能力前置条件必须原样传播实际状态：$violations"
+        fail "能力前置条件不得把真实失败改写成 SKIP 或成功：$violations"
 }
 
 main() {
@@ -509,9 +387,11 @@ main() {
         test_forbidden_marker_survives_ignored_status
         test_forbidden_marker_survives_command_substitution
         test_registration_check_rejects_missing_extra_and_duplicates
-        test_suite_runners_keep_test_case_out_of_conditionals
-        test_suite_runner_linter_rejects_conditional_pipeline_and_side_fixture
-        test_capability_preconditions_propagate_exact_status
+        test_shared_suite_runner_preserves_failure_semantics
+        test_shared_suite_runner_preserves_skip_and_strict_mode
+        test_shared_suite_runner_rejects_conditional_context
+        test_business_suites_use_registered_runner
+        test_capability_preconditions_do_not_mask_failure_status
     )
 
     assert_all_tests_registered "${BASH_SOURCE[0]}" "${tests[@]}" || return 1

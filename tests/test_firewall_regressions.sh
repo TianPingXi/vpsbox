@@ -1551,7 +1551,7 @@ test_internal_port_transition_preserves_unrelated_public_ports() {
 }
 
 main() {
-    local name test status passed=0 skipped=0
+    local name
     local -a required=(
         process_start_ticks
         normalize_port_decimal
@@ -1616,29 +1616,8 @@ main() {
     for name in "${required[@]}"; do
         require_function "$name"
     done
-    assert_all_tests_registered "${BASH_SOURCE[0]}" "${tests[@]}" || return 1
-    for test in "${tests[@]}"; do
-        set +e
-        run_test_case "$test"
-        status=$?
-        set -e
-        case "$status" in
-            0)
-                printf 'ok - %s\n' "$test"
-                passed=$((passed + 1))
-                ;;
-            "$SKIP_STATUS")
-                printf 'ok - %s # SKIP %s\n' "$test" "$(test_skip_reason)"
-                skipped=$((skipped + 1))
-                ;;
-            *)
-                printf 'not ok - %s\n' "$test" >&2
-                return 1
-                ;;
-        esac
-    done
-    printf '%s firewall regression tests passed, %s skipped, %s registered.\n' \
-        "$passed" "$skipped" "${#tests[@]}"
+    run_registered_test_suite \
+        "${BASH_SOURCE[0]}" "firewall regression tests" "${tests[@]}"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

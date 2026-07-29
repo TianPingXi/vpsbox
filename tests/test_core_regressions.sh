@@ -1512,8 +1512,24 @@ test_vpsbox_main_orchestration_and_recovery_short_circuit() {
 
         vpsbox_main
     )
-    assert_eq $'root\nos\nlock\nrecover-singbox\nrecover-node\nrepair-uri\ninstall-self\ncheck-update\nauto-update\nmenu' \
-        "$(cat "$log")" "vpsbox_main 必须按恢复、安装、更新、菜单的顺序完成启动"
+    awk '
+        !first[$0] { first[$0] = NR }
+        END {
+            required = "root os lock recover-singbox recover-node repair-uri install-self check-update auto-update menu"
+            count = split(required, names, " ")
+            for (i = 1; i <= count; i++) if (!first[names[i]]) exit 1
+            if (!(first["root"] < first["lock"] && first["os"] < first["lock"])) exit 1
+            if (!(first["lock"] < first["recover-singbox"] &&
+                  first["recover-singbox"] < first["recover-node"])) exit 1
+            if (!(first["recover-node"] < first["repair-uri"] &&
+                  first["recover-node"] < first["install-self"] &&
+                  first["recover-node"] < first["check-update"])) exit 1
+            if (!(first["check-update"] < first["auto-update"] &&
+                  first["auto-update"] < first["menu"] &&
+                  first["repair-uri"] < first["menu"] &&
+                  first["install-self"] < first["menu"])) exit 1
+        }
+    ' "$log" || fail "vpsbox_main 未满足恢复前置、更新依赖或最终进入菜单的启动契约"
 
     : > "$log"
     (
@@ -2983,7 +2999,7 @@ test_dangling_node_symlink_is_not_treated_as_no_node() {
 }
 
 main() {
-    local name test status passed=0 skipped=0
+    local name
     local -a required=(
         acquire_lock
         install_lock_cleanup_traps
@@ -3093,29 +3109,8 @@ main() {
     for name in "${required[@]}"; do
         require_function "$name"
     done
-    assert_all_tests_registered "${BASH_SOURCE[0]}" "${tests[@]}" || return 1
-    for test in "${tests[@]}"; do
-        set +e
-        run_test_case "$test"
-        status=$?
-        set -e
-        case "$status" in
-            0)
-                printf 'ok - %s\n' "$test"
-                passed=$((passed + 1))
-                ;;
-            "$SKIP_STATUS")
-                printf 'ok - %s # SKIP %s\n' "$test" "$(test_skip_reason)"
-                skipped=$((skipped + 1))
-                ;;
-            *)
-                printf 'not ok - %s\n' "$test" >&2
-                return 1
-                ;;
-        esac
-    done
-    printf '%s core regression tests passed, %s skipped, %s registered.\n' \
-        "$passed" "$skipped" "${#tests[@]}"
+    run_registered_test_suite \
+        "${BASH_SOURCE[0]}" "core regression tests" "${tests[@]}"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

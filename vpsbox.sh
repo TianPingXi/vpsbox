@@ -6579,80 +6579,11 @@ fail2ban_simple_action_is_safe() {
         [[ "$actionban" != *'$('* ]]
 }
 
-fail2ban_ipset_action_backend() {
-    local actionban="$1" safe left right executable
-
-    [[ "$actionban" == *'<ip>'* ]] || return 1
-    [[ "$actionban" != *';'* ]] || return 1
-    [[ "$actionban" != *'&'* ]] || return 1
-    [[ "$actionban" != *'`'* ]] || return 1
-    [[ "$actionban" != *'$('* ]] || return 1
-    safe="${actionban//||/}"
-    [[ "$safe" != *'|'* ]] || return 1
-
-    if [[ "$actionban" == *'||'* ]]; then
-        left="$(fail2ban_single_action_line "${actionban%%||*}")" || return 1
-        right="${actionban#*||}"
-        [[ "$right" != *'||'* ]] || return 1
-        right="$(fail2ban_single_action_line "$right")" || return 1
-        executable="$(fail2ban_action_executable "$left")"
-        case "$executable" in ipset|*/ipset|'<ipset>') ;; *) return 1 ;; esac
-        executable="$(fail2ban_action_executable "$right")"
-        case "$executable" in ipset|*/ipset|'<ipset>') ;; *) return 1 ;; esac
-        [[ " $left " == *' --test '* && " $right " == *' --add '* ]] || return 1
-    else
-        left="$(fail2ban_single_action_line "$actionban")" || return 1
-        executable="$(fail2ban_action_executable "$left")"
-        case "$executable" in ipset|*/ipset|'<ipset>') ;; *) return 1 ;; esac
-        [[ " $left " == *' add '* ]] || return 1
-    fi
-    printf '%s\n' ipset
-}
-
-fail2ban_ufw_action_backend() {
-    local actionban="$1" safe line executable after_and
-    local saw_if=0 saw_then=0 saw_else=0 saw_fi=0 ufw_commands=0
-
-    [[ "$actionban" == *'<ip>'* ]] || return 1
-    [[ "$actionban" != *';'* ]] || return 1
-    [[ "$actionban" != *'|'* ]] || return 1
-    [[ "$actionban" != *'`'* ]] || return 1
-    [[ "$actionban" != *'$('* ]] || return 1
-    safe="${actionban//&&/}"
-    [[ "$safe" != *'&'* ]] || return 1
-
-    while IFS= read -r line; do
-        line="$(printf '%s\n' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-        [ -n "$line" ] || continue
-        case "$line" in
-            if\ \[\ -n\ *' ] && '* )
-                [ "$saw_if" -eq 0 ] || return 1
-                after_and="${line#* ] && }"
-                executable="$(fail2ban_action_executable "$after_and")"
-                case "$executable" in ufw|*/ufw|'<ufw>') ;; *) return 1 ;; esac
-                [[ " $after_and " == *' app info '* ]] || return 1
-                saw_if=1
-                ;;
-            then) saw_then=$((saw_then + 1)) ;;
-            else) saw_else=$((saw_else + 1)) ;;
-            fi) saw_fi=$((saw_fi + 1)) ;;
-            *)
-                executable="$(fail2ban_action_executable "$line")"
-                case "$executable" in ufw|*/ufw|'<ufw>') ;; *) return 1 ;; esac
-                [[ " $line " == *' from <ip> '* ]] || return 1
-                ufw_commands=$((ufw_commands + 1))
-                ;;
-        esac
-    done <<< "$actionban"
-    [ "$saw_if" -eq 1 ] && [ "$saw_then" -eq 1 ] &&
-        [ "$saw_else" -eq 1 ] && [ "$saw_fi" -eq 1 ] &&
-        [ "$ufw_commands" -eq 2 ] || return 1
-    printf '%s\n' ufw
-}
-
 fail2ban_action_backend() {
     local action="$1" actionban="$2" line executable
 
+    # vpsbox 只写入 nftables-multiport；深度检测拒绝其他动作，避免测试封禁
+    # 意外触发邮件、外部命令或与受管配置不一致的防火墙后端。
     [[ "$actionban" == *'<ip>'* ]] || return 1
     case "$action" in
         nftables|nftables-multiport|nftables-allports)
@@ -6662,43 +6593,6 @@ fail2ban_action_backend() {
             case "$executable" in nft|*/nft|'<nft>'|'<nftables>') ;; *) return 1 ;; esac
             [[ " $line " == *' add element '* ]] || return 1
             printf '%s\n' nftables
-            ;;
-        iptables|iptables-multiport|iptables-allports)
-            fail2ban_simple_action_is_safe "$actionban" || return 1
-            line="$(fail2ban_single_action_line "$actionban")" || return 1
-            executable="$(fail2ban_action_executable "$line")"
-            case "$executable" in iptables|*/iptables|'<iptables>') ;; *) return 1 ;; esac
-            [[ " $line " == *' -I '* && " $line " == *' -s <ip> '* ]] || return 1
-            printf '%s\n' iptables
-            ;;
-        iptables-ipset|iptables-ipset-*)
-            fail2ban_ipset_action_backend "$actionban"
-            ;;
-        ipset)
-            fail2ban_ipset_action_backend "$actionban"
-            ;;
-        ufw)
-            fail2ban_ufw_action_backend "$actionban"
-            ;;
-        firewallcmd-new|firewallcmd-multiport|firewallcmd-allports|firewallcmd-ipset)
-            fail2ban_simple_action_is_safe "$actionban" || return 1
-            line="$(fail2ban_single_action_line "$actionban")" || return 1
-            executable="$(fail2ban_action_executable "$line")"
-            case "$executable" in
-                firewall-cmd|*/firewall-cmd|'<firewall-cmd>')
-                    if [[ " $line " == *' --direct --add-rule '* && " $line " == *' -s <ip> '* ]] ||
-                        [[ " $line " == *' --add-entry=<ip> '* ]]; then
-                        printf '%s\n' firewalld
-                    else
-                        return 1
-                    fi
-                    ;;
-                ipset|*/ipset|'<ipset>')
-                    [[ " $line " == *' add '* ]] || return 1
-                    printf '%s\n' ipset
-                    ;;
-                *) return 1 ;;
-            esac
             ;;
         *) return 1 ;;
     esac
@@ -6790,33 +6684,12 @@ ensure_fail2ban_nftables_dependency() {
 }
 
 fail2ban_backend_dump() {
-    local backend="$1" ipsets ipset_name
+    local backend="$1"
 
     case "$backend" in
         nftables)
             command -v nft >/dev/null 2>&1 || return 1
             nft list ruleset 2>/dev/null
-            ;;
-        iptables)
-            command -v iptables-save >/dev/null 2>&1 || return 1
-            iptables-save 2>/dev/null
-            ;;
-        ipset)
-            command -v ipset >/dev/null 2>&1 || return 1
-            ipset save 2>/dev/null
-            ;;
-        ufw)
-            command -v ufw >/dev/null 2>&1 || return 1
-            ufw show raw 2>/dev/null
-            ;;
-        firewalld)
-            command -v firewall-cmd >/dev/null 2>&1 || return 1
-            firewall-cmd --direct --get-all-rules 2>/dev/null || return 1
-            firewall-cmd --list-all-zones 2>/dev/null || return 1
-            ipsets="$(firewall-cmd --get-ipsets 2>/dev/null)" || return 1
-            for ipset_name in $ipsets; do
-                firewall-cmd --ipset="$ipset_name" --get-entries 2>/dev/null || return 1
-            done
             ;;
         *) return 1 ;;
     esac

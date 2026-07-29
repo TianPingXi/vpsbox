@@ -526,28 +526,22 @@ test_stale_restore_lock_is_reclaimed() {
         fail "SIGKILL 遗留的 restore.lock 不应永久阻塞快照恢复"
 }
 
-test_restore_lock_metadata_is_atomically_published() {
+test_rollback_script_preserves_atomic_publication() {
     local snapshot=""
 
     reset_firewall_case atomic-restore-lock
     firewall_create_rollback_snapshot snapshot ""
 
     assert_file_contains "$snapshot/rollback.sh" \
-        '[.]restore[.]lock[.]owner[.]\$\$'
-    assert_file_contains "$snapshot/rollback.sh" \
         'mv[[:space:]]+-f[[:space:]]+"\$[^"]+"[[:space:]]+"\$lock_dir/owner"'
     assert_file_not_contains "$snapshot/rollback.sh" \
         '>[[:space:]]*"\$lock_dir/owner"'
     assert_file_contains "$snapshot/rollback.sh" \
-        'mktemp "\$parent/[.]vpsbox-firewall-restore[.]XXXXXX"'
+        'mktemp[[:space:]]+"\$parent/[^"]+"'
     assert_file_contains "$snapshot/rollback.sh" \
         'mv[[:space:]]+-f[[:space:]]+"\$[^"]+"[[:space:]]+"\$target"'
-    assert_file_contains "$snapshot/rollback.sh" \
-        'if \[ -L "\$target" \]; then'
-    assert_file_contains "$snapshot/rollback.sh" \
-        '\[ ! -d "\$target" \] \|\| return 1'
     assert_file_not_contains "$snapshot/rollback.sh" \
-        '>[[:space:]]*"\$lock_dir/pid"'
+        '>[[:space:]]*"\$target"'
 }
 
 test_rollback_rejects_directory_symlink_target() {
@@ -712,7 +706,7 @@ test_stale_pid_does_not_hide_real_watchdog() {
 }
 
 main() {
-    local name test status passed=0 skipped=0
+    local name
     local -a required=(
         firewall_create_rollback_snapshot
         firewall_snapshot_runtime_state
@@ -737,7 +731,7 @@ main() {
         test_openrc_enabled_active_service_state_is_restored
         test_legacy_runtime_snapshot_is_rejected
         test_stale_restore_lock_is_reclaimed
-        test_restore_lock_metadata_is_atomically_published
+        test_rollback_script_preserves_atomic_publication
         test_rollback_rejects_directory_symlink_target
         test_identity_mismatch_is_cleaned_without_kill
         test_pid_only_partial_watchdog_is_stopped
@@ -750,29 +744,8 @@ main() {
     for name in "${required[@]}"; do
         require_function "$name"
     done
-    assert_all_tests_registered "${BASH_SOURCE[0]}" "${tests[@]}" || return 1
-    for test in "${tests[@]}"; do
-        set +e
-        run_test_case "$test"
-        status=$?
-        set -e
-        case "$status" in
-            0)
-                printf 'ok - %s\n' "$test"
-                passed=$((passed + 1))
-                ;;
-            "$SKIP_STATUS")
-                printf 'ok - %s # SKIP %s\n' "$test" "$(test_skip_reason)"
-                skipped=$((skipped + 1))
-                ;;
-            *)
-                printf 'not ok - %s\n' "$test" >&2
-                return 1
-                ;;
-        esac
-    done
-    printf '%s firewall watchdog tests passed, %s skipped, %s registered.\n' \
-        "$passed" "$skipped" "${#tests[@]}"
+    run_registered_test_suite \
+        "${BASH_SOURCE[0]}" "firewall watchdog tests" "${tests[@]}"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

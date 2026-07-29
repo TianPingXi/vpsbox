@@ -1695,7 +1695,9 @@ test_ntp_restore_accepts_complete_current_metadata() {
     )
 }
 
-test_ntp_restore_requires_complete_current_metadata() {
+assert_ntp_restore_rejects_metadata() {
+    local mode="$1" failure_message="$2"
+
     (
         forbid_init
         detect_os() {
@@ -1705,106 +1707,85 @@ test_ntp_restore_requires_complete_current_metadata() {
         is_systemd() { return 0; }
         chrony_service_name() { printf '%s\n' chrony; }
         manifest_value() {
+            if [ "$mode" = "missing" ] && [ "$1" = "BACKUP_NTP_CONF" ]; then
+                return 1
+            fi
+            if [ "$mode" = "invalid" ] && [ "$1" = "NTP_CHRONY_ACTIVE" ]; then
+                printf '%s\n' damaged
+                return 0
+            fi
             case "$1" in
-                BACKUP_NTP_CONF) return 1 ;;
-                BACKUP_NTP_SOURCES) printf '%s\n' absent ;;
+                BACKUP_NTP_CONF|BACKUP_NTP_SOURCES) printf '%s\n' absent ;;
                 NTP_CHRONY_PACKAGE|NTP_TIMESYNCD_PACKAGE) printf '%s\n' installed ;;
                 NTP_CHRONY_UNIT|NTP_TIMESYNCD_UNIT) printf '%s\n' present ;;
                 NTP_CHRONY_ENABLED|NTP_TIMESYNCD_ENABLED) printf '%s\n' enabled ;;
-                NTP_CHRONY_ACTIVE|NTP_TIMESYNCD_ACTIVE) printf '%s\n' active ;;
-                *) return 1 ;;
-            esac
-        }
-        systemctl() { forbid "NTP 恢复元数据不完整时不得修改服务"; }
-        restore_ntp_packages_to_state() { forbid "NTP 恢复元数据不完整时不得修改软件包"; }
-        restore_change_file() { forbid "NTP 恢复元数据不完整时不得恢复文件"; }
-
-        if restore_recorded_ntp_change >/dev/null 2>&1; then
-            fail "缺少当前格式的 NTP 文件备份状态时恢复必须失败"
-        fi
-        assert_no_forbidden "NTP 元数据校验必须发生在任何恢复副作用之前"
-    )
-}
-
-test_ntp_restore_rejects_invalid_current_metadata() {
-    (
-        forbid_init
-        detect_os() {
-            # shellcheck disable=SC2034 # 被测恢复函数动态读取。
-            OS=debian
-        }
-        is_systemd() { return 0; }
-        chrony_service_name() { printf '%s\n' chrony; }
-        manifest_value() {
-            case "$1" in
-                BACKUP_NTP_CONF|BACKUP_NTP_SOURCES) printf '%s\n' absent ;;
-                NTP_CHRONY_PACKAGE|NTP_TIMESYNCD_PACKAGE) printf '%s\n' absent ;;
-                NTP_CHRONY_UNIT|NTP_TIMESYNCD_UNIT) printf '%s\n' absent ;;
-                NTP_CHRONY_ENABLED|NTP_TIMESYNCD_ENABLED) printf '%s\n' enabled ;;
-                NTP_CHRONY_ACTIVE) printf '%s\n' damaged ;;
+                NTP_CHRONY_ACTIVE) printf '%s\n' active ;;
                 NTP_TIMESYNCD_ACTIVE) printf '%s\n' inactive ;;
                 *) return 1 ;;
             esac
         }
-        systemctl() { forbid "NTP 恢复枚举值非法时不得修改服务"; }
-        restore_ntp_packages_to_state() { forbid "NTP 恢复枚举值非法时不得修改软件包"; }
-        restore_change_file() { forbid "NTP 恢复枚举值非法时不得恢复文件"; }
+        systemctl() { forbid "NTP 元数据异常时不得修改服务"; }
+        restore_ntp_packages_to_state() { forbid "NTP 元数据异常时不得修改软件包"; }
+        restore_change_file() { forbid "NTP 元数据异常时不得恢复文件"; }
 
         if restore_recorded_ntp_change >/dev/null 2>&1; then
-            fail "NTP 恢复记录包含非法枚举值时必须失败"
+            fail "$failure_message"
         fi
-        assert_no_forbidden "NTP 非法枚举值校验必须发生在任何恢复副作用之前"
+        assert_no_forbidden "NTP 元数据校验必须先于任何恢复副作用"
+    )
+}
+
+test_ntp_restore_requires_complete_current_metadata() {
+    assert_ntp_restore_rejects_metadata missing \
+        "缺少当前格式的 NTP 文件备份状态时恢复必须失败"
+}
+
+test_ntp_restore_rejects_invalid_current_metadata() {
+    assert_ntp_restore_rejects_metadata invalid \
+        "NTP 恢复记录包含非法枚举值时必须失败"
+}
+
+assert_fail2ban_restore_rejects_metadata() {
+    local mode="$1" failure_message="$2"
+
+    (
+        forbid_init
+        # shellcheck disable=SC2034 # 被测恢复函数动态读取。
+        OS=debian
+        manifest_value() {
+            case "$1" in
+                FAIL2BAN_ACTIVE) printf '%s\n' active ;;
+                FAIL2BAN_ENABLED)
+                    case "$mode" in
+                        missing) return 1 ;;
+                        invalid) printf '%s\n' damaged ;;
+                        *) return 1 ;;
+                    esac
+                    ;;
+                *) return 1 ;;
+            esac
+        }
+        restore_change_file() { forbid "Fail2ban 元数据异常时不得恢复配置"; }
+        fail2ban_installed() { return 0; }
+        is_systemd() { return 0; }
+        resolv_conf_managed_by_systemd_resolved() { return 1; }
+        systemctl() { forbid "Fail2ban 元数据异常时不得修改服务"; }
+
+        if restore_fail2ban_system_change >/dev/null 2>&1; then
+            fail "$failure_message"
+        fi
+        assert_no_forbidden "Fail2ban 元数据校验必须先于配置和服务恢复"
     )
 }
 
 test_fail2ban_restore_requires_complete_service_metadata() {
-    (
-        forbid_init
-        # shellcheck disable=SC2034 # 被测恢复函数动态读取。
-        OS=debian
-        manifest_value() {
-            case "$1" in
-                FAIL2BAN_ACTIVE) printf '%s\n' active ;;
-                FAIL2BAN_ENABLED) return 1 ;;
-                *) return 1 ;;
-            esac
-        }
-        restore_change_file() { forbid "Fail2ban 恢复元数据不完整时不得恢复配置"; }
-        fail2ban_installed() { return 0; }
-        is_systemd() { return 0; }
-        resolv_conf_managed_by_systemd_resolved() { return 1; }
-        systemctl() { forbid "Fail2ban 恢复元数据不完整时不得修改服务"; }
-
-        if restore_fail2ban_system_change >/dev/null 2>&1; then
-            fail "缺少当前格式的 Fail2ban 服务状态时恢复必须失败"
-        fi
-        assert_no_forbidden "Fail2ban 元数据校验必须发生在配置和服务恢复之前"
-    )
+    assert_fail2ban_restore_rejects_metadata missing \
+        "缺少当前格式的 Fail2ban 服务状态时恢复必须失败"
 }
 
 test_fail2ban_restore_rejects_invalid_service_metadata() {
-    (
-        forbid_init
-        # shellcheck disable=SC2034 # 被测恢复函数动态读取。
-        OS=debian
-        manifest_value() {
-            case "$1" in
-                FAIL2BAN_ACTIVE) printf '%s\n' active ;;
-                FAIL2BAN_ENABLED) printf '%s\n' damaged ;;
-                *) return 1 ;;
-            esac
-        }
-        restore_change_file() { forbid "Fail2ban 恢复枚举值非法时不得恢复配置"; }
-        fail2ban_installed() { return 0; }
-        is_systemd() { return 0; }
-        resolv_conf_managed_by_systemd_resolved() { return 1; }
-        systemctl() { forbid "Fail2ban 恢复枚举值非法时不得修改服务"; }
-
-        if restore_fail2ban_system_change >/dev/null 2>&1; then
-            fail "Fail2ban 恢复记录包含非法枚举值时必须失败"
-        fi
-        assert_no_forbidden "Fail2ban 非法枚举值校验必须发生在配置和服务恢复之前"
-    )
+    assert_fail2ban_restore_rejects_metadata invalid \
+        "Fail2ban 恢复记录包含非法枚举值时必须失败"
 }
 
 test_fail2ban_restore_accepts_complete_service_metadata() {
@@ -1986,7 +1967,7 @@ test_uninstall_restore_failure_aborts_offer() {
 }
 
 main() {
-    local name test status passed=0 skipped=0
+    local name
     local -a required=(
         cancel_unmodified_change_transaction
         change_restore_state
@@ -2089,29 +2070,8 @@ main() {
     for name in "${required[@]}"; do
         require_function "$name"
     done
-    assert_all_tests_registered "${BASH_SOURCE[0]}" "${tests[@]}" || return 1
-    for test in "${tests[@]}"; do
-        set +e
-        run_test_case "$test"
-        status=$?
-        set -e
-        case "$status" in
-            0)
-                printf 'ok - %s\n' "$test"
-                passed=$((passed + 1))
-                ;;
-            "$SKIP_STATUS")
-                printf 'ok - %s # SKIP %s\n' "$test" "$(test_skip_reason)"
-                skipped=$((skipped + 1))
-                ;;
-            *)
-                printf 'not ok - %s\n' "$test" >&2
-                return 1
-                ;;
-        esac
-    done
-    printf '%s system regression tests passed, %s skipped, %s registered.\n' \
-        "$passed" "$skipped" "${#tests[@]}"
+    run_registered_test_suite \
+        "${BASH_SOURCE[0]}" "system regression tests" "${tests[@]}"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

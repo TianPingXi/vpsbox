@@ -225,6 +225,57 @@ run_test_case() {
     return "$status"
 }
 
+run_test_suite() {
+    local summary="$1" test status probe_status passed=0 skipped=0
+    # set +/-e 属于调用方状态；统一 runner 返回时必须恢复原选项。
+    local -
+    shift
+
+    # Bash 会让 if/!/&&/|| 条件中的整个函数调用链忽略 errexit，连内部显式
+    # set -e 也不生效。用一个无副作用探针识别这种上下文，避免用例假绿。
+    set +e
+    (
+        trap - ERR
+        set -e
+        builtin false
+        exit 0
+    )
+    probe_status=$?
+    set -e
+    if [ "$probe_status" -eq 0 ]; then
+        fail "统一测试 runner 不能在 if、!、&& 或 || 条件上下文中调用"
+        return 2
+    fi
+
+    [ "$#" -gt 0 ] || {
+        fail "测试套件未登记任何用例：$summary"
+        return 1
+    }
+    for test in "$@"; do
+        # 必须保持独立调用；放在 if/&&/|| 中会让 Bash 忽略用例子 shell 的 errexit。
+        set +e
+        run_test_case "$test"
+        status=$?
+        set -e
+        case "$status" in
+            0)
+                printf 'ok - %s\n' "$test"
+                passed=$((passed + 1))
+                ;;
+            "$SKIP_STATUS")
+                printf 'ok - %s # SKIP %s\n' "$test" "$(test_skip_reason)"
+                skipped=$((skipped + 1))
+                ;;
+            *)
+                printf 'not ok - %s\n' "$test" >&2
+                return 1
+                ;;
+        esac
+    done
+    printf '%s %s passed, %s skipped, %s registered.\n' \
+        "$passed" "$summary" "$skipped" "$#"
+}
+
 assert_all_tests_registered() {
     local file="$1"
     local definitions registered
@@ -296,4 +347,12 @@ assert_all_tests_registered() {
         fail "存在已登记但未定义的测试：$extra"
         return 1
     }
+}
+
+run_registered_test_suite() {
+    local file="$1" summary="$2"
+    shift 2
+
+    assert_all_tests_registered "$file" "$@" || return 1
+    run_test_suite "$summary" "$@"
 }
