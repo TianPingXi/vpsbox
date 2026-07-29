@@ -2602,6 +2602,18 @@ node_file_is_secure() {
     [ "$owner" = "0" ] && [ "$group" = "0" ] && [ "$mode" = "600" ]
 }
 
+node_uri_file_is_safe() {
+    local file="$1" owner group mode
+
+    [ -f "$file" ] && [ ! -L "$file" ] || return 1
+    owner="$(stat -c '%u' "$file" 2>/dev/null)" || return 1
+    group="$(stat -c '%g' "$file" 2>/dev/null)" || return 1
+    mode="$(stat -c '%a' "$file" 2>/dev/null)" || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    [ "$owner" = "0" ] && [ "$group" = "0" ] &&
+        [ $((8#$mode & 8#077)) -eq 0 ]
+}
+
 node_dir_is_secure() {
     local dir="$1"
     local owner group mode
@@ -2764,22 +2776,20 @@ node_uri_matches_loaded_state() {
     local uri="$1"
     local expected
 
-    [ -e "$uri" ] || return 0
+    [ -f "$uri" ] && [ ! -L "$uri" ] || return 1
     node_file_is_secure "$uri" || return 1
     expected="$(generate_link_from_loaded_state)" || return 1
     [ "$(wc -l < "$uri")" -eq 1 ] && [ "$(cat "$uri")" = "$expected" ]
 }
 
-validate_protocol_node_artifacts() {
+validate_protocol_node_core() {
     local protocol="$1"
     local config="${2:-}"
     local state="${3:-}"
-    local uri="${4:-}"
     local expected
 
     [ -n "$config" ] || config="$(node_config_path "$protocol")" || return 2
     [ -n "$state" ] || state="$(node_state_path "$protocol")" || return 2
-    [ -n "$uri" ] || uri="$(node_uri_path "$protocol")" || return 2
     case "$protocol" in
         ss) expected=shadowsocks ;;
         vless) expected=vless-reality ;;
@@ -2787,7 +2797,19 @@ validate_protocol_node_artifacts() {
     esac
     node_file_is_secure "$state" || return 1
     load_state_file "$state" "$expected" || return 1
-    node_config_matches_loaded_state "$protocol" "$config" || return 1
+    node_config_matches_loaded_state "$protocol" "$config"
+}
+
+validate_protocol_node_artifacts() {
+    local protocol="$1"
+    local config="${2:-}"
+    local state="${3:-}"
+    local uri="${4:-}"
+
+    [ -n "$config" ] || config="$(node_config_path "$protocol")" || return 2
+    [ -n "$state" ] || state="$(node_state_path "$protocol")" || return 2
+    [ -n "$uri" ] || uri="$(node_uri_path "$protocol")" || return 2
+    validate_protocol_node_core "$protocol" "$config" "$state" || return 1
     node_uri_matches_loaded_state "$uri"
 }
 
@@ -2802,7 +2824,7 @@ protocol_node_exists() {
     esac
     [ -f "$config" ] && [ ! -L "$config" ] &&
         [ -f "$state" ] && [ ! -L "$state" ] &&
-        validate_protocol_node_artifacts "$protocol" "$config" "$state" "$(node_uri_path "$protocol")" >/dev/null 2>&1
+        validate_protocol_node_core "$protocol" "$config" "$state" >/dev/null 2>&1
 }
 
 protocol_visible_exists() {
@@ -2826,13 +2848,20 @@ node_exists() {
     protocol_node_exists ss || protocol_node_exists vless
 }
 
-node_artifacts_present() {
-    [ -e "$URI_FILE" ] || [ -L "$URI_FILE" ] ||
-        [ -e "$NODE_CONFIG_DIR" ] || [ -L "$NODE_CONFIG_DIR" ] ||
+node_core_artifacts_present() {
+    [ -e "$NODE_CONFIG_DIR" ] || [ -L "$NODE_CONFIG_DIR" ] ||
         [ -e "$SS_STATE_FILE" ] || [ -L "$SS_STATE_FILE" ] ||
-        [ -e "$VLESS_STATE_FILE" ] || [ -L "$VLESS_STATE_FILE" ] ||
+        [ -e "$VLESS_STATE_FILE" ] || [ -L "$VLESS_STATE_FILE" ]
+}
+
+node_uri_artifacts_present() {
+    [ -e "$URI_FILE" ] || [ -L "$URI_FILE" ] ||
         [ -e "$SS_URI_FILE" ] || [ -L "$SS_URI_FILE" ] ||
         [ -e "$VLESS_URI_FILE" ] || [ -L "$VLESS_URI_FILE" ]
+}
+
+node_artifacts_present() {
+    node_core_artifacts_present || node_uri_artifacts_present
 }
 
 node_config_dir_contents_valid() {
@@ -2854,7 +2883,10 @@ node_config_dir_contents_valid() {
 aggregate_uri_matches_nodes() {
     local protocol expected="" link
 
-    [ -e "$URI_FILE" ] || return 0
+    node_exists || {
+        [ ! -e "$URI_FILE" ] && [ ! -L "$URI_FILE" ]
+        return
+    }
     node_file_is_secure "$URI_FILE" || return 1
     for protocol in ss vless; do
         protocol_node_exists "$protocol" || continue
@@ -2865,12 +2897,48 @@ aggregate_uri_matches_nodes() {
     [ -n "$expected" ] && [ "$(cat "$URI_FILE")" = "$expected" ]
 }
 
-require_valid_node_state_if_present() {
-    local has_core=0 protocol label config state uri
+node_uri_cache_paths_secure() {
     local path
 
-    for path in "$URI_FILE" "$NODE_CONFIG_DIR" "$SS_CONFIG_PATH" "$VLESS_CONFIG_PATH" \
-        "$SS_STATE_FILE" "$VLESS_STATE_FILE" "$SS_URI_FILE" "$VLESS_URI_FILE"; do
+    for path in "$URI_FILE" "$SS_URI_FILE" "$VLESS_URI_FILE"; do
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            node_uri_file_is_safe "$path" || return 1
+        fi
+    done
+}
+
+node_uri_cache_matches_nodes() {
+    local protocol uri
+
+    node_uri_cache_paths_secure || return 1
+    for protocol in ss vless; do
+        uri="$(node_uri_path "$protocol")" || return 1
+        if protocol_node_exists "$protocol"; then
+            load_protocol_state "$protocol" || return 1
+            node_uri_matches_loaded_state "$uri" || return 1
+        elif [ -e "$uri" ] || [ -L "$uri" ]; then
+            return 1
+        fi
+    done
+    aggregate_uri_matches_nodes
+}
+
+node_uri_cache_status() {
+    if ! node_uri_cache_paths_secure; then
+        printf '%s\n' unsafe
+    elif node_uri_cache_matches_nodes; then
+        printf '%s\n' current
+    else
+        printf '%s\n' stale
+    fi
+}
+
+require_valid_node_state_if_present() {
+    local protocol label config state
+    local path
+
+    for path in "$NODE_CONFIG_DIR" "$SS_CONFIG_PATH" "$VLESS_CONFIG_PATH" \
+        "$SS_STATE_FILE" "$VLESS_STATE_FILE"; do
         if [ -L "$path" ]; then
             err "检测到节点路径为符号链接，已拒绝继续：$path"
             return 1
@@ -2885,31 +2953,15 @@ require_valid_node_state_if_present() {
         label="$(node_protocol_display_name "$protocol")" || return 1
         config="$(node_config_path "$protocol")" || return 1
         state="$(node_state_path "$protocol")" || return 1
-        uri="$(node_uri_path "$protocol")" || return 1
         if [ -e "$config" ] || [ -e "$state" ]; then
             [ -f "$config" ] && [ -f "$state" ] &&
-                validate_protocol_node_artifacts "$protocol" "$config" "$state" "$uri" || {
+                validate_protocol_node_core "$protocol" "$config" "$state" || {
                 err "检测到 $label 节点配置残缺、不安全或内容无效。"
                 err "请检查 $config 与 $state。"
                 return 1
             }
-            has_core=1
-        fi
-        if [ -e "$uri" ] && ! protocol_node_exists "$protocol"; then
-            err "检测到没有对应节点状态的孤立链接文件：$uri"
-            return 1
         fi
     done
-
-    if [ "$has_core" -eq 0 ] &&
-        { [ -e "$URI_FILE" ] || [ -e "$SS_URI_FILE" ] || [ -e "$VLESS_URI_FILE" ]; }; then
-        err "检测到孤立的节点链接文件，已拒绝继续以免误判节点状态。"
-        return 1
-    fi
-    if [ "$has_core" -eq 1 ] && ! aggregate_uri_matches_nodes; then
-        err "检测到汇总节点链接与独立节点状态不一致：$URI_FILE"
-        return 1
-    fi
 }
 
 commit_node_state_file() {
@@ -3342,11 +3394,11 @@ publish_uri_file_group() {
         return 1
     }
     for dest in "$URI_FILE" "$SS_URI_FILE" "$VLESS_URI_FILE"; do
-        [ ! -L "$dest" ] || {
-            rm -rf -- "$rollback_dir" "$tmp_dir"
-            return 1
-        }
-        if [ -f "$dest" ]; then
+        if [ -e "$dest" ] || [ -L "$dest" ]; then
+            node_uri_file_is_safe "$dest" || {
+                rm -rf -- "$rollback_dir" "$tmp_dir"
+                return 1
+            }
             cp -a -- "$dest" "$rollback_dir/${dest##*/}" || {
                 rm -rf -- "$rollback_dir" "$tmp_dir"
                 return 1
@@ -3384,6 +3436,8 @@ publish_uri_file_group() {
 write_uri_files() {
     local build_dir
 
+    require_valid_node_state_if_present || return 1
+    node_uri_cache_paths_secure || return 1
     secure_config_dir || return 1
     build_dir="$(mktemp -d "$CONFIG_DIR/.vpsbox-uri-build.XXXXXX")" || return 1
     if ! build_current_uri_files "$build_dir" ||
@@ -3392,6 +3446,44 @@ write_uri_files() {
         return 1
     fi
     rm -rf -- "$build_dir"
+}
+
+repair_node_uri_cache() {
+    local status
+
+    require_valid_node_state_if_present || return 1
+    status="$(node_uri_cache_status)" || return 1
+    case "$status" in
+        current) return 0 ;;
+        unsafe) return 1 ;;
+        stale) ;;
+        *) return 1 ;;
+    esac
+    write_uri_files || return 1
+    [ "$(node_uri_cache_status)" = current ]
+}
+
+repair_node_uri_cache_best_effort() {
+    local context="${1:-节点操作}"
+    local status
+
+    repair_node_uri_cache && return 0
+    status="$(node_uri_cache_status 2>/dev/null || true)"
+    if [ "$status" = unsafe ]; then
+        warn "$context未自动修复节点链接缓存：检测到符号链接、非普通文件或不安全权限。"
+    else
+        warn "$context未能更新节点链接缓存；核心配置不受影响，可稍后运行一键检测。"
+    fi
+    return 0
+}
+
+repair_node_uri_cache_on_startup() {
+    node_core_artifacts_present || node_uri_artifacts_present || return 0
+    if node_core_artifacts_present && ! command -v jq >/dev/null 2>&1; then
+        return 0
+    fi
+    require_valid_node_state_if_present >/dev/null 2>&1 || return 0
+    repair_node_uri_cache_best_effort "启动恢复后"
 }
 
 backup_node_files() {
@@ -3406,8 +3498,9 @@ backup_node_files() {
     : > "$manifest" || return 1
     printf 'version|1\n' >> "$manifest" || return 1
 
-    backup_node_file_with_manifest "$URI_FILE" "$backup_dir/node-uri.txt" \
-        node-uri.txt "$manifest" || return 1
+    # URI 是可由配置与状态重建的派生缓存，不作为事务恢复的权威材料。
+    # 保留旧清单字段，兼容 v1.0.43 起已经落盘的 version|1 事务格式。
+    printf 'file|node-uri.txt|absent|-\n' >> "$manifest" || return 1
 
     if [ -d "$NODE_CONFIG_DIR" ] && [ ! -L "$NODE_CONFIG_DIR" ]; then
         cp -a "$NODE_CONFIG_DIR" "$backup_dir/vpsbox.d" || return 1
@@ -3430,10 +3523,8 @@ backup_node_files() {
         ss-state.env "$manifest" || return 1
     backup_node_file_with_manifest "$VLESS_STATE_FILE" "$backup_dir/vless-state.env" \
         vless-state.env "$manifest" || return 1
-    backup_node_file_with_manifest "$SS_URI_FILE" "$backup_dir/ss-uri.txt" \
-        ss-uri.txt "$manifest" || return 1
-    backup_node_file_with_manifest "$VLESS_URI_FILE" "$backup_dir/vless-uri.txt" \
-        vless-uri.txt "$manifest" || return 1
+    printf 'file|ss-uri.txt|absent|-\n' >> "$manifest" || return 1
+    printf 'file|vless-uri.txt|absent|-\n' >> "$manifest" || return 1
     backup_node_file_with_manifest /etc/systemd/system/sing-box.service \
         "$backup_dir/sing-box.service" sing-box.service "$manifest" || return 1
     backup_node_file_with_manifest /etc/init.d/sing-box \
@@ -3535,6 +3626,20 @@ validate_node_backup_file_entry() {
     esac
 }
 
+validate_derived_uri_manifest_entry() {
+    local manifest="$1" name="$2"
+    local line kind entry_name state digest
+
+    line="$(node_backup_manifest_entry "$manifest" "$name")" || return 1
+    IFS='|' read -r kind entry_name state digest <<< "$line"
+    [ "$kind" = "file" ] && [ "$entry_name" = "$name" ] || return 1
+    case "$state" in
+        present) [[ "$digest" =~ ^[0-9a-f]{64}$ ]] ;;
+        absent) [ "$digest" = "-" ] ;;
+        *) return 1 ;;
+    esac
+}
+
 node_backup_entry_is_present() {
     local manifest="$1" name="$2" line kind entry_name state digest
 
@@ -3554,7 +3659,7 @@ validate_node_transaction_backup() {
     local config_dir="$backup_dir/vpsbox.d"
     local ss_config="$config_dir/${SS_CONFIG_PATH##*/}"
     local vless_config="$config_dir/${VLESS_CONFIG_PATH##*/}"
-    local line kind name state digest expected="" link protocol path
+    local line kind name state digest path
     local config_dir_present=0 config_count=0 entry_status
     local -a entries=(
         node-uri.txt vpsbox.d "vpsbox.d/${SS_CONFIG_PATH##*/}"
@@ -3586,13 +3691,15 @@ validate_node_transaction_backup() {
         *) return 1 ;;
     esac
 
-    validate_node_backup_file_entry "$manifest" node-uri.txt "$backup_dir/node-uri.txt" || return 1
+    # v1.0.43 起的旧事务会保存 URI 快照。URI 已是派生缓存，旧快照只校验
+    # 清单结构，不再因文件丢失、权限或哈希损坏阻止核心配置恢复。
+    validate_derived_uri_manifest_entry "$manifest" node-uri.txt || return 1
     validate_node_backup_file_entry "$manifest" "vpsbox.d/${SS_CONFIG_PATH##*/}" "$ss_config" || return 1
     validate_node_backup_file_entry "$manifest" "vpsbox.d/${VLESS_CONFIG_PATH##*/}" "$vless_config" || return 1
     validate_node_backup_file_entry "$manifest" ss-state.env "$backup_dir/ss-state.env" || return 1
     validate_node_backup_file_entry "$manifest" vless-state.env "$backup_dir/vless-state.env" || return 1
-    validate_node_backup_file_entry "$manifest" ss-uri.txt "$backup_dir/ss-uri.txt" || return 1
-    validate_node_backup_file_entry "$manifest" vless-uri.txt "$backup_dir/vless-uri.txt" || return 1
+    validate_derived_uri_manifest_entry "$manifest" ss-uri.txt || return 1
+    validate_derived_uri_manifest_entry "$manifest" vless-uri.txt || return 1
     validate_node_backup_file_entry "$manifest" sing-box.service "$backup_dir/sing-box.service" || return 1
     validate_node_backup_file_entry "$manifest" openrc-sing-box "$backup_dir/openrc-sing-box" || return 1
     validate_node_backup_file_entry "$manifest" service-running "$backup_dir/service-running" || return 1
@@ -3603,8 +3710,7 @@ validate_node_transaction_backup() {
 
     if node_backup_entry_is_present "$manifest" "vpsbox.d/${SS_CONFIG_PATH##*/}"; then
         node_backup_entry_is_present "$manifest" ss-state.env || return 1
-        validate_protocol_node_artifacts ss "$ss_config" "$backup_dir/ss-state.env" \
-            "$backup_dir/ss-uri.txt" || return 1
+        validate_protocol_node_core ss "$ss_config" "$backup_dir/ss-state.env" || return 1
         config_count=$((config_count + 1))
     else
         entry_status=$?
@@ -3618,8 +3724,7 @@ validate_node_transaction_backup() {
     fi
     if node_backup_entry_is_present "$manifest" "vpsbox.d/${VLESS_CONFIG_PATH##*/}"; then
         node_backup_entry_is_present "$manifest" vless-state.env || return 1
-        validate_protocol_node_artifacts vless "$vless_config" "$backup_dir/vless-state.env" \
-            "$backup_dir/vless-uri.txt" || return 1
+        validate_protocol_node_core vless "$vless_config" "$backup_dir/vless-state.env" || return 1
         config_count=$((config_count + 1))
     else
         entry_status=$?
@@ -3642,39 +3747,6 @@ validate_node_transaction_backup() {
         done < <(find "$config_dir" -mindepth 1 -maxdepth 1 -print 2>/dev/null)
     elif [ "$config_dir_present" -eq 1 ]; then
         [ -z "$(find "$config_dir" -mindepth 1 -maxdepth 1 -print 2>/dev/null)" ] || return 1
-    fi
-
-    if node_backup_entry_is_present "$manifest" node-uri.txt; then
-        for protocol in ss vless; do
-            case "$protocol" in
-                ss)
-                    if node_backup_entry_is_present "$manifest" ss-state.env; then
-                        :
-                    else
-                        entry_status=$?
-                        [ "$entry_status" -eq 1 ] || return 1
-                        continue
-                    fi
-                    load_state_file "$backup_dir/ss-state.env" shadowsocks || return 1
-                    ;;
-                vless)
-                    if node_backup_entry_is_present "$manifest" vless-state.env; then
-                        :
-                    else
-                        entry_status=$?
-                        [ "$entry_status" -eq 1 ] || return 1
-                        continue
-                    fi
-                    load_state_file "$backup_dir/vless-state.env" vless-reality || return 1
-                    ;;
-            esac
-            link="$(generate_link_from_loaded_state)" || return 1
-            [ -n "$expected" ] && expected="${expected}"$'\n'
-            expected="${expected}${link}"
-        done
-        [ -n "$expected" ] && [ "$(cat "$backup_dir/node-uri.txt")" = "$expected" ] || return 1
-    else
-        [ "$?" -eq 1 ] || return 1
     fi
 }
 
@@ -3895,11 +3967,8 @@ restore_node_files() {
         return 1
     }
     restore_node_config_dir_from_backup "$backup_dir" || failed=1
-    restore_node_file_from_backup "$backup_dir" node-uri.txt "$backup_dir/node-uri.txt" "$URI_FILE" || failed=1
     restore_node_file_from_backup "$backup_dir" ss-state.env "$backup_dir/ss-state.env" "$SS_STATE_FILE" || failed=1
     restore_node_file_from_backup "$backup_dir" vless-state.env "$backup_dir/vless-state.env" "$VLESS_STATE_FILE" || failed=1
-    restore_node_file_from_backup "$backup_dir" ss-uri.txt "$backup_dir/ss-uri.txt" "$SS_URI_FILE" || failed=1
-    restore_node_file_from_backup "$backup_dir" vless-uri.txt "$backup_dir/vless-uri.txt" "$VLESS_URI_FILE" || failed=1
 
     # 文件未完整恢复前保持服务停止，避免用混合的新旧配置重新拉起 sing-box。
     if [ "$failed" -ne 0 ]; then
@@ -3929,6 +3998,9 @@ restore_node_files() {
         err "操作前的节点配置恢复不完整，备份已保留：$backup_dir"
         return 1
     fi
+    # v1.0.43 起的旧事务可能仍含 URI 快照；URI 现已按派生缓存处理，
+    # 恢复只信任配置和状态，随后安全重建，失败不会掩盖核心恢复结果。
+    repair_node_uri_cache_best_effort "节点事务恢复后"
     info "已恢复到创建前状态。"
 }
 
@@ -4607,17 +4679,48 @@ build_staged_uri_files() {
     secure_uri_build_files "$uri_dir"
 }
 
+validate_staged_uri_group() {
+    local target_protocol="$1"
+    local protocol config state uri final_path aggregate link expected=""
+
+    case "$target_protocol" in
+        ss|vless) ;;
+        *) return 2 ;;
+    esac
+    for protocol in ss vless; do
+        final_path="$(node_config_path "$protocol")" || return 1
+        config="$NODE_TRANSACTION_STAGE/configs/${final_path##*/}"
+        final_path="$(node_state_path "$protocol")" || return 1
+        if [ "$protocol" = "$target_protocol" ]; then
+            state="$NODE_TRANSACTION_STAGE/states/${final_path##*/}"
+        else
+            state="$final_path"
+        fi
+        final_path="$(node_uri_path "$protocol")" || return 1
+        uri="$NODE_TRANSACTION_STAGE/uris/${final_path##*/}"
+
+        if [ "$protocol" != "$target_protocol" ] &&
+            [ ! -e "$config" ] && [ ! -L "$config" ] &&
+            [ ! -e "$state" ] && [ ! -L "$state" ] &&
+            [ ! -e "$uri" ] && [ ! -L "$uri" ]; then
+            continue
+        fi
+        validate_protocol_node_artifacts \
+            "$protocol" "$config" "$state" "$uri" || return 1
+        link="$(cat "$uri")" || return 1
+        [ -n "$expected" ] && expected="${expected}"$'\n'
+        expected="${expected}${link}"
+    done
+
+    aggregate="$NODE_TRANSACTION_STAGE/uris/${URI_FILE##*/}"
+    node_file_is_secure "$aggregate" || return 1
+    [ -n "$expected" ] && [ "$(cat "$aggregate")" = "$expected" ]
+}
+
 validate_staged_node() {
     local protocol="$1"
-    local config state uri final_path
 
-    final_path="$(node_config_path "$protocol")" || return 1
-    config="$NODE_TRANSACTION_STAGE/configs/${final_path##*/}"
-    final_path="$(node_state_path "$protocol")" || return 1
-    state="$NODE_TRANSACTION_STAGE/states/${final_path##*/}"
-    final_path="$(node_uri_path "$protocol")" || return 1
-    uri="$NODE_TRANSACTION_STAGE/uris/${final_path##*/}"
-    validate_protocol_node_artifacts "$protocol" "$config" "$state" "$uri" || return 1
+    validate_staged_uri_group "$protocol" || return 1
     sing-box check -C "$NODE_TRANSACTION_STAGE/configs" >/dev/null
 }
 
@@ -5073,11 +5176,11 @@ EOF
     fi
     if [ "$reality_check_deferred" -eq 1 ]; then
         info "正在检查 Reality 目标的 DNS 与 TLS 443 可达性..."
-    fi
-    if ! check_reality_server "$server_name"; then
-        rollback_node_files_transaction || true
-        err "目标域名无法解析或 TLS 443 不可达，未创建 VLESS Reality 节点。"
-        return 1
+        if ! check_reality_server "$server_name"; then
+            rollback_node_files_transaction || true
+            err "目标域名无法解析或 TLS 443 不可达，未创建 VLESS Reality 节点。"
+            return 1
+        fi
     fi
     uuid="$(sing-box generate uuid 2>/dev/null | tr -d '\r\n')"
     if [[ ! "$uuid" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
@@ -5157,15 +5260,11 @@ EOF
 view_node_link() {
     local protocol label uri displayed=0
 
-    if node_artifacts_present; then
+    if node_core_artifacts_present; then
         require_node_commands "查看节点链接" jq || return 1
     fi
     require_valid_node_state_if_present || return 1
     node_exists || { warn "当前没有已创建的节点。"; return 0; }
-    write_uri_files || {
-        err "节点链接生成或写入失败。"
-        return 1
-    }
 
     for protocol in vless ss; do
         protocol_visible_exists "$protocol" || continue
@@ -5211,7 +5310,7 @@ EOF
 }
 
 delete_node_protocol() {
-    local protocol="$1" label config state uri node_port node_protocols
+    local protocol="$1" label config state node_port node_protocols
     local confirm port_status transaction_validation="full" singbox_available=1
     local firewall_drop_udp=""
 
@@ -5220,7 +5319,7 @@ delete_node_protocol() {
         ss) label="Shadowsocks"; node_protocols=both ;;
         *) return 2 ;;
     esac
-    if node_artifacts_present; then
+    if node_core_artifacts_present; then
         if command -v sing-box >/dev/null 2>&1; then
             require_node_commands "删除节点" jq ss sha256sum || return 1
         else
@@ -5296,15 +5395,11 @@ delete_node_protocol() {
 
     config="$(node_config_path "$protocol")" || return 1
     state="$(node_state_path "$protocol")" || return 1
-    uri="$(node_uri_path "$protocol")" || return 1
-    rm -f -- "$config" "$state" "$uri" || {
+    rm -f -- "$config" "$state" || {
         fail_after_node_rollback "$label 节点文件删除失败" "删除前" || true
         return 1
     }
-    write_uri_files || {
-        fail_after_node_rollback "剩余节点链接更新失败" "删除前" || true
-        return 1
-    }
+    repair_node_uri_cache_best_effort "删除节点后"
 
     if node_exists; then
         if [ "$singbox_available" -eq 1 ]; then
@@ -5866,12 +5961,13 @@ update_singbox() {
         info "请先用原安装方式更新或卸载，再由 vpsbox 安装受管版本。"
         return 1
     fi
-    if node_artifacts_present; then
+    if node_core_artifacts_present; then
         ensure_node_dependencies || return 1
         require_valid_node_state_if_present || {
             err "节点配置完整性未通过，已拒绝更新 sing-box。"
             return 1
         }
+        repair_node_uri_cache_best_effort "更新 sing-box 前"
         node_exists && check_node_config_set || {
             err "节点配置未通过当前 sing-box 检查，已拒绝更新。"
             return 1
@@ -13771,7 +13867,7 @@ run_self_check() {
     local node_integrity_failed="0"
     local max_use
     local max_file
-    local state node_protocols protocol label ips detail ports_report
+    local state node_protocols protocol label ips detail ports_report uri_cache_state
     local install_metadata installed_version installed_at
     local bbr_config_expected=0 ipv4_priority_expected=0 ssh_hardening_expected=0
     local singbox_available=0
@@ -13814,7 +13910,7 @@ EOF
         check_info "首次安装" "历史未记录"
     fi
 
-    if node_artifacts_present; then
+    if node_core_artifacts_present; then
         has_node_artifacts="1"
         if ! require_valid_node_state_if_present >/dev/null 2>&1; then
             node_integrity_failed="1"
@@ -13879,12 +13975,14 @@ EOF
         fi
     fi
 
-    if [ "$has_node" = "1" ] && [ "$node_integrity_failed" != "1" ]; then
-        if [ -s "$URI_FILE" ]; then
-            check_ok "节点链接" "$URI_FILE"
-        else
-            check_fail "节点链接" "未生成"
-        fi
+    if [ "$has_node" = "1" ] || node_uri_artifacts_present; then
+        uri_cache_state="$(node_uri_cache_status 2>/dev/null || true)"
+        case "$uri_cache_state" in
+            current) check_ok "节点链接" "$URI_FILE" ;;
+            stale) check_warn "节点链接" "缺失或已过期" ;;
+            unsafe) check_fail "节点链接" "文件不安全，已拒绝自动覆盖" ;;
+            *) check_warn "节点链接" "状态无法确认" ;;
+        esac
     fi
 
     local ip
@@ -14680,7 +14778,7 @@ verify_current_node_runtime() {
 }
 
 start_service_action() {
-    if ! node_artifacts_present && ! node_exists; then
+    if ! node_core_artifacts_present && ! node_exists; then
         warn "当前没有节点配置，请先创建节点。"
         return 0
     fi
@@ -14690,6 +14788,7 @@ start_service_action() {
         warn "当前没有节点配置，请先创建节点。"
         return 0
     fi
+    repair_node_uri_cache_best_effort "启动 sing-box 前"
 
     if service_is_running &&
         verify_current_node_runtime &&
@@ -14722,7 +14821,7 @@ start_service_action() {
 }
 
 restart_service_action() {
-    if ! node_artifacts_present && ! node_exists; then
+    if ! node_core_artifacts_present && ! node_exists; then
         warn "当前没有节点配置，请先创建节点。"
         return 0
     fi
@@ -14732,6 +14831,7 @@ restart_service_action() {
         warn "当前没有节点配置，请先创建节点。"
         return 0
     fi
+    repair_node_uri_cache_best_effort "重启 sing-box 前"
     install_singbox_if_missing || return 1
     setup_service || return 1
     restart_singbox_cleanly || return 1
@@ -14804,7 +14904,7 @@ node_address() {
 node_summary() {
     local protocol label
 
-    if node_artifacts_present &&
+    if node_core_artifacts_present &&
         ! require_valid_node_state_if_present >/dev/null 2>&1; then
         printf '%s\n 节点状态：异常，请进入节点管理检查\n' '----------------------------------------'
         return 0
@@ -15302,6 +15402,7 @@ vpsbox_main() {
         err "节点事务未能恢复，已停止启动 vpsbox，避免覆盖现有节点。"
         return 1
     }
+    repair_node_uri_cache_on_startup
     install_self_command
     if [ -z "${PENDING_VPSBOX_UPDATE_BACKUP:-}${PENDING_VPSBOX_UPDATE_READY_FILE:-}" ]; then
         check_vpsbox_update_on_start

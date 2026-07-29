@@ -385,16 +385,127 @@ test_service_definition_uses_independent_config_directory() {
     )
 }
 
-test_orphan_protocol_uri_is_rejected() {
+test_uri_cache_is_derived_from_core_state() {
     (
-        set_node_paths "$TEST_TMP/orphan-uri"
+        set_node_paths "$TEST_TMP/derived-uri"
         mkdir -p "$NODE_CONFIG_DIR"
-        printf 'stale\n' > "$SS_URI_FILE"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_uri_files
+        printf 'stale-protocol\n' > "$SS_URI_FILE"
+        printf 'stale-aggregate\n' > "$URI_FILE"
+        chmod 600 "$SS_URI_FILE" "$URI_FILE"
 
-        if require_valid_node_state_if_present > "$TEST_TMP/orphan-uri.out" 2>&1; then
-            fail "没有 Shadowsocks 配置和状态时不得接受孤立链接文件"
+        require_valid_node_state_if_present ||
+            fail "URI 缓存陈旧不得破坏核心节点完整性"
+        protocol_node_exists ss ||
+            fail "URI 缓存陈旧时仍应识别 Shadowsocks 核心节点"
+        [ "$(node_uri_cache_status)" = stale ] ||
+            fail "陈旧 URI 缓存必须被单独识别"
+        repair_node_uri_cache ||
+            fail "安全的陈旧 URI 缓存应能一次原子重建"
+        assert_eq current "$(node_uri_cache_status)" \
+            "URI 缓存重建后必须与核心状态一致"
+        assert_file_contains "$SS_URI_FILE" '^ss://'
+        assert_file_contains "$URI_FILE" '^ss://'
+
+        rm -f "$URI_FILE" "$SS_URI_FILE" "$VLESS_URI_FILE"
+        assert_eq stale "$(node_uri_cache_status)" \
+            "核心节点存在但 URI 全部缺失时必须识别为缓存缺失"
+        repair_node_uri_cache ||
+            fail "缺失的 URI 缓存应能从核心状态重建"
+        assert_eq current "$(node_uri_cache_status)"
+    )
+}
+
+test_uri_cache_repair_refuses_unsafe_paths() {
+    (
+        local target="$TEST_TMP/unsafe-uri-target"
+
+        if [ "$DUAL_NODES_REAL_PERMISSIONS" -ne 1 ]; then
+            skip "需要真实的 root 属主与 Unix 权限语义"
+            return "$SKIP_STATUS"
         fi
-        assert_file_contains "$TEST_TMP/orphan-uri.out" '孤立链接文件'
+        require_real_symlink file || return "$?"
+        set_node_paths "$TEST_TMP/unsafe-uri"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_uri_files
+
+        chmod 666 "$SS_URI_FILE"
+        assert_eq unsafe "$(node_uri_cache_status)" \
+            "权限不安全的 URI 必须分类为 unsafe"
+        if repair_node_uri_cache >/dev/null 2>&1; then
+            fail "权限不安全的 URI 缓存不得被自动覆盖"
+        fi
+        assert_file_contains "$SS_URI_FILE" '^ss://'
+        assert_eq 666 "$(stat -c '%a' "$SS_URI_FILE")" \
+            "自动修复不得偷偷收紧不安全 URI 的权限"
+
+        chmod 600 "$SS_URI_FILE"
+        command chown 65534:65534 "$SS_URI_FILE"
+        assert_eq unsafe "$(node_uri_cache_status)" \
+            "所有者不安全的 URI 必须分类为 unsafe"
+        if repair_node_uri_cache >/dev/null 2>&1; then
+            fail "所有者不安全的 URI 缓存不得被自动覆盖"
+        fi
+        assert_eq 65534 "$(stat -c '%u' "$SS_URI_FILE")" \
+            "自动修复不得替换所有者不安全的 URI"
+        command chown root:root "$SS_URI_FILE"
+
+        chmod 400 "$SS_URI_FILE"
+        assert_eq stale "$(node_uri_cache_status)" \
+            "root 所有的只读 URI 应视为安全但需要规范化"
+        repair_node_uri_cache ||
+            fail "安全的只读 URI 应能原子重建"
+        assert_eq 600 "$(stat -c '%a' "$SS_URI_FILE")" \
+            "URI 重建后必须恢复为标准 0600 权限"
+        assert_eq current "$(node_uri_cache_status)"
+
+        printf 'keep-target\n' > "$target"
+        rm -f "$SS_URI_FILE"
+        ln -s "$target" "$SS_URI_FILE"
+        assert_eq unsafe "$(node_uri_cache_status)" \
+            "URI 符号链接必须分类为 unsafe"
+        if repair_node_uri_cache >/dev/null 2>&1; then
+            fail "URI 符号链接不得被自动覆盖"
+        fi
+        [ -L "$SS_URI_FILE" ] || fail "自动修复不得替换 URI 符号链接"
+        assert_file_contains "$target" '^keep-target$'
+
+        rm -f "$SS_URI_FILE"
+        mkdir "$SS_URI_FILE"
+        assert_eq unsafe "$(node_uri_cache_status)" \
+            "非普通 URI 文件必须分类为 unsafe"
+        if repair_node_uri_cache >/dev/null 2>&1; then
+            fail "非普通 URI 文件不得被自动覆盖"
+        fi
+        [ -d "$SS_URI_FILE" ] || fail "自动修复不得删除非普通 URI 文件"
+    )
+}
+
+test_unsafe_uri_cache_does_not_block_node_transaction() {
+    (
+        local target="$TEST_TMP/transaction-uri-target"
+
+        require_real_symlink file || return "$?"
+        set_node_paths "$TEST_TMP/transaction-unsafe-uri"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        printf 'keep-target\n' > "$target"
+        ln -s "$target" "$SS_URI_FILE"
+        service_is_running() { return 1; }
+        service_is_enabled() { return 1; }
+
+        begin_node_transaction static ||
+            fail "URI 是派生缓存，不安全 URI 不应阻止核心节点事务"
+        cancel_unmodified_node_transaction ||
+            fail "未修改事务应能正常清理"
+        [ -L "$SS_URI_FILE" ] ||
+            fail "事务准备不得擅自替换 URI 符号链接"
+        assert_file_contains "$target" '^keep-target$'
     )
 }
 
@@ -624,6 +735,60 @@ test_static_node_backup_validation_does_not_execute_singbox() {
             fail "静态校验仍必须拒绝哈希被篡改的备份"
         fi
         assert_no_forbidden "静态事务备份校验执行了 sing-box"
+    )
+}
+
+test_legacy_uri_snapshot_damage_does_not_block_core_recovery() {
+    (
+        local backup="$TEST_TMP/legacy-uri-backup/backup"
+        local manifest_tmp="$TEST_TMP/legacy-uri-backup/manifest.tmp"
+        local source name digest
+
+        set_node_paths "$TEST_TMP/legacy-uri-backup/node"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_uri_files
+        service_is_running() { return 1; }
+        service_is_enabled() { return 1; }
+
+        backup_node_files "$backup"
+        for source in "$URI_FILE" "$SS_URI_FILE"; do
+            case "$source" in
+                "$URI_FILE") name=node-uri.txt ;;
+                "$SS_URI_FILE") name=ss-uri.txt ;;
+            esac
+            cp -- "$source" "$backup/$name"
+            chmod 600 "$backup/$name"
+            digest="$(sha256sum "$backup/$name" | awk '{print $1}')"
+            awk -F'|' -v OFS='|' -v name="$name" -v digest="$digest" '
+                $1 == "file" && $2 == name {
+                    $3 = "present"
+                    $4 = digest
+                }
+                { print }
+            ' "$backup/manifest" > "$manifest_tmp"
+            mv -- "$manifest_tmp" "$backup/manifest"
+            chmod 600 "$backup/manifest"
+        done
+
+        validate_node_transaction_backup "$backup" ||
+            fail "v1.0.43 的合法 URI 快照清单应继续兼容"
+
+        printf 'tampered-derived-cache\n' > "$backup/node-uri.txt"
+        rm -f "$backup/ss-uri.txt"
+        validate_node_transaction_backup "$backup" ||
+            fail "派生 URI 快照损坏或丢失不得阻止核心配置恢复"
+
+        awk -F'|' -v OFS='|' '
+            $1 == "file" && $2 == "node-uri.txt" { $4 = "invalid-digest" }
+            { print }
+        ' "$backup/manifest" > "$manifest_tmp"
+        mv -- "$manifest_tmp" "$backup/manifest"
+        chmod 600 "$backup/manifest"
+        if validate_node_transaction_backup "$backup"; then
+            fail "旧 URI 清单的结构或摘要字段非法时仍必须拒绝恢复"
+        fi
     )
 }
 
@@ -1260,7 +1425,7 @@ test_config_state_identity_and_credentials_must_match() {
         mkdir -p "$NODE_CONFIG_DIR"
         write_ss_config_fixture "$SS_CONFIG_PATH"
         write_ss_state_fixture "$SS_STATE_FILE" 20001 999999999999999999999999
-        if validate_protocol_node_artifacts ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$SS_URI_FILE"; then
+        if validate_protocol_node_core ss "$SS_CONFIG_PATH" "$SS_STATE_FILE"; then
             fail "配置标识不一致时 Shadowsocks 完整性校验不得通过"
         fi
     )
@@ -1270,7 +1435,7 @@ test_config_state_identity_and_credentials_must_match() {
         write_ss_config_fixture "$SS_CONFIG_PATH"
         write_ss_state_fixture "$SS_STATE_FILE"
         sed -i 's/^PASSWORD=.*/PASSWORD=TkVXTkVXTkVXTkVXTkVXQQ==/' "$SS_STATE_FILE"
-        if validate_protocol_node_artifacts ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$SS_URI_FILE"; then
+        if validate_protocol_node_core ss "$SS_CONFIG_PATH" "$SS_STATE_FILE"; then
             fail "Shadowsocks 密码不一致时完整性校验不得通过"
         fi
     )
@@ -1279,7 +1444,7 @@ test_config_state_identity_and_credentials_must_match() {
         mkdir -p "$NODE_CONFIG_DIR"
         write_vless_config_fixture "$VLESS_CONFIG_PATH"
         write_vless_state_fixture "$VLESS_STATE_FILE" 29999
-        if validate_protocol_node_artifacts vless "$VLESS_CONFIG_PATH" "$VLESS_STATE_FILE" "$VLESS_URI_FILE"; then
+        if validate_protocol_node_core vless "$VLESS_CONFIG_PATH" "$VLESS_STATE_FILE"; then
             fail "VLESS 端口不一致时完整性校验不得通过"
         fi
     )
@@ -1292,13 +1457,82 @@ test_config_state_identity_and_credentials_must_match() {
             -e 's/^UUID=.*/UUID=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee/' \
             -e 's/^REALITY_PRIVATE_KEY=.*/REALITY_PRIVATE_KEY=CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC/' \
             "$VLESS_STATE_FILE"
-        if validate_protocol_node_artifacts vless "$VLESS_CONFIG_PATH" "$VLESS_STATE_FILE" "$VLESS_URI_FILE"; then
+        if validate_protocol_node_core vless "$VLESS_CONFIG_PATH" "$VLESS_STATE_FILE"; then
             fail "VLESS UUID 或 Reality 私钥不一致时完整性校验不得通过"
         fi
     )
 }
 
-test_aggregate_uri_must_match_independent_nodes() {
+test_full_artifact_validation_keeps_uri_strict() {
+    (
+        set_node_paths "$TEST_TMP/strict-uri-artifacts"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_uri_files
+
+        validate_protocol_node_artifacts \
+            ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$SS_URI_FILE" ||
+            fail "新生成的完整节点产物必须通过严格校验"
+        chmod 400 "$SS_URI_FILE"
+        if validate_protocol_node_artifacts \
+            ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$SS_URI_FILE"; then
+            fail "创建与发布边界必须坚持 URI 使用标准 0600 权限"
+        fi
+        chmod 600 "$SS_URI_FILE"
+        printf 'tampered-uri\n' > "$SS_URI_FILE"
+        if validate_protocol_node_artifacts \
+            ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$SS_URI_FILE"; then
+            fail "发布边界仍必须拒绝与配置状态不一致的 URI"
+        fi
+    )
+}
+
+test_staged_uri_group_rejects_sibling_and_aggregate_drift() {
+    (
+        local staged_ss_state
+        local staged_vless_uri staged_aggregate
+
+        set_node_paths "$TEST_TMP/staged-uri-group"
+        mkdir -p "$NODE_CONFIG_DIR" \
+            "$NODE_TRANSACTION_STAGE/configs" \
+            "$NODE_TRANSACTION_STAGE/states" \
+            "$NODE_TRANSACTION_STAGE/uris"
+        chmod 700 "$NODE_TRANSACTION_STAGE" \
+            "$NODE_TRANSACTION_STAGE/configs" \
+            "$NODE_TRANSACTION_STAGE/states" \
+            "$NODE_TRANSACTION_STAGE/uris"
+        write_vless_config_fixture "$VLESS_CONFIG_PATH"
+        write_vless_state_fixture "$VLESS_STATE_FILE"
+        cp -- "$VLESS_CONFIG_PATH" \
+            "$NODE_TRANSACTION_STAGE/configs/${VLESS_CONFIG_PATH##*/}"
+        staged_ss_state="$NODE_TRANSACTION_STAGE/states/${SS_STATE_FILE##*/}"
+        write_ss_config_fixture \
+            "$NODE_TRANSACTION_STAGE/configs/${SS_CONFIG_PATH##*/}"
+        write_ss_state_fixture "$staged_ss_state"
+        build_staged_uri_files ss "$staged_ss_state"
+
+        validate_staged_node ss ||
+            fail "完整且一致的暂存节点组应通过严格校验"
+
+        staged_vless_uri="$NODE_TRANSACTION_STAGE/uris/${VLESS_URI_FILE##*/}"
+        printf 'tampered-sibling-uri\n' > "$staged_vless_uri"
+        chmod 600 "$staged_vless_uri"
+        if validate_staged_node ss; then
+            fail "暂存兄弟协议 URI 漂移时不得发布节点"
+        fi
+
+        build_staged_uri_files ss "$staged_ss_state"
+        staged_aggregate="$NODE_TRANSACTION_STAGE/uris/${URI_FILE##*/}"
+        printf 'tampered-aggregate-uri\n' > "$staged_aggregate"
+        chmod 600 "$staged_aggregate"
+        if validate_staged_node ss; then
+            fail "暂存汇总 URI 漂移时不得发布节点"
+        fi
+    )
+}
+
+test_aggregate_uri_drift_does_not_invalidate_core_node() {
     (
         set_node_paths "$TEST_TMP/mismatch-aggregate-uri"
         mkdir -p "$NODE_CONFIG_DIR"
@@ -1307,9 +1541,13 @@ test_aggregate_uri_must_match_independent_nodes() {
         write_uri_files
         printf 'stale-aggregate\n' > "$URI_FILE"
 
-        if require_valid_node_state_if_present >/dev/null 2>&1; then
-            fail "汇总链接与独立节点不一致时完整性校验不得通过"
-        fi
+        require_valid_node_state_if_present ||
+            fail "汇总 URI 陈旧不得使核心节点完整性失败"
+        assert_eq stale "$(node_uri_cache_status)" \
+            "汇总 URI 陈旧必须被识别为缓存漂移"
+        repair_node_uri_cache ||
+            fail "汇总 URI 陈旧时应能从核心状态重建"
+        assert_eq current "$(node_uri_cache_status)"
     )
 }
 
@@ -1499,10 +1737,18 @@ main() {
         atomic_staging_dir
         fail_after_node_rollback
         node_file_is_secure
+        node_uri_file_is_safe
         node_dir_is_secure
         node_backup_file_is_safe
+        validate_protocol_node_core
+        validate_derived_uri_manifest_entry
+        build_staged_uri_files
+        validate_staged_uri_group
+        validate_staged_node
         node_config_matches_loaded_state
         node_config_dir_contents_valid
+        node_uri_cache_status
+        repair_node_uri_cache
         require_valid_node_state_if_present
         begin_node_transaction
         mark_node_transaction_mutated
@@ -1522,7 +1768,9 @@ main() {
         test_create_vless_preserves_shadowsocks_node
         test_independent_states_and_links_are_aggregated
         test_service_definition_uses_independent_config_directory
-        test_orphan_protocol_uri_is_rejected
+        test_uri_cache_is_derived_from_core_state
+        test_uri_cache_repair_refuses_unsafe_paths
+        test_unsafe_uri_cache_does_not_block_node_transaction
         test_stopped_sibling_port_is_rejected
         test_stopped_target_port_is_rechecked_against_system_listeners
         test_delete_one_protocol_keeps_sibling_running
@@ -1530,6 +1778,7 @@ main() {
         test_delete_residual_node_without_singbox_keeps_sibling_static
         test_delete_last_residual_node_without_singbox_skips_missing_service
         test_static_node_backup_validation_does_not_execute_singbox
+        test_legacy_uri_snapshot_damage_does_not_block_core_recovery
         test_node_transaction_full_and_static_validation_modes
         test_dual_node_backup_restore_round_trip
         test_verify_runtime_checks_both_protocols
@@ -1549,7 +1798,9 @@ main() {
         test_failed_recovery_keeps_transaction_backup
         test_committed_transaction_is_not_rolled_back
         test_config_state_identity_and_credentials_must_match
-        test_aggregate_uri_must_match_independent_nodes
+        test_full_artifact_validation_keeps_uri_strict
+        test_staged_uri_group_rejects_sibling_and_aggregate_drift
+        test_aggregate_uri_drift_does_not_invalidate_core_node
         test_singbox_update_rejects_mismatched_layout_before_download
         test_uri_group_failure_restores_old_files
         test_last_uri_delete_failure_is_not_masked

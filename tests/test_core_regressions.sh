@@ -853,15 +853,130 @@ test_reality_checks_require_bounded_dns_and_openssl() {
     )
 }
 
-test_view_node_propagates_uri_failure() {
+test_reality_candidate_is_checked_only_once() {
     (
+        local check_log="$TEST_TMP/reality-candidate-checks.log"
+
+        ensure_node_dependencies() { return 0; }
+        require_valid_node_state_if_present() { return 0; }
+        protocol_visible_exists() { return 1; }
+        configured_node_ports_csv() { printf '\n'; }
+        prompt_node_host() { printf -v "$1" '%s' vless.example.com; }
+        choose_node_port() { printf '%s\n' 20001; }
+        confirm_default_yes() { return 0; }
+        begin_node_transaction() { return 0; }
+        install_singbox_for_node_transaction() { return 0; }
+        rollback_node_files_transaction() { return 0; }
+        check_reality_server() {
+            printf '%s\n' "$1" >> "$check_log"
+            [ "$1" = good.example ]
+        }
+        sing-box() { return 1; }
+
+        : > "$check_log"
+        if create_vless_reality_node <<< $'\nbad.example\ngood.example\n' >/dev/null 2>&1; then
+            fail "UUID 夹具失败时创建流程不应报告成功"
+        fi
+        assert_eq $'bad.example\ngood.example' "$(cat "$check_log")" \
+            "每个 Reality 候选只能执行一次 DNS/TLS 探测"
+    )
+    (
+        local event_log="$TEST_TMP/reality-dependency-order.log"
+        local dependencies_ready=0
+
+        node_dependencies_available() { [ "$dependencies_ready" -eq 1 ]; }
+        install_deps() {
+            printf 'install\n' >> "$event_log"
+            dependencies_ready=1
+        }
+        require_valid_node_state_if_present() { return 0; }
+        protocol_visible_exists() { return 1; }
+        configured_node_ports_csv() { printf '\n'; }
+        prompt_node_host() { printf -v "$1" '%s' vless.example.com; }
+        choose_node_port() { printf '%s\n' 20001; }
+        check_reality_server() {
+            [ "$dependencies_ready" -eq 1 ] ||
+                fail "Reality 探测不得早于依赖补齐"
+            printf 'check:%s\n' "$1" >> "$event_log"
+        }
+        confirm_default_yes() {
+            printf 'confirm\n' >> "$event_log"
+            return 1
+        }
+        command() {
+            if [ "${1:-}" = -v ] && [ "${2:-}" = openssl ]; then
+                [ "$dependencies_ready" -eq 1 ]
+                return
+            fi
+            builtin command "$@"
+        }
+
+        : > "$event_log"
+        create_vless_reality_node <<< $'\ngood.example\n' >/dev/null
+        assert_eq $'install\ncheck:good.example\nconfirm' "$(cat "$event_log")" \
+            "缺少依赖时必须先补齐，再对成功候选只探测一次"
+    )
+}
+
+test_view_node_link_is_read_only() {
+    (
+        local write_log="$TEST_TMP/view-node-write.log"
+        local output="$TEST_TMP/view-node-link.out"
+
         require_valid_node_state_if_present() { return 0; }
         node_exists() { return 0; }
-        write_uri_files() { return 1; }
+        protocol_visible_exists() { [ "$1" = ss ]; }
+        load_protocol_state() {
+            PROTOCOL=shadowsocks
+            DOMAIN=ss.example.com
+            PORT=20001
+            NAME=ss-node
+            METHOD=2022-blake3-aes-128-gcm
+            PASSWORD=QUFBQUFBQUFBQUFBQUFBQQ==
+            : "$PROTOCOL" "$DOMAIN" "$PORT" "$NAME" "$METHOD" "$PASSWORD"
+        }
+        write_uri_files() {
+            printf 'unexpected-write\n' >> "$write_log"
+            return 1
+        }
+        repair_node_uri_cache() {
+            printf 'unexpected-repair\n' >> "$write_log"
+            return 1
+        }
+        repair_node_uri_cache_best_effort() {
+            printf 'unexpected-best-effort-repair\n' >> "$write_log"
+            return 1
+        }
 
-        if view_node_link >/dev/null 2>&1; then
-            fail "节点链接写入失败时查看功能不应成功"
-        fi
+        : > "$write_log"
+        view_node_link > "$output"
+        assert_empty_file "$write_log" "查看节点链接不得写入 URI 缓存"
+        assert_file_contains "$output" '^ ss://'
+    )
+}
+
+test_uri_cache_repair_failure_is_warning_only() {
+    (
+        local output="$TEST_TMP/uri-cache-best-effort-unsafe.out"
+
+        repair_node_uri_cache() { return 1; }
+        node_uri_cache_status() { printf '%s\n' unsafe; }
+
+        repair_node_uri_cache_best_effort "测试操作" > "$output" 2>&1 ||
+            fail "URI 缓存修复失败不得阻止核心节点操作"
+        assert_file_contains "$output" \
+            '测试操作未自动修复节点链接缓存.*不安全权限'
+    )
+    (
+        local output="$TEST_TMP/uri-cache-best-effort-stale.out"
+
+        repair_node_uri_cache() { return 1; }
+        node_uri_cache_status() { printf '%s\n' stale; }
+
+        repair_node_uri_cache_best_effort "测试操作" > "$output" 2>&1 ||
+            fail "普通 URI 缓存重建失败不得阻止核心节点操作"
+        assert_file_contains "$output" \
+            '测试操作未能更新节点链接缓存.*核心配置不受影响'
     )
 }
 
@@ -956,7 +1071,7 @@ test_ssh_port_summary_line_states() {
 test_node_summary_orders_only_existing_protocols() {
     (
         local mock_vless=0 mock_ss=0 output="$TEST_TMP/node-summary.out"
-        node_artifacts_present() { return 1; }
+        node_core_artifacts_present() { return 1; }
         load_protocol_state() {
             case "$1" in
                 vless)
@@ -1039,7 +1154,7 @@ test_self_check_classifies_and_summarizes_results() {
         detect_os() { OS=debian; }
         id() { printf '%s\n' 0; }
         CMD_PATH=/bin/sh
-        node_artifacts_present() { return 1; }
+        node_core_artifacts_present() { return 1; }
         load_protocol_state() { return 1; }
         singbox_installed() { return 1; }
         public_ipv4() { return 1; }
@@ -1172,7 +1287,7 @@ test_self_check_classifies_and_summarizes_results() {
         detect_os() { OS=debian; }
         id() { printf '%s\n' 0; }
         CMD_PATH=/bin/sh
-        node_artifacts_present() { return 0; }
+        node_core_artifacts_present() { return 0; }
         require_valid_node_state_if_present() { return 1; }
         load_protocol_state() { return 1; }
         singbox_installed() { return 0; }
@@ -1257,12 +1372,17 @@ test_self_check_classifies_and_summarizes_results() {
     )
     (
         local output="$TEST_TMP/self-check-node-unavailable.out"
+        local unsafe_output="$TEST_TMP/self-check-node-uri-unsafe.out"
+        local current_output="$TEST_TMP/self-check-node-uri-current.out"
+        local mock_uri_cache_state=stale
 
         detect_os() { OS=debian; }
         id() { printf '%s\n' 0; }
         CMD_PATH=/bin/sh
-        node_artifacts_present() { return 0; }
+        node_core_artifacts_present() { return 0; }
+        node_uri_artifacts_present() { return 1; }
         require_valid_node_state_if_present() { return 0; }
+        node_uri_cache_status() { printf '%s\n' "$mock_uri_cache_state"; }
         load_protocol_state() {
             [ "$1" = vless ] || return 1
             DOMAIN=192.0.2.10
@@ -1301,7 +1421,24 @@ test_self_check_classifies_and_summarizes_results() {
         run_self_check > "$output" 2>&1 ||
             fail "节点监听和链接缺失时仍应完成状态报告"
         assert_file_contains "$output" 'FAIL[[:space:]]+[|] VLESS Reality 监听[[:space:]]+[|] 20001 未监听'
-        assert_file_contains "$output" 'FAIL[[:space:]]+[|] 节点链接[[:space:]]+[|] 未生成'
+        assert_file_contains "$output" 'WARN[[:space:]]+[|] 节点链接[[:space:]]+[|] 缺失或已过期'
+        assert_file_not_contains "$output" 'FAIL[[:space:]]+[|] 配置完整性'
+
+        mock_uri_cache_state=unsafe
+        run_self_check > "$unsafe_output" 2>&1 ||
+            fail "URI 缓存不安全时一键检测仍应完成状态报告"
+        assert_file_contains "$unsafe_output" \
+            'FAIL[[:space:]]+[|] 节点链接[[:space:]]+[|] 文件不安全，已拒绝自动覆盖'
+        assert_file_not_contains "$unsafe_output" \
+            'WARN[[:space:]]+[|] 节点链接|OK[[:space:]]+[|] 节点链接'
+
+        mock_uri_cache_state=current
+        run_self_check > "$current_output" 2>&1 ||
+            fail "URI 缓存正常时一键检测仍应完成状态报告"
+        assert_file_contains "$current_output" \
+            'OK[[:space:]]+[|] 节点链接[[:space:]]+[|]'
+        assert_file_not_contains "$current_output" \
+            'WARN[[:space:]]+[|] 节点链接|FAIL[[:space:]]+[|] 节点链接'
     )
 }
 
@@ -1367,6 +1504,7 @@ test_vpsbox_main_orchestration_and_recovery_short_circuit() {
         acquire_lock() { printf '%s\n' lock >> "$log"; }
         recover_pending_singbox_update() { printf '%s\n' recover-singbox >> "$log"; }
         recover_pending_node_transaction() { printf '%s\n' recover-node >> "$log"; }
+        repair_node_uri_cache_on_startup() { printf '%s\n' repair-uri >> "$log"; }
         install_self_command() { printf '%s\n' install-self >> "$log"; }
         check_vpsbox_update_on_start() { printf '%s\n' check-update >> "$log"; }
         auto_update_vpsbox_on_start() { printf '%s\n' auto-update >> "$log"; }
@@ -1374,7 +1512,7 @@ test_vpsbox_main_orchestration_and_recovery_short_circuit() {
 
         vpsbox_main
     )
-    assert_eq $'root\nos\nlock\nrecover-singbox\nrecover-node\ninstall-self\ncheck-update\nauto-update\nmenu' \
+    assert_eq $'root\nos\nlock\nrecover-singbox\nrecover-node\nrepair-uri\ninstall-self\ncheck-update\nauto-update\nmenu' \
         "$(cat "$log")" "vpsbox_main 必须按恢复、安装、更新、菜单的顺序完成启动"
 
     : > "$log"
@@ -1389,6 +1527,7 @@ test_vpsbox_main_orchestration_and_recovery_short_circuit() {
             return 23
         }
         recover_pending_node_transaction() { printf '%s\n' unexpected-node >> "$log"; }
+        repair_node_uri_cache_on_startup() { printf '%s\n' unexpected-repair >> "$log"; }
         install_self_command() { printf '%s\n' unexpected-install >> "$log"; }
         main_loop() { printf '%s\n' unexpected-menu >> "$log"; }
 
@@ -1411,6 +1550,7 @@ test_vpsbox_main_orchestration_and_recovery_short_circuit() {
             printf '%s\n' recover-node >> "$log"
             return 24
         }
+        repair_node_uri_cache_on_startup() { printf '%s\n' unexpected-repair >> "$log"; }
         install_self_command() { printf '%s\n' unexpected-install >> "$log"; }
         main_loop() { printf '%s\n' unexpected-menu >> "$log"; }
 
@@ -1625,6 +1765,7 @@ test_start_service_action_healthy_is_noop() {
         : > "$log"
         require_valid_node_state_if_present() { return 0; }
         node_exists() { return 0; }
+        repair_node_uri_cache_best_effort() { return 0; }
         service_is_running() { return 0; }
         verify_current_node_runtime() { return 0; }
         singbox_service_definition_is_current() { return 0; }
@@ -1646,6 +1787,7 @@ test_start_service_action_uses_light_start() {
         : > "$log"
         require_valid_node_state_if_present() { return 0; }
         node_exists() { return 0; }
+        repair_node_uri_cache_best_effort() { printf '%s\n' repair >> "$log"; }
         service_is_running() { return 1; }
         install_singbox_if_missing() { printf '%s\n' install >> "$log"; }
         singbox_service_definition_is_current() { return 0; }
@@ -1659,6 +1801,7 @@ test_start_service_action_uses_light_start() {
         verify_current_node_runtime() { return 0; }
 
         start_service_action >/dev/null
+        assert_file_contains "$log" '^repair$'
         assert_file_contains "$log" '^install$'
         assert_file_contains "$log" '^start$'
         assert_file_not_contains "$log" '^(enable|setup|restart)$' \
@@ -1672,12 +1815,14 @@ test_restart_service_action_keeps_full_restart() {
         : > "$log"
         require_valid_node_state_if_present() { return 0; }
         node_exists() { return 0; }
+        repair_node_uri_cache_best_effort() { printf '%s\n' repair >> "$log"; }
         install_singbox_if_missing() { printf '%s\n' install >> "$log"; }
         setup_service() { printf '%s\n' setup >> "$log"; }
         restart_singbox_cleanly() { printf '%s\n' restart >> "$log"; }
         verify_current_node_runtime() { return 0; }
 
         restart_service_action >/dev/null
+        assert_file_contains "$log" '^repair$'
         assert_file_contains "$log" '^install$'
         assert_file_contains "$log" '^setup$'
         assert_file_contains "$log" '^restart$'
@@ -2720,7 +2865,7 @@ test_read_only_node_actions_do_not_install_dependencies() {
             local event_log="$TEST_TMP/$action-dependency-order.log"
             : > "$event_log"
 
-            node_artifacts_present() { return 0; }
+            node_core_artifacts_present() { return 0; }
             missing_node_commands() { printf '%s\n' jq; }
             install_deps() { printf '%s\n' install >> "$event_log"; }
             require_valid_node_state_if_present() {
@@ -2743,7 +2888,7 @@ test_singbox_update_prepares_dependencies_before_validation() {
         local event_log="$TEST_TMP/update_singbox-dependency-order.log"
         : > "$event_log"
 
-        node_artifacts_present() { return 0; }
+        node_core_artifacts_present() { return 0; }
         singbox_installed() { return 0; }
         singbox_version() { printf '%s\n' 1.13.13; }
         singbox_binary_is_package_managed() { return 0; }
@@ -2838,6 +2983,11 @@ main() {
         stop_service_action
         ssh_port_summary_line
         change_applied_recorded_readonly
+        node_core_artifacts_present
+        node_uri_cache_status
+        repair_node_uri_cache
+        repair_node_uri_cache_best_effort
+        repair_node_uri_cache_on_startup
         run_self_check
         show_menu
         main_loop
@@ -2874,7 +3024,9 @@ main() {
         test_lockdir_first_acquisition_uses_reclaim_guard
         test_lock_acquisition_installs_runtime_cleanup_traps
         test_reality_checks_require_bounded_dns_and_openssl
-        test_view_node_propagates_uri_failure
+        test_reality_candidate_is_checked_only_once
+        test_view_node_link_is_read_only
+        test_uri_cache_repair_failure_is_warning_only
         test_node_state_writes_are_atomic
         test_service_running_requires_exact_config_process
         test_singbox_summary_line_states
