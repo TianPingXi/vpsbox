@@ -18,6 +18,8 @@ MOCK_JAIL_STATE="$TEST_TMP/fail2ban-jail.state"
 MOCK_BACKEND_STATE="$TEST_TMP/fail2ban-backend.state"
 MOCK_ACTION_NAME="nftables-multiport"
 MOCK_ACTIONBAN="/usr/sbin/nft add element inet f2b-table addr-set-sshd { <ip> }"
+MOCK_ACTION_PORTS="6384"
+MOCK_ACTION_PORT_QUERY_FAIL=0
 MOCK_BAN_MODE="normal"
 MOCK_UNBAN_FAIL=0
 
@@ -36,6 +38,8 @@ reset_mock() {
     : > "$MOCK_BACKEND_STATE"
     MOCK_ACTION_NAME="nftables-multiport"
     MOCK_ACTIONBAN="/usr/sbin/nft add element inet f2b-table addr-set-sshd { <ip> }"
+    MOCK_ACTION_PORTS="6384"
+    MOCK_ACTION_PORT_QUERY_FAIL=0
     MOCK_BAN_MODE="normal"
     MOCK_UNBAN_FAIL=0
     ACTIVE_FAIL2BAN_TEST_IP=""
@@ -65,8 +69,16 @@ fail2ban-client() {
             printf 'The jail sshd has the following actions:\n%s\n' "$MOCK_ACTION_NAME"
             ;;
         "get sshd action")
-            [ "${5:-}" = "actionban" ] || return 2
-            printf '%s\n' "$MOCK_ACTIONBAN"
+            case "${5:-}" in
+                actionban)
+                    printf '%s\n' "$MOCK_ACTIONBAN"
+                    ;;
+                port)
+                    [ "$MOCK_ACTION_PORT_QUERY_FAIL" -eq 0 ] || return 1
+                    printf '%s\n' "$MOCK_ACTION_PORTS"
+                    ;;
+                *) return 2 ;;
+            esac
             ;;
         "get sshd banip")
             tr '\n' ' ' < "$MOCK_JAIL_STATE"
@@ -561,11 +573,11 @@ test_sync_port_mismatch_rolls_back() {
     FAIL2BAN_VPSBOX_SSHD_CONF="$sync_dir/99-vpsbox-sshd.local"
     printf 'old-config\n' > "$FAIL2BAN_VPSBOX_SSHD_CONF"
     : > "$systemctl_log"
+    MOCK_ACTION_PORTS="22"
 
     fail2ban_installed() { return 0; }
     fail2ban_service_state() { printf '运行中\n'; }
     fail2ban_service_is_enabled() { return 0; }
-    fail2ban_sshd_state() { printf '端口未同步\n'; }
     manifest_set_once() { return 0; }
     backup_change_file_once() { return 0; }
     begin_change_transaction() { return 0; }
@@ -643,6 +655,7 @@ test_sync_restores_initial_stopped_state() {
     FAIL2BAN_CONFIG_DIR="$sync_dir"
     FAIL2BAN_VPSBOX_SSHD_CONF="$sync_dir/99-vpsbox-sshd.local"
     : > "$systemctl_log"
+    MOCK_ACTION_PORTS="2222"
 
     fail2ban_installed() { return 0; }
     fail2ban_service_state() { [ "$running" -eq 1 ] && printf '运行中\n' || printf '未运行\n'; }
@@ -698,9 +711,26 @@ test_fail2ban_health_requires_canonical_current_config() {
         fail2ban_service_is_enabled() { return 0; }
         ssh_effective_ports_csv() { printf '22222\n'; }
         is_systemd() { return 0; }
+        MOCK_ACTION_PORTS="22222"
 
         fail2ban_sshd_configuration_healthy ||
             fail "规范配置、端口及服务状态正常时应识别为健康"
+        assert_eq "已启用" "$(fail2ban_sshd_state)" \
+            "磁盘配置和运行态端口都一致时应显示已启用"
+        MOCK_ACTION_PORTS="22"
+        if fail2ban_sshd_configuration_healthy; then
+            fail "运行态仍使用旧端口时不得识别为健康"
+        fi
+        assert_eq "端口未同步" "$(fail2ban_sshd_state)" \
+            "运行态仍使用旧端口时应显示端口未同步"
+        MOCK_ACTION_PORTS="22222"
+        MOCK_ACTION_PORT_QUERY_FAIL=1
+        if fail2ban_sshd_configuration_healthy; then
+            fail "无法读取运行态端口时不得识别为健康"
+        fi
+        assert_eq "端口未同步" "$(fail2ban_sshd_state)" \
+            "无法读取运行态端口时应显示端口未同步"
+        MOCK_ACTION_PORT_QUERY_FAIL=0
         MOCK_ACTION_NAME="iptables-multiport"
         MOCK_ACTIONBAN="/usr/sbin/iptables -w -I f2b-sshd 1 -s <ip> -j REJECT"
         if fail2ban_sshd_configuration_healthy; then
@@ -941,6 +971,7 @@ test_fail2ban_rollback_failure_is_reported() {
 main() {
     local -a required=(
         fail2ban_action_names
+        fail2ban_sshd_runtime_ports_match
         fail2ban_ipv4_in_text
         production_fail2ban_local_ipv4_text
         ensure_fail2ban_nftables_dependency

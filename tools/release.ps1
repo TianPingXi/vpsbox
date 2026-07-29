@@ -27,14 +27,44 @@ function Invoke-Native {
 function Get-VersionFromText {
     param([Parameter(Mandatory)][string]$Text)
 
-    $matches = [regex]::Matches(
+    $declarationMatches = [regex]::Matches(
+        $Text,
+        '(?m)^[\t ]*(?:(?:export|readonly|local)[\t ]+|(?:declare|typeset)(?:[\t ]+-[^\t \r\n]+)*[\t ]+)?VPSBOX_VERSION[\t ]*='
+    )
+    $canonicalMatches = [regex]::Matches(
         $Text,
         '(?m)^VPSBOX_VERSION="(v[0-9]+\.[0-9]+\.[0-9]+)"\r?$'
     )
-    if ($matches.Count -ne 1) {
+    if ($declarationMatches.Count -ne 1 -or $canonicalMatches.Count -ne 1) {
         throw 'vpsbox.sh 必须且只能包含一个格式正确的 VPSBOX_VERSION。'
     }
-    return $matches[0].Groups[1].Value
+    return $canonicalMatches[0].Groups[1].Value
+}
+
+function Assert-VersionDeclarationRules {
+    $canonical = Get-VersionFromText -Text 'VPSBOX_VERSION="v1.0.44"'
+    if ($canonical -cne 'v1.0.44') {
+        throw "版本声明规则断言失败：规范声明解析为 $canonical。"
+    }
+
+    foreach ($invalidText in @(
+            "VPSBOX_VERSION=`"v1.0.44`"`nexport VPSBOX_VERSION=`"v9.9.9`""
+            'readonly VPSBOX_VERSION="v1.0.44"'
+            'declare -gr VPSBOX_VERSION="v1.0.44"'
+            'typeset VPSBOX_VERSION="v1.0.44"'
+            'local VPSBOX_VERSION="v1.0.44"'
+        )) {
+        $rejected = $false
+        try {
+            [void](Get-VersionFromText -Text $invalidText)
+        }
+        catch {
+            $rejected = $true
+        }
+        if (-not $rejected) {
+            throw "版本声明规则断言失败：必须拒绝非规范或冲突声明：$invalidText"
+        }
+    }
 }
 
 function Get-NextPatchVersion {
@@ -307,6 +337,7 @@ $selfRelativePath = 'tools/release.ps1'
 $releaseScriptPath = Join-Path $repoRoot $selfRelativePath
 
 Assert-NextPatchVersionRules
+Assert-VersionDeclarationRules
 
 if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf) -or
     -not (Test-Path -LiteralPath $testsPath -PathType Container)) {

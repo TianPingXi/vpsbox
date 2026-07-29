@@ -6469,7 +6469,9 @@ fail2ban_sshd_state() {
         exit
     }' "$FAIL2BAN_VPSBOX_SSHD_CONF" 2>/dev/null || true)"
     effective_ports="$(ssh_effective_ports_csv || true)"
-    if [ -n "$effective_ports" ] && [ "$configured_ports" = "$effective_ports" ]; then
+    if [ -n "$effective_ports" ] &&
+        [ "$configured_ports" = "$effective_ports" ] &&
+        fail2ban_sshd_runtime_ports_match "$effective_ports"; then
         echo "已启用"
     else
         echo "端口未同步"
@@ -6504,6 +6506,7 @@ fail2ban_sshd_configuration_healthy() {
         cmp -s - "$FAIL2BAN_VPSBOX_SSHD_CONF" || return 1
     fail2ban-client -t -c /etc/fail2ban >/dev/null 2>&1 || return 1
     fail2ban-client status sshd >/dev/null 2>&1 || return 1
+    fail2ban_sshd_runtime_ports_match "$ports" || return 1
     fail2ban_sshd_uses_only_nftables
 }
 
@@ -6517,6 +6520,27 @@ fail2ban_action_names() {
         sed '1d' |
         tr ',' '\n' |
         sed 's/^[[:space:]]*//; s/[[:space:]]*$//; /^$/d'
+}
+
+fail2ban_sshd_runtime_ports_match() {
+    local expected_ports actions action action_ports normalized_ports
+    local checked=0
+
+    expected_ports="$(normalize_port_csv "${1:-}")" || return 1
+    [ -n "$expected_ports" ] || return 1
+    actions="$(fail2ban_action_names)" || return 1
+    [ -n "$actions" ] || return 1
+
+    while IFS= read -r action; do
+        [ -n "$action" ] || continue
+        action_ports="$(fail2ban-client get sshd action "$action" port 2>/dev/null)" || return 1
+        action_ports="${action_ports//[[:space:]]/}"
+        normalized_ports="$(normalize_port_csv "$action_ports")" || return 1
+        [ -n "$normalized_ports" ] && [ "$normalized_ports" = "$expected_ports" ] || return 1
+        checked=1
+    done <<< "$actions"
+
+    [ "$checked" -eq 1 ]
 }
 
 fail2ban_deep_check_error() {
