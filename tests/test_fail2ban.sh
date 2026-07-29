@@ -307,13 +307,17 @@ test_cleanup_keeps_residual_state_visible() {
     reset_mock
     MOCK_UNBAN_FAIL=1
 
-    if verify_fail2ban_real_ban > "$output" 2>&1; then
-        fail "无法解封测试地址时验证必须报失败"
+    if verify_fail2ban_real_ban_advisory > "$output" 2>&1; then
+        fail "无法解封测试地址时 advisory 必须保留残留状态"
     else
         status=$?
     fi
 
     assert_eq "2" "$status" "存在残留时应返回专用状态码"
+    assert_file_contains "$output" '\[WARN\]' \
+        "深度检测残留应以警告呈现"
+    assert_file_not_contains "$output" '\[ERR\]' \
+        "深度检测残留不应误报为基础配置失败"
     residual_ip="$ACTIVE_FAIL2BAN_TEST_IP"
     [ -n "$residual_ip" ] || fail "解封失败后必须保留活动测试 IP 供再次清理"
     assert_file_contains "$MOCK_JAIL_STATE" "^${residual_ip//./\\.}$" \
@@ -371,8 +375,7 @@ test_sync_deep_validation_failure_warns_and_commits() {
     FAIL2BAN_VPSBOX_SSHD_CONF="$sync_dir/99-vpsbox-sshd.local"
     printf 'old-config\n' > "$FAIL2BAN_VPSBOX_SSHD_CONF"
     : > "$systemctl_log"
-    MOCK_ACTION_NAME="sendmail-whois"
-    MOCK_ACTIONBAN="/usr/sbin/sendmail root"
+    MOCK_BAN_MODE="jail-only"
 
     fail2ban_installed() { return 0; }
     fail2ban_service_state() { printf '运行中\n'; }
@@ -400,6 +403,41 @@ test_sync_deep_validation_failure_warns_and_commits() {
         "普通深度检测失败不得触发回滚"
     assert_file_contains "$systemctl_log" '^marked$' \
         "基础验收通过后必须标记变更已应用"
+}
+
+test_sync_non_nftables_backend_rolls_back() {
+    local sync_dir="$TEST_TMP/sync-non-nftables"
+    local systemctl_log="$TEST_TMP/systemctl-non-nftables.log"
+    local output="$TEST_TMP/sync-non-nftables.out"
+    reset_mock
+    mkdir -p "$sync_dir"
+    FAIL2BAN_CONFIG_DIR="$sync_dir"
+    FAIL2BAN_VPSBOX_SSHD_CONF="$sync_dir/99-vpsbox-sshd.local"
+    printf 'old-config\n' > "$FAIL2BAN_VPSBOX_SSHD_CONF"
+    : > "$systemctl_log"
+    MOCK_ACTION_NAME="sendmail-whois"
+    MOCK_ACTIONBAN="/usr/sbin/sendmail root"
+
+    fail2ban_installed() { return 0; }
+    fail2ban_service_state() { printf '运行中\n'; }
+    fail2ban_service_is_enabled() { return 0; }
+    manifest_set_once() { return 0; }
+    backup_change_file_once() { return 0; }
+    begin_change_transaction() { return 0; }
+    ssh_effective_ports_csv() { printf '6384\n'; }
+    is_systemd() { return 0; }
+    chown() { return 0; }
+    systemctl() { printf '%s\n' "$*" >> "$systemctl_log"; }
+    mark_change_applied() { printf 'marked\n' >> "$systemctl_log"; }
+
+    if sync_fail2ban_sshd_port > "$output" 2>&1; then
+        fail "sshd jail 未使用 nftables 后端时同步不得成功"
+    fi
+    assert_file_contains "$FAIL2BAN_VPSBOX_SSHD_CONF" '^old-config$' \
+        "nftables 后端身份不符时必须恢复旧配置"
+    assert_file_contains "$output" '未使用预期的 nftables 防火墙后端'
+    assert_file_not_contains "$systemctl_log" '^marked$' \
+        "后端身份不符不得标记变更已应用"
 }
 
 test_sync_config_precheck_failure_rolls_back() {
@@ -555,7 +593,7 @@ test_sync_port_mismatch_rolls_back() {
         "端口不一致不得标记变更已应用"
 }
 
-test_sync_residual_test_ip_commits_without_rollback_then_fails() {
+test_sync_residual_test_ip_warns_and_commits() {
     local sync_dir="$TEST_TMP/sync-residual"
     local transition_log="$TEST_TMP/systemctl-residual.log"
     local output="$TEST_TMP/sync-residual.out"
@@ -591,18 +629,76 @@ test_sync_residual_test_ip_commits_without_rollback_then_fails() {
     }
     mark_change_applied() { printf 'marked\n' >> "$transition_log"; }
 
-    if sync_fail2ban_sshd_port > "$output" 2>&1; then
-        fail "测试地址未清理时同步必须返回失败"
-    fi
+    sync_fail2ban_sshd_port > "$output" 2>&1 ||
+        fail "测试地址未清理不得否定已通过基础验收的同步"
     assert_eq $'start fail2ban\nstop fail2ban\nmarked' "$(cat "$transition_log")" \
-        "残留失败前必须先恢复原停止状态并标记基础变更已应用"
-    assert_eq 0 "$running" "残留失败后必须恢复原运行状态"
+        "残留告警前必须先恢复原停止状态并标记基础变更已应用"
+    assert_eq 0 "$running" "残留告警后必须恢复原运行状态"
     assert_file_contains "$FAIL2BAN_VPSBOX_SSHD_CONF" '^port = 6384$' \
-        "测试地址残留不得回滚已通过基础验收的新配置"
+        "测试地址残留告警不得回滚已通过基础验收的新配置"
     assert_file_not_contains "$FAIL2BAN_VPSBOX_SSHD_CONF" '^old-config$' \
-        "测试地址残留不得恢复旧配置"
-    assert_file_contains "$output" '基础配置已通过并保留' \
-        "残留失败应明确说明基础配置已保留"
+        "测试地址残留告警不得恢复旧配置"
+    assert_file_contains "$output" \
+        'Fail2ban 基础配置已通过并保留，但深度检测的测试地址仍未完全清理' \
+        "测试地址残留应明确警告基础配置已保留"
+    assert_file_not_contains "$output" '\[ERR\]' \
+        "测试地址残留不得显示为同步硬错误"
+    assert_eq "192.0.2.254" "$ACTIVE_FAIL2BAN_TEST_IP" \
+        "测试地址残留后必须保留活动状态供退出清理重试"
+}
+
+test_install_fail2ban_residual_deep_check_warns_and_succeeds() {
+    (
+        local install_dir="$TEST_TMP/install-residual"
+        local output="$TEST_TMP/install-residual.out"
+        local event_log="$TEST_TMP/install-residual.log"
+        mkdir -p "$install_dir"
+        FAIL2BAN_CONFIG_DIR="$install_dir"
+        FAIL2BAN_VPSBOX_SSHD_CONF="$install_dir/99-vpsbox-sshd.local"
+        printf 'old-config\n' > "$FAIL2BAN_VPSBOX_SSHD_CONF"
+        : > "$event_log"
+        ACTIVE_FAIL2BAN_TEST_IP=""
+        ACTIVE_FAIL2BAN_TEST_BACKENDS=""
+
+        detect_os() { OS=debian; }
+        fail2ban_sshd_configuration_healthy() { return 1; }
+        fail2ban_installed() { return 0; }
+        fail2ban_service_state() { printf '运行中\n'; }
+        fail2ban_service_is_enabled() { return 0; }
+        ensure_change_store() { return 0; }
+        backup_change_file_once() { return 0; }
+        manifest_set_once() { return 0; }
+        begin_change_transaction() { return 0; }
+        ensure_fail2ban_nftables_dependency() { return 0; }
+        ensure_fail2ban_service_running() { return 0; }
+        ssh_effective_ports_csv() { printf '6384\n'; }
+        is_systemd() { return 0; }
+        systemctl() { printf '%s\n' "$*" >> "$event_log"; }
+        fail2ban_sshd_state() { printf '已启用\n'; }
+        verify_fail2ban_real_ban_advisory() {
+            ACTIVE_FAIL2BAN_TEST_IP="198.51.100.254"
+            ACTIVE_FAIL2BAN_TEST_BACKENDS="nftables"
+            return 2
+        }
+        mark_change_applied() { printf 'marked:%s\n' "$1" >> "$event_log"; }
+
+        install_fail2ban > "$output" 2>&1 ||
+            fail "深度检测测试地址残留不得令 Fail2ban 安装报告失败"
+        assert_file_contains "$output" \
+            'Fail2ban 基础配置已通过并保留，但深度检测的测试地址仍未完全清理' \
+            "安装流程应保留深度检测残留警告"
+        assert_file_not_contains "$output" '\[ERR\]' \
+            "深度检测残留不得显示为安装硬错误"
+        assert_file_contains "$output" \
+            'Fail2ban 已安装，SSH 防护已启用，端口：6384' \
+            "基础验收通过后安装流程应正常完成"
+        assert_file_contains "$FAIL2BAN_VPSBOX_SSHD_CONF" '^port = 6384$' \
+            "安装流程应保留通过基础验收的新配置"
+        assert_eq "198.51.100.254" "$ACTIVE_FAIL2BAN_TEST_IP" \
+            "安装完成后必须保留活动测试地址供退出清理重试"
+        assert_file_contains "$event_log" '^marked:FAIL2BAN_SSHD$' \
+            "残留告警不得阻止记录已应用状态"
+    )
 }
 
 test_sync_restores_initial_stopped_state() {
@@ -953,11 +1049,13 @@ main() {
         test_runtime_cleanup_reuses_active_unban
         test_stale_active_test_blocks_new_ban
         test_sync_deep_validation_failure_warns_and_commits
+        test_sync_non_nftables_backend_rolls_back
         test_sync_config_precheck_failure_rolls_back
         test_sync_service_failure_rolls_back
         test_sync_jail_not_ready_rolls_back
         test_sync_port_mismatch_rolls_back
-        test_sync_residual_test_ip_commits_without_rollback_then_fails
+        test_sync_residual_test_ip_warns_and_commits
+        test_install_fail2ban_residual_deep_check_warns_and_succeeds
         test_sync_restores_initial_stopped_state
         test_sync_healthy_configuration_only_checks_nftables_dependency
         test_fail2ban_health_requires_canonical_current_config

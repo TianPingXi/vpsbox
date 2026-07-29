@@ -925,7 +925,12 @@ test_view_node_link_is_read_only() {
         local write_log="$TEST_TMP/view-node-write.log"
         local output="$TEST_TMP/view-node-link.out"
 
-        require_valid_node_state_if_present() { return 0; }
+        # 一个兄弟节点损坏时，全局完整性检查会失败；健康节点的链接仍应独立显示。
+        require_valid_node_state_if_present() { return 1; }
+        node_config_dir_layout_valid() { return 0; }
+        protocol_node_status() {
+            [ "$1" = ss ] && printf '%s\n' normal || printf '%s\n' damaged
+        }
         node_exists() { return 0; }
         protocol_visible_exists() { [ "$1" = ss ]; }
         load_protocol_state() {
@@ -951,9 +956,13 @@ test_view_node_link_is_read_only() {
         }
 
         : > "$write_log"
-        view_node_link > "$output"
+        view_node_link > "$output" ||
+            fail "兄弟节点损坏时仍应能查看健康 Shadowsocks 节点链接"
         assert_empty_file "$write_log" "查看节点链接不得写入 URI 缓存"
+        assert_file_contains "$output" 'Shadowsocks 节点'
         assert_file_contains "$output" '^ ss://'
+        assert_file_not_contains "$output" '^ vless://' \
+            "损坏的 VLESS 节点不得生成链接"
     )
 }
 

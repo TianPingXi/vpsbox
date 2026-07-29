@@ -1208,26 +1208,121 @@ test_main_ssh_port_is_inserted_before_match_without_global_port() {
     )
 }
 
-test_active_ufw_must_allow_new_ssh_port_before_mutation() {
+test_active_ufw_and_firewalld_unrecognized_rules_warn() {
     (
-        local allow_target=0
+        local ufw_active=1 ufw_allow_target=0
+        local firewalld_active=0 firewalld_allow_target=0
+        local output="$TEST_TMP/ssh-access-firewall-warning.out"
 
         # shellcheck disable=SC2034 # 被测访问控制函数动态读取。
         SSH_TARGET_PORT=49222
         ufw() {
             [ "$1" = status ] || return 1
-            printf '%s\n' 'Status: active'
-            [ "$allow_target" -eq 0 ] ||
+            if [ "$ufw_active" -eq 1 ]; then
+                printf '%s\n' 'Status: active'
+            else
+                printf '%s\n' 'Status: inactive'
+            fi
+            [ "$ufw_allow_target" -eq 0 ] ||
                 printf '%s\n' '49222/tcp                 ALLOW       Anywhere'
         }
+        firewall-cmd() {
+            case "${1:-}" in
+                --state) [ "$firewalld_active" -eq 1 ] ;;
+                --quiet)
+                    [ "${2:-}" = "--query-port=49222/tcp" ] &&
+                        [ "$firewalld_allow_target" -eq 1 ]
+                    ;;
+                *) return 2 ;;
+            esac
+        }
+        getenforce() { printf 'Disabled\n'; }
 
-        if validate_ssh_access_controls >/dev/null 2>&1; then
-            fail "活动 UFW 未放行新 SSH 端口时必须拒绝继续"
-        fi
-        allow_target=1
-        validate_ssh_access_controls >/dev/null ||
-            fail "活动 UFW 已放行新 SSH 端口时应允许继续"
+        validate_ssh_access_controls > "$output" 2>&1 ||
+            fail "活动 UFW 无简单规则时应允许转入人工确认"
+        assert_file_contains "$output" 'UFW.*自动确认.*TCP 49222' \
+            "无法识别 UFW 简单规则时应给出人工确认前置警告"
+        assert_file_not_contains "$output" '\[ERR\]' \
+            "UFW 规则无法自动确认不得显示为硬错误"
+
+        ufw_allow_target=1
+        : > "$output"
+        validate_ssh_access_controls > "$output" 2>&1 ||
+            fail "活动 UFW 已直接放行新 SSH 端口时应通过检查"
+        assert_file_not_contains "$output" 'UFW.*自动确认.*TCP 49222' \
+            "已识别 UFW 直接规则时不应要求人工兜底"
+
+        ufw_active=0
+        firewalld_active=1
+        : > "$output"
+        validate_ssh_access_controls > "$output" 2>&1 ||
+            fail "活动 firewalld 无简单规则时应允许转入人工确认"
+        assert_file_contains "$output" 'firewalld.*自动确认.*TCP 49222' \
+            "无法识别 firewalld 简单规则时应给出人工确认前置警告"
+        assert_file_not_contains "$output" '\[ERR\]' \
+            "firewalld 规则无法自动确认不得显示为硬错误"
+
+        firewalld_allow_target=1
+        : > "$output"
+        validate_ssh_access_controls > "$output" 2>&1 ||
+            fail "活动 firewalld 已直接放行新 SSH 端口时应通过检查"
+        assert_file_not_contains "$output" 'firewalld.*自动确认.*TCP 49222' \
+            "已识别 firewalld 直接规则时不应要求人工兜底"
     )
+}
+
+test_unrecognized_local_firewall_rule_still_requires_exact_yes() {
+    local answer
+
+    for answer in yes YES; do
+        (
+            local case_dir="$TEST_TMP/ssh-firewall-confirm-$answer"
+            local event_log="$case_dir/events.log"
+            local output="$case_dir/output.log"
+            mkdir -p "$case_dir"
+            : > "$event_log"
+            SSHD_MAIN_CONF="$case_dir/sshd_config"
+            printf 'Port 22\n' > "$SSHD_MAIN_CONF"
+
+            sshd_binary() { printf '%s\n' /bin/true; }
+            ssh_socket_activation_enabled_or_active() { return 1; }
+            settle_stale_unapplied_ssh_tracking() { return 0; }
+            choose_ssh_target_port() { printf '49222\n'; }
+            ssh_effective_ports_match_target() { return 1; }
+            firewall_runtime_enabled() { return 1; }
+            ufw() {
+                [ "${1:-}" = status ] || return 1
+                printf 'Status: active\n'
+            }
+            firewall-cmd() {
+                [ "${1:-}" = --state ] && return 0
+                return 1
+            }
+            getenforce() { printf 'Disabled\n'; }
+            backup_change_file_once() {
+                printf 'backup\n' >> "$event_log"
+                return 1
+            }
+            cleanup_unapplied_ssh_tracking() { return 0; }
+
+            if [ "$answer" = YES ]; then
+                if apply_ssh_port_change <<< "$answer" > "$output" 2>&1; then
+                    fail "精确 YES 后的强制备份失败不应报告成功"
+                fi
+                assert_file_contains "$event_log" '^backup$' \
+                    "精确 YES 应通过人工确认并进入修改前备份阶段"
+            else
+                apply_ssh_port_change <<< "$answer" > "$output" 2>&1 ||
+                    fail "非精确 YES 应作为安全取消返回"
+                assert_empty_file "$event_log" \
+                    "非精确 YES 不得备份、修改 SSH 或调整防火墙"
+            fi
+            assert_file_contains "$output" 'UFW.*自动确认.*TCP 49222' \
+                "UFW 简单规则未识别时必须保留警告"
+            assert_file_contains "$output" 'firewalld.*自动确认.*TCP 49222' \
+                "firewalld 简单规则未识别时必须保留警告"
+        )
+    done
 }
 
 test_selinux_ssh_port_range_is_validated() {
@@ -2021,7 +2116,8 @@ main() {
         test_sshd_include_only_activates_vpsbox_files
         test_main_ssh_port_rewrite_handles_case_and_match_blocks
         test_main_ssh_port_is_inserted_before_match_without_global_port
-        test_active_ufw_must_allow_new_ssh_port_before_mutation
+        test_active_ufw_and_firewalld_unrecognized_rules_warn
+        test_unrecognized_local_firewall_rule_still_requires_exact_yes
         test_selinux_ssh_port_range_is_validated
         test_enabled_inactive_ssh_socket_is_detected
         test_multiple_ssh_socket_streams_are_parsed

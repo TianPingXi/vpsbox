@@ -2651,7 +2651,24 @@ node_file_is_secure() {
     owner="$(stat -c '%u' "$file" 2>/dev/null)" || return 1
     group="$(stat -c '%g' "$file" 2>/dev/null)" || return 1
     mode="$(stat -c '%a' "$file" 2>/dev/null)" || return 1
-    [ "$owner" = "0" ] && [ "$group" = "0" ] && [ "$mode" = "600" ]
+    [ "$owner" = "0" ] && [ "$group" = "0" ] || return 1
+    case "$mode" in
+        400|600) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+node_cleanup_source_file_is_safe() {
+    local file="$1" owner group mode
+
+    [ -f "$file" ] && [ ! -L "$file" ] || return 1
+    owner="$(stat -c '%u' "$file" 2>/dev/null)" || return 1
+    group="$(stat -c '%g' "$file" 2>/dev/null)" || return 1
+    mode="$(stat -c '%a' "$file" 2>/dev/null)" || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    [ "$owner" = "0" ] && [ "$group" = "0" ] &&
+        [ $((8#$mode & 8#400)) -ne 0 ] &&
+        [ $((8#$mode & 8#022)) -eq 0 ]
 }
 
 node_uri_file_is_safe() {
@@ -3617,14 +3634,64 @@ repair_node_uri_cache_on_startup() {
     repair_node_uri_cache_best_effort "启动恢复后"
 }
 
+node_transaction_validation_spec() {
+    local transaction_dir="$1"
+    local spec_file="$transaction_dir/validation-mode"
+    local spec
+
+    if [ ! -e "$spec_file" ] && [ ! -L "$spec_file" ]; then
+        # v1.0.43-v1.0.44 的旧事务没有该字段，均按原完整事务校验。
+        printf '%s\n' full
+        return 0
+    fi
+    node_file_is_secure "$spec_file" || return 1
+    [ "$(wc -l < "$spec_file")" -eq 1 ] || return 1
+    IFS= read -r spec < "$spec_file" || return 1
+    case "$spec" in
+        full|static|cleanup:ss|cleanup:vless)
+            printf '%s\n' "$spec"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+write_node_transaction_validation_spec() {
+    local spec="$1"
+    local spec_file="$NODE_TRANSACTION_DIR/validation-mode"
+
+    case "$spec" in
+        full|static|cleanup:ss|cleanup:vless) ;;
+        *) return 2 ;;
+    esac
+    printf '%s\n' "$spec" > "$spec_file" || return 1
+    chown root:root "$spec_file" && chmod 600 "$spec_file"
+}
+
 backup_node_files() {
     local backup_dir="$1"
+    local validation_spec="${2:-full}"
     local manifest="$backup_dir/manifest"
+    local cleanup_protocol="" normalize_ss=0 normalize_vless=0 path
+
+    case "$validation_spec" in
+        full|static) ;;
+        cleanup:ss) cleanup_protocol=ss; normalize_ss=1 ;;
+        cleanup:vless) cleanup_protocol=vless; normalize_vless=1 ;;
+        *) return 2 ;;
+    esac
 
     command -v sha256sum >/dev/null 2>&1 || {
         err "缺少 sha256sum，无法建立可校验的节点事务备份。"
         return 1
     }
+    if [ -n "$cleanup_protocol" ]; then
+        for path in "$(node_config_path "$cleanup_protocol")" \
+            "$(node_state_path "$cleanup_protocol")"; do
+            if [ -e "$path" ] || [ -L "$path" ]; then
+                node_cleanup_source_file_is_safe "$path" || return 1
+            fi
+        done
+    fi
     mkdir -p "$backup_dir" || return 1
     : > "$manifest" || return 1
     printf 'version|1\n' >> "$manifest" || return 1
@@ -3638,10 +3705,10 @@ backup_node_files() {
         printf 'dir|vpsbox.d|present|-\n' >> "$manifest" || return 1
         backup_node_copied_file_with_manifest \
             "$backup_dir/vpsbox.d/${SS_CONFIG_PATH##*/}" \
-            "vpsbox.d/${SS_CONFIG_PATH##*/}" "$manifest" || return 1
+            "vpsbox.d/${SS_CONFIG_PATH##*/}" "$manifest" "$normalize_ss" || return 1
         backup_node_copied_file_with_manifest \
             "$backup_dir/vpsbox.d/${VLESS_CONFIG_PATH##*/}" \
-            "vpsbox.d/${VLESS_CONFIG_PATH##*/}" "$manifest" || return 1
+            "vpsbox.d/${VLESS_CONFIG_PATH##*/}" "$manifest" "$normalize_vless" || return 1
     elif [ ! -e "$NODE_CONFIG_DIR" ] && [ ! -L "$NODE_CONFIG_DIR" ]; then
         printf 'dir|vpsbox.d|absent|-\n' >> "$manifest" || return 1
         printf 'file|vpsbox.d/%s|absent|-\n' "${SS_CONFIG_PATH##*/}" >> "$manifest" || return 1
@@ -3651,9 +3718,9 @@ backup_node_files() {
     fi
 
     backup_node_file_with_manifest "$SS_STATE_FILE" "$backup_dir/ss-state.env" \
-        ss-state.env "$manifest" || return 1
+        ss-state.env "$manifest" "$normalize_ss" || return 1
     backup_node_file_with_manifest "$VLESS_STATE_FILE" "$backup_dir/vless-state.env" \
-        vless-state.env "$manifest" || return 1
+        vless-state.env "$manifest" "$normalize_vless" || return 1
     printf 'file|ss-uri.txt|absent|-\n' >> "$manifest" || return 1
     printf 'file|vless-uri.txt|absent|-\n' >> "$manifest" || return 1
     backup_node_file_with_manifest /etc/systemd/system/sing-box.service \
@@ -3681,12 +3748,27 @@ backup_node_files() {
         service-enabled "$manifest" || return 1
 }
 
+normalize_cleanup_backup_file() {
+    local file="$1" mode
+
+    chown root:root "$file" || return 1
+    mode="$(stat -c '%a' "$file" 2>/dev/null)" || return 1
+    case "$mode" in
+        400|600) ;;
+        *) chmod 600 "$file" || return 1 ;;
+    esac
+}
+
 backup_node_file_with_manifest() {
     local source="$1" backup="$2" name="$3" manifest="$4"
+    local normalize="${5:-0}"
     local digest
 
     if [ -f "$source" ] && [ ! -L "$source" ]; then
         cp -a -- "$source" "$backup" || return 1
+        if [ "$normalize" = "1" ]; then
+            normalize_cleanup_backup_file "$backup" || return 1
+        fi
         digest="$(sha256sum "$backup" | awk '{print $1}')" || return 1
         [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
         printf 'file|%s|present|%s\n' "$name" "$digest" >> "$manifest"
@@ -3699,9 +3781,13 @@ backup_node_file_with_manifest() {
 
 backup_node_copied_file_with_manifest() {
     local backup="$1" name="$2" manifest="$3"
+    local normalize="${4:-0}"
     local digest
 
     if [ -f "$backup" ] && [ ! -L "$backup" ]; then
+        if [ "$normalize" = "1" ]; then
+            normalize_cleanup_backup_file "$backup" || return 1
+        fi
         digest="$(sha256sum "$backup" | awk '{print $1}')" || return 1
         [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
         printf 'file|%s|present|%s\n' "$name" "$digest" >> "$manifest"
@@ -3786,12 +3872,14 @@ node_backup_entry_is_present() {
 
 validate_node_transaction_backup() {
     local backup_dir="$1"
+    local validation_spec="${2:-full}"
     local manifest="$backup_dir/manifest"
     local config_dir="$backup_dir/vpsbox.d"
     local ss_config="$config_dir/${SS_CONFIG_PATH##*/}"
     local vless_config="$config_dir/${VLESS_CONFIG_PATH##*/}"
-    local line kind name state digest path
+    local line kind name state digest path protocol config state_path
     local config_dir_present=0 config_count=0 entry_status
+    local cleanup_protocol="" config_present state_present
     local -a entries=(
         node-uri.txt vpsbox.d "vpsbox.d/${SS_CONFIG_PATH##*/}"
         "vpsbox.d/${VLESS_CONFIG_PATH##*/}" ss-state.env vless-state.env
@@ -3799,6 +3887,12 @@ validate_node_transaction_backup() {
         service-running service-enabled
     )
 
+    case "$validation_spec" in
+        full|static) ;;
+        cleanup:ss) cleanup_protocol=ss ;;
+        cleanup:vless) cleanup_protocol=vless ;;
+        *) return 1 ;;
+    esac
     command -v sha256sum >/dev/null 2>&1 || return 1
     [ -d "$backup_dir" ] && [ ! -L "$backup_dir" ] || return 1
     node_backup_file_is_safe "$manifest" || return 1
@@ -3839,34 +3933,42 @@ validate_node_transaction_backup() {
     grep -Eq '^[01]$' "$backup_dir/service-running" || return 1
     grep -Eq '^[01]$' "$backup_dir/service-enabled" || return 1
 
-    if node_backup_entry_is_present "$manifest" "vpsbox.d/${SS_CONFIG_PATH##*/}"; then
-        node_backup_entry_is_present "$manifest" ss-state.env || return 1
-        validate_protocol_node_core ss "$ss_config" "$backup_dir/ss-state.env" || return 1
-        config_count=$((config_count + 1))
-    else
-        entry_status=$?
-        [ "$entry_status" -eq 1 ] || return 1
-        if node_backup_entry_is_present "$manifest" ss-state.env; then
-            return 1
+    for protocol in ss vless; do
+        case "$protocol" in
+            ss)
+                config="$ss_config"
+                state_path="$backup_dir/ss-state.env"
+                ;;
+            vless)
+                config="$vless_config"
+                state_path="$backup_dir/vless-state.env"
+                ;;
+        esac
+        config_present=0
+        state_present=0
+        if node_backup_entry_is_present "$manifest" "vpsbox.d/${config##*/}"; then
+            config_present=1
+            config_count=$((config_count + 1))
         else
             entry_status=$?
             [ "$entry_status" -eq 1 ] || return 1
         fi
-    fi
-    if node_backup_entry_is_present "$manifest" "vpsbox.d/${VLESS_CONFIG_PATH##*/}"; then
-        node_backup_entry_is_present "$manifest" vless-state.env || return 1
-        validate_protocol_node_core vless "$vless_config" "$backup_dir/vless-state.env" || return 1
-        config_count=$((config_count + 1))
-    else
-        entry_status=$?
-        [ "$entry_status" -eq 1 ] || return 1
-        if node_backup_entry_is_present "$manifest" vless-state.env; then
-            return 1
+        if node_backup_entry_is_present "$manifest" "${state_path##*/}"; then
+            state_present=1
         else
             entry_status=$?
             [ "$entry_status" -eq 1 ] || return 1
         fi
-    fi
+
+        if [ "$protocol" = "$cleanup_protocol" ]; then
+            [ "$config_present" -eq 1 ] || [ "$state_present" -eq 1 ] || return 1
+            continue
+        fi
+        [ "$config_present" -eq "$state_present" ] || return 1
+        if [ "$config_present" -eq 1 ]; then
+            validate_protocol_node_core "$protocol" "$config" "$state_path" || return 1
+        fi
+    done
     if [ "$config_count" -gt 0 ]; then
         [ "$config_dir_present" -eq 1 ] || return 1
         while IFS= read -r path; do
@@ -3917,9 +4019,12 @@ prepare_node_transaction_store() {
 }
 
 begin_node_transaction() {
-    local validation_mode="${1:-full}"
+    local validation_spec="${1:-full}"
 
-    case "$validation_mode" in full|static) ;; *) return 2 ;; esac
+    case "$validation_spec" in
+        full|static|cleanup:ss|cleanup:vless) ;;
+        *) return 2 ;;
+    esac
     prepare_node_transaction_store || return 1
     if [ -e "$NODE_TRANSACTION_DIR/pending" ]; then
         err "检测到尚未恢复的节点事务，已拒绝开始新操作：$NODE_TRANSACTION_DIR"
@@ -3947,16 +4052,20 @@ begin_node_transaction() {
         remove_node_transaction_dir || true
         return 1
     }
-    if ! backup_node_files "$NODE_TRANSACTION_BACKUP"; then
+    if ! write_node_transaction_validation_spec "$validation_spec"; then
         remove_node_transaction_dir || true
         return 1
     fi
-    if ! validate_node_transaction_backup "$NODE_TRANSACTION_BACKUP"; then
+    if ! backup_node_files "$NODE_TRANSACTION_BACKUP" "$validation_spec"; then
+        remove_node_transaction_dir || true
+        return 1
+    fi
+    if ! validate_node_transaction_backup "$NODE_TRANSACTION_BACKUP" "$validation_spec"; then
         remove_node_transaction_dir || true
         err "节点事务备份未通过完整性检查。"
         return 1
     fi
-    if [ "$validation_mode" = "full" ] &&
+    if [ "$validation_spec" = "full" ] &&
         { [ -f "$NODE_TRANSACTION_BACKUP/vpsbox.d/${SS_CONFIG_PATH##*/}" ] ||
             [ -f "$NODE_TRANSACTION_BACKUP/vpsbox.d/${VLESS_CONFIG_PATH##*/}" ]; }; then
         if ! command -v sing-box >/dev/null 2>&1 ||
@@ -4042,9 +4151,10 @@ restore_node_file_from_backup() {
 }
 
 restore_node_config_dir_from_backup() {
-    local backup_dir="$1" status
+    local backup_dir="$1" validation_spec="${2:-full}" status
 
-    if [ -e "$NODE_CONFIG_DIR" ] && ! node_config_dir_contents_valid; then
+    if [ -e "$NODE_CONFIG_DIR" ] &&
+        ! node_config_dir_restore_target_safe "$validation_spec"; then
         err "当前节点配置目录不安全或包含未知文件，已拒绝覆盖：$NODE_CONFIG_DIR"
         return 1
     fi
@@ -4070,13 +4180,49 @@ restore_node_config_dir_from_backup() {
     [ ! -e "$NODE_CONFIG_DIR" ] || rmdir -- "$NODE_CONFIG_DIR"
 }
 
+node_config_dir_restore_target_safe() {
+    local validation_spec="$1" cleanup_target="" path entries
+
+    case "$validation_spec" in
+        full|static)
+            node_config_dir_contents_valid
+            return $?
+            ;;
+        cleanup:ss) cleanup_target="$SS_CONFIG_PATH" ;;
+        cleanup:vless) cleanup_target="$VLESS_CONFIG_PATH" ;;
+        *) return 1 ;;
+    esac
+    [ -e "$NODE_CONFIG_DIR" ] || return 0
+    node_dir_is_secure "$NODE_CONFIG_DIR" || return 1
+    entries="$(find "$NODE_CONFIG_DIR" -mindepth 1 -maxdepth 1 -print 2>/dev/null)" ||
+        return 1
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        case "$path" in
+            "$SS_CONFIG_PATH"|"$VLESS_CONFIG_PATH") ;;
+            *) return 1 ;;
+        esac
+        if [ "$path" = "$cleanup_target" ]; then
+            node_cleanup_source_file_is_safe "$path" || return 1
+        else
+            node_file_is_secure "$path" || return 1
+        fi
+    done <<< "$entries"
+}
+
 restore_node_files() {
     local backup_dir="$1"
+    local transaction_dir validation_spec
     local was_running="0"
     local was_enabled="0"
     local failed=0
 
-    if ! validate_node_transaction_backup "$backup_dir"; then
+    transaction_dir="$(dirname "$backup_dir")"
+    validation_spec="$(node_transaction_validation_spec "$transaction_dir")" || {
+        err "节点事务校验模式不安全或内容无效，已拒绝恢复。"
+        return 1
+    }
+    if ! validate_node_transaction_backup "$backup_dir" "$validation_spec"; then
         err "节点事务备份不完整、不可解析或哈希不匹配，已拒绝覆盖现有节点文件。"
         err "事务备份已保留：$backup_dir"
         return 1
@@ -4097,7 +4243,7 @@ restore_node_files() {
         err "节点配置目录异常，已拒绝恢复：$NODE_CONFIG_DIR"
         return 1
     }
-    restore_node_config_dir_from_backup "$backup_dir" || failed=1
+    restore_node_config_dir_from_backup "$backup_dir" "$validation_spec" || failed=1
     restore_node_file_from_backup "$backup_dir" ss-state.env "$backup_dir/ss-state.env" "$SS_STATE_FILE" || failed=1
     restore_node_file_from_backup "$backup_dir" vless-state.env "$backup_dir/vless-state.env" "$VLESS_STATE_FILE" || failed=1
 
@@ -5389,17 +5535,36 @@ EOF
 }
 
 view_node_link() {
-    local protocol label uri displayed=0
+    local protocol label uri status path displayed=0 damaged=0
 
     if node_core_artifacts_present; then
         require_node_commands "查看节点链接" jq || return 1
     fi
-    require_valid_node_state_if_present || return 1
-    node_exists || { warn "当前没有已创建的节点。"; return 0; }
+    for path in "$NODE_CONFIG_DIR" "$SS_CONFIG_PATH" "$VLESS_CONFIG_PATH" \
+        "$SS_STATE_FILE" "$VLESS_STATE_FILE"; do
+        if [ -L "$path" ]; then
+            err "检测到节点路径为符号链接，已拒绝显示链接：$path"
+            return 1
+        fi
+    done
+    node_config_dir_layout_valid || {
+        err "节点配置目录不安全或包含未知文件，已拒绝显示链接：$NODE_CONFIG_DIR"
+        return 1
+    }
 
     for protocol in vless ss; do
-        protocol_visible_exists "$protocol" || continue
         label="$(node_protocol_display_name "$protocol")" || return 1
+        status="$(protocol_node_status "$protocol")" || return 1
+        case "$status" in
+            absent) continue ;;
+            damaged)
+                warn "$label 节点配置残缺、不安全或内容无效，已跳过该节点链接。"
+                damaged=1
+                continue
+                ;;
+            normal|deviated) ;;
+            *) return 1 ;;
+        esac
         load_protocol_state "$protocol" || {
             err "$label 节点状态读取失败，无法显示链接。"
             return 1
@@ -5437,17 +5602,50 @@ EOF
         fi
         displayed=1
     done
-    [ "$displayed" -eq 1 ]
+    if [ "$displayed" -eq 1 ]; then
+        return 0
+    fi
+    if [ "$damaged" -eq 1 ]; then
+        err "没有可安全显示链接的有效节点。"
+        return 1
+    fi
+    warn "当前没有已创建的节点。"
+}
+
+node_cleanup_target_artifacts_safe() {
+    local protocol="$1" config state path found=0
+
+    config="$(node_config_path "$protocol")" || return 2
+    state="$(node_state_path "$protocol")" || return 2
+    for path in "$config" "$state"; do
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            found=1
+            node_cleanup_source_file_is_safe "$path" || {
+                err "损坏节点路径不是受保护的 root 普通文件，已拒绝自动删除：$path"
+                return 1
+            }
+        fi
+    done
+    [ "$found" -eq 1 ]
 }
 
 delete_node_protocol() {
-    local protocol="$1" label config state node_port node_protocols
+    local protocol="$1" label config state node_port="" node_protocols
     local confirm port_status transaction_validation="full" singbox_available=1
-    local firewall_drop_udp=""
+    local firewall_drop_udp="" status sibling_protocol sibling_status
+    local cleanup_mode=0 port_unknown=0
 
     case "$protocol" in
-        vless) label="VLESS Reality"; node_protocols=tcp ;;
-        ss) label="Shadowsocks"; node_protocols=both ;;
+        vless)
+            label="VLESS Reality"
+            node_protocols=tcp
+            sibling_protocol=ss
+            ;;
+        ss)
+            label="Shadowsocks"
+            node_protocols=both
+            sibling_protocol=vless
+            ;;
         *) return 2 ;;
     esac
     if node_core_artifacts_present; then
@@ -5458,20 +5656,58 @@ delete_node_protocol() {
             require_node_commands "删除节点" jq sha256sum || return 1
         fi
     fi
-    require_valid_node_state_if_present || return 1
-    if ! protocol_visible_exists "$protocol"; then
-        warn "当前没有已创建的 $label 节点。"
-        return 0
-    fi
-    load_protocol_state "$protocol" || {
-        err "$label 节点状态不安全或内容无效，已拒绝删除。"
+    node_config_dir_layout_valid || {
+        err "节点配置目录不安全或包含未知文件，已拒绝删除：$NODE_CONFIG_DIR"
         return 1
     }
-    node_port="$PORT"
-    if [ "$protocol" = "ss" ]; then
+    status="$(protocol_node_status "$protocol")" || return 1
+    case "$status" in
+        absent)
+            warn "当前没有已创建的 $label 节点。"
+            return 0
+            ;;
+        normal|deviated)
+            require_valid_node_state_if_present || return 1
+            load_protocol_state "$protocol" || {
+                err "$label 节点状态读取失败，已拒绝删除。"
+                return 1
+            }
+            node_port="$PORT"
+            ;;
+        damaged)
+            cleanup_mode=1
+            transaction_validation="cleanup:$protocol"
+            node_cleanup_target_artifacts_safe "$protocol" || return 1
+            sibling_status="$(protocol_node_status "$sibling_protocol")" || return 1
+            case "$sibling_status" in
+                absent|normal|deviated) ;;
+                damaged)
+                    err "两个协议的节点均已损坏；为避免批量清理扩大影响，已拒绝自动删除。"
+                    return 1
+                    ;;
+                *) return 1 ;;
+            esac
+            port_unknown=1
+            if command -v sing-box >/dev/null 2>&1 &&
+                service_is_running &&
+                ! sing-box check -C "$NODE_CONFIG_DIR" >/dev/null 2>&1; then
+                err "sing-box 当前仍在运行，但磁盘节点配置无法通过检查；停止服务前无法保证失败回滚后恢复运行。"
+                err "请先在 sing-box 管理中停止服务，再重新清理损坏节点。"
+                return 1
+            fi
+            warn "$label 节点配置已损坏；本次只清理固定受管路径，不从损坏内容推断旧端口，并保留可校验事务备份。"
+            ;;
+        *) return 1 ;;
+    esac
+    if [ "$protocol" = "ss" ] && [ -n "$node_port" ]; then
         firewall_drop_udp="$node_port"
     fi
-    if ! read -r -p "确认删除 $label 节点？[y/N]: " confirm; then
+    if [ "$cleanup_mode" -eq 1 ]; then
+        if ! read -r -p "确认清理损坏的 $label 节点？[y/N]: " confirm; then
+            info "输入已结束，已取消。"
+            return 1
+        fi
+    elif ! read -r -p "确认删除 $label 节点？[y/N]: " confirm; then
         info "输入已结束，已取消。"
         return 1
     fi
@@ -5479,19 +5715,27 @@ delete_node_protocol() {
 
     if ! command -v sing-box >/dev/null 2>&1; then
         singbox_available=0
-        transaction_validation="static"
+        [ "$cleanup_mode" -eq 1 ] || transaction_validation="static"
         if service_manager_is_active || [ -n "$(singbox_config_pids)" ]; then
             err "sing-box 未安装，但服务或残留进程仍在运行；为保留回滚能力，已拒绝删除节点。"
             return 1
         fi
-        warn "sing-box 未安装；本次只删除已通过静态完整性校验的残留节点配置。"
+        if [ "$cleanup_mode" -eq 1 ]; then
+            warn "sing-box 未安装；本次只清理已通过结构与备份校验的损坏节点残留。"
+        else
+            warn "sing-box 未安装；本次只删除已通过静态完整性校验的残留节点配置。"
+        fi
     fi
 
     if ! begin_node_transaction "$transaction_validation"; then
         err "备份当前节点失败，已取消删除。"
         return 1
     fi
-    if ! mark_node_transaction_mutated ||
+    if ! mark_node_transaction_mutated; then
+        fail_after_node_rollback "节点删除事务无法记录首次修改，已取消删除" "删除前" || true
+        return 1
+    fi
+    if [ "$cleanup_mode" -eq 0 ] &&
         ! firewall_prepare_port_transition \
             "" "" "$node_port" "$firewall_drop_udp"; then
         fail_after_node_rollback "主机防火墙无法开始节点删除事务，已取消删除" "删除前" || true
@@ -5511,7 +5755,7 @@ delete_node_protocol() {
         fail_after_node_rollback "sing-box 服务仍在运行" "删除前" || true
         return 1
     fi
-    if [ "$singbox_available" -eq 1 ]; then
+    if [ "$singbox_available" -eq 1 ] && [ -n "$node_port" ]; then
         if port_in_use_for_protocols "$node_port" "$node_protocols"; then
             fail_after_node_rollback "节点端口 $node_port 仍被其他进程监听" "删除前" || true
             return 1
@@ -5555,7 +5799,7 @@ delete_node_protocol() {
         [ "$NODE_CONFIG_DIR" = "$CONFIG_DIR/vpsbox.d" ] &&
             rmdir "$NODE_CONFIG_DIR" 2>/dev/null || true
     fi
-    if ! firewall_complete_port_transition; then
+    if [ "$cleanup_mode" -eq 0 ] && ! firewall_complete_port_transition; then
         fail_after_node_rollback "主机防火墙端口同步失败" "删除前" || true
         return 1
     fi
@@ -5564,15 +5808,26 @@ delete_node_protocol() {
         fail_after_node_rollback "节点删除事务提交失败" "删除前" || true
         return 1
     fi
+    if [ "$port_unknown" -eq 1 ] && firewall_control_plane_present; then
+        warn "无法从损坏状态中取得可信旧端口，未自动猜测或删除防火墙端口；请进入 [4] 主机防火墙执行一键开启/更新。"
+    fi
     if node_exists; then
         if [ "$singbox_available" -eq 1 ]; then
-            info "$label 节点已删除，其他节点继续运行。"
+            if [ "$cleanup_mode" -eq 1 ]; then
+                info "损坏的 $label 节点残留已清理，其他节点继续运行。"
+            else
+                info "$label 节点已删除，其他节点继续运行。"
+            fi
         else
             info "$label 节点已删除；其他节点配置已保留，但 sing-box 未安装，当前不会运行。"
         fi
     else
         if [ "$singbox_available" -eq 1 ]; then
-            info "$label 节点已删除，sing-box 服务已停止并禁用开机启动。"
+            if [ "$cleanup_mode" -eq 1 ]; then
+                info "损坏的 $label 节点残留已清理，sing-box 服务已停止并禁用开机启动。"
+            else
+                info "$label 节点已删除，sing-box 服务已停止并禁用开机启动。"
+            fi
         else
             info "$label 节点残留配置已删除；sing-box 未安装，无需停止服务。"
         fi
@@ -8900,12 +9155,14 @@ validate_ssh_access_controls() {
     local failed=0
 
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-        ufw status 2>/dev/null | grep -Eq "^${SSH_TARGET_PORT}/tcp[[:space:]]+ALLOW" ||
-            { err "UFW 正在运行，但未放行 TCP $SSH_TARGET_PORT；请先放行后重试。"; failed=1; }
+        if ! ufw status 2>/dev/null | grep -Eq "^${SSH_TARGET_PORT}/tcp[[:space:]]+ALLOW"; then
+            warn "UFW 正在运行，但未能自动确认已放行 TCP $SSH_TARGET_PORT；将由修改前的人工确认兜底。"
+        fi
     fi
     if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        firewall-cmd --quiet --query-port="${SSH_TARGET_PORT}/tcp" >/dev/null 2>&1 ||
-            { err "firewalld 正在运行，但未放行 TCP $SSH_TARGET_PORT；请先放行后重试。"; failed=1; }
+        if ! firewall-cmd --quiet --query-port="${SSH_TARGET_PORT}/tcp" >/dev/null 2>&1; then
+            warn "firewalld 正在运行，但未能自动确认已放行 TCP $SSH_TARGET_PORT；将由修改前的人工确认兜底。"
+        fi
     fi
     if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = "Enforcing" ]; then
         if command -v semanage >/dev/null 2>&1; then
@@ -9114,6 +9371,12 @@ sync_fail2ban_sshd_port() {
             "$backup" "$was_running" || true
         return 1
     fi
+    if ! fail2ban_sshd_uses_only_nftables; then
+        fail2ban_sync_failure_with_rollback \
+            "Fail2ban sshd jail 未使用预期的 nftables 防火墙后端" \
+            "$backup" "$was_running" || true
+        return 1
+    fi
     if verify_fail2ban_real_ban_advisory; then
         :
     else
@@ -9134,8 +9397,7 @@ sync_fail2ban_sshd_port() {
     fi
     prune_fail2ban_sshd_backups || warn "Fail2ban 历史备份清理不完整，最多保留 5 份的策略未完全执行。"
     if [ "$deep_check_status" -eq 2 ] || [ -n "${ACTIVE_FAIL2BAN_TEST_IP:-}" ]; then
-        err "Fail2ban 基础配置已通过并保留，但深度检测的测试地址仍未完全清理。"
-        return 1
+        warn "Fail2ban 基础配置已通过并保留，但深度检测的测试地址仍未完全清理。"
     fi
 }
 
@@ -9186,12 +9448,12 @@ apply_ssh_port_change() {
 
     if firewall_runtime_enabled; then
         vpsbox_firewall_active=1
-        if ! read -r -p "vpsbox 防火墙将自动临时放行 TCP $SSH_TARGET_PORT；如厂商另有安全组，请先在厂商面板放行。输入 YES 继续: " confirm; then
+        if ! read -r -p "vpsbox 防火墙将自动临时放行 TCP $SSH_TARGET_PORT；请确认商家安全组、UFW/firewalld 或其他防火墙也已放行。输入 YES 继续: " confirm; then
             info "输入已结束，已取消，未修改 SSH 配置。"
             return 0
         fi
     else
-        if ! read -r -p "确认已在商家安全组或其他外部防火墙放行 TCP $SSH_TARGET_PORT？输入 YES 继续: " confirm; then
+        if ! read -r -p "确认已在商家安全组、UFW/firewalld 或其他防火墙放行 TCP $SSH_TARGET_PORT？输入 YES 继续: " confirm; then
             info "输入已结束，已取消，未修改 SSH 配置。"
             return 0
         fi

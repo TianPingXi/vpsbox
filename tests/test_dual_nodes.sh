@@ -97,6 +97,9 @@ else
     node_file_is_secure() {
         [ -f "$1" ] && [ ! -L "$1" ]
     }
+    node_cleanup_source_file_is_safe() {
+        [ -f "$1" ] && [ ! -L "$1" ]
+    }
     node_uri_file_is_safe() {
         [ -f "$1" ] && [ ! -L "$1" ] &&
             [ "$(stat -c '%a' "$1" 2>/dev/null)" = "600" ]
@@ -462,12 +465,12 @@ test_uri_cache_repair_refuses_unsafe_paths() {
         command chown root:root "$SS_URI_FILE"
 
         chmod 400 "$SS_URI_FILE"
-        assert_eq stale "$(node_uri_cache_status)" \
-            "root 所有的只读 URI 应视为安全但需要规范化"
+        assert_eq current "$(node_uri_cache_status)" \
+            "root 所有的 0400 只读 URI 应视为安全且保持可用"
         repair_node_uri_cache ||
-            fail "安全的只读 URI 应能原子重建"
-        assert_eq 600 "$(stat -c '%a' "$SS_URI_FILE")" \
-            "URI 重建后必须恢复为标准 0600 权限"
+            fail "安全的只读 URI 不应阻止缓存检查"
+        assert_eq 400 "$(stat -c '%a' "$SS_URI_FILE")" \
+            "只读检查不得擅自把用户设置的安全 0400 权限改回 0600"
         assert_eq current "$(node_uri_cache_status)"
 
         printf 'keep-target\n' > "$target"
@@ -718,6 +721,450 @@ test_delete_last_residual_node_without_singbox_skips_missing_service() {
         assert_file_contains "$event_log" '^complete$'
         assert_file_not_contains "$event_log" '^(unexpected:|rollback$)'
         assert_file_contains "$output" 'sing-box 未安装，无需停止服务'
+    )
+}
+
+test_delete_damaged_protocol_keeps_valid_sibling_running() {
+    (
+        local event_log="$TEST_TMP/delete-damaged-with-sibling.events"
+        local output="$TEST_TMP/delete-damaged-with-sibling.out"
+        local ss_config_before ss_state_before
+
+        set_node_paths "$TEST_TMP/delete-damaged-with-sibling"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_vless_config_fixture "$VLESS_CONFIG_PATH"
+        write_vless_state_fixture "$VLESS_STATE_FILE"
+        write_uri_files
+        printf '%s\n' '{"broken":true}' > "$VLESS_CONFIG_PATH"
+        chmod 600 "$VLESS_CONFIG_PATH"
+        assert_eq damaged "$(protocol_node_status vless)" \
+            "测试前提：目标 VLESS 节点必须处于损坏状态"
+        ss_config_before="$(cat "$SS_CONFIG_PATH")"
+        ss_state_before="$(cat "$SS_STATE_FILE")"
+        : > "$event_log"
+        forbid_init
+
+        require_node_commands() { return 0; }
+        service_is_running() { return 1; }
+        service_is_enabled() { return 0; }
+        service_stop() { return 0; }
+        stop_singbox_config_processes() { return 0; }
+        service_manager_is_active() { return 1; }
+        singbox_config_pids() { return 0; }
+        port_in_use_for_protocols() {
+            forbid "损坏配置对应的可解析 state 端口不得用于占用检查"
+        }
+        firewall_prepare_port_transition() {
+            forbid "损坏配置对应的可解析 state 端口不得用于防火墙删除"
+        }
+        firewall_complete_port_transition() {
+            forbid "cleanup 不得提交未建立的防火墙端口事务"
+        }
+        setup_service() { printf '%s\n' setup >> "$event_log"; }
+        restart_singbox_cleanly() { printf '%s\n' restart >> "$event_log"; }
+        verify_all_node_runtime() { printf '%s\n' verify >> "$event_log"; }
+
+        delete_vless_reality_node <<< y > "$output" 2>&1 ||
+            fail "应能安全删除损坏的 VLESS 节点并保留健康兄弟节点"
+
+        [ ! -e "$VLESS_CONFIG_PATH" ] && [ ! -L "$VLESS_CONFIG_PATH" ] &&
+            [ ! -e "$VLESS_STATE_FILE" ] && [ ! -L "$VLESS_STATE_FILE" ] ||
+            fail "损坏目标节点的配置与状态文件都应被删除"
+        assert_eq "$ss_config_before" "$(cat "$SS_CONFIG_PATH")" \
+            "清理损坏目标时不得改写健康兄弟节点配置"
+        assert_eq "$ss_state_before" "$(cat "$SS_STATE_FILE")" \
+            "清理损坏目标时不得改写健康兄弟节点状态"
+        validate_protocol_node_core ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" ||
+            fail "删除损坏目标后健康兄弟节点必须保持完整"
+        assert_eq $'setup\nrestart\nverify' "$(cat "$event_log")" \
+            "健康兄弟节点必须重新建立服务、启动并验证运行状态"
+        assert_file_contains "$output" '其他节点继续运行'
+        assert_no_forbidden "损坏节点清理错误使用了不可信 state 端口"
+    )
+}
+
+test_delete_partial_damaged_protocol_does_not_guess_firewall_port() {
+    (
+        local output="$TEST_TMP/delete-partial-damaged.out"
+
+        set_node_paths "$TEST_TMP/delete-partial-damaged"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        printf '%s\n' '{"broken":true}' > "$VLESS_CONFIG_PATH"
+        chmod 600 "$VLESS_CONFIG_PATH"
+        assert_eq damaged "$(protocol_node_status vless)" \
+            "测试前提：缺少状态文件的 VLESS 节点必须处于损坏状态"
+        forbid_init
+
+        require_node_commands() { return 0; }
+        service_is_running() { return 1; }
+        service_is_enabled() { return 0; }
+        service_stop() { return 0; }
+        stop_singbox_config_processes() { return 0; }
+        service_manager_is_active() { return 1; }
+        singbox_config_pids() { return 0; }
+        port_in_use_for_protocols() {
+            forbid "没有可信目标端口时不得执行端口占用检查"
+        }
+        firewall_prepare_port_transition() {
+            forbid "损坏节点端口未知时不得开始端口删除事务"
+        }
+        firewall_complete_port_transition() {
+            forbid "损坏节点端口未知时不得提交端口删除事务"
+        }
+        firewall_runtime_enabled() { return 1; }
+        firewall_control_plane_present() { return 0; }
+        setup_service() { return 0; }
+        restart_singbox_cleanly() { return 0; }
+        verify_all_node_runtime() { return 0; }
+
+        delete_vless_reality_node <<< y > "$output" 2>&1 ||
+            fail "状态文件缺失时仍应能清理固定路径上的损坏 VLESS 配置"
+
+        [ ! -e "$VLESS_CONFIG_PATH" ] && [ ! -L "$VLESS_CONFIG_PATH" ] ||
+            fail "残缺目标的配置文件应被删除"
+        [ ! -e "$VLESS_STATE_FILE" ] && [ ! -L "$VLESS_STATE_FILE" ] ||
+            fail "残缺目标不得产生新的状态文件"
+        validate_protocol_node_core ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" ||
+            fail "清理残缺目标后健康兄弟节点必须保持完整"
+        assert_file_contains "$output" '未自动猜测或删除防火墙端口' \
+            "防火墙持久控制面存在时必须明确保留无法确认的旧端口规则"
+        assert_no_forbidden "残缺节点清理使用了未经确认的目标端口"
+    )
+}
+
+test_running_service_with_invalid_disk_config_blocks_damaged_cleanup() {
+    (
+        local output="$TEST_TMP/delete-running-invalid.out"
+
+        set_node_paths "$TEST_TMP/delete-running-invalid"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        printf '%s\n' '{"broken":true}' > "$VLESS_CONFIG_PATH"
+        chmod 600 "$VLESS_CONFIG_PATH"
+        forbid_init
+
+        require_node_commands() { return 0; }
+        service_is_running() { return 0; }
+        service_stop() { forbid "运行中的无效磁盘配置不得进入停止服务阶段"; }
+        stop_singbox_config_processes() { forbid "运行中的无效磁盘配置不得停止进程"; }
+        begin_node_transaction() { forbid "运行中的无效磁盘配置不得建立删除事务"; }
+        firewall_prepare_port_transition() { forbid "运行中的无效磁盘配置不得修改防火墙"; }
+
+        if delete_vless_reality_node <<< y > "$output" 2>&1; then
+            fail "运行中的 sing-box 对应无效磁盘配置时必须拒绝清理"
+        fi
+
+        [ -f "$VLESS_CONFIG_PATH" ] ||
+            fail "拒绝清理后必须保留损坏节点文件"
+        validate_protocol_node_core ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" ||
+            fail "拒绝清理时健康兄弟节点必须保持完整"
+        assert_file_contains "$output" '请先在 sing-box 管理中停止服务'
+        assert_no_forbidden "运行中的无效磁盘配置拒绝路径发生了系统修改"
+    )
+}
+
+test_delete_damaged_protocol_rejects_unsafe_target_before_mutation() {
+    (
+        local external="$TEST_TMP/delete-unsafe-target.external"
+        local output="$TEST_TMP/delete-unsafe-target.out"
+
+        require_real_symlink file || return "$?"
+        set_node_paths "$TEST_TMP/delete-unsafe-target"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        printf '%s\n' external-node-data > "$external"
+        ln -s "$external" "$VLESS_CONFIG_PATH"
+        write_vless_state_fixture "$VLESS_STATE_FILE"
+        forbid_init
+
+        require_node_commands() { return 0; }
+        service_stop() { forbid "不安全目标不得触发服务停止"; }
+        stop_singbox_config_processes() { forbid "不安全目标不得触发进程停止"; }
+        firewall_prepare_port_transition() { forbid "不安全目标不得触发防火墙事务"; }
+
+        if delete_vless_reality_node <<< y > "$output" 2>&1; then
+            fail "符号链接形式的损坏节点目标必须拒绝删除"
+        fi
+
+        [ -L "$VLESS_CONFIG_PATH" ] ||
+            fail "拒绝删除后目标符号链接必须保留"
+        assert_eq external-node-data "$(cat "$external")" \
+            "拒绝删除时不得改写符号链接指向的外部文件"
+        validate_protocol_node_core ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" ||
+            fail "拒绝不安全目标时健康兄弟节点必须保持完整"
+        assert_no_forbidden "拒绝不安全损坏节点前发生了系统修改"
+    )
+}
+
+test_delete_damaged_protocol_requires_valid_sibling() {
+    (
+        local output="$TEST_TMP/delete-damaged-sibling.out"
+
+        set_node_paths "$TEST_TMP/delete-damaged-sibling"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_vless_config_fixture "$VLESS_CONFIG_PATH"
+        write_vless_state_fixture "$VLESS_STATE_FILE"
+        printf '%s\n' '{"broken":"ss"}' > "$SS_CONFIG_PATH"
+        printf '%s\n' '{"broken":"vless"}' > "$VLESS_CONFIG_PATH"
+        chmod 600 "$SS_CONFIG_PATH" "$VLESS_CONFIG_PATH"
+        forbid_init
+
+        require_node_commands() { return 0; }
+        service_stop() { forbid "兄弟节点也损坏时不得停止服务"; }
+        stop_singbox_config_processes() { forbid "兄弟节点也损坏时不得停止进程"; }
+        firewall_prepare_port_transition() { forbid "兄弟节点也损坏时不得修改防火墙"; }
+
+        if delete_vless_reality_node <<< y > "$output" 2>&1; then
+            fail "兄弟节点也损坏时不得进入单协议 cleanup 删除"
+        fi
+
+        [ -f "$SS_CONFIG_PATH" ] && [ -f "$SS_STATE_FILE" ] &&
+            [ -f "$VLESS_CONFIG_PATH" ] && [ -f "$VLESS_STATE_FILE" ] ||
+            fail "拒绝含损坏兄弟节点的 cleanup 时必须保留全部节点文件"
+        assert_no_forbidden "兄弟节点损坏的 cleanup 拒绝路径发生了系统修改"
+    )
+}
+
+test_damaged_protocol_cleanup_rolls_back_after_late_failure() {
+    (
+        local event_log="$TEST_TMP/delete-damaged-rollback.events"
+        local output="$TEST_TMP/delete-damaged-rollback.out"
+        local ss_config_before ss_state_before vless_config_before vless_state_before
+
+        set_node_paths "$TEST_TMP/delete-damaged-rollback"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_vless_config_fixture "$VLESS_CONFIG_PATH"
+        write_vless_state_fixture "$VLESS_STATE_FILE"
+        write_uri_files
+        printf '%s\n' '{"broken":"restore-exactly"}' > "$VLESS_CONFIG_PATH"
+        chmod 600 "$VLESS_CONFIG_PATH"
+        ss_config_before="$(cat "$SS_CONFIG_PATH")"
+        ss_state_before="$(cat "$SS_STATE_FILE")"
+        vless_config_before="$(cat "$VLESS_CONFIG_PATH")"
+        vless_state_before="$(cat "$VLESS_STATE_FILE")"
+        : > "$event_log"
+
+        require_node_commands() { return 0; }
+        service_is_running() { return 1; }
+        service_is_enabled() { return 0; }
+        service_stop() { return 0; }
+        stop_singbox_config_processes() { return 0; }
+        service_manager_is_active() { return 1; }
+        singbox_config_pids() { return 0; }
+        port_in_use_for_protocols() { return 1; }
+        firewall_prepare_port_transition() { return 0; }
+        firewall_complete_port_transition() { return 0; }
+        commit_node_transaction() {
+            printf '%s\n' commit-reached >> "$event_log"
+            return 1
+        }
+        firewall_refresh_if_enabled() { return 0; }
+        setup_service() { return 0; }
+        restart_singbox_cleanly() { return 0; }
+        verify_all_node_runtime() { return 0; }
+        restore_singbox_service_state() { return 0; }
+        is_systemd() { return 1; }
+        OS=debian
+
+        if delete_vless_reality_node <<< y > "$output" 2>&1; then
+            fail "删除后的事务提交失败时 cleanup 不得报告成功"
+        fi
+
+        assert_file_contains "$event_log" '^commit-reached$' \
+            "测试必须确认失败发生在目标文件删除之后"
+        assert_eq "$ss_config_before" "$(cat "$SS_CONFIG_PATH")" \
+            "cleanup 回滚必须恢复健康兄弟节点配置"
+        assert_eq "$ss_state_before" "$(cat "$SS_STATE_FILE")" \
+            "cleanup 回滚必须恢复健康兄弟节点状态"
+        assert_eq "$vless_config_before" "$(cat "$VLESS_CONFIG_PATH")" \
+            "cleanup 回滚必须逐字恢复原损坏配置"
+        assert_eq "$vless_state_before" "$(cat "$VLESS_STATE_FILE")" \
+            "cleanup 回滚必须恢复原目标状态"
+        assert_file_contains "$output" '恢复' \
+            "cleanup 回滚完成后必须向用户说明恢复结果"
+    )
+}
+
+test_cleanup_transaction_recovers_one_sided_damage_after_hard_interruption() {
+    (
+        local config_before output="$TEST_TMP/cleanup-hard-interruption.out"
+
+        require_root_permission_semantics || return "$?"
+        set_node_paths "$TEST_TMP/cleanup-hard-interruption"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        printf '%s\n' '{"broken":"one-sided"}' > "$VLESS_CONFIG_PATH"
+        chmod 400 "$VLESS_CONFIG_PATH"
+        config_before="$(cat "$VLESS_CONFIG_PATH")"
+
+        service_is_running() { return 1; }
+        service_is_enabled() { return 1; }
+        service_stop() { return 0; }
+        stop_singbox_config_processes() { return 0; }
+        service_manager_is_active() { return 1; }
+        singbox_config_pids() { return 0; }
+        restore_singbox_service_state() { return 0; }
+        firewall_refresh_if_enabled() { return 0; }
+        is_systemd() { return 1; }
+        OS=debian
+
+        begin_node_transaction cleanup:vless ||
+            fail "应能为单边损坏节点建立 cleanup 事务"
+        mark_node_transaction_mutated ||
+            fail "应能持久化 cleanup 事务的首次修改标记"
+        rm -f -- "$VLESS_CONFIG_PATH"
+
+        # 模拟进程被硬中断后由下一次 vpsbox 启动恢复，只依赖落盘事务信息。
+        ACTIVE_NODE_BACKUP=""
+        # shellcheck disable=SC2034 # 被已 source 的生产恢复函数通过全局状态动态读取。
+        ACTIVE_NODE_TRANSACTION_MUTATED=0
+        recover_pending_node_transaction > "$output" 2>&1 ||
+            fail "下次启动必须能按持久化 cleanup 模式恢复单边损坏节点"
+
+        assert_eq "$config_before" "$(cat "$VLESS_CONFIG_PATH")" \
+            "硬中断恢复必须逐字恢复原损坏配置"
+        assert_eq 400 "$(stat -c '%a' "$VLESS_CONFIG_PATH")" \
+            "cleanup 事务应保留原 0400 权限"
+        [ ! -e "$VLESS_STATE_FILE" ] && [ ! -L "$VLESS_STATE_FILE" ] ||
+            fail "原本缺失的状态文件在恢复后仍应缺失"
+        validate_protocol_node_core ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" ||
+            fail "硬中断恢复不得破坏健康兄弟节点"
+        [ ! -e "$NODE_TRANSACTION_DIR" ] ||
+            fail "成功恢复后应清理已完成的事务目录"
+        assert_file_contains "$output" '未提交节点事务的节点配置与服务状态已恢复'
+    )
+}
+
+test_cleanup_recovery_can_replace_safe_permission_damaged_target() {
+    (
+        local config_before output="$TEST_TMP/cleanup-permission-recovery.out"
+
+        require_root_permission_semantics || return "$?"
+        set_node_paths "$TEST_TMP/cleanup-permission-recovery"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_vless_config_fixture "$VLESS_CONFIG_PATH"
+        write_vless_state_fixture "$VLESS_STATE_FILE"
+        config_before="$(cat "$VLESS_CONFIG_PATH")"
+        chmod 644 "$VLESS_CONFIG_PATH"
+
+        service_is_running() { return 1; }
+        service_is_enabled() { return 1; }
+        service_stop() { return 0; }
+        stop_singbox_config_processes() { return 0; }
+        service_manager_is_active() { return 1; }
+        singbox_config_pids() { return 0; }
+        restore_singbox_service_state() { return 0; }
+        firewall_refresh_if_enabled() { return 0; }
+        is_systemd() { return 1; }
+        OS=debian
+
+        begin_node_transaction cleanup:vless ||
+            fail "应能为权限损坏但来源安全的节点建立 cleanup 事务"
+        mark_node_transaction_mutated ||
+            fail "应能持久化 cleanup 事务的首次修改标记"
+
+        # 模拟写入 mutated 后、真正删除目标文件前被硬中断。
+        ACTIVE_NODE_BACKUP=""
+        # shellcheck disable=SC2034 # 被已 source 的生产恢复函数通过全局状态动态读取。
+        ACTIVE_NODE_TRANSACTION_MUTATED=0
+        recover_pending_node_transaction > "$output" 2>&1 ||
+            fail "cleanup 恢复必须能安全覆盖原 0644 目标，不能被严格节点权限卡住"
+
+        assert_eq "$config_before" "$(cat "$VLESS_CONFIG_PATH")" \
+            "权限损坏目标恢复后内容必须保持不变"
+        assert_eq 600 "$(stat -c '%a' "$VLESS_CONFIG_PATH")" \
+            "cleanup 备份恢复后应收敛为安全的 0600 权限"
+        validate_protocol_node_core vless "$VLESS_CONFIG_PATH" "$VLESS_STATE_FILE" ||
+            fail "权限损坏目标恢复后必须重新满足节点核心完整性"
+        validate_protocol_node_core ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" ||
+            fail "权限损坏目标恢复不得破坏健康兄弟节点"
+        [ ! -e "$NODE_TRANSACTION_DIR" ] ||
+            fail "权限损坏目标成功恢复后应清理事务目录"
+    )
+}
+
+test_delete_last_damaged_protocol_stops_and_disables_service() {
+    (
+        local enabled=1 event_log="$TEST_TMP/delete-last-damaged.events"
+        local output="$TEST_TMP/delete-last-damaged.out"
+
+        set_node_paths "$TEST_TMP/delete-last-damaged"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_vless_config_fixture "$VLESS_CONFIG_PATH"
+        write_vless_state_fixture "$VLESS_STATE_FILE"
+        printf '%s\n' '{"broken":"last-node"}' > "$VLESS_CONFIG_PATH"
+        chmod 600 "$VLESS_CONFIG_PATH"
+        : > "$event_log"
+        forbid_init
+
+        require_node_commands() { return 0; }
+        service_is_running() { return 1; }
+        service_is_enabled() { [ "$enabled" -eq 1 ]; }
+        service_stop() { printf '%s\n' stop >> "$event_log"; }
+        stop_singbox_config_processes() { return 0; }
+        service_manager_is_active() { return 1; }
+        singbox_config_pids() { return 0; }
+        port_in_use_for_protocols() { forbid "损坏节点不得执行旧端口占用检查"; }
+        firewall_prepare_port_transition() { forbid "损坏节点不得删除推测的防火墙端口"; }
+        firewall_complete_port_transition() { forbid "cleanup 不得提交防火墙端口事务"; }
+        firewall_control_plane_present() { return 1; }
+        setup_service() { forbid "删除最后节点后不得重建服务"; }
+        restart_singbox_cleanly() { forbid "删除最后节点后不得重启服务"; }
+        verify_all_node_runtime() { forbid "删除最后节点后不得验证已删除节点"; }
+        service_disable() {
+            enabled=0
+            printf '%s\n' disable >> "$event_log"
+        }
+
+        delete_vless_reality_node <<< y > "$output" 2>&1 ||
+            fail "最后一个损坏节点应能安全清理"
+
+        [ ! -e "$VLESS_CONFIG_PATH" ] && [ ! -L "$VLESS_CONFIG_PATH" ] &&
+            [ ! -e "$VLESS_STATE_FILE" ] && [ ! -L "$VLESS_STATE_FILE" ] ||
+            fail "最后一个损坏节点的固定配置与状态路径都应删除"
+        assert_eq 0 "$enabled" "删除最后一个损坏节点后必须禁用开机启动"
+        assert_eq $'stop\ndisable' "$(cat "$event_log")" \
+            "删除最后一个损坏节点必须停止服务并禁用自启"
+        assert_file_contains "$output" '服务已停止并禁用开机启动'
+        assert_no_forbidden "删除最后一个损坏节点调用了兄弟节点或端口流程"
+    )
+}
+
+test_view_link_uses_real_files_and_skips_damaged_sibling() {
+    (
+        local output="$TEST_TMP/view-link-real-sibling.out"
+
+        set_node_paths "$TEST_TMP/view-link-real-sibling"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_vless_config_fixture "$VLESS_CONFIG_PATH"
+        write_vless_state_fixture "$VLESS_STATE_FILE"
+        printf '%s\n' '{"broken":"link-sibling"}' > "$VLESS_CONFIG_PATH"
+        chmod 600 "$VLESS_CONFIG_PATH"
+
+        view_node_link > "$output" 2>&1 ||
+            fail "真实文件夹具中损坏兄弟节点不应阻止显示健康链接"
+
+        assert_file_contains "$output" 'VLESS Reality 节点配置.*已跳过该节点链接' \
+            "链接页面必须说明已跳过损坏兄弟节点"
+        assert_file_contains "$output" 'Shadowsocks 节点'
+        assert_file_contains "$output" '^ ss://'
+        assert_file_not_contains "$output" '^ vless://' \
+            "损坏兄弟节点不得生成 VLESS 链接"
     )
 }
 
@@ -1596,7 +2043,7 @@ test_self_check_warns_for_template_drift_without_integrity_failure() {
     )
 }
 
-test_full_artifact_validation_keeps_uri_strict() {
+test_full_artifact_validation_accepts_safe_uri_modes() {
     (
         set_node_paths "$TEST_TMP/strict-uri-artifacts"
         mkdir -p "$NODE_CONFIG_DIR"
@@ -1609,11 +2056,9 @@ test_full_artifact_validation_keeps_uri_strict() {
             fail "新生成的完整节点产物必须通过严格校验"
         if [ "$DUAL_NODES_REAL_PERMISSIONS" -eq 1 ]; then
             chmod 400 "$SS_URI_FILE"
-            if validate_protocol_node_artifacts \
-                ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$SS_URI_FILE"; then
-                fail "创建与发布边界必须坚持 URI 使用标准 0600 权限"
-            fi
-            chmod 600 "$SS_URI_FILE"
+            validate_protocol_node_artifacts \
+                ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$SS_URI_FILE" ||
+                fail "内容一致且 root 所有的 0400 URI 应通过完整产物校验"
         fi
         printf 'tampered-uri\n' > "$SS_URI_FILE"
         if validate_protocol_node_artifacts \
@@ -1791,6 +2236,19 @@ test_insecure_node_permissions_are_rejected() {
         chmod 700 "$CONFIG_DIR" "$NODE_CONFIG_DIR"
         chmod 600 "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$URI_FILE" "$SS_URI_FILE"
 
+        require_valid_node_state_if_present >/dev/null 2>&1 ||
+            fail "root:root 且 0600 的节点配置与状态必须被接受"
+        chmod 400 "$SS_CONFIG_PATH" "$SS_STATE_FILE"
+        require_valid_node_state_if_present >/dev/null 2>&1 ||
+            fail "root:root 且 0400 的只读节点配置与状态必须被接受"
+        assert_eq normal "$(protocol_node_status ss)" \
+            "0400 节点仍应被识别为正常节点"
+
+        chmod 440 "$SS_CONFIG_PATH"
+        if require_valid_node_state_if_present >/dev/null 2>&1; then
+            fail "组可读的 0440 节点配置必须被拒绝"
+        fi
+        chmod 600 "$SS_CONFIG_PATH" "$SS_STATE_FILE"
         chmod 666 "$SS_CONFIG_PATH"
         if require_valid_node_state_if_present >/dev/null 2>&1; then
             fail "0666 节点配置必须被拒绝"
@@ -1913,6 +2371,8 @@ main() {
         node_uri_cache_status
         repair_node_uri_cache
         require_valid_node_state_if_present
+        normalize_cleanup_backup_file
+        node_config_dir_restore_target_safe
         begin_node_transaction
         mark_node_transaction_mutated
         rollback_active_node_transaction
@@ -1941,6 +2401,16 @@ main() {
         test_delete_last_protocol_disables_service
         test_delete_residual_node_without_singbox_keeps_sibling_static
         test_delete_last_residual_node_without_singbox_skips_missing_service
+        test_delete_damaged_protocol_keeps_valid_sibling_running
+        test_delete_partial_damaged_protocol_does_not_guess_firewall_port
+        test_running_service_with_invalid_disk_config_blocks_damaged_cleanup
+        test_delete_damaged_protocol_rejects_unsafe_target_before_mutation
+        test_delete_damaged_protocol_requires_valid_sibling
+        test_damaged_protocol_cleanup_rolls_back_after_late_failure
+        test_cleanup_transaction_recovers_one_sided_damage_after_hard_interruption
+        test_cleanup_recovery_can_replace_safe_permission_damaged_target
+        test_delete_last_damaged_protocol_stops_and_disables_service
+        test_view_link_uses_real_files_and_skips_damaged_sibling
         test_static_node_backup_validation_does_not_execute_singbox
         test_legacy_uri_snapshot_damage_does_not_block_core_recovery
         test_node_transaction_full_and_static_validation_modes
@@ -1964,7 +2434,7 @@ main() {
         test_config_state_identity_and_credentials_must_match
         test_protocol_status_distinguishes_template_drift_from_damage
         test_self_check_warns_for_template_drift_without_integrity_failure
-        test_full_artifact_validation_keeps_uri_strict
+        test_full_artifact_validation_accepts_safe_uri_modes
         test_staged_uri_group_rejects_sibling_and_aggregate_drift
         test_aggregate_uri_drift_does_not_invalidate_core_node
         test_singbox_update_rejects_mismatched_layout_before_download
