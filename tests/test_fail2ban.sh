@@ -391,8 +391,9 @@ test_stale_active_test_blocks_new_ban() {
     cleanup_active_fail2ban_test >/dev/null 2>&1 || fail "测试收尾应能清理旧地址"
 }
 
-test_sync_validation_failure_rolls_back() {
-    local sync_dir="$TEST_TMP/sync-rollback" systemctl_log="$TEST_TMP/systemctl.log"
+test_sync_deep_validation_failure_warns_and_commits() {
+    local sync_dir="$TEST_TMP/sync-advisory" systemctl_log="$TEST_TMP/systemctl-advisory.log"
+    local output="$TEST_TMP/sync-advisory.out"
     reset_mock
     mkdir -p "$sync_dir"
     FAIL2BAN_CONFIG_DIR="$sync_dir"
@@ -414,12 +415,223 @@ test_sync_validation_failure_rolls_back() {
     systemctl() { printf '%s\n' "$*" >> "$systemctl_log"; }
     mark_change_applied() { printf 'marked\n' >> "$systemctl_log"; }
 
-    if sync_fail2ban_sshd_port > "$TEST_TMP/sync-rollback.out" 2>&1; then
-        fail "真实封禁验证失败时同步必须报失败"
+    sync_fail2ban_sshd_port > "$output" 2>&1 ||
+        fail "真实封禁普通失败不得否定已通过基础验收的配置"
+    assert_file_contains "$FAIL2BAN_VPSBOX_SSHD_CONF" '^port = 6384$' \
+        "深度检测普通失败后应保留新配置"
+    assert_file_not_contains "$FAIL2BAN_VPSBOX_SSHD_CONF" '^old-config$' \
+        "深度检测普通失败不得恢复旧配置"
+    assert_file_contains "$output" '真实封禁深度检测未通过；已保留当前配置' \
+        "普通深度检测失败应明确降级为警告"
+    assert_file_not_contains "$output" '\[ERR\]' \
+        "普通深度检测失败不得显示为硬错误"
+    assert_file_not_contains "$output" '已恢复同步前的配置与服务状态' \
+        "普通深度检测失败不得触发回滚"
+    assert_file_contains "$systemctl_log" '^marked$' \
+        "基础验收通过后必须标记变更已应用"
+}
+
+test_sync_config_precheck_failure_rolls_back() {
+    local sync_dir="$TEST_TMP/sync-config-failure"
+    local systemctl_log="$TEST_TMP/systemctl-config-failure.log"
+    local config_checks=0
+    reset_mock
+    mkdir -p "$sync_dir"
+    FAIL2BAN_CONFIG_DIR="$sync_dir"
+    FAIL2BAN_VPSBOX_SSHD_CONF="$sync_dir/99-vpsbox-sshd.local"
+    printf 'old-config\n' > "$FAIL2BAN_VPSBOX_SSHD_CONF"
+    : > "$systemctl_log"
+
+    fail2ban_installed() { return 0; }
+    fail2ban_service_state() { printf '运行中\n'; }
+    fail2ban_service_is_enabled() { return 0; }
+    manifest_set_once() { return 0; }
+    backup_change_file_once() { return 0; }
+    begin_change_transaction() { return 0; }
+    ssh_effective_ports_csv() { printf '6384\n'; }
+    is_systemd() { return 0; }
+    chown() { return 0; }
+    systemctl() { printf '%s\n' "$*" >> "$systemctl_log"; }
+    mark_change_applied() { printf 'marked\n' >> "$systemctl_log"; }
+    fail2ban-client() {
+        if [ "${1:-}" = "-t" ]; then
+            config_checks=$((config_checks + 1))
+            [ "$config_checks" -gt 1 ]
+            return
+        fi
+        return 0
+    }
+
+    if sync_fail2ban_sshd_port > "$TEST_TMP/sync-config-failure.out" 2>&1; then
+        fail "Fail2ban 配置预检失败时同步不得成功"
     fi
-    assert_file_contains "$FAIL2BAN_VPSBOX_SSHD_CONF" '^old-config$' "应恢复同步前配置"
-    assert_file_contains "$systemctl_log" '^restart fail2ban$' "应按原运行状态重启旧配置"
-    assert_file_not_contains "$systemctl_log" '^marked$' "验证失败不得标记变更已应用"
+    assert_file_contains "$FAIL2BAN_VPSBOX_SSHD_CONF" '^old-config$' \
+        "配置预检失败后必须恢复旧配置"
+    assert_file_contains "$systemctl_log" '^restart fail2ban$' \
+        "恢复旧配置后必须恢复原运行状态"
+    assert_file_not_contains "$systemctl_log" '^marked$' \
+        "配置预检失败不得标记变更已应用"
+}
+
+test_sync_service_failure_rolls_back() {
+    local sync_dir="$TEST_TMP/sync-service-failure"
+    local systemctl_log="$TEST_TMP/systemctl-service-failure.log"
+    local restart_calls=0
+    reset_mock
+    mkdir -p "$sync_dir"
+    FAIL2BAN_CONFIG_DIR="$sync_dir"
+    FAIL2BAN_VPSBOX_SSHD_CONF="$sync_dir/99-vpsbox-sshd.local"
+    printf 'old-config\n' > "$FAIL2BAN_VPSBOX_SSHD_CONF"
+    : > "$systemctl_log"
+
+    fail2ban_installed() { return 0; }
+    fail2ban_service_state() { printf '运行中\n'; }
+    fail2ban_service_is_enabled() { return 0; }
+    manifest_set_once() { return 0; }
+    backup_change_file_once() { return 0; }
+    begin_change_transaction() { return 0; }
+    ssh_effective_ports_csv() { printf '6384\n'; }
+    is_systemd() { return 0; }
+    chown() { return 0; }
+    systemctl() {
+        printf '%s\n' "$*" >> "$systemctl_log"
+        if [ "${1:-}" = "restart" ]; then
+            restart_calls=$((restart_calls + 1))
+            [ "$restart_calls" -gt 3 ]
+            return
+        fi
+        return 0
+    }
+    mark_change_applied() { printf 'marked\n' >> "$systemctl_log"; }
+
+    if sync_fail2ban_sshd_port > "$TEST_TMP/sync-service-failure.out" 2>&1; then
+        fail "Fail2ban 服务重启失败时同步不得成功"
+    fi
+    assert_file_contains "$FAIL2BAN_VPSBOX_SSHD_CONF" '^old-config$' \
+        "服务重启失败后必须恢复旧配置"
+    assert_eq 4 "$(grep -c '^restart fail2ban$' "$systemctl_log")" \
+        "三次服务重试失败后应再重启一次恢复旧配置"
+    assert_file_not_contains "$systemctl_log" '^marked$' \
+        "服务重启失败不得标记变更已应用"
+}
+
+test_sync_jail_not_ready_rolls_back() {
+    local sync_dir="$TEST_TMP/sync-jail-failure"
+    local systemctl_log="$TEST_TMP/systemctl-jail-failure.log"
+    reset_mock
+    mkdir -p "$sync_dir"
+    FAIL2BAN_CONFIG_DIR="$sync_dir"
+    FAIL2BAN_VPSBOX_SSHD_CONF="$sync_dir/99-vpsbox-sshd.local"
+    printf 'old-config\n' > "$FAIL2BAN_VPSBOX_SSHD_CONF"
+    : > "$systemctl_log"
+
+    fail2ban_installed() { return 0; }
+    fail2ban_service_state() { printf '运行中\n'; }
+    fail2ban_service_is_enabled() { return 0; }
+    manifest_set_once() { return 0; }
+    backup_change_file_once() { return 0; }
+    begin_change_transaction() { return 0; }
+    ssh_effective_ports_csv() { printf '6384\n'; }
+    is_systemd() { return 0; }
+    chown() { return 0; }
+    systemctl() { printf '%s\n' "$*" >> "$systemctl_log"; }
+    mark_change_applied() { printf 'marked\n' >> "$systemctl_log"; }
+    fail2ban-client() {
+        [ "${1:-}" = "-t" ] && return 0
+        [ "${1:-} ${2:-}" != "status sshd" ]
+    }
+
+    if sync_fail2ban_sshd_port > "$TEST_TMP/sync-jail-failure.out" 2>&1; then
+        fail "sshd jail 未就绪时同步不得成功"
+    fi
+    assert_file_contains "$FAIL2BAN_VPSBOX_SSHD_CONF" '^old-config$' \
+        "sshd jail 未就绪时必须恢复旧配置"
+    assert_file_contains "$systemctl_log" '^restart fail2ban$' \
+        "jail 验证失败后必须恢复原服务状态"
+    assert_file_not_contains "$systemctl_log" '^marked$' \
+        "jail 未就绪不得标记变更已应用"
+}
+
+test_sync_port_mismatch_rolls_back() {
+    local sync_dir="$TEST_TMP/sync-port-mismatch"
+    local systemctl_log="$TEST_TMP/systemctl-port-mismatch.log"
+    reset_mock
+    mkdir -p "$sync_dir"
+    FAIL2BAN_CONFIG_DIR="$sync_dir"
+    FAIL2BAN_VPSBOX_SSHD_CONF="$sync_dir/99-vpsbox-sshd.local"
+    printf 'old-config\n' > "$FAIL2BAN_VPSBOX_SSHD_CONF"
+    : > "$systemctl_log"
+
+    fail2ban_installed() { return 0; }
+    fail2ban_service_state() { printf '运行中\n'; }
+    fail2ban_service_is_enabled() { return 0; }
+    fail2ban_sshd_state() { printf '端口未同步\n'; }
+    manifest_set_once() { return 0; }
+    backup_change_file_once() { return 0; }
+    begin_change_transaction() { return 0; }
+    ssh_effective_ports_csv() { printf '6384\n'; }
+    is_systemd() { return 0; }
+    chown() { return 0; }
+    systemctl() { printf '%s\n' "$*" >> "$systemctl_log"; }
+    mark_change_applied() { printf 'marked\n' >> "$systemctl_log"; }
+
+    if sync_fail2ban_sshd_port > "$TEST_TMP/sync-port-mismatch.out" 2>&1; then
+        fail "Fail2ban 端口与 SSH 生效端口不一致时同步不得成功"
+    fi
+    assert_file_contains "$FAIL2BAN_VPSBOX_SSHD_CONF" '^old-config$' \
+        "端口一致性验证失败时必须恢复旧配置"
+    assert_file_not_contains "$systemctl_log" '^marked$' \
+        "端口不一致不得标记变更已应用"
+}
+
+test_sync_residual_test_ip_commits_without_rollback_then_fails() {
+    local sync_dir="$TEST_TMP/sync-residual"
+    local transition_log="$TEST_TMP/systemctl-residual.log"
+    local output="$TEST_TMP/sync-residual.out"
+    local running=0
+    reset_mock
+    mkdir -p "$sync_dir"
+    FAIL2BAN_CONFIG_DIR="$sync_dir"
+    FAIL2BAN_VPSBOX_SSHD_CONF="$sync_dir/99-vpsbox-sshd.local"
+    printf 'old-config\n' > "$FAIL2BAN_VPSBOX_SSHD_CONF"
+    : > "$transition_log"
+
+    fail2ban_installed() { return 0; }
+    fail2ban_service_state() {
+        [ "$running" -eq 1 ] && printf '运行中\n' || printf '未运行\n'
+    }
+    fail2ban_service_is_enabled() { return 1; }
+    manifest_set_once() { return 0; }
+    backup_change_file_once() { return 0; }
+    begin_change_transaction() { return 0; }
+    ssh_effective_ports_csv() { printf '6384\n'; }
+    is_systemd() { return 0; }
+    chown() { return 0; }
+    systemctl() {
+        case "${1:-}" in
+            start|restart) running=1 ;;
+            stop) running=0 ;;
+        esac
+        printf '%s\n' "$*" >> "$transition_log"
+    }
+    verify_fail2ban_real_ban_advisory() {
+        ACTIVE_FAIL2BAN_TEST_IP="192.0.2.254"
+        return 2
+    }
+    mark_change_applied() { printf 'marked\n' >> "$transition_log"; }
+
+    if sync_fail2ban_sshd_port > "$output" 2>&1; then
+        fail "测试地址未清理时同步必须返回失败"
+    fi
+    assert_eq $'start fail2ban\nstop fail2ban\nmarked' "$(cat "$transition_log")" \
+        "残留失败前必须先恢复原停止状态并标记基础变更已应用"
+    assert_eq 0 "$running" "残留失败后必须恢复原运行状态"
+    assert_file_contains "$FAIL2BAN_VPSBOX_SSHD_CONF" '^port = 6384$' \
+        "测试地址残留不得回滚已通过基础验收的新配置"
+    assert_file_not_contains "$FAIL2BAN_VPSBOX_SSHD_CONF" '^old-config$' \
+        "测试地址残留不得恢复旧配置"
+    assert_file_contains "$output" '基础配置已通过并保留' \
+        "残留失败应明确说明基础配置已保留"
 }
 
 test_sync_restores_initial_stopped_state() {
@@ -733,6 +945,7 @@ main() {
         production_fail2ban_local_ipv4_text
         ensure_fail2ban_nftables_dependency
         verify_fail2ban_real_ban
+        verify_fail2ban_real_ban_advisory
         cleanup_active_fail2ban_test
     )
     local name test status passed=0 skipped=0
@@ -751,7 +964,12 @@ main() {
         test_cleanup_keeps_residual_state_visible
         test_runtime_cleanup_reuses_active_unban
         test_stale_active_test_blocks_new_ban
-        test_sync_validation_failure_rolls_back
+        test_sync_deep_validation_failure_warns_and_commits
+        test_sync_config_precheck_failure_rolls_back
+        test_sync_service_failure_rolls_back
+        test_sync_jail_not_ready_rolls_back
+        test_sync_port_mismatch_rolls_back
+        test_sync_residual_test_ip_commits_without_rollback_then_fails
         test_sync_restores_initial_stopped_state
         test_sync_healthy_configuration_only_checks_nftables_dependency
         test_fail2ban_health_requires_canonical_current_config

@@ -870,6 +870,113 @@ test_singbox_version_guards() {
     assert_file_contains "$MOCK_SINGBOX_EVENT_LOG" '^installer:1\.13\.14$'
 }
 
+test_singbox_update_continues_without_rollback_package() {
+    (
+        local fake_bin="$TEST_TMP/singbox-no-package-success/bin"
+        local output="$TEST_TMP/singbox-no-package-success.out"
+
+        require_root_permission_semantics || return "$?"
+        reset_singbox_case no-package-success
+        mkdir -p "$fake_bin"
+        printf '%s\n' '#!/bin/sh' 'printf "sing-box version 1.13.13\n"' > "$fake_bin/sing-box"
+        chmod 755 "$fake_bin/sing-box"
+        PATH="$fake_bin:$PATH"
+        MOCK_SINGBOX_VERSION=1.13.13
+
+        node_core_artifacts_present() { return 1; }
+        prepare_singbox_rollback_package() {
+            printf '%s\n' rollback-package-unavailable >> "$MOCK_SINGBOX_EVENT_LOG"
+            return 23
+        }
+
+        update_singbox > "$output" 2>&1 ||
+            fail "旧版本回滚包不可用时，可信旧二进制已持久化后仍应继续更新"
+        assert_file_contains "$MOCK_SINGBOX_EVENT_LOG" '^rollback-package-unavailable$'
+        assert_file_contains "$MOCK_SINGBOX_EVENT_LOG" '^installer:1\.13\.14$'
+        assert_file_contains "$output" '旧版 sing-box 回滚包.*继续更新'
+        [ ! -e "$SINGBOX_UPDATE_TRANSACTION_DIR" ] ||
+            fail "无旧包的成功更新也必须提交并清理事务"
+    )
+}
+
+test_singbox_update_without_package_rolls_back_binary_and_service() {
+    (
+        local fake_bin="$TEST_TMP/singbox-no-package-failure/bin"
+        local output="$TEST_TMP/singbox-no-package-failure.out"
+
+        require_root_permission_semantics || return "$?"
+        reset_singbox_case no-package-failure
+        mkdir -p "$fake_bin"
+        printf '%s\n' '#!/bin/sh' 'printf "sing-box version 1.13.13\n"' > "$fake_bin/sing-box"
+        chmod 755 "$fake_bin/sing-box"
+        PATH="$fake_bin:$PATH"
+        MOCK_SINGBOX_VERSION=1.13.13
+
+        node_core_artifacts_present() { return 1; }
+        service_is_running() { return 0; }
+        service_is_enabled() { return 0; }
+        prepare_singbox_rollback_package() { return 23; }
+        install_singbox_package_file() {
+            printf 'package-install:%s\n' "$1" >> "$MOCK_SINGBOX_EVENT_LOG"
+            return 23
+        }
+        run_singbox_installer() {
+            printf '%s\n' installer-failed >> "$MOCK_SINGBOX_EVENT_LOG"
+            printf '%s\n' '#!/bin/sh' 'printf "sing-box version 1.13.14\n"' > "$fake_bin/sing-box"
+            chmod 755 "$fake_bin/sing-box"
+            MOCK_SINGBOX_VERSION=1.13.14
+            return 23
+        }
+
+        if update_singbox > "$output" 2>&1; then
+            fail "新版安装失败后 update_singbox 必须返回失败"
+        fi
+        assert_file_contains "$MOCK_SINGBOX_EVENT_LOG" '^installer-failed$'
+        assert_file_not_contains "$MOCK_SINGBOX_EVENT_LOG" '^package-install:'
+        assert_file_contains "$MOCK_SINGBOX_EVENT_LOG" '^restore:1:1$'
+        assert_eq 1.13.13 "$(singbox_binary_version_at "$fake_bin/sing-box")" \
+            "无旧包时必须恢复经过版本校验的旧二进制"
+        assert_file_contains "$output" '软件包管理记录可能不一致'
+        [ ! -e "$SINGBOX_UPDATE_TRANSACTION_DIR" ] ||
+            fail "旧二进制和服务状态完整恢复后应清理事务"
+    )
+}
+
+test_pending_singbox_update_without_package_recovers_on_startup() {
+    (
+        local root="$TEST_TMP/singbox-no-package-recovery"
+        local binary="$root/bin/sing-box" backup="$root/old-binary"
+        local output="$root/recovery.out"
+
+        require_root_permission_semantics || return "$?"
+        reset_singbox_case no-package-recovery
+        mkdir -p "$(dirname "$binary")"
+        printf '%s\n' '#!/bin/sh' 'printf "sing-box version 1.13.13\n"' > "$binary"
+        chmod 755 "$binary"
+        cp -a "$binary" "$backup"
+        singbox_version() { singbox_binary_version_at "$binary"; }
+        install_singbox_package_file() {
+            fail "package_name=none 时不得尝试安装路径：$1"
+        }
+
+        persist_singbox_update_transaction \
+            "$binary" "$backup" "" 1.13.13 1 1
+        assert_file_contains "$SINGBOX_UPDATE_TRANSACTION_STATE" '^package_name=none$'
+        assert_file_contains "$SINGBOX_UPDATE_TRANSACTION_STATE" '^package_sha256=none$'
+
+        printf '%s\n' '#!/bin/sh' 'printf "sing-box version 1.13.14\n"' > "$binary"
+        chmod 755 "$binary"
+        recover_pending_singbox_update > "$output" 2>&1 ||
+            fail "无旧包的未完成更新应使用持久化旧二进制恢复"
+
+        assert_eq 1.13.13 "$(singbox_binary_version_at "$binary")"
+        assert_file_contains "$MOCK_SINGBOX_EVENT_LOG" '^restore:1:1$'
+        assert_file_contains "$output" '软件包管理记录可能不一致'
+        [ ! -e "$SINGBOX_UPDATE_TRANSACTION_DIR" ] ||
+            fail "无旧包事务完整恢复后必须清理"
+    )
+}
+
 test_singbox_redhat_release_arch_mapping() {
     local input expected actual
     local -a cases=(
@@ -938,6 +1045,9 @@ main() {
         test_stale_previous_without_handshake_is_ignored
         test_pending_update_rejects_unexpected_backup_path
         test_singbox_version_guards
+        test_singbox_update_continues_without_rollback_package
+        test_singbox_update_without_package_rolls_back_binary_and_service
+        test_pending_singbox_update_without_package_recovers_on_startup
         test_interrupted_singbox_cleanup_validates_current_binary
         test_singbox_commit_removes_pending_then_syncs_before_cleanup
         test_singbox_redhat_release_arch_mapping

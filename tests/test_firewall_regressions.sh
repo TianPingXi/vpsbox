@@ -63,6 +63,24 @@ test_cleanup() {
 }
 trap test_cleanup EXIT
 
+require_root_permission_semantics() {
+    local probe="$TEST_TMP/firewall-root-permission-probe" owner group mode
+
+    mkdir -p "$probe" || return 1
+    : > "$probe/file" || return 1
+    if command chown root:root "$probe" "$probe/file" 2>/dev/null &&
+        command chmod 700 "$probe" && command chmod 600 "$probe/file"; then
+        owner="$(stat -c '%u' "$probe/file" 2>/dev/null || true)"
+        group="$(stat -c '%g' "$probe/file" 2>/dev/null || true)"
+        mode="$(stat -c '%a' "$probe/file" 2>/dev/null || true)"
+        rm -rf -- "$probe"
+        [ "$owner" = 0 ] && [ "$group" = 0 ] && [ "$mode" = 600 ] && return 0
+    else
+        rm -rf -- "$probe"
+    fi
+    skip "需要真实的 root 属主与 Unix 权限语义"
+}
+
 wait_for_file() {
     local path="$1"
 
@@ -802,6 +820,46 @@ test_stopped_docker_fixed_binding_is_public() {
     )
 }
 
+test_stopped_docker_requires_explicit_ignore_for_full_update() {
+    (
+        local output="$TEST_TMP/docker-stopped-ignore.out"
+        local calls=0
+
+        firewall_detect_docker_ports() {
+            calls=$((calls + 1))
+            return 2
+        }
+        FW_DOCKER_STOPPED_IGNORED=0
+
+        set +e
+        firewall_detect_docker_ports_for_update initial <<< "" >"$output" 2>&1
+        local status=$?
+        set -e
+        assert_eq 3 "$status" "默认回车不得忽略已停止的 Docker daemon"
+        assert_eq 0 "$FW_DOCKER_STOPPED_IGNORED"
+
+        : >"$output"
+        firewall_detect_docker_ports_for_update initial <<< "y" >"$output" 2>&1 ||
+            fail "用户明确输入 y 后应允许本次忽略已停止的 Docker daemon"
+        assert_eq 1 "$FW_DOCKER_STOPPED_IGNORED"
+        assert_file_contains "$output" '启动 Docker 后必须再次执行 \[1\]'
+
+        firewall_detect_docker_ports_for_update confirmed </dev/null >>"$output" 2>&1 ||
+            fail "确认后的二次扫描应复用同一次明确忽略决定"
+        assert_eq 3 "$calls" "默认拒绝、首次允许和二次扫描都应重新确认 daemon 仍未运行"
+    )
+    (
+        local output="$TEST_TMP/docker-active-unreadable.out"
+
+        firewall_detect_docker_ports() { return 1; }
+        FW_DOCKER_STOPPED_IGNORED=0
+        if firewall_detect_docker_ports_for_update initial <<< "y" >"$output" 2>&1; then
+            fail "活跃但不可读取的 Docker daemon 不得通过交互降级忽略"
+        fi
+        assert_eq 0 "$FW_DOCKER_STOPPED_IGNORED"
+    )
+}
+
 test_additive_config_builder_adds_tcp_without_rebuilding_other_rules() {
     local source="$TEST_TMP/additive-tcp-old.nft"
     local dest="$TEST_TMP/additive-tcp-new.nft"
@@ -1328,26 +1386,106 @@ test_lightweight_add_does_not_rescan_docker_or_ssh() {
         firewall_write_state_file() { printf '%s\n' state > "$1"; }
         firewall_check_config_file() { return 0; }
         firewall_config_direct_ports() { printf '%s\n' 6384; }
-        firewall_create_rollback_snapshot() {
-            printf 'snapshot:%s\n' "$2" >> "$log"
-            mkdir -p "$case_dir/snapshot"
-            printf -v "$1" '%s' "$case_dir/snapshot"
+        firewall_config_keeps_tcp_ports() { return 0; }
+        firewall_begin_additive_transaction() {
+            printf 'additive:%s:%s\n' "$1" "$2" >> "$log"
+            ACTIVE_FIREWALL_ADDITIVE_DIR="$case_dir/additive"
+            mkdir -p "$ACTIVE_FIREWALL_ADDITIVE_DIR"
         }
         firewall_apply_config_file() { printf '%s\n' apply >> "$log"; }
         firewall_live_added_ports_match() { printf '%s\n' verify >> "$log"; }
-        firewall_begin_commit() { printf '%s\n' begin >> "$log"; }
-        firewall_install_managed_file() { printf '%s\n' install >> "$log"; }
-        firewall_finish_commit() { printf '%s\n' finish >> "$log"; }
+        firewall_install_managed_file() {
+            printf '%s\n' install >> "$log"
+            cp "$1" "$2"
+        }
+        firewall_commit_additive_transaction() { printf '%s\n' finish >> "$log"; }
+        firewall_restore_additive_transaction() { printf '%s\n' restore >> "$log"; }
+        firewall_create_rollback_snapshot() { forbid "轻量新增不得创建完整服务级快照"; }
+        firewall_start_rollback_watchdog() { forbid "轻量新增不得启动 watchdog"; }
+        firewall_snapshot_service_state() { forbid "轻量新增不得读取服务状态"; }
+        firewall_snapshot_persistence_state() { forbid "轻量新增不得读取开机状态"; }
         firewall_detect_allowed_ports() { forbid "轻量新增不得重新扫描 SSH、节点或 Docker"; }
 
         firewall_apply_added_ports tcp 8443 8080 ""
-        assert_file_contains "$log" '^snapshot:6384$'
+        assert_file_contains "$log" '^additive:6384:1$'
         assert_file_contains "$log" '^apply$'
         assert_eq 2 "$(grep -Fxc verify "$log")" "运行规则与持久化后都应验证新增端口"
-        assert_file_contains "$log" '^begin$'
         assert_eq 2 "$(grep -Fxc install "$log")" "配置与状态应分别原子落盘"
         assert_file_contains "$log" '^finish$'
-        assert_no_forbidden "轻量新增重新扫描了 SSH、节点或 Docker"
+        assert_no_forbidden "轻量新增触发了完整快照、watchdog、服务状态或全量端口扫描"
+    )
+}
+
+test_additive_transaction_restores_only_config_state_and_live_rules() {
+    (
+        local case_dir="$TEST_TMP/additive-transaction"
+        local apply_log="$case_dir/apply.log"
+
+        require_root_permission_semantics || return "$?"
+        mkdir -p "$case_dir/state/firewall-rollbacks"
+        chmod 700 "$case_dir/state" "$case_dir/state/firewall-rollbacks"
+        VPSBOX_STATE_DIR="$case_dir/state"
+        FIREWALL_ROLLBACK_DIR="$VPSBOX_STATE_DIR/firewall-rollbacks"
+        FIREWALL_CONFIG="$VPSBOX_STATE_DIR/firewall.nft"
+        FIREWALL_STATE_FILE="$VPSBOX_STATE_DIR/firewall.env"
+        ACTIVE_FIREWALL_ADDITIVE_DIR=""
+        printf '%s\n' old-config >"$FIREWALL_CONFIG"
+        printf '%s\n' old-state >"$FIREWALL_STATE_FILE"
+        chmod 600 "$FIREWALL_CONFIG" "$FIREWALL_STATE_FILE"
+        : >"$apply_log"
+
+        firewall_apply_config_file() {
+            printf '%s\n' "$(cat "$1")" >>"$apply_log"
+        }
+        firewall_config_direct_ports() { printf '%s\n' 6384; }
+        firewall_live_tcp_ports() { printf '%s\n' 6384; }
+
+        firewall_begin_additive_transaction 6384 1 ||
+            fail "应能创建只含配置与状态的轻量事务"
+        printf '%s\n' new-config >"$FIREWALL_CONFIG"
+        printf '%s\n' new-state >"$FIREWALL_STATE_FILE"
+
+        firewall_restore_additive_transaction "$ACTIVE_FIREWALL_ADDITIVE_DIR" ||
+            fail "轻量事务失败后应恢复旧配置、状态和运行规则"
+        assert_file_contains "$FIREWALL_CONFIG" '^old-config$'
+        assert_file_contains "$FIREWALL_STATE_FILE" '^old-state$'
+        assert_file_contains "$apply_log" '^old-config$'
+        [ ! -e "$FIREWALL_ROLLBACK_DIR/firewall-additive" ] ||
+            fail "恢复完成后应清理轻量事务"
+    )
+}
+
+test_additive_transaction_recovery_keeps_committed_files() {
+    (
+        local case_dir="$TEST_TMP/additive-committed"
+
+        require_root_permission_semantics || return "$?"
+        mkdir -p "$case_dir/state/firewall-rollbacks"
+        chmod 700 "$case_dir/state" "$case_dir/state/firewall-rollbacks"
+        VPSBOX_STATE_DIR="$case_dir/state"
+        FIREWALL_ROLLBACK_DIR="$VPSBOX_STATE_DIR/firewall-rollbacks"
+        FIREWALL_CONFIG="$VPSBOX_STATE_DIR/firewall.nft"
+        FIREWALL_STATE_FILE="$VPSBOX_STATE_DIR/firewall.env"
+        ACTIVE_FIREWALL_ADDITIVE_DIR=""
+        printf '%s\n' old-config >"$FIREWALL_CONFIG"
+        printf '%s\n' old-state >"$FIREWALL_STATE_FILE"
+        chmod 600 "$FIREWALL_CONFIG" "$FIREWALL_STATE_FILE"
+        firewall_config_direct_ports() { printf '%s\n' 6384; }
+
+        firewall_begin_additive_transaction 6384 0 ||
+            fail "应能创建轻量事务"
+        printf '%s\n' new-config >"$FIREWALL_CONFIG"
+        printf '%s\n' new-state >"$FIREWALL_STATE_FILE"
+        firewall_mark_additive_transaction_committed ||
+            fail "应能原子标记轻量事务已提交"
+
+        ACTIVE_FIREWALL_ADDITIVE_DIR=""
+        firewall_recover_pending_additive_transaction ||
+            fail "已提交但清理中断的轻量事务应只清理残留"
+        assert_file_contains "$FIREWALL_CONFIG" '^new-config$'
+        assert_file_contains "$FIREWALL_STATE_FILE" '^new-state$'
+        [ ! -e "$FIREWALL_ROLLBACK_DIR/firewall-additive" ] ||
+            fail "已提交事务恢复时应清理目录"
     )
 }
 
@@ -1426,6 +1564,7 @@ main() {
         run_bounded_with_timeout
         firewall_start_rollback_watchdog
         firewall_apply_desired_state
+        firewall_detect_docker_ports_for_update
         firewall_directory_metadata_is_exact
         firewall_desired_state_is_current
         firewall_detect_docker_ports
@@ -1458,6 +1597,7 @@ main() {
         test_busybox_timeout_fallback_releases_lock
         test_watchdog_survives_parent_without_holding_lock
         test_stopped_docker_fixed_binding_is_public
+        test_stopped_docker_requires_explicit_ignore_for_full_update
         test_additive_config_builder_adds_tcp_without_rebuilding_other_rules
         test_additive_config_builder_creates_first_udp_rule_and_set
         test_adding_port_uses_lightweight_commit_path
@@ -1468,6 +1608,8 @@ main() {
         test_firewall_disable_internal_verifies_service_and_live_table
         test_extra_port_remove_and_clear_commit_expected_state
         test_lightweight_add_does_not_rescan_docker_or_ssh
+        test_additive_transaction_restores_only_config_state_and_live_rules
+        test_additive_transaction_recovery_keeps_committed_files
         test_internal_port_transition_preserves_unrelated_public_ports
     )
 

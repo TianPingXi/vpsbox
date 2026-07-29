@@ -111,6 +111,7 @@ ACTIVE_NODE_TRANSACTION_MUTATED=0
 ACTIVE_FIREWALL_TRANSITION_DIR=""
 ACTIVE_SSH_FIREWALL_TRANSITION=0
 ACTIVE_FIREWALL_ROLLBACK_DIR=""
+ACTIVE_FIREWALL_ADDITIVE_DIR=""
 ACTIVE_UNAPPLIED_SSH_TRACKING=0
 ACTIVE_FAIL2BAN_TEST_IP=""
 ACTIVE_FAIL2BAN_TEST_BACKENDS=""
@@ -170,6 +171,7 @@ FW_DOCKER_HOST_NETWORK=0
 FW_DOCKER_DYNAMIC_PORT=0
 FW_DOCKER_DIRECT_NETWORK=0
 FW_DOCKER_CUSTOM_BRIDGE=0
+FW_DOCKER_STOPPED_IGNORED=0
 FW_ALLOWED_TCP=""
 FW_ALLOWED_UDP=""
 
@@ -188,6 +190,18 @@ confirm_default_yes() {
             ""|Y|y) return 0 ;;
             N|n) return 1 ;;
             *) warn "请输入 y 或 n；直接回车默认 y。" ;;
+        esac
+    done
+}
+
+confirm_default_no() {
+    local prompt="$1" answer
+    while true; do
+        read -r -p "$prompt [y/N]: " answer || return 1
+        case "$answer" in
+            Y|y) return 0 ;;
+            ""|N|n) return 1 ;;
+            *) warn "请输入 y 或 n；直接回车默认 n。" ;;
         esac
     done
 }
@@ -615,6 +629,7 @@ cleanup_vpsbox_lock() {
 cleanup_vpsbox_runtime() {
     local backup="${ACTIVE_NODE_BACKUP:-}"
     local firewall_rollback="${ACTIVE_FIREWALL_ROLLBACK_DIR:-}"
+    local firewall_additive="${ACTIVE_FIREWALL_ADDITIVE_DIR:-}"
     if declare -F cleanup_active_bounded_command >/dev/null 2>&1; then
         cleanup_active_bounded_command
     fi
@@ -641,6 +656,19 @@ cleanup_vpsbox_runtime() {
         declare -F firewall_abort_port_transition >/dev/null 2>&1; then
         firewall_abort_port_transition ||
             warn "端口切换被中断，防火墙临时规则恢复失败，请重新进入防火墙菜单更新。"
+    fi
+    if [ -n "$firewall_additive" ] &&
+        declare -F firewall_additive_transaction_dir_valid >/dev/null 2>&1 &&
+        firewall_additive_transaction_dir_valid "$firewall_additive" &&
+        declare -F firewall_restore_additive_transaction >/dev/null 2>&1; then
+        if [ -e "$firewall_additive/committed" ]; then
+            ACTIVE_FIREWALL_ADDITIVE_DIR=""
+            rm -rf -- "$firewall_additive" ||
+                warn "新增防火墙端口已提交，但轻量事务残留未能清理：$firewall_additive"
+        else
+            firewall_restore_additive_transaction "$firewall_additive" ||
+                warn "新增防火墙端口操作被中断，配置恢复失败；轻量事务已保留：$firewall_additive"
+        fi
     fi
     if declare -F firewall_rollback_dir_valid >/dev/null 2>&1 &&
         firewall_rollback_dir_valid "$firewall_rollback" &&
@@ -5705,7 +5733,7 @@ restore_singbox_update_backup() {
     local binary_path="$1" backup_binary="$2" backup_dir="$3"
     local was_enabled="$4" was_active="$5"
     local rollback_package="${6:-}" old_version="${7:-}"
-    local failed=0 package_restore_failed=0
+    local failed=0 package_state_may_differ=0
     local package_restored=0 binary_ready=0 service_ready=1
 
     if ! service_stop 2>/dev/null && service_manager_is_active; then
@@ -5727,8 +5755,12 @@ restore_singbox_update_backup() {
             binary_ready=1
         else
             err "旧 sing-box 软件包恢复失败，正在尝试恢复二进制副本。"
-            package_restore_failed=1
+            package_state_may_differ=1
         fi
+    else
+        # 旧版本 Release 包只是优先回滚材料；可信旧二进制仍是持久事务的必要保障。
+        # 二进制回滚可恢复运行，但无法保证 dpkg/apk/rpm 的版本记录一并回退。
+        package_state_may_differ=1
     fi
     if [ "$package_restored" -eq 0 ]; then
         if restore_singbox_binary_atomically "$backup_binary" "$binary_path" "$old_version"; then
@@ -5755,7 +5787,7 @@ restore_singbox_update_backup() {
         warn "sing-box 更新备份已保留：$backup_dir"
         return 1
     fi
-    if [ "$package_restore_failed" -eq 1 ]; then
+    if [ "$package_state_may_differ" -eq 1 ]; then
         warn "旧 sing-box 二进制和服务状态已恢复，但软件包管理记录可能不一致；后续更新前请检查系统软件包状态。"
     fi
     return 0
@@ -5929,7 +5961,7 @@ commit_singbox_update_transaction() {
 }
 
 update_singbox() {
-    local binary_path backup_dir backup_binary rollback_package old_version
+    local binary_path backup_dir backup_binary rollback_package old_version package_name
     local relation new_version
     local was_active=0 was_enabled=0 had_nodes=0
 
@@ -5992,11 +6024,10 @@ update_singbox() {
         err "更新依赖准备失败；sing-box 二进制和服务状态均未修改。"
         return 1
     fi
-    rollback_package="$(prepare_singbox_rollback_package "$old_version" "$backup_dir")" || {
-        cancel_unmodified_singbox_update_transaction
-        err "无法下载并校验旧版 sing-box 回滚包，已取消更新。"
-        return 1
-    }
+    if ! rollback_package="$(prepare_singbox_rollback_package "$old_version" "$backup_dir")"; then
+        rollback_package=""
+        warn "无法下载并校验旧版 sing-box 回滚包；将使用已校验的旧二进制副本作为回滚保障并继续更新。若后续发生回滚，软件包管理记录可能仍显示新版。"
+    fi
     ACTIVE_SINGBOX_UPDATE_PACKAGE="$rollback_package"
     ACTIVE_SINGBOX_UPDATE_OLD_VERSION="$old_version"
     if ! persist_singbox_update_transaction \
@@ -6009,7 +6040,12 @@ update_singbox() {
     rm -rf -- "$backup_dir"
     backup_dir="$SINGBOX_UPDATE_TRANSACTION_DIR"
     backup_binary="$backup_dir/old-binary"
-    rollback_package="$backup_dir/$(singbox_update_state_value package_name)"
+    package_name="$(singbox_update_state_value package_name)"
+    if [ "$package_name" = "none" ]; then
+        rollback_package=""
+    else
+        rollback_package="$backup_dir/$package_name"
+    fi
     ACTIVE_SINGBOX_UPDATE_DIR="$backup_dir"
     ACTIVE_SINGBOX_UPDATE_BACKUP="$backup_binary"
     ACTIVE_SINGBOX_UPDATE_PACKAGE="$rollback_package"
@@ -6483,6 +6519,14 @@ fail2ban_action_names() {
         sed 's/^[[:space:]]*//; s/[[:space:]]*$//; /^$/d'
 }
 
+fail2ban_deep_check_error() {
+    if [ "${FAIL2BAN_DEEP_CHECK_WARN_ONLY:-0}" = "1" ]; then
+        warn "$@" >&2
+    else
+        err "$@"
+    fi
+}
+
 fail2ban_single_action_line() {
     local line
 
@@ -6640,26 +6684,26 @@ fail2ban_effective_firewall_backends() {
     local actions action actionban backend backends=""
 
     actions="$(fail2ban_action_names)" || {
-        err "无法读取 Fail2ban sshd jail 的动作列表，已取消真实封禁验证。"
+        fail2ban_deep_check_error "无法读取 Fail2ban sshd jail 的动作列表，已取消真实封禁验证。"
         return 1
     }
     [ -n "$actions" ] || {
-        err "Fail2ban sshd jail 没有可验证的封禁动作。"
+        fail2ban_deep_check_error "Fail2ban sshd jail 没有可验证的封禁动作。"
         return 1
     }
 
     while IFS= read -r action; do
         [ -n "$action" ] || continue
         actionban="$(fail2ban-client get sshd action "$action" actionban 2>/dev/null)" || {
-            err "无法读取 Fail2ban 动作 $action 的实际封禁命令。"
+            fail2ban_deep_check_error "无法读取 Fail2ban 动作 $action 的实际封禁命令。"
             return 1
         }
         [ -n "$actionban" ] || {
-            err "Fail2ban 动作 $action 没有实际封禁命令。"
+            fail2ban_deep_check_error "Fail2ban 动作 $action 没有实际封禁命令。"
             return 1
         }
         backend="$(fail2ban_action_backend "$action" "$actionban")" || {
-            err "Fail2ban 动作 $action 不是受支持的纯防火墙封禁命令；为避免通知或外部副作用，未执行测试封禁。"
+            fail2ban_deep_check_error "Fail2ban 动作 $action 不是受支持的纯防火墙封禁命令；为避免通知或外部副作用，未执行测试封禁。"
             return 1
         }
         if ! grep -qxF "$backend" <<< "$backends"; then
@@ -6760,7 +6804,7 @@ fail2ban_backends_readable() {
     while IFS= read -r backend; do
         [ -n "$backend" ] || continue
         if ! fail2ban_backend_dump "$backend" >/dev/null; then
-            err "无法读取 Fail2ban 的 $backend 防火墙后端；请检查对应命令与运行状态。"
+            fail2ban_deep_check_error "无法读取 Fail2ban 的 $backend 防火墙后端；请检查对应命令与运行状态。"
             return 1
         fi
     done <<< "$backends"
@@ -6895,8 +6939,8 @@ cleanup_active_fail2ban_test() {
         [ "$attempt" -lt 5 ] && sleep 1
     done
 
-    err "Fail2ban 测试地址 $ip 未能自动完全解封。"
-    err "请保持当前 SSH 会话并执行：fail2ban-client set sshd unbanip $ip"
+    fail2ban_deep_check_error "Fail2ban 测试地址 $ip 未能自动完全解封。"
+    fail2ban_deep_check_error "请保持当前 SSH 会话并执行：fail2ban-client set sshd unbanip $ip"
     return 1
 }
 
@@ -6904,13 +6948,13 @@ verify_fail2ban_real_ban() {
     local backends test_ip attempt present=0
 
     if [ -n "${ACTIVE_FAIL2BAN_TEST_IP:-}" ] && ! cleanup_active_fail2ban_test; then
-        err "上一次 Fail2ban 测试地址仍未清理，已拒绝开始新的验证。"
+        fail2ban_deep_check_error "上一次 Fail2ban 测试地址仍未清理，已拒绝开始新的验证。"
         return 2
     fi
     backends="$(fail2ban_effective_firewall_backends)" || return 1
     fail2ban_backends_readable "$backends" || return 1
     test_ip="$(fail2ban_select_test_ip "$backends")" || {
-        err "无法选出未被占用的 TEST-NET IPv4 测试地址。"
+        fail2ban_deep_check_error "无法选出未被占用的 TEST-NET IPv4 测试地址。"
         return 1
     }
 
@@ -6918,7 +6962,7 @@ verify_fail2ban_real_ban() {
     ACTIVE_FAIL2BAN_TEST_BACKENDS="$backends"
     info "正在验证 Fail2ban sshd jail 与实际防火墙封禁链路..."
     if ! fail2ban-client set sshd banip "$test_ip" >/dev/null 2>&1; then
-        err "Fail2ban 测试封禁命令执行失败。"
+        fail2ban_deep_check_error "Fail2ban 测试封禁命令执行失败。"
         if cleanup_active_fail2ban_test; then
             return 1
         fi
@@ -6932,7 +6976,7 @@ verify_fail2ban_real_ban() {
         [ "$attempt" -lt 5 ] && sleep 1
     done
     if [ "$present" -ne 1 ]; then
-        err "测试地址未同时出现在 sshd jail 与实际防火墙后端。"
+        fail2ban_deep_check_error "测试地址未同时出现在 sshd jail 与实际防火墙后端。"
         if cleanup_active_fail2ban_test; then
             return 1
         fi
@@ -6943,6 +6987,22 @@ verify_fail2ban_real_ban() {
     fi
 
     info "Fail2ban 真实封禁、后端落地与解封清理验证通过。"
+}
+
+verify_fail2ban_real_ban_advisory() {
+    local FAIL2BAN_DEEP_CHECK_WARN_ONLY=1
+    local status
+
+    if verify_fail2ban_real_ban; then
+        return 0
+    else
+        status=$?
+    fi
+    if [ "$status" -eq 2 ] || [ -n "${ACTIVE_FAIL2BAN_TEST_IP:-}" ]; then
+        return 2
+    fi
+    warn "Fail2ban 基础配置已通过，但真实封禁深度检测未通过；已保留当前配置。"
+    return 0
 }
 
 chrony_service_name() {
@@ -8925,6 +8985,7 @@ prune_fail2ban_sshd_backups() {
 sync_fail2ban_sshd_port() {
     local backup=""
     local backend="auto"
+    local deep_check_status=0
     local ports
     local service_action
     local tmp
@@ -9015,29 +9076,35 @@ sync_fail2ban_sshd_port() {
             "$backup" "$was_running" || true
         return 1
     fi
-    if verify_fail2ban_real_ban; then
+    if [ "$(fail2ban_sshd_state)" != "已启用" ]; then
+        fail2ban_sync_failure_with_rollback \
+            "Fail2ban sshd jail 端口未与 SSH 当前生效端口一致" \
+            "$backup" "$was_running" || true
+        return 1
+    fi
+    if verify_fail2ban_real_ban_advisory; then
         :
     else
-        service_action=$?
-        if [ "$service_action" -eq 2 ] || [ -n "${ACTIVE_FAIL2BAN_TEST_IP:-}" ]; then
-            err "Fail2ban 真实封禁验证失败，且测试地址仍有残留；为保留解封能力，暂不回滚当前 jail。"
-        elif restore_fail2ban_sshd_sync_state "$backup" "$was_running"; then
-            err "Fail2ban 真实封禁验证失败，已恢复同步前的配置与服务状态。"
-        else
-            err "Fail2ban 真实封禁验证失败，且同步前状态未能完整恢复，请检查服务与配置。"
-        fi
-        return 1
+        deep_check_status=$?
     fi
     if ! restore_fail2ban_runtime_after_sync "$was_running"; then
         err "Fail2ban 配置验证通过，但无法恢复同步前的停止状态。"
         return 1
     fi
     if ! mark_change_applied FAIL2BAN_SSHD; then
+        if [ "$deep_check_status" -eq 2 ] || [ -n "${ACTIVE_FAIL2BAN_TEST_IP:-}" ]; then
+            err "Fail2ban 基础配置已通过，但测试地址仍有残留且无法记录已应用状态；当前配置未回滚。"
+            return 1
+        fi
         fail2ban_sync_failure_with_rollback \
             "Fail2ban 防护已验证，但无法记录已应用状态" "$backup" "$was_running" || true
         return 1
     fi
     prune_fail2ban_sshd_backups || warn "Fail2ban 历史备份清理不完整，最多保留 5 份的策略未完全执行。"
+    if [ "$deep_check_status" -eq 2 ] || [ -n "${ACTIVE_FAIL2BAN_TEST_IP:-}" ]; then
+        err "Fail2ban 基础配置已通过并保留，但深度检测的测试地址仍未完全清理。"
+        return 1
+    fi
 }
 
 apply_ssh_port_change() {
@@ -11020,9 +11087,11 @@ firewall_detect_docker_ports() {
     esac
 
     if ! firewall_docker_available; then
-        err "检测到 Docker 命令，但无法连接 Docker daemon。"
-        err "请先启动 Docker 或移除无效客户端，再更新主机防火墙。"
-        return 1
+        if docker_daemon_process_present; then
+            err "检测到 dockerd 正在运行，但无法读取 Docker daemon；已拒绝忽略可能存在的发布端口。"
+            return 1
+        fi
+        return 2
     fi
 
     security_options="$(docker_with_timeout info --format '{{json .SecurityOptions}}' 2>/dev/null)" || {
@@ -11414,11 +11483,47 @@ firewall_detect_managed_ports() {
     done
 }
 
+firewall_detect_docker_ports_for_update() {
+    local phase="${1:-strict}" status
+
+    if firewall_detect_docker_ports; then
+        return 0
+    else
+        status=$?
+    fi
+    [ "$status" -eq 2 ] || return "$status"
+
+    case "$phase" in
+        initial)
+            warn "检测到本机 Docker 客户端，但 Docker daemon 当前未运行，无法枚举发布端口。"
+            if confirm_default_no "本次忽略 Docker 并继续更新防火墙？"; then
+                FW_DOCKER_STOPPED_IGNORED=1
+                warn "本次将按没有 Docker 发布端口处理；启动 Docker 后必须再次执行 [1] 一键开启/更新防火墙。"
+                return 0
+            fi
+            info "已取消，未修改防火墙。"
+            return 3
+            ;;
+        confirmed)
+            if [ "${FW_DOCKER_STOPPED_IGNORED:-0}" = "1" ]; then
+                return 0
+            fi
+            err "Docker daemon 在确认期间停止，端口状态已变化；请重新执行防火墙更新。"
+            return 1
+            ;;
+        strict)
+            err "检测到本机 Docker 客户端，但 Docker daemon 未运行，无法可靠核对发布端口。"
+            return 1
+            ;;
+        *) return 2 ;;
+    esac
+}
+
 firewall_detect_allowed_ports() {
-    local known_tcp known_udp
+    local docker_phase="${1:-strict}" known_tcp known_udp
 
     firewall_detect_managed_ports || return 1
-    firewall_detect_docker_ports || return 1
+    firewall_detect_docker_ports_for_update "$docker_phase" || return $?
     firewall_detect_public_listeners || return 1
     known_tcp="$(merge_port_csv "$FW_SSH_PORTS" "$FW_NODE_TCP" "$FW_DOCKER_PUBLIC_TCP" "$FW_EXTRA_TCP")" || return 1
     known_udp="$(merge_port_csv "$FW_NODE_UDP" "$FW_DOCKER_PUBLIC_UDP" "$FW_EXTRA_UDP")" || return 1
@@ -11875,10 +11980,201 @@ firewall_cleanup_finished_rollback() {
     rm -rf -- "$dir"
 }
 
+firewall_additive_transaction_path() {
+    printf '%s/firewall-additive\n' "$FIREWALL_ROLLBACK_DIR"
+}
+
+firewall_additive_transaction_dir_valid() {
+    [ "${1:-}" = "$(firewall_additive_transaction_path)" ]
+}
+
+firewall_config_keeps_tcp_ports() {
+    local config="$1" required="$2" actual
+
+    required="$(normalize_port_csv "$required")" || return 1
+    actual="$(firewall_config_direct_ports "$config" tcp)" || return 1
+    port_csv_is_subset "$required" "$actual"
+}
+
+firewall_live_tcp_ports() {
+    nft -nn list chain inet vpsbox input 2>/dev/null |
+        firewall_ports_from_nft_chain tcp
+}
+
+firewall_additive_transaction_contents_valid() {
+    local dir="$1" path old_tcp normalized marker_count=0
+
+    [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    [ "$(stat -c '%u:%g %a' "$dir" 2>/dev/null || true)" = "0:0 700" ] || return 1
+    for path in config state old-tcp; do
+        [ -f "$dir/$path" ] && [ ! -L "$dir/$path" ] || return 1
+        [ "$(stat -c '%u:%g %a' "$dir/$path" 2>/dev/null || true)" = "0:0 600" ] || return 1
+    done
+    for path in pending committed runtime-active; do
+        [ -e "$dir/$path" ] || continue
+        [ -f "$dir/$path" ] && [ ! -L "$dir/$path" ] || return 1
+        [ "$(stat -c '%u:%g %a' "$dir/$path" 2>/dev/null || true)" = "0:0 600" ] || return 1
+    done
+    [ -e "$dir/pending" ] && marker_count=$((marker_count + 1))
+    [ -e "$dir/committed" ] && marker_count=$((marker_count + 1))
+    [ "$marker_count" -ge 1 ] || return 1
+
+    old_tcp="$(cat "$dir/old-tcp" 2>/dev/null)" || return 1
+    [ -n "$old_tcp" ] || return 1
+    normalized="$(normalize_port_csv "$old_tcp")" || return 1
+    [ "$normalized" = "$old_tcp" ] || return 1
+    firewall_config_keeps_tcp_ports "$dir/config" "$old_tcp"
+}
+
+firewall_remove_additive_transaction_dir() {
+    local dir="${1:-$(firewall_additive_transaction_path)}"
+
+    firewall_additive_transaction_dir_valid "$dir" || return 1
+    [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    rm -rf -- "$dir" || return 1
+    sync_node_transaction_store
+}
+
+firewall_begin_additive_transaction() {
+    local old_tcp="$1" was_runtime="$2" target build_dir path
+
+    [ "$was_runtime" = "0" ] || [ "$was_runtime" = "1" ] || return 2
+    old_tcp="$(normalize_port_csv "$old_tcp")" || return 1
+    [ -n "$old_tcp" ] || return 1
+    [ -z "${ACTIVE_FIREWALL_ADDITIVE_DIR:-}" ] &&
+        [ -z "${ACTIVE_FIREWALL_ROLLBACK_DIR:-}" ] || return 1
+    firewall_prepare_rollback_store || return 1
+    target="$(firewall_additive_transaction_path)"
+    [ ! -e "$target" ] && [ ! -L "$target" ] || {
+        err "已有未完成的防火墙轻量事务，已拒绝覆盖：$target"
+        return 1
+    }
+
+    build_dir="$(mktemp -d "$FIREWALL_ROLLBACK_DIR/.firewall-additive-build.XXXXXX")" || return 1
+    chmod 700 "$build_dir" || { rm -rf -- "$build_dir"; return 1; }
+    if ! cp -a -- "$FIREWALL_CONFIG" "$build_dir/config" ||
+        ! cp -a -- "$FIREWALL_STATE_FILE" "$build_dir/state" ||
+        ! printf '%s\n' "$old_tcp" >"$build_dir/old-tcp" ||
+        ! : >"$build_dir/pending"; then
+        rm -rf -- "$build_dir"
+        return 1
+    fi
+    if [ "$was_runtime" = "1" ] && ! : >"$build_dir/runtime-active"; then
+        rm -rf -- "$build_dir"
+        return 1
+    fi
+    for path in config state old-tcp pending runtime-active; do
+        [ -e "$build_dir/$path" ] || continue
+        chown root:root "$build_dir/$path" && chmod 600 "$build_dir/$path" || {
+            rm -rf -- "$build_dir"
+            return 1
+        }
+    done
+    chown root:root "$build_dir" || { rm -rf -- "$build_dir"; return 1; }
+    firewall_additive_transaction_contents_valid "$build_dir" || {
+        rm -rf -- "$build_dir"
+        return 1
+    }
+    sync_node_transaction_store || { rm -rf -- "$build_dir"; return 1; }
+    mv -- "$build_dir" "$target" || { rm -rf -- "$build_dir"; return 1; }
+    ACTIVE_FIREWALL_ADDITIVE_DIR="$target"
+    sync_node_transaction_store || return 1
+    firewall_additive_transaction_contents_valid "$target"
+}
+
+firewall_mark_additive_transaction_committed() {
+    local dir="${ACTIVE_FIREWALL_ADDITIVE_DIR:-$(firewall_additive_transaction_path)}"
+    local tmp
+
+    firewall_additive_transaction_dir_valid "$dir" || return 1
+    firewall_additive_transaction_contents_valid "$dir" || return 1
+    tmp="$(mktemp "$dir/.committed.XXXXXX")" || return 1
+    if ! chown root:root "$tmp" || ! chmod 600 "$tmp" ||
+        ! mv -f -- "$tmp" "$dir/committed"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    sync_node_transaction_store
+}
+
+firewall_commit_additive_transaction() {
+    local dir="${ACTIVE_FIREWALL_ADDITIVE_DIR:-}"
+
+    firewall_additive_transaction_dir_valid "$dir" || return 1
+    firewall_mark_additive_transaction_committed || return 1
+    ACTIVE_FIREWALL_ADDITIVE_DIR=""
+    if ! firewall_remove_additive_transaction_dir "$dir"; then
+        warn "新增端口已提交，但轻量事务残留未能清理：$dir"
+    fi
+    return 0
+}
+
+firewall_restore_additive_transaction() {
+    local dir="$1" old_tcp live_tcp failed=0
+
+    firewall_additive_transaction_dir_valid "$dir" || return 1
+    firewall_additive_transaction_contents_valid "$dir" || return 1
+    [ ! -e "$dir/committed" ] || return 1
+    old_tcp="$(cat "$dir/old-tcp")" || return 1
+
+    firewall_install_managed_file "$dir/config" "$FIREWALL_CONFIG" 600 || failed=1
+    firewall_install_managed_file "$dir/state" "$FIREWALL_STATE_FILE" 600 || failed=1
+    if [ -e "$dir/runtime-active" ]; then
+        firewall_apply_config_file "$dir/config" || failed=1
+    fi
+    cmp -s "$dir/config" "$FIREWALL_CONFIG" || failed=1
+    cmp -s "$dir/state" "$FIREWALL_STATE_FILE" || failed=1
+    firewall_config_keeps_tcp_ports "$FIREWALL_CONFIG" "$old_tcp" || failed=1
+    if [ -e "$dir/runtime-active" ]; then
+        live_tcp="$(firewall_live_tcp_ports)" || failed=1
+        port_csv_is_subset "$old_tcp" "$live_tcp" || failed=1
+    fi
+    [ "$failed" -eq 0 ] || return 1
+    # 先确保持久化旧配置和状态，再删除唯一的轻量事务备份。
+    sync_node_transaction_store || return 1
+
+    ACTIVE_FIREWALL_ADDITIVE_DIR=""
+    firewall_remove_additive_transaction_dir "$dir"
+}
+
+firewall_recover_pending_additive_transaction() {
+    local dir build_dir
+
+    firewall_prepare_rollback_store || return 1
+    for build_dir in "$FIREWALL_ROLLBACK_DIR"/.firewall-additive-build.*; do
+        [ -e "$build_dir" ] || continue
+        [ -d "$build_dir" ] && [ ! -L "$build_dir" ] || {
+            err "检测到不安全的防火墙轻量事务构建目录：$build_dir"
+            return 1
+        }
+        rm -rf -- "$build_dir" || return 1
+    done
+
+    dir="$(firewall_additive_transaction_path)"
+    [ -e "$dir" ] || [ -L "$dir" ] || return 0
+    firewall_additive_transaction_dir_valid "$dir" &&
+        firewall_additive_transaction_contents_valid "$dir" || {
+        err "防火墙轻量事务未通过完整性检查，已保留：$dir"
+        return 1
+    }
+    if [ -e "$dir/committed" ]; then
+        ACTIVE_FIREWALL_ADDITIVE_DIR=""
+        firewall_remove_additive_transaction_dir "$dir"
+        return
+    fi
+    warn "检测到未完成的新增端口操作，正在恢复原防火墙配置。"
+    ACTIVE_FIREWALL_ADDITIVE_DIR="$dir"
+    firewall_restore_additive_transaction "$dir" || {
+        err "新增端口的旧配置未能完整恢复，轻量事务已保留：$dir"
+        return 1
+    }
+}
+
 firewall_recover_pending_rollbacks() {
     local dir decision owner
 
     firewall_prepare_rollback_store || return 1
+    firewall_recover_pending_additive_transaction || return 1
     for dir in "$FIREWALL_ROLLBACK_DIR"/.firewall-rollback-build.*; do
         [ -e "$dir" ] || continue
         if [ ! -d "$dir" ] || [ -L "$dir" ]; then
@@ -12374,6 +12670,7 @@ EOF
 
 firewall_apply_desired_state() {
     local work_dir rollback_dir answer service_file service_target service_mode
+    local detect_status
 
     firewall_settle_pending_port_transition || return 1
     detect_os
@@ -12386,7 +12683,14 @@ firewall_apply_desired_state() {
     ensure_nftables || return 1
     firewall_check_conflicts || return 1
     firewall_load_state || return 1
-    firewall_detect_allowed_ports || return 1
+    FW_DOCKER_STOPPED_IGNORED=0
+    if firewall_detect_allowed_ports initial; then
+        :
+    else
+        detect_status=$?
+        [ "$detect_status" -eq 3 ] && return 0
+        return "$detect_status"
+    fi
 
     if firewall_desired_state_is_current; then
         info "当前防火墙规则与端口状态一致，无需更新。"
@@ -12401,10 +12705,10 @@ firewall_apply_desired_state() {
         err "确认后防火墙状态文件发生异常，未修改防火墙。"
         return 1
     }
-    firewall_detect_allowed_ports || {
+    if ! firewall_detect_allowed_ports confirmed; then
         err "确认后端口状态发生异常，未修改防火墙。"
         return 1
-    }
+    fi
     if firewall_desired_state_is_current; then
         info "当前防火墙规则与端口状态一致，无需更新。"
         return 0
@@ -13212,7 +13516,7 @@ firewall_check_config_file() {
 }
 
 firewall_live_added_ports_match() {
-    local protocols="$1" port="$2" input_ports
+    local protocols="$1" port="$2" required_tcp="${3:-}" input_ports
 
     case "$protocols" in tcp|udp|both) ;; *) return 2 ;; esac
     if [ "$protocols" = "tcp" ] || [ "$protocols" = "both" ]; then
@@ -13225,20 +13529,15 @@ firewall_live_added_ports_match() {
         csv_contains_port "$input_ports" "$port" || return 1
         firewall_live_port_set_matches extra_udp_dnat_ports "$FW_EXTRA_UDP" || return 1
     fi
-}
-
-firewall_restore_additive_snapshot() {
-    local rollback_dir="$1" commit_owner="${2:-0}"
-
-    if ! firewall_restore_snapshot_now "$rollback_dir" "$commit_owner"; then
-        err "新增端口失败且旧防火墙状态未能自动恢复，快照保留在：$rollback_dir"
-        return 1
+    if [ -n "$required_tcp" ]; then
+        input_ports="$(firewall_live_tcp_ports)" || return 1
+        port_csv_is_subset "$required_tcp" "$input_ports" || return 1
     fi
 }
 
 firewall_apply_added_ports() {
     local protocols="$1" port="$2" old_tcp="$3" old_udp="$4"
-    local work_dir rollback_dir old_direct_tcp was_runtime=0 committed=0 persist_failed=0
+    local work_dir old_direct_tcp was_runtime=0 persist_failed=0
     local new_config new_state
 
     case "$protocols" in tcp|udp|both) ;; *) return 2 ;; esac
@@ -13272,44 +13571,54 @@ firewall_apply_added_ports() {
         rm -rf "$work_dir"
         return 1
     }
-    if ! firewall_create_rollback_snapshot rollback_dir "$old_direct_tcp"; then
+    if ! firewall_config_keeps_tcp_ports "$new_config" "$old_direct_tcp"; then
         rm -rf "$work_dir"
-        err "无法创建新增端口的防火墙回滚快照。"
+        err "新增端口后的配置未保留原有 TCP 放行端口，已拒绝应用。"
+        return 1
+    fi
+    if ! firewall_begin_additive_transaction "$old_direct_tcp" "$was_runtime"; then
+        rm -rf "$work_dir"
+        err "无法创建新增端口的轻量回滚事务。"
         return 1
     fi
 
     if [ "$was_runtime" -eq 1 ]; then
         if ! firewall_apply_config_file "$new_config" ||
-            ! firewall_live_added_ports_match "$protocols" "$port"; then
+            ! firewall_live_added_ports_match "$protocols" "$port" "$old_direct_tcp"; then
             err "新增端口的运行规则验证失败，正在恢复旧状态。"
-            firewall_restore_additive_snapshot "$rollback_dir" || true
+            firewall_restore_additive_transaction "$ACTIVE_FIREWALL_ADDITIVE_DIR" ||
+                err "旧防火墙配置未能完整恢复，轻量事务已保留：$ACTIVE_FIREWALL_ADDITIVE_DIR"
             rm -rf "$work_dir"
             return 1
         fi
     fi
-    if ! firewall_begin_commit "$rollback_dir"; then
-        err "新增端口提交前回滚快照状态异常，正在恢复旧状态。"
-        firewall_restore_additive_snapshot "$rollback_dir" || true
-        rm -rf "$work_dir"
-        return 1
-    fi
-    committed=1
     if ! firewall_install_managed_file "$new_config" "$FIREWALL_CONFIG" 600; then
         persist_failed=1
     elif ! firewall_install_managed_file "$new_state" "$FIREWALL_STATE_FILE" 600; then
         persist_failed=1
-    elif [ "$was_runtime" -eq 1 ] && ! firewall_live_added_ports_match "$protocols" "$port"; then
+    elif ! cmp -s "$new_config" "$FIREWALL_CONFIG" ||
+        ! cmp -s "$new_state" "$FIREWALL_STATE_FILE" ||
+        ! firewall_config_keeps_tcp_ports "$FIREWALL_CONFIG" "$old_direct_tcp"; then
+        persist_failed=1
+    elif [ "$was_runtime" -eq 1 ] &&
+        ! firewall_live_added_ports_match "$protocols" "$port" "$old_direct_tcp"; then
+        persist_failed=1
+    fi
+    # committed 标记表示新文件可作为启动恢复基线；发布标记前必须先落盘。
+    if [ "$persist_failed" -eq 0 ] && ! sync_node_transaction_store; then
         persist_failed=1
     fi
     if [ "$persist_failed" -ne 0 ]; then
         err "新增端口的持久化验证失败，正在恢复旧状态。"
-        firewall_restore_additive_snapshot "$rollback_dir" "$committed" || true
+        firewall_restore_additive_transaction "$ACTIVE_FIREWALL_ADDITIVE_DIR" ||
+            err "旧防火墙配置未能完整恢复，轻量事务已保留：$ACTIVE_FIREWALL_ADDITIVE_DIR"
         rm -rf "$work_dir"
         return 1
     fi
-    if ! firewall_finish_commit "$rollback_dir"; then
-        err "新增端口提交收尾失败，正在恢复旧状态。"
-        firewall_restore_additive_snapshot "$rollback_dir" "$committed" || true
+    if ! firewall_commit_additive_transaction; then
+        err "新增端口提交标记失败，正在恢复旧状态。"
+        firewall_restore_additive_transaction "$ACTIVE_FIREWALL_ADDITIVE_DIR" ||
+            err "旧防火墙配置未能完整恢复，轻量事务已保留：$ACTIVE_FIREWALL_ADDITIVE_DIR"
         rm -rf "$work_dir"
         return 1
     fi
