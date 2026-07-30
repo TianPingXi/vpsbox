@@ -1275,6 +1275,50 @@ test_node_transaction_full_and_static_validation_modes() {
     )
 }
 
+test_node_transaction_restores_service_manager_state() {
+    (
+        local backup="$TEST_TMP/service-manager-state-backup"
+        local service_active=1 service_enabled=1 restored_process_requirement=""
+
+        set_node_paths "$TEST_TMP/service-manager-state"
+        service_manager_is_active() { [ "$service_active" -eq 1 ]; }
+        service_is_enabled() { [ "$service_enabled" -eq 1 ]; }
+        # 模拟 active 的自定义/旧 -c 服务：服务管理器可见，但不匹配 VPSBox -C 进程。
+        service_is_running() { return 1; }
+
+        backup_node_files "$backup"
+        assert_eq 1 "$(cat "$backup/service-running")" \
+            "节点事务必须记录服务管理器原本的 active 状态"
+        assert_eq 1 "$(cat "$backup/service-enabled")" \
+            "节点事务必须记录服务管理器原本的 enabled 状态"
+
+        service_active=0
+        service_enabled=0
+        service_stop() { service_active=0; }
+        stop_singbox_config_processes() { return 0; }
+        singbox_config_pids() { return 0; }
+        service_enable() { service_enabled=1; }
+        service_disable() { service_enabled=0; }
+        restart_singbox_cleanly() {
+            restored_process_requirement="${1:-}"
+            service_active=1
+            service_manager_is_active
+        }
+        is_systemd() { return 1; }
+        OS=unknown
+        : "$OS"
+        repair_node_uri_cache_best_effort() { return 0; }
+
+        restore_node_files "$backup" >/dev/null
+        [ "$service_active" -eq 1 ] ||
+            fail "节点事务恢复后必须重新激活原 active 服务"
+        [ "$service_enabled" -eq 1 ] ||
+            fail "节点事务恢复后必须恢复原 enabled 状态"
+        assert_eq 0 "$restored_process_requirement" \
+            "恢复自定义或旧布局服务时只验证服务管理器 active，不要求匹配 VPSBox -C 进程"
+    )
+}
+
 test_dual_node_backup_restore_round_trip() {
     (
         local backup="$TEST_TMP/dual-backup"
@@ -1960,6 +2004,32 @@ test_protocol_status_distinguishes_template_drift_from_damage() {
             "VLESS 自定义出站应标记为 deviated，而不是损坏"
     )
     (
+        set_node_paths "$TEST_TMP/status-vless-extra-credentials"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_vless_config_fixture "$VLESS_CONFIG_PATH"
+        write_vless_state_fixture "$VLESS_STATE_FILE"
+        jq '
+            .inbounds[].users += [{
+                "name": "extra",
+                "uuid": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                "flow": "xtls-rprx-vision"
+            }] |
+            .inbounds[].tls.reality.short_id += ["fedcba9876543210"]
+        ' "$VLESS_CONFIG_PATH" > "$VLESS_CONFIG_PATH.tmp"
+        mv "$VLESS_CONFIG_PATH.tmp" "$VLESS_CONFIG_PATH"
+        chmod 600 "$VLESS_CONFIG_PATH"
+
+        validate_protocol_node_core vless "$VLESS_CONFIG_PATH" "$VLESS_STATE_FILE" ||
+            fail "额外 VLESS user 或 short_id 不应破坏配置与状态的核心一致性"
+        check_node_config_set ||
+            fail "合法的额外 VLESS 凭据不应阻止 sing-box 配置检查"
+        if node_config_matches_vpsbox_template vless "$VLESS_CONFIG_PATH"; then
+            fail "额外 VLESS user 或 short_id 不应继续被识别为 VPSBox 管理模板"
+        fi
+        assert_eq deviated "$(protocol_node_status vless)" \
+            "额外 VLESS user 或 short_id 应标记为 deviated，而不是 damaged"
+    )
+    (
         set_node_paths "$TEST_TMP/status-custom-listen"
         mkdir -p "$NODE_CONFIG_DIR"
         write_ss_config_fixture "$SS_CONFIG_PATH"
@@ -2414,6 +2484,7 @@ main() {
         test_static_node_backup_validation_does_not_execute_singbox
         test_legacy_uri_snapshot_damage_does_not_block_core_recovery
         test_node_transaction_full_and_static_validation_modes
+        test_node_transaction_restores_service_manager_state
         test_dual_node_backup_restore_round_trip
         test_verify_runtime_checks_both_protocols
         test_cancel_eof_and_input_interrupt_have_no_mutation

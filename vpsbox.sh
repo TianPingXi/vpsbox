@@ -1165,8 +1165,14 @@ restore_root_file_snapshot() {
 }
 
 install_command_alias() {
+    local alias_target
+
     if [ ! -f "$CMD_PATH" ] || [ -L "$CMD_PATH" ]; then
         err "管理命令文件不存在或不安全：$CMD_PATH"
+        return 1
+    fi
+    if [ -d "$CMD_ALIAS_PATH" ]; then
+        err "管理命令入口是目录或指向目录，已拒绝覆盖：$CMD_ALIAS_PATH"
         return 1
     fi
     chmod 755 "$CMD_PATH" || {
@@ -1177,6 +1183,11 @@ install_command_alias() {
         err "无法创建命令入口：$CMD_ALIAS_PATH"
         return 1
     }
+    alias_target="$(readlink "$CMD_ALIAS_PATH" 2>/dev/null || true)"
+    if [ ! -L "$CMD_ALIAS_PATH" ] || [ "$alias_target" != "$CMD_PATH" ]; then
+        err "管理命令入口创建后校验失败：$CMD_ALIAS_PATH"
+        return 1
+    fi
 }
 
 ensure_curl() {
@@ -1838,8 +1849,11 @@ backup_change_file_once() {
     [[ "$name" =~ ^[A-Z0-9_]+$ ]] || return 1
     state="$(manifest_value "BACKUP_$name" 2>/dev/null || true)"
     [ -n "$state" ] && return 0
+    [ ! -L "$target" ] || {
+        err "备份目标是符号链接，已拒绝：$target"
+        return 1
+    }
     if [ -e "$target" ]; then
-        [ ! -L "$target" ] || { err "备份目标是符号链接，已拒绝：$target"; return 1; }
         cp -a "$target" "$CHANGE_BACKUP_DIR/$name" || return 1
         manifest_set "BACKUP_$name" file
     else
@@ -2862,10 +2876,18 @@ node_config_matches_vpsbox_template() {
             ' "$config" >/dev/null 2>&1
             ;;
         vless)
-            jq -e --arg config_id "$CONFIG_ID" '
+            jq -e \
+                --arg config_id "$CONFIG_ID" \
+                --arg uuid "${UUID:-}" \
+                --arg flow "${FLOW:-}" \
+                --arg short_id "${REALITY_SHORT_ID:-}" '
                 (.inbounds | type == "array" and (length == 1 or length == 2)) and
                 (all(.inbounds[];
                     (.listen == "0.0.0.0" or .listen == "::") and
+                    (.users | type == "array" and length == 1) and
+                    (.users[0].uuid == $uuid and .users[0].flow == $flow) and
+                    (.tls.reality.short_id | type == "array" and length == 1) and
+                    (.tls.reality.short_id[0] == $short_id) and
                     (.tag | type == "string" and contains($config_id))
                 )) and
                 (if (.inbounds | length) == 2 then
@@ -3728,7 +3750,9 @@ backup_node_files() {
     backup_node_file_with_manifest /etc/init.d/sing-box \
         "$backup_dir/openrc-sing-box" openrc-sing-box "$manifest" || return 1
 
-    if service_is_running; then
+    # 事务恢复的是服务管理器原本的 active 状态。精确匹配 `run -C vpsbox.d`
+    # 只用于 VPSBox 节点运行验证，不能把 active 的自定义或旧布局服务记成未运行。
+    if service_manager_is_active; then
         printf '1\n' > "$backup_dir/service-running" || return 1
     else
         printf '0\n' > "$backup_dir/service-running" || return 1
@@ -4213,7 +4237,7 @@ node_config_dir_restore_target_safe() {
 restore_node_files() {
     local backup_dir="$1"
     local transaction_dir validation_spec
-    local was_running="0"
+    local was_active="0"
     local was_enabled="0"
     local failed=0
 
@@ -4227,7 +4251,7 @@ restore_node_files() {
         err "事务备份已保留：$backup_dir"
         return 1
     fi
-    was_running="$(cat "$backup_dir/service-running")" || return 1
+    was_active="$(cat "$backup_dir/service-running")" || return 1
     was_enabled="$(cat "$backup_dir/service-enabled")" || return 1
 
     warn "操作未完成，正在恢复操作前的节点配置..."
@@ -4269,7 +4293,9 @@ restore_node_files() {
         return 1
     fi
 
-    restore_singbox_service_state "$was_enabled" "$was_running" 2>/dev/null || failed=1
+    # 原服务可能使用自定义或旧布局；这里验证服务管理器的 enabled/active 状态，
+    # 不要求恢复出的进程必须匹配 VPSBox 的 `run -C vpsbox.d`。
+    restore_singbox_service_state "$was_enabled" "$was_active" 0 2>/dev/null || failed=1
 
     if [ "$failed" -ne 0 ]; then
         err "操作前的节点配置恢复不完整，备份已保留：$backup_dir"
@@ -7843,6 +7869,15 @@ enable_ntp_sync() {
         fi
         show_ntp_runtime_details "$svc"
         return 0
+    fi
+    if [ -L "$conf" ] || { [ -e "$conf" ] && [ ! -f "$conf" ]; }; then
+        err "chrony 配置不是普通文件，已拒绝修改：$conf"
+        return 1
+    fi
+    if [ -L "$source_file" ] ||
+        { [ -e "$source_file" ] && [ ! -f "$source_file" ]; }; then
+        err "NTP 源配置不是普通文件，已拒绝修改：$source_file"
+        return 1
     fi
 
     ntp_package_installed chrony && chrony_package="installed"
@@ -13158,6 +13193,7 @@ firewall_active_config_ready_for_sync() {
         err "主机防火墙配置存在但规则表未运行，无法同步端口。"
         return 1
     }
+    firewall_prepare_rollback_store
 }
 
 firewall_sync_active_config() {
@@ -14992,85 +15028,18 @@ hostname_short_name() {
     printf '%s\n' "${1%%.*}"
 }
 
-hostname_snapshot_file() {
-    local dir="$1" name="$2" target="$3"
-
-    [ ! -L "$target" ] || return 1
-    if [ -e "$target" ]; then
-        [ -f "$target" ] || return 1
-        cp -a -- "$target" "$dir/$name" || return 1
-        : > "$dir/$name.present"
-    else
-        : > "$dir/$name.absent"
-    fi
-}
-
-create_hostname_operation_snapshot() {
-    local output_var="$1" current_hostname="$2" dir
-
-    dir="$(mktemp -d /tmp/vpsbox-hostname.XXXXXX)" || return 1
-    chmod 700 "$dir" || { rm -rf -- "$dir"; return 1; }
-    if ! hostname_snapshot_file "$dir" hostname "$HOSTNAME_PATH" ||
-        ! hostname_snapshot_file "$dir" hosts "$HOSTS_PATH" ||
-        ! printf '%s\n' "$current_hostname" > "$dir/runtime-hostname" ||
-        ! chmod 600 "$dir/runtime-hostname"; then
-        rm -rf -- "$dir"
-        return 1
-    fi
-    printf -v "$output_var" '%s' "$dir"
-}
-
-restore_hostname_snapshot_file() {
-    local dir="$1" name="$2" target="$3"
-
-    if [ -e "$dir/$name.present" ]; then
-        [ -f "$dir/$name" ] && [ ! -L "$dir/$name" ] || return 1
-        restore_file_atomically_from_snapshot "$dir/$name" "$target"
-    elif [ -e "$dir/$name.absent" ]; then
-        remove_snapshot_target_file "$target"
-    else
-        return 1
-    fi
-}
-
-hostname_operation_snapshot_valid() {
-    local dir="$1" runtime
-
-    { [[ "$dir" == /tmp/vpsbox-hostname.* ]] ||
-        [ "${VPSBOX_TEST_MODE:-0}" = "1" ]; } &&
-        [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
-    [ -f "$dir/runtime-hostname" ] && [ ! -L "$dir/runtime-hostname" ] || return 1
-    runtime="$(cat "$dir/runtime-hostname" 2>/dev/null || true)"
-    is_valid_hostname_value "$runtime" || return 1
-    { [ -e "$dir/hostname.present" ] && [ ! -e "$dir/hostname.absent" ]; } ||
-        { [ -e "$dir/hostname.absent" ] && [ ! -e "$dir/hostname.present" ]; } || return 1
-    { [ -e "$dir/hosts.present" ] && [ ! -e "$dir/hosts.absent" ]; } ||
-        { [ -e "$dir/hosts.absent" ] && [ ! -e "$dir/hosts.present" ]; } || return 1
-}
-
-rollback_hostname_change() {
-    local snapshot="$1" original failed=0
-
-    hostname_operation_snapshot_valid "$snapshot" || return 1
-    original="$(cat "$snapshot/runtime-hostname")"
-    restore_hostname_snapshot_file "$snapshot" hostname "$HOSTNAME_PATH" || failed=1
-    restore_hostname_snapshot_file "$snapshot" hosts "$HOSTS_PATH" || failed=1
-    set_system_hostname "$original" >/dev/null 2>&1 || failed=1
-    [ "$(hostname_current_value 2>/dev/null || true)" = "$original" ] || failed=1
-    if [ "$failed" -eq 0 ]; then
-        manifest_remove PENDING_HOSTNAME || failed=1
-    fi
-    if [ "$failed" -eq 0 ]; then
-        rm -rf -- "$snapshot"
-        return 0
-    fi
-    warn "本次主机名操作恢复未完成，临时快照已保留：$snapshot"
-    return 1
-}
-
 change_system_hostname() {
-    local old new short_name hosts_entry tmp operation_snapshot=""
-    old="$(hostname_current_value)"
+    local old new short_name hosts_entry hostname_tmp="" hosts_tmp=""
+    local hostname_file_value runtime_value hosts_state
+
+    old="$(hostname_current_value)" || {
+        err "无法读取当前主机名，已取消修改。"
+        return 1
+    }
+    [ -n "$old" ] || {
+        err "当前主机名为空，已取消修改。"
+        return 1
+    }
     echo "当前主机名：$old"
     if ! read -r -p "请输入新主机名（留空取消）: " new; then
         info "输入已结束，已取消。"
@@ -15080,76 +15049,96 @@ change_system_hostname() {
     [ -n "$new" ] || { info "已取消。"; return 0; }
     is_valid_hostname_value "$new" || { err "主机名格式不正确：仅允许字母、数字、点和连字符，长度不超过 64。"; return 1; }
     [ "$new" != "$old" ] || { info "新旧主机名相同。"; return 0; }
-    [ ! -L "$HOSTNAME_PATH" ] || { err "$HOSTNAME_PATH 是符号链接，已拒绝修改。"; return 1; }
-    hostname_hosts_markers_valid || { err "$HOSTS_PATH 是符号链接或 vpsbox 主机名标记异常，已拒绝修改。"; return 1; }
-    backup_change_file_once HOSTNAME_FILE "$HOSTNAME_PATH" || return 1
-    backup_change_file_once HOSTS_FILE "$HOSTS_PATH" || return 1
-    manifest_set_once HOSTNAME_VALUE "$old" || return 1
-    begin_change_transaction HOSTNAME || { err "记录主机名修改事务失败，已取消修改。"; return 1; }
-    if ! create_hostname_operation_snapshot operation_snapshot "$old"; then
-        manifest_remove PENDING_HOSTNAME || true
-        err "无法创建本次主机名操作快照，已取消修改。"
+    if [ -L "$HOSTNAME_PATH" ] ||
+        { [ -e "$HOSTNAME_PATH" ] && [ ! -f "$HOSTNAME_PATH" ]; }; then
+        err "$HOSTNAME_PATH 不是安全的普通文件，已拒绝修改。"
         return 1
     fi
+    hostname_hosts_markers_valid || { err "$HOSTS_PATH 是符号链接或 vpsbox 主机名标记异常，已拒绝修改。"; return 1; }
+
     short_name="$(hostname_short_name "$new")"
     hosts_entry="127.0.1.1 $new"
     [ "$short_name" = "$new" ] || hosts_entry+=" $short_name"
 
-    tmp="$(mktemp "$(dirname "$HOSTNAME_PATH")/.hostname.vpsbox.XXXXXX")" || {
-        rollback_hostname_change "$operation_snapshot" || true
+    hostname_tmp="$(mktemp "$(dirname "$HOSTNAME_PATH")/.hostname.vpsbox.XXXXXX")" || {
+        err "无法创建 $HOSTNAME_PATH 的临时文件，系统未修改。"
         return 1
     }
-    printf '%s\n' "$new" > "$tmp"
-    if ! chown root:root "$tmp" || ! chmod 644 "$tmp" || ! mv -f "$tmp" "$HOSTNAME_PATH" || ! set_system_hostname "$new"; then
-        rm -f "$tmp"
-        rollback_hostname_change "$operation_snapshot" || true
-        err "主机名修改失败，已尝试恢复原主机名。"
+    if ! printf '%s\n' "$new" > "$hostname_tmp" ||
+        ! chown root:root "$hostname_tmp" || ! chmod 644 "$hostname_tmp"; then
+        rm -f -- "$hostname_tmp"
+        err "生成 $HOSTNAME_PATH 的新内容失败，系统未修改。"
         return 1
     fi
 
-    tmp="$(mktemp "$(dirname "$HOSTS_PATH")/.hosts.vpsbox.XXXXXX")" || {
-        rollback_hostname_change "$operation_snapshot" || true
+    hosts_tmp="$(mktemp "$(dirname "$HOSTS_PATH")/.hosts.vpsbox.XXXXXX")" || {
+        rm -f -- "$hostname_tmp"
+        err "无法创建 $HOSTS_PATH 的临时文件，系统未修改。"
         return 1
     }
     if ! awk -v begin="$HOSTNAME_BEGIN" -v end="$HOSTNAME_END" '
         $0 == begin { skip=1; next }
         $0 == end { skip=0; next }
         !skip { print }
-    ' "$HOSTS_PATH" > "$tmp"; then
-        rm -f "$tmp"
-        rollback_hostname_change "$operation_snapshot" || true
-        err "读取 $HOSTS_PATH 失败，已恢复原配置。"
+    ' "$HOSTS_PATH" > "$hosts_tmp"; then
+        rm -f -- "$hostname_tmp" "$hosts_tmp"
+        err "读取 $HOSTS_PATH 失败，系统未修改。"
         return 1
     fi
     if ! {
         printf '%s\n' "$HOSTNAME_BEGIN" &&
             printf '%s\n' "$hosts_entry" &&
             printf '%s\n' "$HOSTNAME_END"
-    } >> "$tmp"; then
-        rm -f "$tmp"
-        rollback_hostname_change "$operation_snapshot" || true
-        err "更新 $HOSTS_PATH 失败，已尝试恢复原配置。"
+    } >> "$hosts_tmp" ||
+        ! chown root:root "$hosts_tmp" || ! chmod 644 "$hosts_tmp"; then
+        rm -f -- "$hostname_tmp" "$hosts_tmp"
+        err "生成 $HOSTS_PATH 的新内容失败，系统未修改。"
         return 1
     fi
-    if ! chown root:root "$tmp" || ! chmod 644 "$tmp" || ! mv -f "$tmp" "$HOSTS_PATH"; then
-        rm -f "$tmp"
-        rollback_hostname_change "$operation_snapshot" || true
-        err "更新 $HOSTS_PATH 失败，已恢复原配置。"
+
+    if ! mv -f -- "$hostname_tmp" "$HOSTNAME_PATH"; then
+        rm -f -- "$hostname_tmp" "$hosts_tmp"
+        err "写入 $HOSTNAME_PATH 失败，运行时主机名和 $HOSTS_PATH 未修改。"
         return 1
     fi
-    if [ "$(tr -d '\r\n' <"$HOSTNAME_PATH")" != "$new" ] ||
-        [ "$(hostname_current_value)" != "$new" ] ||
-        ! grep -Fqx "$hosts_entry" "$HOSTS_PATH"; then
-        rollback_hostname_change "$operation_snapshot" || true
-        err "主机名验证失败，已恢复原配置。"
+    hostname_tmp=""
+    if ! set_system_hostname "$new"; then
+        rm -f -- "$hosts_tmp"
+        hostname_file_value="$(tr -d '\r\n' <"$HOSTNAME_PATH" 2>/dev/null || true)"
+        runtime_value="$(hostname_current_value 2>/dev/null || true)"
+        [ -n "$hostname_file_value" ] || hostname_file_value="<空或无法读取>"
+        [ -n "$runtime_value" ] || runtime_value="<空或无法读取>"
+        err "运行时主机名设置命令失败，$HOSTS_PATH 未修改。"
+        err "当前状态：$HOSTNAME_PATH=$hostname_file_value；运行时主机名=$runtime_value；$HOSTS_PATH=未发布。"
         return 1
     fi
-    if ! mark_change_applied HOSTNAME; then
-        rollback_hostname_change "$operation_snapshot" || true
-        err "无法记录主机名变更，已恢复原配置。"
+    if ! mv -f -- "$hosts_tmp" "$HOSTS_PATH"; then
+        rm -f -- "$hosts_tmp"
+        hostname_file_value="$(tr -d '\r\n' <"$HOSTNAME_PATH" 2>/dev/null || true)"
+        runtime_value="$(hostname_current_value 2>/dev/null || true)"
+        [ -n "$hostname_file_value" ] || hostname_file_value="<空或无法读取>"
+        [ -n "$runtime_value" ] || runtime_value="<空或无法读取>"
+        err "$HOSTS_PATH 更新失败。"
+        err "当前状态：$HOSTNAME_PATH=$hostname_file_value；运行时主机名=$runtime_value；$HOSTS_PATH=未发布。"
         return 1
     fi
-    rm -rf -- "$operation_snapshot"
+    hosts_tmp=""
+
+    hostname_file_value="$(tr -d '\r\n' <"$HOSTNAME_PATH" 2>/dev/null || true)"
+    runtime_value="$(hostname_current_value 2>/dev/null || true)"
+    if grep -Fqx "$hosts_entry" "$HOSTS_PATH"; then
+        hosts_state="已发布"
+    else
+        hosts_state="未检测到目标条目"
+    fi
+    if [ "$hostname_file_value" != "$new" ] ||
+        [ "$runtime_value" != "$new" ] || [ "$hosts_state" != "已发布" ]; then
+        [ -n "$hostname_file_value" ] || hostname_file_value="<空或无法读取>"
+        [ -n "$runtime_value" ] || runtime_value="<空或无法读取>"
+        err "主机名修改后的验证未通过。"
+        err "当前状态：$HOSTNAME_PATH=$hostname_file_value；运行时主机名=$runtime_value；$HOSTS_PATH=$hosts_state。"
+        return 1
+    fi
     info "主机名已修改为：$new"
 }
 
@@ -15265,12 +15254,11 @@ cleanup_system_garbage() {
 }
 
 system_change_items() {
-    printf '%s\n' hostname dns bbr ipv4_priority fail2ban journald ntp
+    printf '%s\n' dns bbr ipv4_priority fail2ban journald ntp
 }
 
 system_change_label() {
     case "$1" in
-        hostname) printf '%s\n' "主机名" ;;
         dns) printf '%s\n' "IPv4 DNS" ;;
         bbr) printf '%s\n' "BBR + fq" ;;
         ipv4_priority) printf '%s\n' "IPv4 优先" ;;
@@ -15283,7 +15271,6 @@ system_change_label() {
 
 system_change_members() {
     case "$1" in
-        hostname) printf '%s\n' HOSTNAME ;;
         dns) printf '%s\n' DNS_RESOLV DNS_RESOLVED ;;
         bbr) printf '%s\n' BBR_CONF ;;
         ipv4_priority) printf '%s\n' GAI_CONF ;;
@@ -15343,29 +15330,6 @@ recorded_system_changes_present() {
         [ "$(system_change_state "$item")" = none ] || return 0
     done < <(system_change_items)
     return 1
-}
-
-restore_hostname_system_change() {
-    local old failed=0
-
-    old="$(manifest_value HOSTNAME_VALUE 2>/dev/null || true)"
-    [ -n "$old" ] &&
-        change_backup_record_is_valid HOSTNAME_FILE &&
-        change_backup_record_is_valid HOSTS_FILE || {
-        err "主机名恢复记录不完整，已拒绝修改系统。"
-        return 1
-    }
-    restore_change_file HOSTNAME_FILE "$HOSTNAME_PATH" || failed=1
-    restore_change_file HOSTS_FILE "$HOSTS_PATH" || failed=1
-    [ "$failed" -eq 0 ] && set_system_hostname "$old" 2>/dev/null || failed=1
-    [ "$failed" -eq 0 ] || return 1
-
-    clear_change_tracking HOSTNAME_FILE || failed=1
-    clear_change_tracking HOSTS_FILE || failed=1
-    manifest_remove APPLIED_HOSTNAME || failed=1
-    manifest_remove PENDING_HOSTNAME || failed=1
-    manifest_remove HOSTNAME_VALUE || failed=1
-    return "$failed"
 }
 
 restore_dns_system_change() {
@@ -15509,7 +15473,6 @@ restore_vpsbox_system_change() {
     [ "$(system_change_state "$item")" != none ] || return 2
     label="$(system_change_label "$item")" || return 2
     case "$item" in
-        hostname) restore_hostname_system_change ;;
         dns) restore_dns_system_change ;;
         bbr) restore_bbr_system_change ;;
         ipv4_priority) restore_ipv4_priority_system_change ;;
@@ -15613,13 +15576,12 @@ system_changes_menu() {
  vpsbox 系统改动
 ========================================
  [1] 恢复全部已记录项目
- [2] 主机名：$(system_change_state_text hostname)
- [3] IPv4 DNS：$(system_change_state_text dns)
- [4] BBR + fq：$(system_change_state_text bbr)
- [5] IPv4 优先：$(system_change_state_text ipv4_priority)
- [6] Fail2ban：$(system_change_state_text fail2ban)
- [7] journald 日志限制：$(system_change_state_text journald)
- [8] NTP 时间同步：$(system_change_state_text ntp)
+ [2] IPv4 DNS：$(system_change_state_text dns)
+ [3] BBR + fq：$(system_change_state_text bbr)
+ [4] IPv4 优先：$(system_change_state_text ipv4_priority)
+ [5] Fail2ban：$(system_change_state_text fail2ban)
+ [6] journald 日志限制：$(system_change_state_text journald)
+ [7] NTP 时间同步：$(system_change_state_text ntp)
 ----------------------------------------
  [0] 返回系统优化菜单
 ========================================
@@ -15629,13 +15591,12 @@ EOF
 
         case "$opt" in
             1) run_menu_action restore_vpsbox_system_changes; pause ;;
-            2) run_menu_action restore_vpsbox_system_change_interactive hostname; pause ;;
-            3) run_menu_action restore_vpsbox_system_change_interactive dns; pause ;;
-            4) run_menu_action restore_vpsbox_system_change_interactive bbr; pause ;;
-            5) run_menu_action restore_vpsbox_system_change_interactive ipv4_priority; pause ;;
-            6) run_menu_action restore_vpsbox_system_change_interactive fail2ban; pause ;;
-            7) run_menu_action restore_vpsbox_system_change_interactive journald; pause ;;
-            8) run_menu_action restore_vpsbox_system_change_interactive ntp; pause ;;
+            2) run_menu_action restore_vpsbox_system_change_interactive dns; pause ;;
+            3) run_menu_action restore_vpsbox_system_change_interactive bbr; pause ;;
+            4) run_menu_action restore_vpsbox_system_change_interactive ipv4_priority; pause ;;
+            5) run_menu_action restore_vpsbox_system_change_interactive fail2ban; pause ;;
+            6) run_menu_action restore_vpsbox_system_change_interactive journald; pause ;;
+            7) run_menu_action restore_vpsbox_system_change_interactive ntp; pause ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac

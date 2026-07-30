@@ -141,6 +141,53 @@ test_atomic_snapshot_restore_replaces_dangling_symlink() {
     [ ! -e "$missing" ] || fail "不得创建悬空链接原本指向的文件"
 }
 
+test_backup_rejects_dangling_symlink_without_absent_record() {
+    local target missing
+
+    require_real_symlink file || return "$?"
+    reset_change_store backup-dangling-symlink
+    target="$TEST_TMP/backup-dangling-symlink/target"
+    missing="$TEST_TMP/backup-dangling-symlink/missing"
+    ln -s "$missing" "$target"
+
+    if backup_change_file_once TEST_FILE "$target" >/dev/null 2>&1; then
+        fail "悬空符号链接不得被记录为不存在"
+    fi
+    [ -L "$target" ] || fail "拒绝备份后必须保留原悬空符号链接"
+    assert_file_not_contains "$CHANGE_MANIFEST" '^BACKUP_TEST_FILE='
+}
+
+test_ntp_rejects_dangling_config_before_tracking_or_install() {
+    (
+        local base="$TEST_TMP/ntp-dangling-config"
+        local missing="$base/missing-chrony.conf"
+        local package_calls=0
+
+        require_real_symlink file || return "$?"
+        reset_change_store ntp-dangling-config
+        mkdir -p "$base"
+        ln -s "$missing" "$base/chrony.conf"
+        CHRONY_SOURCE_FILE="$base/vpsbox.sources"
+        detect_os() { OS=debian; }
+        is_systemd() { return 0; }
+        chrony_service_name() { printf '%s\n' chrony; }
+        chrony_conf_path() { printf '%s\n' "$base/chrony.conf"; }
+        ntp_package_installed() { return 1; }
+        systemd_unit_exists() { return 1; }
+        apt_get_bounded() { package_calls=$((package_calls + 1)); }
+
+        if enable_ntp_sync >/dev/null 2>&1; then
+            fail "chrony 配置是悬空链接时必须拒绝修改"
+        fi
+        assert_eq 0 "$package_calls" \
+            "拒绝不安全配置目标后不得安装软件包"
+        [ -L "$base/chrony.conf" ] ||
+            fail "拒绝 NTP 修改后必须保留原悬空符号链接"
+        assert_file_not_contains "$CHANGE_MANIFEST" 'NTP_' \
+            "修改前拒绝时不得留下 NTP 恢复记录"
+    )
+}
+
 test_atomic_snapshot_restore_move_failure_preserves_target() {
     (
         local source target
@@ -1621,22 +1668,46 @@ test_dns_verification_uses_bounded_command() {
     )
 }
 
-test_hostname_failure_restores_current_operation_state() {
+test_hostname_change_does_not_create_restore_record() {
     (
-        local runtime_hostname="first.example" fail_hosts_publish=1
-        reset_change_store hostname-second-failure
-        HOSTNAME_PATH="$TEST_TMP/hostname-second-failure/hostname"
-        HOSTS_PATH="$TEST_TMP/hostname-second-failure/hosts"
-        printf '%s\n' first.example > "$HOSTNAME_PATH"
+        local runtime_hostname="old.example"
+
+        reset_change_store hostname-no-restore-record
+        HOSTNAME_PATH="$TEST_TMP/hostname-no-restore-record/hostname"
+        HOSTS_PATH="$TEST_TMP/hostname-no-restore-record/hosts"
+        printf '%s\n' old.example > "$HOSTNAME_PATH"
         printf '%s\n' '127.0.0.1 localhost' '192.0.2.10 user-entry' > "$HOSTS_PATH"
-        printf '%s\n' baseline.example > "$CHANGE_BACKUP_DIR/HOSTNAME_FILE"
-        printf '%s\n' '127.0.0.1 baseline' > "$CHANGE_BACKUP_DIR/HOSTS_FILE"
-        cat > "$CHANGE_MANIFEST" <<'EOF'
-BACKUP_HOSTNAME_FILE=file
-BACKUP_HOSTS_FILE=file
-HOSTNAME_VALUE=baseline.example
-APPLIED_HOSTNAME=1
-EOF
+        hostname_current_value() { printf '%s\n' "$runtime_hostname"; }
+        set_system_hostname() { runtime_hostname="$1"; }
+
+        change_system_hostname <<< "new.example" >/dev/null
+
+        assert_eq new.example "$runtime_hostname"
+        assert_file_contains "$HOSTNAME_PATH" '^new[.]example$'
+        assert_file_contains "$HOSTS_PATH" '^192\.0\.2\.10 user-entry$'
+        assert_file_contains "$HOSTS_PATH" '^127[.]0[.]1[.]1 new[.]example new$'
+        assert_file_not_contains "$CHANGE_MANIFEST" 'HOSTNAME' \
+            "主机名修改不应写入 vpsbox 持久恢复清单"
+        [ ! -e "$CHANGE_BACKUP_DIR/HOSTNAME_FILE" ] &&
+            [ ! -e "$CHANGE_BACKUP_DIR/HOSTS_FILE" ] ||
+            fail "主机名修改不应创建持久备份"
+        assert_eq 'dns bbr ipv4_priority fail2ban journald ntp' \
+            "$(system_change_items | paste -sd ' ' -)" \
+            "系统恢复项目不应再包含主机名"
+    )
+}
+
+test_hostname_partial_failure_reports_current_state_without_restore_claim() {
+    (
+        local runtime_hostname="old.example" fail_hosts_publish=1
+        local output="$TEST_TMP/hostname-partial-failure.out"
+
+        reset_change_store hostname-partial-failure
+        HOSTNAME_PATH="$TEST_TMP/hostname-partial-failure/hostname"
+        HOSTS_PATH="$TEST_TMP/hostname-partial-failure/hosts"
+        printf '%s\n' old.example > "$HOSTNAME_PATH"
+        printf '%s\n' \
+            '127.0.0.1 localhost' '192.0.2.10 user-entry' > "$HOSTS_PATH"
         hostname_current_value() { printf '%s\n' "$runtime_hostname"; }
         set_system_hostname() { runtime_hostname="$1"; }
         mv() {
@@ -1644,7 +1715,7 @@ EOF
             local -a args=("$@")
             source="${args[${#args[@]}-2]}"
             target="${args[${#args[@]}-1]}"
-            if [ "$target" = "$HOSTS_PATH" ] && [[ "$source" == */.hosts.vpsbox.* ]] &&
+            if [ "$target" = "$HOSTS_PATH" ] &&
                 [ "$fail_hosts_publish" -eq 1 ]; then
                 fail_hosts_publish=0
                 return 23
@@ -1652,49 +1723,21 @@ EOF
             command mv "$@"
         }
 
-        if change_system_hostname <<< "second.example" >/dev/null 2>&1; then
-            fail "第二次主机名修改的 hosts 发布失败时不得报告成功"
-        fi
-        assert_file_contains "$HOSTNAME_PATH" '^first\.example$'
-        assert_file_contains "$HOSTS_PATH" '^192\.0\.2\.10 user-entry$'
-        assert_eq first.example "$runtime_hostname"
-        assert_file_contains "$CHANGE_MANIFEST" '^APPLIED_HOSTNAME=1$'
-        assert_file_not_contains "$CHANGE_MANIFEST" '^PENDING_HOSTNAME='
-    )
-}
-
-test_hostname_managed_block_write_failure_rolls_back() {
-    (
-        local runtime_hostname="old.example" fail_managed_begin=1
-        local output="$TEST_TMP/hostname-managed-write.out"
-
-        reset_change_store hostname-managed-write
-        HOSTNAME_PATH="$TEST_TMP/hostname-managed-write/hostname"
-        HOSTS_PATH="$TEST_TMP/hostname-managed-write/hosts"
-        builtin printf '%s\n' old.example > "$HOSTNAME_PATH"
-        builtin printf '%s\n' \
-            '127.0.0.1 localhost' '192.0.2.10 user-entry' > "$HOSTS_PATH"
-        hostname_current_value() { builtin printf '%s\n' "$runtime_hostname"; }
-        set_system_hostname() { runtime_hostname="$1"; }
-        printf() {
-            if [ "$fail_managed_begin" -eq 1 ] &&
-                [ "${2:-}" = "$HOSTNAME_BEGIN" ]; then
-                fail_managed_begin=0
-                return 23
-            fi
-            builtin printf "$@"
-        }
-
         if change_system_hostname <<< "new.example" > "$output" 2>&1; then
-            fail "主机名受管块写入不完整时不得报告成功"
+            fail "hosts 发布失败时主机名修改不得报告成功"
         fi
 
-        assert_eq old.example "$runtime_hostname"
-        assert_file_contains "$HOSTNAME_PATH" '^old[.]example$'
+        assert_eq new.example "$runtime_hostname" \
+            "不再提供回滚后，应保留已经成功设置的运行时主机名"
+        assert_file_contains "$HOSTNAME_PATH" '^new[.]example$'
         assert_file_contains "$HOSTS_PATH" '^192[.]0[.]2[.]10 user-entry$'
         assert_file_not_contains "$HOSTS_PATH" '^# (BEGIN|END) VPSBOX HOSTNAME$'
-        assert_file_not_contains "$CHANGE_MANIFEST" '^PENDING_HOSTNAME='
-        assert_file_contains "$output" '更新 .*hosts 失败'
+        assert_file_not_contains "$CHANGE_MANIFEST" 'HOSTNAME'
+        assert_file_contains "$output" 'hosts 更新失败'
+        assert_file_contains "$output" \
+            '当前状态：.*hostname=new[.]example；运行时主机名=new[.]example；.*hosts=未发布'
+        assert_file_not_contains "$output" '恢复' \
+            "没有执行回滚时不得声称已恢复或尝试恢复"
     )
 }
 
@@ -1951,7 +1994,7 @@ test_restore_system_changes_clears_success_and_preserves_failed_group() {
             fail "成功项目必须立即清理自己的备份"
         assert_file_contains "$output" '恢复成功：1 项'
         assert_file_contains "$output" '恢复失败：1 项'
-        assert_file_contains "$output" '无记录：5 项'
+        assert_file_contains "$output" '无记录：4 项'
         assert_no_forbidden "失败组预检后仍执行了系统服务修改"
     )
 }
@@ -2082,6 +2125,8 @@ main() {
         test_atomic_snapshot_restore_replaces_target_symlink
         test_atomic_snapshot_restore_rejects_directory_symlink
         test_atomic_snapshot_restore_replaces_dangling_symlink
+        test_backup_rejects_dangling_symlink_without_absent_record
+        test_ntp_rejects_dangling_config_before_tracking_or_install
         test_atomic_snapshot_restore_move_failure_preserves_target
         test_debian_update_stops_after_first_failure
         test_debian_update_uses_upgrade_timeout
@@ -2130,8 +2175,8 @@ main() {
         test_public_config_dir_rejects_symlink
         test_chrony_source_file_is_service_readable
         test_dns_verification_uses_bounded_command
-        test_hostname_failure_restores_current_operation_state
-        test_hostname_managed_block_write_failure_rolls_back
+        test_hostname_change_does_not_create_restore_record
+        test_hostname_partial_failure_reports_current_state_without_restore_claim
         test_signal_traps_preserve_exit_status
         test_ssh_restore_rejects_legacy_tmp_snapshot
         test_ntp_restore_accepts_complete_current_metadata

@@ -1646,6 +1646,37 @@ test_disabled_firewall_port_transition_skips_rollback_store() {
     )
 }
 
+test_enabled_firewall_sync_recreates_missing_rollback_store() {
+    (
+        local case_dir="$TEST_TMP/enabled-sync-missing-rollback-store"
+
+        mkdir -p "$case_dir/state"
+        VPSBOX_STATE_DIR="$case_dir/state"
+        FIREWALL_ROLLBACK_DIR="$VPSBOX_STATE_DIR/firewall-rollbacks"
+        FIREWALL_CONFIG="$VPSBOX_STATE_DIR/firewall.nft"
+        FIREWALL_STATE_FILE="$VPSBOX_STATE_DIR/firewall.env"
+        FIREWALL_SYSTEMD_UNIT="$case_dir/vpsbox-firewall.service"
+        FIREWALL_OPENRC_SERVICE="$case_dir/vpsbox-firewall"
+        unset ACTIVE_FIREWALL_ROLLBACK_DIR
+        unset ACTIVE_FIREWALL_ADDITIVE_DIR
+        printf '%s\n' 'table inet vpsbox {}' > "$FIREWALL_CONFIG"
+        printf '%s\n' 'EXTRA_TCP_PORTS=' 'EXTRA_UDP_PORTS=' > "$FIREWALL_STATE_FILE"
+        firewall_runtime_enabled() { return 0; }
+        firewall_recover_pending_rollbacks() {
+            fail "缺少回滚目录时没有遗留事务可恢复"
+        }
+        chown() { return 0; }
+        chmod() { return 0; }
+
+        firewall_active_config_ready_for_sync ||
+            fail "已启用防火墙同步前应能重建缺失的回滚目录"
+        [ -d "$FIREWALL_ROLLBACK_DIR" ] && [ ! -L "$FIREWALL_ROLLBACK_DIR" ] ||
+            fail "已启用防火墙同步必须准备真实回滚目录"
+        mktemp "$FIREWALL_ROLLBACK_DIR/config-backup.XXXXXX" >/dev/null ||
+            fail "准备后的回滚目录必须可创建配置备份"
+    )
+}
+
 test_internal_port_transition_preserves_unrelated_public_ports() {
     (
         local case_dir="$TEST_TMP/target-transition"
@@ -1774,6 +1805,7 @@ main() {
         test_additive_transaction_restores_only_config_state_and_live_rules
         test_additive_transaction_recovery_keeps_committed_files
         test_disabled_firewall_port_transition_skips_rollback_store
+        test_enabled_firewall_sync_recreates_missing_rollback_store
         test_internal_port_transition_preserves_unrelated_public_ports
     )
 

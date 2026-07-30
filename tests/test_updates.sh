@@ -170,19 +170,50 @@ reset_update_case() {
 
 test_production_install_command_alias_wires_target() {
     (
+        local alias_dir="$TEST_TMP/install-command-alias"
+        local target_dir="$alias_dir/target-dir"
         local log="$TEST_TMP/install-command-alias.log"
         local output="$TEST_TMP/install-command-alias.out"
-        CMD_PATH="$TEST_TMP/install-command-alias/vpsbox.sh"
-        mkdir -p "${CMD_PATH%/*}"
+        CMD_PATH="$alias_dir/vpsbox.sh"
+        CMD_ALIAS_PATH="$alias_dir/vpsbox"
+        mkdir -p "$alias_dir"
         printf '%s\n' '#!/usr/bin/env bash' > "$CMD_PATH"
-        : > "$log"
-        chmod() { printf 'chmod:%s\n' "$*" >> "$log"; }
-        ln() { printf 'ln:%s\n' "$*" >> "$log"; }
 
         production_install_command_alias > "$output" 2>&1
-        assert_eq "chmod:755 $CMD_PATH
-ln:-sf $CMD_PATH /usr/bin/vpsbox" "$(cat "$log")" \
-            "生产命令入口安装必须设置脚本权限并把固定入口指向 CMD_PATH"
+        [ -L "$CMD_ALIAS_PATH" ] ||
+            fail "生产命令入口安装成功后必须生成符号链接"
+        assert_eq "$CMD_PATH" "$(readlink "$CMD_ALIAS_PATH")" \
+            "生产命令入口必须直接指向 CMD_PATH"
+
+        rm -f -- "$CMD_ALIAS_PATH"
+        mkdir "$CMD_ALIAS_PATH"
+        if production_install_command_alias > "$output" 2>&1; then
+            fail "命令入口是目录时必须拒绝覆盖"
+        fi
+        [ -d "$CMD_ALIAS_PATH" ] ||
+            fail "拒绝目录冲突时不得删除原目录"
+        [ ! -e "$CMD_ALIAS_PATH/${CMD_PATH##*/}" ] ||
+            fail "命令入口是目录时不得在目录内创建嵌套链接"
+
+        rmdir "$CMD_ALIAS_PATH"
+        mkdir "$target_dir"
+        command ln -s "$target_dir" "$CMD_ALIAS_PATH"
+        if production_install_command_alias > "$output" 2>&1; then
+            fail "命令入口指向目录时必须拒绝覆盖"
+        fi
+        [ -L "$CMD_ALIAS_PATH" ] &&
+            [ "$(readlink "$CMD_ALIAS_PATH")" = "$target_dir" ] ||
+            fail "拒绝目录链接冲突时不得替换原链接"
+        [ ! -e "$target_dir/${CMD_PATH##*/}" ] ||
+            fail "命令入口指向目录时不得在目标目录内创建嵌套链接"
+        rm -f -- "$CMD_ALIAS_PATH"
+
+        chmod() { return 0; }
+        ln() { return 0; }
+        if production_install_command_alias > "$output" 2>&1; then
+            fail "ln 未生成预期符号链接时安装不得误报成功"
+        fi
+        assert_file_contains "$output" '入口创建后校验失败'
 
         : > "$log"
         chmod() {

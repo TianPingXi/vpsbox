@@ -713,6 +713,7 @@ test_firewall_sync_restore_failure_preserves_backup() {
         printf '%s\n' old-config > "$FIREWALL_CONFIG"
         printf '%s\n' state > "$FIREWALL_STATE_FILE"
         firewall_recover_pending_rollbacks() { return 0; }
+        firewall_prepare_rollback_store() { return 0; }
         firewall_runtime_enabled() { return 0; }
         firewall_load_state() { return 0; }
         firewall_detect_allowed_ports() { return 0; }
@@ -1706,10 +1707,10 @@ test_menu_dispatch_and_system_status_wiring() {
         system_change_state_text() { printf '%s\n' "无记录"; }
         run_menu_action() { printf '%s\n' "$*" >> "$submenu_log"; }
 
-        system_changes_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n0' >/dev/null
+        system_changes_menu <<< $'1\n2\n3\n4\n5\n6\n7\n0' >/dev/null
     )
-    assert_eq $'restore_vpsbox_system_changes\nrestore_vpsbox_system_change_interactive hostname\nrestore_vpsbox_system_change_interactive dns\nrestore_vpsbox_system_change_interactive bbr\nrestore_vpsbox_system_change_interactive ipv4_priority\nrestore_vpsbox_system_change_interactive fail2ban\nrestore_vpsbox_system_change_interactive journald\nrestore_vpsbox_system_change_interactive ntp' \
-        "$(cat "$submenu_log")" "系统改动菜单必须把恢复全部和七个单项分发到对应操作"
+    assert_eq $'restore_vpsbox_system_changes\nrestore_vpsbox_system_change_interactive dns\nrestore_vpsbox_system_change_interactive bbr\nrestore_vpsbox_system_change_interactive ipv4_priority\nrestore_vpsbox_system_change_interactive fail2ban\nrestore_vpsbox_system_change_interactive journald\nrestore_vpsbox_system_change_interactive ntp' \
+        "$(cat "$submenu_log")" "系统改动菜单必须把恢复全部和六个单项分发到对应操作"
 
     for entry in "${third_party_cases[@]}"; do
         read -r choice action <<< "$entry"
