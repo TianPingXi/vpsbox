@@ -266,9 +266,11 @@ test_complete_configs_merge_with_unique_tags() {
     )
 }
 
-test_create_shadowsocks_preserves_vless_node() {
+test_create_shadowsocks_preserves_vless_and_tolerates_uri_cache_failure() {
     (
         local vless_config_before vless_state_before
+        local event_log="$TEST_TMP/create-shadowsocks-uri.events"
+        local output="$TEST_TMP/create-shadowsocks-uri.out"
         set_node_paths "$TEST_TMP/create-shadowsocks"
         mkdir -p "$NODE_CONFIG_DIR"
         write_vless_config_fixture "$VLESS_CONFIG_PATH"
@@ -276,6 +278,7 @@ test_create_shadowsocks_preserves_vless_node() {
         write_uri_files
         vless_config_before="$(cat "$VLESS_CONFIG_PATH")"
         vless_state_before="$(cat "$VLESS_STATE_FILE")"
+        : > "$event_log"
 
         service_is_running() { return 1; }
         service_is_enabled() { return 1; }
@@ -298,8 +301,26 @@ test_create_shadowsocks_preserves_vless_node() {
         verify_all_node_runtime() { return 0; }
         firewall_complete_port_transition() { return 0; }
         view_node_link() { return 0; }
+        repair_node_uri_cache() {
+            if [ -z "${ACTIVE_NODE_BACKUP:-}" ] &&
+                [ ! -e "$NODE_TRANSACTION_DIR/pending" ]; then
+                printf '%s\n' uri-after-commit >> "$event_log"
+            else
+                printf '%s\n' uri-before-commit >> "$event_log"
+            fi
+            return 1
+        }
+        node_uri_cache_status() { printf '%s\n' stale; }
+        rollback_node_files_transaction() {
+            printf '%s\n' rollback-files >> "$event_log"
+            return 1
+        }
+        rollback_active_node_transaction() {
+            printf '%s\n' rollback-active >> "$event_log"
+            return 1
+        }
 
-        create_or_rebuild_node <<< $'\n' >/dev/null
+        create_or_rebuild_node <<< $'\n' > "$output" 2>&1
 
         protocol_node_exists ss ||
             fail "创建后的 Shadowsocks 节点应可独立读取"
@@ -307,12 +328,20 @@ test_create_shadowsocks_preserves_vless_node() {
             "创建 Shadowsocks 时不得改写 VLESS Reality 配置"
         assert_eq "$vless_state_before" "$(cat "$VLESS_STATE_FILE")" \
             "创建 Shadowsocks 时不得改写 VLESS Reality 状态"
+        assert_file_contains "$event_log" '^uri-after-commit$' \
+            "Shadowsocks 创建必须先提交核心事务，再尝试修复 URI 缓存"
+        assert_file_not_contains "$event_log" '^(uri-before-commit|rollback-)' \
+            "URI 缓存失败不得提前发生或触发 Shadowsocks 核心事务回滚"
+        assert_file_contains "$output" '核心配置不受影响' \
+            "Shadowsocks URI 缓存重建失败应仅给出告警"
     )
 }
 
-test_create_vless_preserves_shadowsocks_node() {
+test_create_vless_preserves_shadowsocks_and_tolerates_uri_cache_failure() {
     (
         local ss_config_before ss_state_before
+        local event_log="$TEST_TMP/create-vless-uri.events"
+        local output="$TEST_TMP/create-vless-uri.out"
         set_node_paths "$TEST_TMP/create-vless"
         mkdir -p "$NODE_CONFIG_DIR"
         write_ss_config_fixture "$SS_CONFIG_PATH"
@@ -320,6 +349,7 @@ test_create_vless_preserves_shadowsocks_node() {
         write_uri_files
         ss_config_before="$(cat "$SS_CONFIG_PATH")"
         ss_state_before="$(cat "$SS_STATE_FILE")"
+        : > "$event_log"
 
         service_is_running() { return 1; }
         service_is_enabled() { return 1; }
@@ -349,8 +379,26 @@ test_create_vless_preserves_shadowsocks_node() {
         verify_all_node_runtime() { return 0; }
         firewall_complete_port_transition() { return 0; }
         view_node_link() { return 0; }
+        repair_node_uri_cache() {
+            if [ -z "${ACTIVE_NODE_BACKUP:-}" ] &&
+                [ ! -e "$NODE_TRANSACTION_DIR/pending" ]; then
+                printf '%s\n' uri-after-commit >> "$event_log"
+            else
+                printf '%s\n' uri-before-commit >> "$event_log"
+            fi
+            return 1
+        }
+        node_uri_cache_status() { printf '%s\n' stale; }
+        rollback_node_files_transaction() {
+            printf '%s\n' rollback-files >> "$event_log"
+            return 1
+        }
+        rollback_active_node_transaction() {
+            printf '%s\n' rollback-active >> "$event_log"
+            return 1
+        }
 
-        create_vless_reality_node <<< $'\n\n' >/dev/null
+        create_vless_reality_node <<< $'\n\n' > "$output" 2>&1
 
         protocol_node_exists vless ||
             fail "创建后的 VLESS Reality 节点应可独立读取"
@@ -358,6 +406,12 @@ test_create_vless_preserves_shadowsocks_node() {
             "创建 VLESS Reality 时不得改写 Shadowsocks 配置"
         assert_eq "$ss_state_before" "$(cat "$SS_STATE_FILE")" \
             "创建 VLESS Reality 时不得改写 Shadowsocks 状态"
+        assert_file_contains "$event_log" '^uri-after-commit$' \
+            "VLESS Reality 创建必须先提交核心事务，再尝试修复 URI 缓存"
+        assert_file_not_contains "$event_log" '^(uri-before-commit|rollback-)' \
+            "URI 缓存失败不得提前发生或触发 VLESS Reality 核心事务回滚"
+        assert_file_contains "$output" '核心配置不受影响' \
+            "VLESS Reality URI 缓存重建失败应仅给出告警"
     )
 }
 
@@ -492,6 +546,10 @@ test_uri_cache_repair_refuses_unsafe_paths() {
             fail "非普通 URI 文件不得被自动覆盖"
         fi
         [ -d "$SS_URI_FILE" ] || fail "自动修复不得删除非普通 URI 文件"
+        require_valid_node_state_if_present ||
+            fail "不安全 URI 缓存不得使配置与状态一致的核心节点失效"
+        protocol_node_exists ss ||
+            fail "不安全 URI 缓存存在时仍应识别有效的 Shadowsocks 节点"
     )
 }
 
@@ -2113,45 +2171,17 @@ test_self_check_warns_for_template_drift_without_integrity_failure() {
     )
 }
 
-test_full_artifact_validation_accepts_safe_uri_modes() {
-    (
-        set_node_paths "$TEST_TMP/strict-uri-artifacts"
-        mkdir -p "$NODE_CONFIG_DIR"
-        write_ss_config_fixture "$SS_CONFIG_PATH"
-        write_ss_state_fixture "$SS_STATE_FILE"
-        write_uri_files
-
-        validate_protocol_node_artifacts \
-            ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$SS_URI_FILE" ||
-            fail "新生成的完整节点产物必须通过严格校验"
-        if [ "$DUAL_NODES_REAL_PERMISSIONS" -eq 1 ]; then
-            chmod 400 "$SS_URI_FILE"
-            validate_protocol_node_artifacts \
-                ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$SS_URI_FILE" ||
-                fail "内容一致且 root 所有的 0400 URI 应通过完整产物校验"
-        fi
-        printf 'tampered-uri\n' > "$SS_URI_FILE"
-        if validate_protocol_node_artifacts \
-            ss "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$SS_URI_FILE"; then
-            fail "发布边界仍必须拒绝与配置状态不一致的 URI"
-        fi
-    )
-}
-
-test_staged_uri_group_rejects_sibling_and_aggregate_drift() {
+test_staged_core_validation_does_not_require_uri_files() {
     (
         local staged_ss_state
-        local staged_vless_uri staged_aggregate
 
-        set_node_paths "$TEST_TMP/staged-uri-group"
+        set_node_paths "$TEST_TMP/staged-core-only"
         mkdir -p "$NODE_CONFIG_DIR" \
             "$NODE_TRANSACTION_STAGE/configs" \
-            "$NODE_TRANSACTION_STAGE/states" \
-            "$NODE_TRANSACTION_STAGE/uris"
+            "$NODE_TRANSACTION_STAGE/states"
         chmod 700 "$NODE_TRANSACTION_STAGE" \
             "$NODE_TRANSACTION_STAGE/configs" \
-            "$NODE_TRANSACTION_STAGE/states" \
-            "$NODE_TRANSACTION_STAGE/uris"
+            "$NODE_TRANSACTION_STAGE/states"
         write_vless_config_fixture "$VLESS_CONFIG_PATH"
         write_vless_state_fixture "$VLESS_STATE_FILE"
         cp -- "$VLESS_CONFIG_PATH" \
@@ -2160,24 +2190,15 @@ test_staged_uri_group_rejects_sibling_and_aggregate_drift() {
         write_ss_config_fixture \
             "$NODE_TRANSACTION_STAGE/configs/${SS_CONFIG_PATH##*/}"
         write_ss_state_fixture "$staged_ss_state"
-        build_staged_uri_files ss "$staged_ss_state"
 
         validate_staged_node ss ||
-            fail "完整且一致的暂存节点组应通过严格校验"
+            fail "配置与状态一致的暂存节点不应依赖 URI 文件"
+        [ ! -e "$NODE_TRANSACTION_STAGE/uris" ] ||
+            fail "核心节点暂存区不应创建 URI 缓存目录"
 
-        staged_vless_uri="$NODE_TRANSACTION_STAGE/uris/${VLESS_URI_FILE##*/}"
-        printf 'tampered-sibling-uri\n' > "$staged_vless_uri"
-        chmod 600 "$staged_vless_uri"
+        sed -i 's/^PORT=20001$/PORT=29999/' "$staged_ss_state"
         if validate_staged_node ss; then
-            fail "暂存兄弟协议 URI 漂移时不得发布节点"
-        fi
-
-        build_staged_uri_files ss "$staged_ss_state"
-        staged_aggregate="$NODE_TRANSACTION_STAGE/uris/${URI_FILE##*/}"
-        printf 'tampered-aggregate-uri\n' > "$staged_aggregate"
-        chmod 600 "$staged_aggregate"
-        if validate_staged_node ss; then
-            fail "暂存汇总 URI 漂移时不得发布节点"
+            fail "URI 解耦后仍必须拒绝配置与状态端口不一致的暂存节点"
         fi
     )
 }
@@ -2430,8 +2451,6 @@ main() {
         node_backup_file_is_safe
         validate_protocol_node_core
         validate_derived_uri_manifest_entry
-        build_staged_uri_files
-        validate_staged_uri_group
         validate_staged_node
         node_config_matches_loaded_state
         node_config_matches_vpsbox_template
@@ -2458,8 +2477,8 @@ main() {
     local -a tests=(
         test_fake_singbox_rejects_invalid_config_schema
         test_complete_configs_merge_with_unique_tags
-        test_create_shadowsocks_preserves_vless_node
-        test_create_vless_preserves_shadowsocks_node
+        test_create_shadowsocks_preserves_vless_and_tolerates_uri_cache_failure
+        test_create_vless_preserves_shadowsocks_and_tolerates_uri_cache_failure
         test_independent_states_and_links_are_aggregated
         test_service_definition_uses_independent_config_directory
         test_uri_cache_is_derived_from_core_state
@@ -2505,8 +2524,7 @@ main() {
         test_config_state_identity_and_credentials_must_match
         test_protocol_status_distinguishes_template_drift_from_damage
         test_self_check_warns_for_template_drift_without_integrity_failure
-        test_full_artifact_validation_accepts_safe_uri_modes
-        test_staged_uri_group_rejects_sibling_and_aggregate_drift
+        test_staged_core_validation_does_not_require_uri_files
         test_aggregate_uri_drift_does_not_invalidate_core_node
         test_singbox_update_rejects_mismatched_layout_before_download
         test_uri_group_failure_restores_old_files

@@ -2930,19 +2930,6 @@ validate_protocol_node_core() {
     node_config_matches_loaded_state "$protocol" "$config"
 }
 
-validate_protocol_node_artifacts() {
-    local protocol="$1"
-    local config="${2:-}"
-    local state="${3:-}"
-    local uri="${4:-}"
-
-    [ -n "$config" ] || config="$(node_config_path "$protocol")" || return 2
-    [ -n "$state" ] || state="$(node_state_path "$protocol")" || return 2
-    [ -n "$uri" ] || uri="$(node_uri_path "$protocol")" || return 2
-    validate_protocol_node_core "$protocol" "$config" "$state" || return 1
-    node_uri_matches_loaded_state "$uri"
-}
-
 protocol_node_exists() {
     local protocol="$1" config state
 
@@ -4932,10 +4919,10 @@ prepare_node_stage() {
     [ "$NODE_TRANSACTION_STAGE" = "$NODE_TRANSACTION_DIR/stage" ] || return 1
     rm -rf -- "$NODE_TRANSACTION_STAGE" || return 1
     mkdir -p "$NODE_TRANSACTION_STAGE/configs" \
-        "$NODE_TRANSACTION_STAGE/states" "$NODE_TRANSACTION_STAGE/uris" || return 1
+        "$NODE_TRANSACTION_STAGE/states" || return 1
     chown -R root:root "$NODE_TRANSACTION_STAGE" || return 1
     chmod 700 "$NODE_TRANSACTION_STAGE" "$NODE_TRANSACTION_STAGE/configs" \
-        "$NODE_TRANSACTION_STAGE/states" "$NODE_TRANSACTION_STAGE/uris"
+        "$NODE_TRANSACTION_STAGE/states"
 }
 
 stage_sibling_node_config() {
@@ -4953,38 +4940,9 @@ stage_sibling_node_config() {
     done
 }
 
-build_staged_uri_files() {
+validate_staged_node() {
     local target_protocol="$1"
-    local target_state="$2"
-    local uri_dir="$NODE_TRANSACTION_STAGE/uris"
-    local aggregate="$uri_dir/${URI_FILE##*/}"
-    local protocol state expected dest
-
-    : > "$aggregate" || return 1
-    for protocol in ss vless; do
-        dest="$(node_uri_path "$protocol")" || return 1
-        if [ "$protocol" = "$target_protocol" ]; then
-            state="$target_state"
-            case "$protocol" in
-                ss) expected=shadowsocks ;;
-                vless) expected=vless-reality ;;
-                *) return 2 ;;
-            esac
-            load_state_file "$state" "$expected" || return 1
-            generate_link_from_loaded_state > "$uri_dir/${dest##*/}" || return 1
-        elif protocol_node_exists "$protocol"; then
-            generate_protocol_link "$protocol" > "$uri_dir/${dest##*/}" || return 1
-        else
-            continue
-        fi
-        cat "$uri_dir/${dest##*/}" >> "$aggregate" || return 1
-    done
-    secure_uri_build_files "$uri_dir"
-}
-
-validate_staged_uri_group() {
-    local target_protocol="$1"
-    local protocol config state uri final_path aggregate link expected=""
+    local protocol config state final_path
 
     case "$target_protocol" in
         ss|vless) ;;
@@ -4999,31 +4957,15 @@ validate_staged_uri_group() {
         else
             state="$final_path"
         fi
-        final_path="$(node_uri_path "$protocol")" || return 1
-        uri="$NODE_TRANSACTION_STAGE/uris/${final_path##*/}"
 
         if [ "$protocol" != "$target_protocol" ] &&
             [ ! -e "$config" ] && [ ! -L "$config" ] &&
-            [ ! -e "$state" ] && [ ! -L "$state" ] &&
-            [ ! -e "$uri" ] && [ ! -L "$uri" ]; then
+            [ ! -e "$state" ] && [ ! -L "$state" ]; then
             continue
         fi
-        validate_protocol_node_artifacts \
-            "$protocol" "$config" "$state" "$uri" || return 1
-        link="$(cat "$uri")" || return 1
-        [ -n "$expected" ] && expected="${expected}"$'\n'
-        expected="${expected}${link}"
+        validate_protocol_node_core \
+            "$protocol" "$config" "$state" || return 1
     done
-
-    aggregate="$NODE_TRANSACTION_STAGE/uris/${URI_FILE##*/}"
-    node_file_is_secure "$aggregate" || return 1
-    [ -n "$expected" ] && [ "$(cat "$aggregate")" = "$expected" ]
-}
-
-validate_staged_node() {
-    local protocol="$1"
-
-    validate_staged_uri_group "$protocol" || return 1
     sing-box check -C "$NODE_TRANSACTION_STAGE/configs" >/dev/null
 }
 
@@ -5058,7 +5000,6 @@ publish_staged_node() {
         "$NODE_TRANSACTION_STAGE/configs/${config##*/}" "$config" || return 1
     publish_staged_node_file \
         "$NODE_TRANSACTION_STAGE/states/${state##*/}" "$state" || return 1
-    publish_uri_file_group "$NODE_TRANSACTION_STAGE/uris" || return 1
     require_valid_node_state_if_present
 }
 
@@ -5342,10 +5283,9 @@ EOF
         ! stage_sibling_node_config ss ||
         ! write_config "$port" "$password" "$config_id" "$staged_config" ||
         ! save_state "$domain" "$name" "$port" "$password" "$config_id" "$staged_state" ||
-        ! build_staged_uri_files ss "$staged_state" ||
         ! validate_staged_node ss; then
         rollback_node_files_transaction || true
-        err "Shadowsocks 配置、状态或链接预生成校验失败，未修改现有节点。"
+        err "Shadowsocks 配置或状态预生成校验失败，未修改现有节点。"
         return 1
     fi
     if ! mark_node_transaction_mutated ||
@@ -5358,7 +5298,7 @@ EOF
     if ! publish_staged_node ss ||
         ! check_node_config_set ||
         ! setup_service; then
-        fail_after_node_rollback "Shadowsocks 配置、状态、链接或服务写入失败" "创建前" || true
+        fail_after_node_rollback "Shadowsocks 配置、状态或服务写入失败" "创建前" || true
         return 1
     fi
     info "正在启动 sing-box 服务..."
@@ -5375,6 +5315,7 @@ EOF
         fail_after_node_rollback "节点事务提交失败" "创建前" || true
         return 1
     fi
+    repair_node_uri_cache_best_effort "创建 Shadowsocks 节点后"
     info "Shadowsocks 节点创建完成，当前节点链接如下："
     view_node_link || {
         err "节点已创建并运行，但链接显示失败，请稍后使用查看节点链接功能重试。"
@@ -5521,10 +5462,9 @@ EOF
         ! save_vless_reality_state \
             "$domain" "$name" "$port" "$uuid" "$server_name" \
             "$private_key" "$public_key" "$short_id" "$config_id" "$staged_state" ||
-        ! build_staged_uri_files vless "$staged_state" ||
         ! validate_staged_node vless; then
         rollback_node_files_transaction || true
-        err "VLESS Reality 配置、状态或链接预生成校验失败，未修改现有节点。"
+        err "VLESS Reality 配置或状态预生成校验失败，未修改现有节点。"
         return 1
     fi
     if ! mark_node_transaction_mutated ||
@@ -5536,7 +5476,7 @@ EOF
     if ! publish_staged_node vless ||
         ! check_node_config_set ||
         ! setup_service; then
-        fail_after_node_rollback "VLESS Reality 配置、状态、链接或服务写入失败" "创建前" || true
+        fail_after_node_rollback "VLESS Reality 配置、状态或服务写入失败" "创建前" || true
         return 1
     fi
     info "正在启动 sing-box 服务..."
@@ -5553,6 +5493,7 @@ EOF
         fail_after_node_rollback "节点事务提交失败" "创建前" || true
         return 1
     fi
+    repair_node_uri_cache_best_effort "创建 VLESS Reality 节点后"
     info "VLESS Reality 节点创建完成，当前节点链接如下："
     view_node_link || {
         err "节点已创建并运行，但链接显示失败，请稍后使用查看节点链接功能重试。"
