@@ -1604,6 +1604,48 @@ test_additive_transaction_recovery_keeps_committed_files() {
     )
 }
 
+test_disabled_firewall_port_transition_skips_rollback_store() {
+    (
+        local case_dir="$TEST_TMP/disabled-port-transition"
+        local recover_calls=0
+
+        mkdir -p "$case_dir"
+        VPSBOX_STATE_DIR="$case_dir/state"
+        FIREWALL_ROLLBACK_DIR="$VPSBOX_STATE_DIR/firewall-rollbacks"
+        FIREWALL_CONFIG="$VPSBOX_STATE_DIR/firewall.nft"
+        FIREWALL_STATE_FILE="$VPSBOX_STATE_DIR/firewall.env"
+        FIREWALL_SYSTEMD_UNIT="$case_dir/vpsbox-firewall.service"
+        FIREWALL_OPENRC_SERVICE="$case_dir/vpsbox-firewall"
+        RUNTIME_DIR="$case_dir/run"
+        unset ACTIVE_FIREWALL_ROLLBACK_DIR
+        unset ACTIVE_FIREWALL_ADDITIVE_DIR
+        unset ACTIVE_FIREWALL_TRANSITION_DIR
+
+        firewall_recover_pending_rollbacks() { recover_calls=$((recover_calls + 1)); }
+        firewall_runtime_enabled() { return 1; }
+        firewall_persistence_enabled() { return 1; }
+        firewall_service_active() { return 1; }
+
+        firewall_prepare_port_transition 43333 ""
+        firewall_complete_port_transition
+
+        assert_eq 0 "$recover_calls" \
+            "防火墙从未启用时，节点或 SSH 端口切换不应扫描持久回滚目录"
+        if [ -e "$FIREWALL_ROLLBACK_DIR" ] || [ -L "$FIREWALL_ROLLBACK_DIR" ]; then
+            fail "防火墙从未启用时不应创建持久回滚目录"
+        fi
+        [ ! -e "$FIREWALL_CONFIG" ] ||
+            fail "防火墙从未启用时不应生成防火墙配置"
+        [ ! -e "$FIREWALL_STATE_FILE" ] ||
+            fail "防火墙从未启用时不应生成防火墙状态"
+
+        mkdir -p "$FIREWALL_ROLLBACK_DIR"
+        firewall_active_config_ready_for_sync
+        assert_eq 1 "$recover_calls" \
+            "已有回滚目录时仍必须进入原有恢复检查"
+    )
+}
+
 test_internal_port_transition_preserves_unrelated_public_ports() {
     (
         local case_dir="$TEST_TMP/target-transition"
@@ -1689,6 +1731,9 @@ main() {
         firewall_read_live_allowed_ports
         firewall_view_rules
         firewall_live_config_matches_expected
+        firewall_active_config_ready_for_sync
+        firewall_prepare_port_transition
+        firewall_complete_port_transition
     )
     local -a tests=(
         test_port_decimal_normalization
@@ -1728,6 +1773,7 @@ main() {
         test_lightweight_add_does_not_rescan_docker_or_ssh
         test_additive_transaction_restores_only_config_state_and_live_rules
         test_additive_transaction_recovery_keeps_committed_files
+        test_disabled_firewall_port_transition_skips_rollback_store
         test_internal_port_transition_preserves_unrelated_public_ports
     )
 

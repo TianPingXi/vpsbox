@@ -13132,7 +13132,13 @@ firewall_replace_active_config() {
 }
 
 firewall_active_config_ready_for_sync() {
-    firewall_recover_pending_rollbacks || return 1
+    # 没有回滚目录或活动事务句柄时不存在可扫描的事务；
+    # 节点和 SSH 的空同步无需预先创建持久回滚目录。
+    if [ -n "${ACTIVE_FIREWALL_ROLLBACK_DIR:-}${ACTIVE_FIREWALL_ADDITIVE_DIR:-}" ] ||
+        [ -e "$FIREWALL_ROLLBACK_DIR" ] ||
+        [ -L "$FIREWALL_ROLLBACK_DIR" ]; then
+        firewall_recover_pending_rollbacks || return 1
+    fi
     if [ ! -f "$FIREWALL_CONFIG" ]; then
         if firewall_runtime_enabled ||
             [ -e "$FIREWALL_SYSTEMD_UNIT" ] ||
