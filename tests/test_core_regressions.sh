@@ -1695,9 +1695,9 @@ test_menu_dispatch_and_system_status_wiring() {
         ssh_basic_hardening_menu() { printf '%s\n' ssh_basic_hardening_menu >> "$submenu_log"; }
         system_changes_menu() { printf '%s\n' system_changes_menu >> "$submenu_log"; }
 
-        system_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n0' >/dev/null
+        system_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n0' >/dev/null
     )
-    assert_eq $'update_system_packages\ncleanup_system_garbage\nchange_system_hostname\nenable_ntp_sync\nchange_ipv4_dns\nenable_ipv4_priority\nenable_bbr_fq\nssh_port_change_menu\nssh_basic_hardening_menu\nshow_current_ssh_config\ninstall_fail2ban\nlimit_systemd_journal\nsystem_changes_menu' \
+    assert_eq $'update_system_packages\ncleanup_system_garbage\nchange_system_hostname\nenable_ntp_sync\nchange_ipv4_dns\nenable_ipv4_priority\nenable_bbr_fq\ndisable_ipv6\nssh_port_change_menu\nssh_basic_hardening_menu\nshow_current_ssh_config\ninstall_fail2ban\nlimit_systemd_journal\nsystem_changes_menu' \
         "$(cat "$submenu_log")" "系统菜单全部编号必须分发到对应操作"
 
     : > "$submenu_log"

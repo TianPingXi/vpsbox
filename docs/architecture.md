@@ -20,7 +20,7 @@
 | 平台与持久化 | 系统识别、依赖管理、下载校验、原子文件操作、改动记录 |
 | 节点与 sing-box | 节点状态、配置、服务、URI、事务及 sing-box 更新 |
 | vpsbox 自更新 | 下载、替换、旧版恢复、watchdog 和新版启动确认 |
-| 系统与安全 | BBR、DNS、NTP、SSH、Fail2ban、主机名和系统维护 |
+| 系统与安全 | BBR、IPv6、DNS、NTP、SSH、Fail2ban、主机名和系统维护 |
 | 主机防火墙 | 端口采集、nftables 规则、Docker 端口、应用与回滚 |
 | 检测与维护 | 一键检测、状态摘要、卸载和系统改动恢复 |
 | 菜单与入口 | 菜单显示、动作分发和启动流程 |
@@ -66,6 +66,7 @@
 | `/etc/vpsbox/node-transaction/` | 节点事务 |
 | `/etc/vpsbox/singbox-update/` | sing-box 更新事务 |
 | `/etc/vpsbox/firewall*` | 防火墙配置和状态，以及操作需要时按需创建的回滚资料 |
+| `/etc/sysctl.d/99-vpsbox-disable-ipv6.conf` | 用户明确确认后写入的 IPv6 永久禁用配置 |
 | `/run/vpsbox/` | 当前启动期的锁和进程元数据，不作为业务恢复依据 |
 
 系统实际配置仍由 `/etc` 下相应服务文件决定；`/etc/vpsbox` 保存的是 VPSBox 的管理状态、恢复依据和必要元数据。
@@ -93,6 +94,10 @@
 - 完整防火墙更新和自更新使用独立 watchdog；普通低风险操作不套用同等级保护。
 
 主机名修改不进入上述持久恢复体系。它只在单次操作中原子写入 `/etc/hostname` 和受管的 `/etc/hosts` 内容，并同步运行时主机名；任一步失败都返回非零，但 VPSBox 不为其保留跨操作备份，也不在“查看/恢复 vpsbox 系统改动”菜单中提供恢复入口。
+
+禁用 IPv6 同样不进入通用系统改动恢复体系。操作只在检测到全局 IPv6 地址时展示接口与 CIDR，并以默认确认的 `[Y/n]` 询问；当前 SSH 会话明确使用 IPv6 时拒绝执行。确认后先对同目录临时 sysctl 配置应用并核验，再原子发布 `/etc/sysctl.d/99-vpsbox-disable-ipv6.conf`，不重启主机、网络服务或 sing-box。失败时只尽力恢复本次记录的 `all`、`default`、`lo` 三个运行参数；已经中断的 IPv6 连接以及删除的地址和路由不保证立即恢复。
+
+上述专用配置不会显示在“查看/恢复 vpsbox 系统改动”中，卸载 VPSBox 时也不会自动删除，因此成功禁用后会跨重启并在卸载 VPSBox 后继续生效。已有 sing-box 节点配置不会被本操作改写；禁用后新建或重建节点会按当前系统能力选择 IPv4 监听。
 
 ## 5. 节点与 sing-box 模型
 

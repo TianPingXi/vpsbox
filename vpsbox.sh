@@ -10,7 +10,7 @@ umask 077
 # 2. 平台适配与通用持久化：系统识别、启动更新探测、下载、依赖与变更记录
 # 3. 节点与 sing-box：依赖、服务、监听检查、状态、配置、事务及版本更新
 # 4. vpsbox 自更新发布与回滚事务
-# 5. 系统优化与安全：BBR、Fail2ban、NTP、DNS、SSH 与系统维护
+# 5. 系统优化与安全：BBR、IPv6、Fail2ban、NTP、DNS、SSH 与系统维护
 # 6. 主机防火墙：端口发现、nftables、Docker 转发、回滚与菜单
 # 7. 检测：一键检测
 # 8. 维护、恢复与末端菜单动作
@@ -43,6 +43,7 @@ VLESS_STATE_FILE="$CONFIG_DIR/vpsbox-vless.env"
 SS_URI_FILE="$CONFIG_DIR/vpsbox-ss-uri.txt"
 VLESS_URI_FILE="$CONFIG_DIR/vpsbox-vless-uri.txt"
 BBR_CONF="/etc/sysctl.d/99-vpsbox-bbr.conf"
+IPV6_DISABLE_CONF="/etc/sysctl.d/99-vpsbox-disable-ipv6.conf"
 JOURNALD_VPSBOX_CONF="/etc/systemd/journald.conf.d/99-vpsbox.conf"
 VPSBOX_STATE_DIR="/etc/vpsbox"
 # 独立于系统改动清单保存，卸载管理命令时继续保留。
@@ -10291,6 +10292,159 @@ EOF
     fi
 }
 
+global_ipv6_addresses() {
+    command -v ip >/dev/null 2>&1 || return 1
+    ip -6 -o addr show scope global 2>/dev/null |
+        awk '$3 == "inet6" && $4 != "" { print $2, $4 }'
+}
+
+current_ssh_connection_uses_ipv6() {
+    local client_ip client_port server_ip server_port extra
+
+    [ -n "${SSH_CONNECTION:-}" ] || return 1
+    read -r client_ip client_port server_ip server_port extra <<< "$SSH_CONNECTION"
+    [ -n "$client_ip" ] &&
+        [[ "$client_port" =~ ^[0-9]+$ ]] &&
+        [ -n "$server_ip" ] &&
+        [[ "$server_port" =~ ^[0-9]+$ ]] &&
+        [ -z "${extra:-}" ] &&
+        [[ "$server_ip" == *:* ]]
+}
+
+render_ipv6_disable_config() {
+    # --- BEGIN GENERATED TEMPLATE: disable IPv6 sysctl drop-in ---
+    cat <<'EOF'
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+    # --- END GENERATED TEMPLATE: disable IPv6 sysctl drop-in ---
+}
+
+ipv6_disable_runtime_values() {
+    local all default lo
+
+    all="$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" || return 1
+    default="$(sysctl -n net.ipv6.conf.default.disable_ipv6 2>/dev/null)" || return 1
+    lo="$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null)" || return 1
+    [[ "$all" =~ ^[01]$ ]] && [[ "$default" =~ ^[01]$ ]] && [[ "$lo" =~ ^[01]$ ]] || return 1
+    printf '%s %s %s\n' "$all" "$default" "$lo"
+}
+
+ipv6_runtime_matches_values() {
+    local expected_all="$1" expected_default="$2" expected_lo="$3"
+    local actual
+
+    actual="$(ipv6_disable_runtime_values)" || return 1
+    [ "$actual" = "$expected_all $expected_default $expected_lo" ]
+}
+
+ipv6_disabled_runtime_is_current() {
+    local addresses
+
+    ipv6_runtime_matches_values 1 1 1 || return 1
+    addresses="$(global_ipv6_addresses)" || return 1
+    [ -z "$addresses" ]
+}
+
+restore_ipv6_runtime_values() {
+    local old_all="$1" old_default="$2" old_lo="$3" failed=0
+
+    sysctl -w "net.ipv6.conf.all.disable_ipv6=$old_all" >/dev/null 2>&1 || failed=1
+    sysctl -w "net.ipv6.conf.default.disable_ipv6=$old_default" >/dev/null 2>&1 || failed=1
+    sysctl -w "net.ipv6.conf.lo.disable_ipv6=$old_lo" >/dev/null 2>&1 || failed=1
+    [ "$failed" -eq 0 ] && ipv6_runtime_matches_values "$old_all" "$old_default" "$old_lo"
+}
+
+disable_ipv6() {
+    local addresses runtime_values old_all old_default old_lo
+    local parent tmp interface address
+
+    if ! addresses="$(global_ipv6_addresses)"; then
+        err "无法读取全局 IPv6 地址，已取消禁用。"
+        return 1
+    fi
+    if [ -z "$addresses" ]; then
+        info "未检测到全局 IPv6 地址，无需禁用。"
+        return 0
+    fi
+
+    echo "检测到以下全局 IPv6 地址："
+    while read -r interface address; do
+        [ -n "$interface" ] && [ -n "$address" ] || continue
+        printf ' - %s：%s\n' "$interface" "$address"
+    done <<< "$addresses"
+
+    if current_ssh_connection_uses_ipv6; then
+        warn "当前 SSH 会话正在通过 IPv6 连接，禁用后会立即断开。"
+        warn "请改用 IPv4 SSH 或 VPS 控制台后重试。"
+        return 0
+    fi
+
+    warn "禁用后，IPv6 地址、路由和现有 IPv6 连接会立即失效。"
+    warn "现有节点配置不会自动改写；请先确认节点和其他服务可通过 IPv4 访问。"
+    if ! confirm_default_yes "是否禁用 IPv6？"; then
+        info "已取消禁用 IPv6。"
+        return 0
+    fi
+
+    parent="$(dirname "$IPV6_DISABLE_CONF")"
+    [ -d "$parent" ] && [ ! -L "$parent" ] || {
+        err "IPv6 配置目录不存在或不安全：$parent"
+        return 1
+    }
+    if [ -e "$IPV6_DISABLE_CONF" ] || [ -L "$IPV6_DISABLE_CONF" ]; then
+        [ -f "$IPV6_DISABLE_CONF" ] && [ ! -L "$IPV6_DISABLE_CONF" ] || {
+            err "$IPV6_DISABLE_CONF 不是安全的普通文件，已拒绝覆盖。"
+            return 1
+        }
+        if ! render_ipv6_disable_config | cmp -s - "$IPV6_DISABLE_CONF"; then
+            err "$IPV6_DISABLE_CONF 已存在且内容不属于当前配置，已拒绝覆盖。"
+            return 1
+        fi
+    fi
+
+    runtime_values="$(ipv6_disable_runtime_values)" || {
+        err "无法读取 IPv6 内核运行参数，未修改系统。"
+        return 1
+    }
+    read -r old_all old_default old_lo <<< "$runtime_values"
+
+    tmp="$(mktemp "$parent/.vpsbox-disable-ipv6.XXXXXX")" || return 1
+    if ! render_ipv6_disable_config > "$tmp" ||
+        ! chown root:root "$tmp" ||
+        ! chmod 644 "$tmp"; then
+        rm -f -- "$tmp" || warn "清理 IPv6 临时配置失败：$tmp"
+        err "生成 IPv6 配置失败，未修改系统。"
+        return 1
+    fi
+
+    if ! sysctl -p "$tmp" >/dev/null 2>&1 || ! ipv6_disabled_runtime_is_current; then
+        rm -f -- "$tmp" || warn "清理 IPv6 临时配置失败：$tmp"
+        if restore_ipv6_runtime_values "$old_all" "$old_default" "$old_lo"; then
+            err "禁用 IPv6 失败；已恢复记录的运行参数，持久配置未改动。"
+        else
+            err "禁用 IPv6 失败，且记录的运行参数未能确认完整恢复。"
+            err "请通过 IPv4 或 VPS 控制台检查 IPv6 地址、路由及 net.ipv6.conf.*.disable_ipv6。"
+        fi
+        return 1
+    fi
+
+    if ! mv -f -- "$tmp" "$IPV6_DISABLE_CONF"; then
+        rm -f -- "$tmp" || warn "清理 IPv6 临时配置失败：$tmp"
+        if restore_ipv6_runtime_values "$old_all" "$old_default" "$old_lo"; then
+            err "保存 IPv6 配置失败；已恢复记录的运行参数，持久配置未改动。"
+        else
+            err "保存 IPv6 配置失败，且记录的运行参数未能确认完整恢复。"
+            err "请通过 IPv4 或 VPS 控制台检查 IPv6 地址、路由及 net.ipv6.conf.*.disable_ipv6。"
+        fi
+        return 1
+    fi
+
+    info "IPv6 已禁用，重启后仍会保持禁用。"
+    info "该设置不会加入 vpsbox 系统改动恢复菜单。"
+}
+
 render_bbr_fq_config() {
     # --- BEGIN GENERATED TEMPLATE: BBR and fq sysctl drop-in ---
     cat <<EOF
@@ -16058,16 +16212,17 @@ system_menu() {
  [5] 修改 IPv4 DNS
  [6] 开启 IPv4 优先
  [7] 开启 BBR + fq
+ [8] 禁用 IPv6
 
  SSH 安全
- [8] 修改 SSH 端口
- [9] SSH 基础加固
- [10] 查看 SSH 生效配置
- [11] 安装 Fail2ban
+ [9] 修改 SSH 端口
+ [10] SSH 基础加固
+ [11] 查看 SSH 生效配置
+ [12] 安装 Fail2ban
 
  维护
- [12] $journal_label
- [13] 查看/恢复 vpsbox 系统改动
+ [13] $journal_label
+ [14] 查看/恢复 vpsbox 系统改动
 ----------------------------------------
  [0] 返回主菜单
 ========================================
@@ -16083,12 +16238,13 @@ EOF
             5) run_menu_action change_ipv4_dns; pause ;;
             6) run_menu_action enable_ipv4_priority; pause ;;
             7) run_menu_action enable_bbr_fq; pause ;;
-            8) ssh_port_change_menu ;;
-            9) ssh_basic_hardening_menu ;;
-            10) run_menu_action show_current_ssh_config; pause ;;
-            11) run_menu_action install_fail2ban; pause ;;
-            12) run_menu_action limit_systemd_journal; pause ;;
-            13) system_changes_menu ;;
+            8) run_menu_action disable_ipv6; pause ;;
+            9) ssh_port_change_menu ;;
+            10) ssh_basic_hardening_menu ;;
+            11) run_menu_action show_current_ssh_config; pause ;;
+            12) run_menu_action install_fail2ban; pause ;;
+            13) run_menu_action limit_systemd_journal; pause ;;
+            14) system_changes_menu ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
