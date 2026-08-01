@@ -293,11 +293,10 @@ test_sensitive_interaction_eof_cancels_before_mutation() {
         : > "$SSHD_MAIN_CONF"
         sshd_binary() { printf '%s\n' /usr/sbin/sshd; }
         ssh_socket_activation_enabled_or_active() { return 1; }
-        settle_stale_unapplied_ssh_tracking() { return 0; }
         choose_ssh_target_port() { printf '%s\n' 23333; }
         ssh_effective_ports_match_target() { return 1; }
         firewall_runtime_enabled() { return 1; }
-        backup_change_file_once() { printf '%s\n' backup >> "$event_log"; }
+        begin_ssh_runtime_transaction() { printf '%s\n' begin >> "$event_log"; }
         ssh_firewall_transition_begin() { printf '%s\n' firewall >> "$event_log"; }
 
         apply_ssh_port_change </dev/null >"$TEST_TMP/ssh-port-eof.out" 2>&1
@@ -311,9 +310,8 @@ test_sensitive_interaction_eof_cancels_before_mutation() {
         SSHD_MAIN_CONF="$TEST_TMP/ssh-hardening-eof-sshd_config"
         : > "$SSHD_MAIN_CONF"
         sshd_binary() { printf '%s\n' /usr/sbin/sshd; }
-        settle_stale_unapplied_ssh_tracking() { return 0; }
         ssh_basic_hardening_effective() { return 1; }
-        backup_change_file_once() { printf '%s\n' backup >> "$event_log"; }
+        begin_ssh_runtime_transaction() { printf '%s\n' begin >> "$event_log"; }
 
         apply_ssh_basic_hardening </dev/null >"$TEST_TMP/ssh-hardening-eof.out" 2>&1
         assert_empty_file "$event_log" "SSH 加固确认输入结束后不得备份或修改配置"
@@ -418,14 +416,13 @@ test_ssh_access_controls_are_checked_before_mutation() {
         : > "$event_log"
         sshd_binary() { printf '%s\n' /usr/sbin/sshd; }
         ssh_socket_activation_enabled_or_active() { return 1; }
-        settle_stale_unapplied_ssh_tracking() { return 0; }
         choose_ssh_target_port() { printf '%s\n' 23333; }
         ssh_effective_ports_match_target() { return 1; }
         validate_ssh_access_controls() {
             printf '%s\n' access-check >> "$event_log"
             return 1
         }
-        backup_change_file_once() { printf '%s\n' backup >> "$event_log"; }
+        begin_ssh_runtime_transaction() { printf '%s\n' begin >> "$event_log"; }
         ssh_firewall_transition_begin() { printf '%s\n' firewall >> "$event_log"; }
 
         if apply_ssh_port_change >"$TEST_TMP/ssh-access-controls.out" 2>&1; then
@@ -2365,7 +2362,6 @@ firewall_abort_port_transition() { :; }
 firewall_rollback_dir_valid() { return 0; }
 firewall_restore_snapshot_now() { printf 'firewall:%s\n' "$2" >> "$EVENT_LOG"; }
 cleanup_active_fail2ban_test() { :; }
-cleanup_unapplied_ssh_tracking() { :; }
 cleanup_vpsbox_lock() { printf '%s\n' lock >> "$EVENT_LOG"; }
 rollback_pending_vpsbox_update() { printf '%s\n' update >> "$EVENT_LOG"; }
 

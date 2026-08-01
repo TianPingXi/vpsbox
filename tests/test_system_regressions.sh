@@ -323,6 +323,100 @@ test_chrony_source_layout_detection() {
     )
 }
 
+test_chrony_vpsbox_marker_validation() {
+    (
+        local conf="$TEST_TMP/chrony-marker-validation.conf"
+        local mode
+
+        for mode in absent valid orphan-begin orphan-end duplicate reversed; do
+            case "$mode" in
+                absent)
+                    printf '%s\n' 'driftfile /var/lib/chrony/drift' > "$conf"
+                    ;;
+                valid)
+                    printf '%s\n' "$NTP_SOURCES_BEGIN" 'pool example.test iburst' \
+                        "$NTP_SOURCES_END" > "$conf"
+                    ;;
+                orphan-begin)
+                    printf '%s\n' "$NTP_SOURCES_BEGIN" > "$conf"
+                    ;;
+                orphan-end)
+                    printf '%s\n' "$NTP_SOURCES_END" > "$conf"
+                    ;;
+                duplicate)
+                    printf '%s\n' "$NTP_SOURCES_BEGIN" "$NTP_SOURCES_BEGIN" \
+                        "$NTP_SOURCES_END" > "$conf"
+                    ;;
+                reversed)
+                    printf '%s\n' "$NTP_SOURCES_END" "$NTP_SOURCES_BEGIN" > "$conf"
+                    ;;
+            esac
+
+            if [ "$mode" = absent ] || [ "$mode" = valid ]; then
+                chrony_vpsbox_markers_valid "$conf" ||
+                    fail "NTP 标记的 $mode 布局应被接受"
+            elif chrony_vpsbox_markers_valid "$conf"; then
+                fail "NTP 标记的 $mode 布局必须被拒绝"
+            fi
+        done
+    )
+}
+
+test_chrony_sourcedir_inside_managed_block_is_not_external() {
+    (
+        local conf="$TEST_TMP/chrony-sourcedir-inside-block.conf"
+
+        printf '%s\n' "$NTP_SOURCES_BEGIN" \
+            'sourcedir /etc/chrony/sources.d' "$NTP_SOURCES_END" > "$conf"
+
+        if chrony_main_uses_source_dir "$conf"; then
+            fail "旧管理块内的 sourcedir 不得被识别为用户的外部 sourcedir"
+        fi
+    )
+}
+
+test_installed_chrony_config_drift_skips_package_manager() {
+    (
+        local case_dir="$TEST_TMP/ntp-installed-drift"
+        local log="$case_dir/events.log"
+
+        mkdir -p "$case_dir"
+        : > "$log"
+        CHRONY_SOURCE_FILE="$case_dir/vpsbox.sources"
+        printf '%s\n' 'driftfile /var/lib/chrony/drift' > "$case_dir/chrony.conf"
+        detect_os() { OS=debian; }
+        is_systemd() { return 0; }
+        chrony_service_name() { printf '%s\n' chrony; }
+        chrony_conf_path() { printf '%s\n' "$case_dir/chrony.conf"; }
+        ntp_package_installed() { [ "$1" = chrony ]; }
+        systemd_unit_exists() { [ "$1" = chrony.service ]; }
+        chrony_sources_are_current() { return 1; }
+        systemctl() {
+            case "$*" in
+                'is-active --quiet chrony'|'is-enabled --quiet chrony') return 0 ;;
+                'stop chrony'|'enable --now chrony') return 0 ;;
+                *) return 1 ;;
+            esac
+        }
+        backup_change_file_once() { return 0; }
+        manifest_set_once() { return 0; }
+        mark_change_applied() { return 0; }
+        manifest_value() { return 1; }
+        write_chrony_sources() { printf '%s\n' write >> "$log"; }
+        apt_get_bounded() { forbid "已安装 chrony 的配置漂移不得调用 apt"; }
+        dnf_bounded() { forbid "已安装 chrony 的配置漂移不得调用 dnf"; }
+        yum_bounded() { forbid "已安装 chrony 的配置漂移不得调用 yum"; }
+        show_ntp_runtime_details() { :; }
+        sleep() { :; }
+
+        forbid_init
+        enable_ntp_sync >/dev/null
+
+        assert_file_contains "$log" '^write$' "配置漂移仍应进入配置修复路径"
+        assert_no_forbidden "已安装 chrony 的配置漂移路径调用了包管理器"
+    )
+}
+
 test_enable_ntp_healthy_is_noop() {
     (
         local log="$TEST_TMP/ntp-healthy.log"
@@ -419,7 +513,12 @@ test_ntp_service_drift_uses_light_repair() {
                 'is-active --quiet chrony') [ "$mock_chrony_active" -eq 1 ] ;;
                 'is-enabled --quiet systemd-timesyncd') [ "$mock_timesyncd_enabled" -eq 1 ] ;;
                 'is-active --quiet systemd-timesyncd') [ "$mock_timesyncd_active" -eq 1 ] ;;
-                'enable chrony') mock_chrony_enabled=1; printf '%s\n' 'enable chrony' >> "$log" ;;
+                'enable chrony')
+                    assert_eq 1 "${ACTIVE_NTP_SERVICE_ROLLBACK:-0}" \
+                        "NTP 轻量修复必须在首次服务修改前登记回滚"
+                    mock_chrony_enabled=1
+                    printf '%s\n' 'enable chrony' >> "$log"
+                    ;;
                 'start chrony') mock_chrony_active=1; printf '%s\n' 'start chrony' >> "$log" ;;
                 'disable --now systemd-timesyncd')
                     mock_timesyncd_enabled=0
@@ -434,6 +533,8 @@ test_ntp_service_drift_uses_light_repair() {
         assert_file_contains "$log" '^enable chrony$'
         assert_file_contains "$log" '^start chrony$'
         assert_file_contains "$log" '^disable timesyncd$'
+        assert_eq 0 "${ACTIVE_NTP_SERVICE_ROLLBACK:-0}" \
+            "NTP 轻量修复成功后必须清除活动回滚"
     )
 }
 
@@ -536,6 +637,55 @@ test_ntp_light_repair_reports_restore_outcome() {
     done
 }
 
+test_ntp_light_repair_is_covered_by_runtime_cleanup() {
+    (
+        local observed_chrony_enabled=enabled observed_chrony_active=active
+        local observed_timesyncd_enabled=disabled observed_timesyncd_active=inactive
+
+        # shellcheck disable=SC2034 # 被测 NTP 事务入口通过动态作用域读取。
+        ACTIVE_NTP_SNAPSHOT=""
+        # shellcheck disable=SC2034 # 被测 NTP 事务入口通过动态作用域读取。
+        ACTIVE_NTP_ROLLBACK_ARGS=()
+        ACTIVE_NTP_SERVICE_ROLLBACK=0
+        ACTIVE_NTP_SERVICE_ROLLBACK_ARGS=()
+        systemd_unit_exists() {
+            case "$1" in
+                chrony.service|systemd-timesyncd.service) return 0 ;;
+                *) return 1 ;;
+            esac
+        }
+        systemctl() {
+            case "$*" in
+                'enable chrony') observed_chrony_enabled=enabled ;;
+                'disable chrony') observed_chrony_enabled=disabled ;;
+                'start chrony') observed_chrony_active=active ;;
+                'stop chrony') observed_chrony_active=inactive ;;
+                'enable systemd-timesyncd') observed_timesyncd_enabled=enabled ;;
+                'disable systemd-timesyncd') observed_timesyncd_enabled=disabled ;;
+                'start systemd-timesyncd') observed_timesyncd_active=active ;;
+                'stop systemd-timesyncd') observed_timesyncd_active=inactive ;;
+                'is-enabled chrony') printf '%s\n' "$observed_chrony_enabled" ;;
+                'is-active chrony') printf '%s\n' "$observed_chrony_active" ;;
+                'is-enabled systemd-timesyncd') printf '%s\n' "$observed_timesyncd_enabled" ;;
+                'is-active systemd-timesyncd') printf '%s\n' "$observed_timesyncd_active" ;;
+                *) return 1 ;;
+            esac
+        }
+        cleanup_vpsbox_lock() { return 0; }
+
+        arm_ntp_service_runtime_rollback chrony disabled inactive \
+            present enabled active
+        cleanup_vpsbox_runtime
+
+        assert_eq disabled "$observed_chrony_enabled"
+        assert_eq inactive "$observed_chrony_active"
+        assert_eq enabled "$observed_timesyncd_enabled"
+        assert_eq active "$observed_timesyncd_active"
+        assert_eq 0 "${ACTIVE_NTP_SERVICE_ROLLBACK:-0}"
+        assert_eq 0 "${#ACTIVE_NTP_SERVICE_ROLLBACK_ARGS[@]}"
+    )
+}
+
 test_enable_ntp_failure_stages_enter_runtime_rollback() {
     local stage
 
@@ -570,14 +720,6 @@ test_enable_ntp_failure_stages_enter_runtime_rollback() {
                     NTP_CHRONY_ACTIVE|NTP_TIMESYNCD_ACTIVE) printf '%s\n' inactive ;;
                     *) return 1 ;;
                 esac
-            }
-            mktemp() {
-                if [ "${1:-}" = -d ]; then
-                    mkdir -p "$case_dir/snapshot"
-                    printf '%s\n' "$case_dir/snapshot"
-                else
-                    command mktemp "$@"
-                fi
             }
             apt_get_bounded() {
                 if [ "$stage" = package ] && [[ " $* " == *" install -y chrony "* ]]; then
@@ -1119,6 +1261,7 @@ test_ipv6_default_confirmation_applies_and_repeated_run_is_noop() {
         local output="$TEST_TMP/ipv6-success.out" before_count after_count
 
         setup_ipv6_disable_case success
+        # shellcheck disable=SC2034 # 被测 IPv6 会话检测通过动态作用域读取。
         SSH_CONNECTION="198.51.100.20 52341 192.0.2.10 22"
         forbid_init
         systemctl() { forbid "禁用 IPv6 不得调用 systemd"; }
@@ -1394,7 +1537,7 @@ test_journald_apply_and_failed_restart_restore_previous_config() {
     )
 }
 
-prepare_ssh_change_tracking() {
+prepare_legacy_ssh_change_tracking() {
     reset_change_store "$1"
     printf '%s\n' \
         'BACKUP_SSHD_MAIN=present' \
@@ -1415,146 +1558,41 @@ assert_ssh_tracking_cleared() {
     [ ! -e "$CHANGE_BACKUP_DIR/SSHD_HARDENING" ] || fail "SSHD_HARDENING 备份未清理"
 }
 
-test_first_ssh_port_rollback_clears_tracking() {
-    prepare_ssh_change_tracking ssh-port-first
-    restore_ssh_config_backup() { return 0; }
-    sshd_binary() { printf '%s\n' /bin/true; }
-    restart_ssh_service() { return 0; }
-    wait_for_any_ssh_listener_csv() { return 0; }
-    ssh_firewall_transition_abort() { return 0; }
-
-    rollback_ssh_port_change "" "" 22 0
-    assert_ssh_tracking_cleared
-}
-
-test_first_ssh_hardening_rollback_clears_tracking() {
-    prepare_ssh_change_tracking ssh-hardening-first
-    restore_ssh_config_backup() { return 0; }
-    restart_ssh_service() { return 0; }
-
-    rollback_ssh_hardening_change "" "" 0 1
-    assert_ssh_tracking_cleared
-}
-
-test_existing_ssh_baseline_survives_later_rollback() {
-    prepare_ssh_change_tracking ssh-existing
-    restore_ssh_config_backup() { return 0; }
-    restart_ssh_service() { return 0; }
-
-    rollback_ssh_hardening_change "" "" 1 1
-    assert_file_contains "$CHANGE_MANIFEST" '^BACKUP_SSHD_MAIN=present$'
-    assert_file_contains "$CHANGE_MANIFEST" '^APPLIED_SSH_CONFIG=1$'
-    assert_file_contains "$CHANGE_MANIFEST" '^SSH_PORTS=22$'
-    [ -f "$CHANGE_BACKUP_DIR/SSHD_MAIN" ] ||
-        fail "后续事务失败不应删除此前成功应用所需的 SSH 基线"
-}
-
-test_ssh_hardening_requires_listener_after_restart() {
+test_ssh_snapshot_root_and_transaction_names_are_restricted() {
     (
-        local ssh_dir="$TEST_TMP/ssh-hardening-listener/etc/ssh"
-        local log="$TEST_TMP/ssh-hardening-listener.log"
-        local wait_calls=0
-        reset_change_store ssh-hardening-listener
-        mkdir -p "$ssh_dir/sshd_config.d"
-        SSHD_MAIN_CONF="$ssh_dir/sshd_config"
-        SSHD_CONFIG_DIR="$ssh_dir/sshd_config.d"
-        SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
-        SSHD_VPSBOX_HARDENING_CONF="$SSHD_CONFIG_DIR/01-vpsbox-ssh-hardening.conf"
-        printf '%s\n' 'Port 6384' > "$SSHD_MAIN_CONF"
-        : > "$log"
-
-        sshd_binary() { printf '%s\n' /bin/true; }
-        settle_stale_unapplied_ssh_tracking() { return 0; }
-        ssh_basic_hardening_effective() { return 1; }
-        backup_change_file_once() { return 0; }
-        ssh_effective_ports_csv() { printf '%s\n' 6384; }
-        manifest_set_once() { return 0; }
-        backup_ssh_file() { printf '%s\n' "$TEST_TMP/ssh-hardening-backup"; }
-        mark_change_applied() { return 0; }
-        write_vpsbox_ssh_hardening_config() { return 0; }
-        ensure_sshd_dropin_include() { return 0; }
-        validate_ssh_hardening_effective_config() { return 0; }
-        restart_ssh_service() { printf '%s\n' restart >> "$log"; }
-        wait_for_any_ssh_listener_csv() {
-            wait_calls=$((wait_calls + 1))
-            printf 'wait:%s:%s\n' "$wait_calls" "$1" >> "$log"
-            [ "$wait_calls" -gt 1 ]
-        }
-        restore_ssh_config_backup() { printf '%s\n' restore >> "$log"; }
-        clear_ssh_change_tracking() { printf '%s\n' clear >> "$log"; }
-
-        if apply_ssh_basic_hardening <<< "y" >"$TEST_TMP/ssh-hardening-listener.out" 2>&1; then
-            fail "SSH 重启后原端口未监听时加固不得报告成功"
+        RUNTIME_DIR="$TEST_TMP/runtime-root"
+        assert_eq "$RUNTIME_DIR/ssh-transactions" "$(ssh_restore_snapshot_root)"
+        ssh_restore_snapshot_path_allowed "$RUNTIME_DIR/ssh-transactions/transaction.good" ||
+            fail "transaction.* 运行期快照名称应被接受"
+        ssh_restore_snapshot_path_allowed "$RUNTIME_DIR/ssh-transactions/.building.good" ||
+            fail ".building.* 构建目录名称应被接受"
+        if ssh_restore_snapshot_path_allowed /tmp/transaction.bad; then
+            fail "不得接受 /tmp 下的 SSH 快照"
         fi
-        assert_file_contains "$log" '^wait:1:6384$'
-        assert_file_contains "$log" '^restore$' "监听验证失败后必须回滚配置"
-        assert_file_contains "$log" '^wait:2:6384$' "回滚后必须再次确认原端口监听"
-        assert_file_contains "$log" '^clear$'
+        if ssh_restore_snapshot_path_allowed "$TEST_TMP/persistent/ssh-transactions/transaction.old"; then
+            fail "不得接受旧持久状态根下的 SSH 快照"
+        fi
+        if ssh_restore_snapshot_path_allowed "$RUNTIME_DIR/ssh-transactions/restore.old"; then
+            fail "不得接受旧 restore.* 快照名称"
+        fi
     )
 }
 
-test_ssh_pre_mark_failure_cleans_first_baseline() {
-    local ssh_dir="$TEST_TMP/ssh-pre-mark/etc/ssh"
-
-    reset_change_store ssh-pre-mark
-    mkdir -p "$ssh_dir/sshd_config.d"
-    SSHD_MAIN_CONF="$ssh_dir/sshd_config"
-    SSHD_CONFIG_DIR="$ssh_dir/sshd_config.d"
-    # Consumed indirectly by the sourced SSH transaction.
-    # shellcheck disable=SC2034
-    SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
-    # shellcheck disable=SC2034
-    SSHD_VPSBOX_HARDENING_CONF="$SSHD_CONFIG_DIR/01-vpsbox-ssh-hardening.conf"
-    printf '%s\n' 'Port 22' > "$SSHD_MAIN_CONF"
-    ACTIVE_UNAPPLIED_SSH_TRACKING=0
-
-    sshd_binary() { printf '%s\n' /bin/true; }
-    ssh_socket_activation_active() { return 1; }
-    choose_ssh_target_port() { printf '%s\n' 2222; }
-    ssh_effective_ports_match_target() { return 1; }
-    firewall_runtime_enabled() { return 1; }
-    ssh_effective_ports_csv() { return 23; }
-
-    if apply_ssh_port_change <<< "YES" >/dev/null 2>&1; then
-        fail "首次 SSH 事务在 APPLIED 标记前失败时不应成功"
-    fi
-    assert_ssh_tracking_cleared
-    assert_eq 0 "$ACTIVE_UNAPPLIED_SSH_TRACKING" "失败后不应保留活动清理标记"
-}
-
-test_ssh_port_change_failure_stages_rollback_and_success_syncs_fail2ban() {
+test_ssh_port_transaction_stage_order_and_rollback() {
     local stage
 
-    for stage in publish validate restart listener firewall success; do
+    for stage in publish validate restart listener fail2ban firewall commit success; do
         (
-            local case_dir="$TEST_TMP/ssh-port-entry-$stage"
-            local log="$case_dir/events.log"
-
+            local case_dir="$TEST_TMP/ssh-port-transaction-$stage" log
+            log="$case_dir/events.log"
             mkdir -p "$case_dir"
             : > "$log"
-            SSHD_MAIN_CONF="$case_dir/sshd_config"
-            SSHD_CONFIG_DIR="$case_dir/sshd_config.d"
-            SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
-            SSHD_VPSBOX_HARDENING_CONF="$SSHD_CONFIG_DIR/01-vpsbox-ssh-hardening.conf"
-            mkdir -p "$SSHD_CONFIG_DIR"
-            printf '%s\n' 'Port 22' > "$SSHD_MAIN_CONF"
-
-            sshd_binary() { printf '%s\n' /bin/true; }
-            ssh_socket_activation_enabled_or_active() { return 1; }
-            settle_stale_unapplied_ssh_tracking() { return 0; }
-            choose_ssh_target_port() { printf '%s\n' 2222; }
-            ssh_effective_ports_match_target() { return 1; }
-            validate_ssh_access_controls() { return 0; }
-            firewall_runtime_enabled() { return 1; }
-            manifest_value() {
-                [ "$1" = APPLIED_SSH_CONFIG ] && printf '%s\n' 1
+            SSH_TARGET_PORT=2222
+            begin_ssh_runtime_transaction() {
+                [ "$1" = 22 ] && [ "$2" = 1 ] || return 1
+                printf '%s\n' snapshot >> "$log"
             }
-            backup_change_file_once() { return 0; }
-            ssh_effective_ports_csv() { printf '%s\n' 22; }
-            manifest_set_once() { return 0; }
-            backup_ssh_file() { printf '%s\n' "$case_dir/backup-${1##*/}"; }
             ssh_firewall_transition_begin() { printf '%s\n' firewall-begin >> "$log"; }
-            mark_change_applied() { return 0; }
             sshd_main_has_active_port_directive() { return 1; }
             sshd_vpsbox_port_include_available() { return 0; }
             write_vpsbox_ssh_port_config() {
@@ -1573,80 +1611,156 @@ test_ssh_port_change_failure_stages_rollback_and_success_syncs_fail2ban() {
                 printf '%s\n' listener >> "$log"
                 [ "$stage" != listener ]
             }
+            sync_fail2ban_sshd_port() {
+                printf '%s\n' fail2ban >> "$log"
+                [ "$stage" != fail2ban ]
+            }
             ssh_firewall_transition_finish() {
                 printf '%s\n' firewall-finish >> "$log"
                 [ "$stage" != firewall ]
             }
-            rollback_ssh_port_change() {
-                printf 'rollback:%s\n' "$stage" >> "$log"
-                return 0
+            commit_ssh_runtime_transaction() {
+                printf '%s\n' commit >> "$log"
+                [ "$stage" != commit ]
             }
-            sync_fail2ban_sshd_port() { printf '%s\n' fail2ban-sync >> "$log"; }
+            rollback_active_ssh_transaction() { printf '%s\n' rollback >> "$log"; }
+            retire_legacy_ssh_change_tracking() { printf '%s\n' retire >> "$log"; }
             fail2ban_installed() { return 0; }
 
             if [ "$stage" = success ]; then
-                apply_ssh_port_change <<< "YES" >/dev/null ||
+                apply_ssh_port_target_transaction 22 >/dev/null ||
                     fail "SSH 端口完整成功路径不应失败"
-                assert_file_contains "$log" '^fail2ban-sync$' \
-                    "SSH 端口修改成功后必须同步 Fail2ban"
-                assert_file_not_contains "$log" '^rollback:' \
-                    "SSH 端口成功路径不得回滚"
+                assert_eq $'snapshot\nfirewall-begin\npublish\nvalidate\nrestart\nlistener\nfail2ban\nfirewall-finish\ncommit\nretire' "$(cat "$log")" \
+                    "SSH 端口事务阶段顺序错误"
             else
-                if apply_ssh_port_change <<< "YES" >/dev/null 2>&1; then
+                if apply_ssh_port_target_transaction 22 >/dev/null 2>&1; then
                     fail "SSH 端口的 $stage 阶段失败时入口不得报告成功"
                 fi
-                assert_eq 1 "$(grep -c '^rollback:' "$log")" \
+                assert_eq 1 "$(grep -c '^rollback$' "$log")" \
                     "SSH 端口的 $stage 阶段失败后必须触发一次完整回滚"
-                assert_file_contains "$log" "^rollback:${stage}$"
-                assert_file_not_contains "$log" '^fail2ban-sync$' \
-                    "SSH 端口事务失败后不得同步 Fail2ban"
+                assert_file_not_contains "$log" '^retire$' \
+                    "SSH 端口事务失败后不得退役旧状态"
+                if [ "$stage" = fail2ban ]; then
+                    assert_file_not_contains "$log" '^commit$' \
+                        "Fail2ban 失败后不得提交 SSH 事务"
+                fi
             fi
         )
     done
 }
 
-test_runtime_cleanup_clears_interrupted_ssh_baseline() {
-    prepare_ssh_change_tracking ssh-interrupted
-    ACTIVE_UNAPPLIED_SSH_TRACKING=1
-    cleanup_vpsbox_lock() { return 0; }
+test_runtime_cleanup_rolls_back_active_ssh_transaction() {
+    (
+        local log="$TEST_TMP/ssh-cleanup-active.log"
+        : > "$log"
+        ACTIVE_SSH_TRANSACTION_DIR="$TEST_TMP/runtime/ssh-transactions/transaction.active"
+        rollback_active_ssh_transaction() {
+            printf '%s\n' rollback >> "$log"
+            ACTIVE_SSH_TRANSACTION_DIR=""
+        }
+        cleanup_vpsbox_lock() { return 0; }
 
-    cleanup_vpsbox_runtime
-
-    assert_ssh_tracking_cleared
-    assert_eq 0 "$ACTIVE_UNAPPLIED_SSH_TRACKING" "运行时清理后不应保留 SSH 首次事务标记"
+        cleanup_vpsbox_runtime
+        assert_eq rollback "$(cat "$log")" \
+            "cleanup 必须回滚活动 SSH 运行期事务"
+    )
 }
 
-test_failed_ssh_tracking_cleanup_remains_retryable() {
-    local fail_once=1
+test_finished_ssh_firewall_is_resynced_during_rollback() {
+    (
+        local log="$TEST_TMP/ssh-finished-firewall-rollback.log"
+        : > "$log"
+        ACTIVE_SSH_TRANSACTION_DIR="$TEST_TMP/runtime/ssh-transactions/transaction.finished"
+        ACTIVE_SSH_ORIGINAL_PORTS=22
+        ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE=1
+        # shellcheck disable=SC2034 # 被测 SSH 回滚通过动态作用域读取。
+        ACTIVE_SSH_FIREWALL_TRANSITION=0
+        # shellcheck disable=SC2034 # 被测 SSH 回滚通过动态作用域读取。
+        ACTIVE_FIREWALL_TRANSITION_DIR=""
+        # shellcheck disable=SC2034 # 被测 Fail2ban 清理通过动态作用域读取。
+        ACTIVE_FAIL2BAN_SYNC_WAS_RUNNING=""
+        restore_ssh_runtime_snapshot() { printf '%s\n' restore >> "$log"; }
+        sync_fail2ban_sshd_port() { printf '%s\n' fail2ban >> "$log"; }
+        firewall_runtime_enabled() { return 0; }
+        ssh_firewall_sync_current_safe_ports() { printf '%s\n' firewall-sync >> "$log"; }
+        remove_ssh_restore_snapshot() { printf '%s\n' snapshot-remove >> "$log"; }
 
-    reset_change_store ssh-cleanup-retry
-    : > "$CHANGE_BACKUP_DIR/SSHD_MAIN"
-    ACTIVE_UNAPPLIED_SSH_TRACKING=1
-    manifest_remove() {
-        if [ "$1" = "BACKUP_SSHD_MAIN" ] && [ "$fail_once" -eq 1 ]; then
-            fail_once=0
-            return 23
-        fi
-        return 0
-    }
-
-    if cleanup_unapplied_ssh_tracking 0; then
-        fail "首次清理失败时不应报告成功"
-    fi
-    assert_eq 1 "$ACTIVE_UNAPPLIED_SSH_TRACKING" "清理失败后必须保留重试标记"
-    cleanup_unapplied_ssh_tracking 0
-    assert_eq 0 "$ACTIVE_UNAPPLIED_SSH_TRACKING" "后续完整清理后才可清除重试标记"
+        rollback_active_ssh_transaction
+        assert_eq $'restore\nfail2ban\nfirewall-sync\nsnapshot-remove' "$(cat "$log")" \
+            "finish 后的端口事务回滚必须按恢复配置、Fail2ban、重同步防火墙顺序执行"
+        assert_eq "" "$ACTIVE_SSH_TRANSACTION_DIR"
+        assert_eq 0 "$ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE"
+    )
 }
 
-test_stale_unapplied_ssh_baseline_is_removed_on_next_run() {
-    prepare_ssh_change_tracking ssh-stale-unapplied
-    manifest_remove APPLIED_SSH_CONFIG
-    ACTIVE_UNAPPLIED_SSH_TRACKING=0
+test_successful_ssh_transaction_uses_only_runtime_snapshot() {
+    (
+        local log="$TEST_TMP/ssh-runtime-only.log"
+        : > "$log"
+        forbid_init
+        SSH_TARGET_PORT=2222
+        ACTIVE_SSH_TRANSACTION_DIR="$TEST_TMP/runtime/ssh-transactions/transaction.success"
+        ACTIVE_SSH_ORIGINAL_PORTS=22
+        begin_ssh_runtime_transaction() {
+            [ "$1" = 22 ] && [ "$2" = 1 ] || return 1
+            printf '%s\n' snapshot >> "$log"
+        }
+        ssh_firewall_transition_begin() { printf '%s\n' firewall-begin >> "$log"; }
+        sshd_main_has_active_port_directive() { return 1; }
+        sshd_vpsbox_port_include_available() { return 0; }
+        write_vpsbox_ssh_port_config() { printf '%s\n' publish >> "$log"; }
+        validate_ssh_port_effective_config() { return 0; }
+        restart_ssh_service() { return 0; }
+        wait_for_ssh_listener() { return 0; }
+        sync_fail2ban_sshd_port() { return 0; }
+        ssh_firewall_transition_finish() { return 0; }
+        commit_ssh_runtime_transaction() {
+            printf '%s\n' commit >> "$log"
+            ACTIVE_SSH_TRANSACTION_DIR=""
+            ACTIVE_SSH_ORIGINAL_PORTS=""
+            ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE=0
+        }
+        retire_legacy_ssh_change_tracking() { return 0; }
+        fail2ban_installed() { return 1; }
+        backup_change_file_once() { forbid "SSH 成功路径不得创建持久备份"; }
+        manifest_set() { forbid "SSH 成功路径不得写入 SSH_PORTS"; }
+        manifest_set_once() { forbid "SSH 成功路径不得写入 SSH_PORTS"; }
 
-    settle_stale_unapplied_ssh_tracking
+        apply_ssh_port_target_transaction 22 >/dev/null
+        assert_eq "" "$ACTIVE_SSH_TRANSACTION_DIR" "成功后必须清除运行期快照标记"
+        assert_eq "" "$ACTIVE_SSH_ORIGINAL_PORTS" "成功后必须清除原端口标记"
+        assert_eq 0 "$ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE" \
+            "成功后必须清除端口变更标记"
+        assert_no_forbidden "SSH 成功路径仍调用了旧持久备份接口"
+    )
+}
 
-    assert_ssh_tracking_cleared
-    assert_eq 0 "$ACTIVE_UNAPPLIED_SSH_TRACKING"
+test_effective_hardening_force_rewrite_consumes_one_confirmation() {
+    (
+        local reads=0
+        SSHD_MAIN_CONF="$TEST_TMP/ssh-hardening-confirm/sshd_config"
+        mkdir -p "$(dirname "$SSHD_MAIN_CONF")"
+        : > "$SSHD_MAIN_CONF"
+        sshd_binary() { printf '%s\n' /bin/true; }
+        ssh_basic_hardening_effective() { return 0; }
+        read() {
+            reads=$((reads + 1))
+            printf -v "${@: -1}" '%s' y
+        }
+        ssh_effective_ports_csv() { printf '%s\n' 22; }
+        begin_ssh_runtime_transaction() { [ "${2:-0}" = 0 ]; }
+        write_vpsbox_ssh_hardening_config() { return 0; }
+        ensure_sshd_dropin_include() { return 0; }
+        validate_ssh_hardening_effective_config() { return 0; }
+        ssh_effective_ports_match_csv() { [ "$1" = 22 ]; }
+        restart_ssh_service() { return 0; }
+        wait_for_all_ssh_listeners_csv() { [ "$1" = 22 ]; }
+        commit_ssh_runtime_transaction() { return 0; }
+        retire_legacy_ssh_change_tracking() { return 0; }
+
+        apply_ssh_basic_hardening >/dev/null
+        assert_eq 1 "$reads" "已生效加固的强制重写只能消费一次确认"
+    )
 }
 
 test_absent_resolv_conf_is_created_successfully() {
@@ -1663,6 +1777,259 @@ test_absent_resolv_conf_is_created_successfully() {
     )
 }
 
+test_identical_resolv_conf_is_side_effect_free() {
+    (
+        local case_dir="$TEST_TMP/dns-identical-direct"
+        local before after
+
+        mkdir -p "$case_dir"
+        RESOLV_CONF="$case_dir/resolv.conf"
+        printf '%s\n' 'nameserver 1.1.1.1' 'nameserver 8.8.8.8' \
+            'search example.test' > "$RESOLV_CONF"
+        before="$(cksum < "$RESOLV_CONF")"
+        forbid_init
+        root_owned_config_file_is_safe_readonly() { return 0; }
+        mktemp() { forbid "相同 resolv.conf 不得创建临时文件"; }
+        backup_change_file_once() { forbid "相同 resolv.conf 不得创建恢复备份"; }
+        begin_change_transaction() { forbid "相同 resolv.conf 不得开启事务"; }
+        mv() { forbid "相同 resolv.conf 不得写入"; }
+        chown() { forbid "相同 resolv.conf 不得改所有者"; }
+        chmod() { forbid "相同 resolv.conf 不得改权限"; }
+
+        write_resolv_conf_dns 1.1.1.1 8.8.8.8 >/dev/null
+        after="$(cksum < "$RESOLV_CONF")"
+
+        assert_eq "$before" "$after" "相同 resolv.conf 内容必须保持不变"
+        assert_no_forbidden "相同 resolv.conf 仍产生了写入副作用"
+        [ -z "$(find "$case_dir" -type f -name '*.bak.*' -print -quit)" ] ||
+            fail "DNS 幂等路径不得生成带时间戳的 .bak 文件"
+    )
+}
+
+test_identical_systemd_resolved_config_repairs_only_service_state() {
+    local initial_state
+
+    for initial_state in active inactive; do
+        (
+            local state="$initial_state"
+            local log="$TEST_TMP/resolved-identical-$initial_state.log"
+
+            : > "$log"
+            forbid_init
+            root_owned_config_dir_is_safe_readonly() { return 0; }
+            root_owned_config_file_is_safe_readonly() { return 0; }
+            cmp() { cat >/dev/null; }
+            retry() {
+                shift 2
+                "$@"
+            }
+            systemctl() {
+                printf '%s\n' "$*" >> "$log"
+                case "$*" in
+                    'is-active --quiet systemd-resolved') [ "$state" = active ] ;;
+                    'start systemd-resolved') state=active ;;
+                    *) return 1 ;;
+                esac
+            }
+            ensure_public_config_dir() { forbid "相同 resolved 配置不得准备写入目录"; }
+            mktemp() { forbid "相同 resolved 配置不得创建临时文件"; }
+            backup_change_file_once() { forbid "相同 resolved 配置不得创建恢复备份"; }
+            begin_change_transaction() { forbid "相同 resolved 配置不得开启事务"; }
+            mv() { forbid "相同 resolved 配置不得写入"; }
+
+            write_systemd_resolved_dns 1.1.1.1 8.8.8.8 >/dev/null
+
+            assert_no_forbidden "相同 resolved 配置仍产生了文件副作用"
+            assert_file_not_contains "$log" '^restart systemd-resolved$' \
+                "相同 resolved 配置不得重启服务"
+            if [ "$initial_state" = active ]; then
+                assert_eq 1 "$(grep -c '^is-active --quiet systemd-resolved$' "$log")" \
+                    "活动服务只需检查一次状态"
+                assert_file_not_contains "$log" '^start systemd-resolved$'
+            else
+                assert_eq 2 "$(grep -c '^is-active --quiet systemd-resolved$' "$log")" \
+                    "启动后应再次确认服务状态"
+                assert_eq 1 "$(grep -c '^start systemd-resolved$' "$log")" \
+                    "非活动服务应只执行 start"
+            fi
+        )
+    done
+}
+
+test_dns_operation_snapshot_restores_existing_and_absent_targets() {
+    local mode
+
+    for mode in existing absent; do
+        (
+            local case_dir="$TEST_TMP/dns-operation-snapshot-$mode"
+            local target snapshot="" was_created=0
+
+            mkdir -p "$case_dir"
+            target="$case_dir/target.conf"
+            if [ "$mode" = existing ]; then
+                printf '%s\n' original > "$target"
+            fi
+
+            create_dns_operation_snapshot "$target" ".rollback" snapshot was_created
+            if [ "$mode" = existing ]; then
+                assert_eq 0 "$was_created"
+                [ -f "$snapshot" ] || fail "既有 DNS 文件必须创建本次操作快照"
+                assert_file_contains "$snapshot" '^original$'
+            else
+                assert_eq 1 "$was_created"
+                assert_eq "" "$snapshot" "原目标不存在时不应伪造快照路径"
+            fi
+
+            printf '%s\n' modified > "$target"
+            restore_dns_operation_snapshot "$snapshot" "$target" "$was_created"
+            remove_dns_operation_snapshot "$snapshot"
+
+            if [ "$mode" = existing ]; then
+                assert_file_contains "$target" '^original$'
+                [ ! -e "$snapshot" ] || fail "恢复成功后必须清理 DNS 操作快照"
+            else
+                [ ! -e "$target" ] || fail "原目标不存在时回滚必须删除新建文件"
+            fi
+        )
+    done
+}
+
+test_pending_dns_same_target_commits_without_rewrite() {
+    local kind
+
+    for kind in direct resolved; do
+        (
+            local case_dir="$TEST_TMP/dns-pending-same-$kind"
+            local log="$case_dir/events.log"
+
+            mkdir -p "$case_dir"
+            : > "$log"
+            RESOLV_CONF="$case_dir/resolv.conf"
+            printf '%s\n' 'nameserver 1.1.1.1' 'nameserver 8.8.8.8' > "$RESOLV_CONF"
+            forbid_init
+            manifest_value_readonly() {
+                case "$1" in
+                    PENDING_DNS_RESOLV) [ "$kind" = direct ] && printf '%s\n' 1 ;;
+                    PENDING_DNS_RESOLVED) [ "$kind" = resolved ] && printf '%s\n' 1 ;;
+                    *) return 1 ;;
+                esac
+            }
+            change_backup_record_is_valid() {
+                printf 'backup:%s\n' "$1" >> "$log"
+                return 0
+            }
+            root_owned_config_file_is_safe_readonly() { return 0; }
+            root_owned_config_dir_is_safe_readonly() { return 0; }
+            cmp() { cat >/dev/null; }
+            verify_dns_resolution() { printf '%s\n' verify >> "$log"; }
+            mark_change_applied() { printf 'applied:%s\n' "$1" >> "$log"; }
+            systemctl() {
+                printf 'systemctl:%s\n' "$*" >> "$log"
+                [ "$*" = 'is-active --quiet systemd-resolved' ]
+            }
+            mktemp() { forbid "pending 同目标提交不得创建临时文件"; }
+            backup_change_file_once() { forbid "pending 同目标提交不得覆盖恢复基线"; }
+            begin_change_transaction() { forbid "pending 同目标提交不得重开事务"; }
+            ensure_public_config_dir() { forbid "pending 同目标提交不得准备写入目录"; }
+            mv() { forbid "pending 同目标提交不得重写 DNS 文件"; }
+
+            if [ "$kind" = direct ]; then
+                write_resolv_conf_dns 1.1.1.1 8.8.8.8 >/dev/null
+                assert_eq $'backup:DNS_RESOLV\nverify\napplied:DNS_RESOLV' "$(cat "$log")"
+            else
+                write_systemd_resolved_dns 1.1.1.1 8.8.8.8 >/dev/null
+                assert_eq $'backup:DNS_RESOLVED\nsystemctl:is-active --quiet systemd-resolved\nsystemctl:is-active --quiet systemd-resolved\nverify\napplied:DNS_RESOLVED' \
+                    "$(cat "$log")"
+            fi
+            assert_no_forbidden "pending 同目标提交产生了重复写入副作用"
+        )
+    done
+}
+
+test_pending_dns_different_target_is_rejected_without_side_effects() {
+    local kind
+
+    for kind in direct resolved; do
+        (
+            local case_dir="$TEST_TMP/dns-pending-different-$kind"
+
+            mkdir -p "$case_dir"
+            RESOLV_CONF="$case_dir/resolv.conf"
+            printf '%s\n' 'nameserver 9.9.9.9' > "$RESOLV_CONF"
+            forbid_init
+            manifest_value_readonly() {
+                case "$1" in
+                    PENDING_DNS_RESOLV) [ "$kind" = direct ] && printf '%s\n' 1 ;;
+                    PENDING_DNS_RESOLVED) [ "$kind" = resolved ] && printf '%s\n' 1 ;;
+                    *) return 1 ;;
+                esac
+            }
+            change_backup_record_is_valid() { return 0; }
+            root_owned_config_file_is_safe_readonly() { return 0; }
+            root_owned_config_dir_is_safe_readonly() { return 0; }
+            cmp() { cat >/dev/null; return 1; }
+            verify_dns_resolution() { forbid "pending 不同目标不得验证新配置"; }
+            mark_change_applied() { forbid "pending 不同目标不得提交事务"; }
+            systemctl() { forbid "pending 不同目标不得修改服务"; }
+            mktemp() { forbid "pending 不同目标不得创建临时文件"; }
+            ensure_public_config_dir() { forbid "pending 不同目标不得准备写入目录"; }
+            mv() { forbid "pending 不同目标不得重写 DNS 文件"; }
+
+            if [ "$kind" = direct ]; then
+                if write_resolv_conf_dns 1.1.1.1 8.8.8.8 >/dev/null 2>&1; then
+                    fail "direct pending 与目标不同时必须拒绝"
+                fi
+            elif write_systemd_resolved_dns 1.1.1.1 8.8.8.8 >/dev/null 2>&1; then
+                fail "resolved pending 与目标不同时必须拒绝"
+            fi
+            assert_no_forbidden "pending 不同目标拒绝后仍产生副作用"
+        )
+    done
+}
+
+test_pending_resolved_unsafe_directory_never_starts_service() {
+    (
+        forbid_init
+        manifest_value_readonly() {
+            [ "$1" = PENDING_DNS_RESOLVED ] && printf '%s\n' 1
+        }
+        change_backup_record_is_valid() { return 0; }
+        root_owned_config_dir_is_safe_readonly() { return 1; }
+        root_owned_config_file_is_safe_readonly() {
+            forbid "危险 resolved 目录后不得继续检查配置文件"
+        }
+        systemctl() { forbid "危险 resolved 目录不得启动或查询服务"; }
+        ensure_public_config_dir() { forbid "pending 危险目录不得进入写入修复"; }
+        mktemp() { forbid "pending 危险目录不得创建临时文件"; }
+        mark_change_applied() { forbid "pending 危险目录不得提交事务"; }
+
+        if write_systemd_resolved_dns 1.1.1.1 8.8.8.8 >/dev/null 2>&1; then
+            fail "pending resolved 目录不安全时必须拒绝"
+        fi
+        assert_no_forbidden "危险 resolved 目录仍触发了服务或写入副作用"
+    )
+}
+
+test_runtime_cleanup_dispatches_active_dns_rollback() {
+    (
+        local log="$TEST_TMP/dns-runtime-cleanup.log"
+
+        : > "$log"
+        ACTIVE_DNS_OPERATION_NAME=DNS_RESOLV
+        rollback_active_dns_operation() {
+            printf '%s\n' dns-rollback >> "$log"
+            clear_active_dns_operation
+        }
+        cleanup_vpsbox_lock() { printf '%s\n' lock >> "$log"; }
+
+        cleanup_vpsbox_runtime
+
+        assert_eq $'dns-rollback\nlock' "$(cat "$log")" \
+            "cleanup 必须在释放锁前分派活动 DNS 回滚"
+        assert_eq "" "$ACTIVE_DNS_OPERATION_NAME"
+    )
+}
+
 test_systemd_resolved_restart_and_verification_failures_rollback() {
     local stage
 
@@ -1676,6 +2043,11 @@ test_systemd_resolved_restart_and_verification_failures_rollback() {
             ensure_public_config_dir() { return 0; }
             backup_change_file_once() { return 0; }
             begin_change_transaction() { return 0; }
+            create_dns_operation_snapshot() {
+                printf -v "$3" '%s' "$case_dir/vpsbox.conf.rollback"
+                printf -v "$4" '%s' 1
+            }
+            arm_dns_operation_rollback() { return 0; }
             cp() { return 0; }
             mktemp() {
                 printf '%s\n' "$case_dir/vpsbox.conf.tmp"
@@ -1697,7 +2069,7 @@ test_systemd_resolved_restart_and_verification_failures_rollback() {
             }
             resolvectl() { return 0; }
             verify_dns_resolution() { [ "$stage" != verify ]; }
-            rollback_systemd_resolved_dns() {
+            rollback_active_dns_operation() {
                 printf 'rollback:%s\n' "$stage" >> "$log"
                 return "$rollback_status"
             }
@@ -1720,10 +2092,10 @@ test_systemd_resolved_rollback_failure_is_reported() {
         local output="$TEST_TMP/resolved-rollback-failure.out"
         remove_snapshot_target_file() { return 23; }
 
-        rollback_systemd_resolved_dns \
-            /etc/systemd/resolved.conf.d/vpsbox.conf "" 1 > "$output" 2>&1
-        assert_file_contains "$output" '删除新建的 systemd-resolved DNS 配置失败'
-        assert_file_not_contains "$output" '已删除新建的 systemd-resolved DNS 配置'
+        if rollback_systemd_resolved_dns \
+            /etc/systemd/resolved.conf.d/vpsbox.conf "" 1 0 > "$output" 2>&1; then
+            fail "systemd-resolved 回滚失败时不得报告成功"
+        fi
     )
 }
 
@@ -1736,13 +2108,17 @@ test_sshd_include_only_activates_vpsbox_files() {
         SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
         SSHD_VPSBOX_HARDENING_CONF="$SSHD_CONFIG_DIR/01-vpsbox-ssh-hardening.conf"
         printf '%s\n' 'Port 22' > "$SSHD_MAIN_CONF"
+        printf '%s\n' 'Port 23333' > "$SSHD_VPSBOX_PORT_CONF"
         printf '%s\n' 'PasswordAuthentication yes' > "$SSHD_CONFIG_DIR/90-dormant.conf"
 
         ensure_sshd_dropin_include
 
         assert_file_contains "$SSHD_MAIN_CONF" \
-            "^Include $SSHD_VPSBOX_PORT_CONF $SSHD_VPSBOX_HARDENING_CONF$"
+            "^Include $SSHD_VPSBOX_HARDENING_CONF$"
+        assert_file_not_contains "$SSHD_MAIN_CONF" "$SSHD_VPSBOX_PORT_CONF" \
+            "仅加固时不得激活 dormant SSH 端口 drop-in"
         assert_file_not_contains "$SSHD_MAIN_CONF" 'sshd_config\.d/\*\.conf'
+        assert_file_contains "$SSHD_VPSBOX_PORT_CONF" '^Port 23333$'
         assert_file_contains "$SSHD_CONFIG_DIR/90-dormant.conf" '^PasswordAuthentication yes$'
     )
 }
@@ -1881,7 +2257,6 @@ test_unrecognized_local_firewall_rule_still_requires_exact_yes() {
 
             sshd_binary() { printf '%s\n' /bin/true; }
             ssh_socket_activation_enabled_or_active() { return 1; }
-            settle_stale_unapplied_ssh_tracking() { return 0; }
             choose_ssh_target_port() { printf '49222\n'; }
             ssh_effective_ports_match_target() { return 1; }
             firewall_runtime_enabled() { return 1; }
@@ -1894,18 +2269,18 @@ test_unrecognized_local_firewall_rule_still_requires_exact_yes() {
                 return 1
             }
             getenforce() { printf 'Disabled\n'; }
-            backup_change_file_once() {
-                printf 'backup\n' >> "$event_log"
+            ssh_effective_ports_csv() { printf '%s\n' 22; }
+            begin_ssh_runtime_transaction() {
+                printf 'begin\n' >> "$event_log"
                 return 1
             }
-            cleanup_unapplied_ssh_tracking() { return 0; }
 
             if [ "$answer" = YES ]; then
                 if apply_ssh_port_change <<< "$answer" > "$output" 2>&1; then
-                    fail "精确 YES 后的强制备份失败不应报告成功"
+                    fail "精确 YES 后的运行期事务创建失败不应报告成功"
                 fi
-                assert_file_contains "$event_log" '^backup$' \
-                    "精确 YES 应通过人工确认并进入修改前备份阶段"
+                assert_file_contains "$event_log" '^begin$' \
+                    "精确 YES 应通过人工确认并进入运行期事务阶段"
             else
                 apply_ssh_port_change <<< "$answer" > "$output" 2>&1 ||
                     fail "非精确 YES 应作为安全取消返回"
@@ -1972,76 +2347,55 @@ test_multiple_ssh_socket_streams_are_parsed() {
     )
 }
 
-test_ssh_restore_does_not_require_current_config_to_parse() {
-    require_root_permission_semantics || return "$?"
+test_ssh_restore_entry_targets_22_without_hardening_change() {
     (
-        local ssh_dir="$TEST_TMP/ssh-invalid-current" transition_log="$TEST_TMP/ssh-invalid-transition"
+        local ssh_dir="$TEST_TMP/ssh-restore-22" log="$TEST_TMP/ssh-restore-22.log"
         forbid_init
-        reset_change_store ssh-invalid-current
         mkdir -p "$ssh_dir/sshd_config.d"
         SSHD_MAIN_CONF="$ssh_dir/sshd_config"
         SSHD_CONFIG_DIR="$ssh_dir/sshd_config.d"
         SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
         SSHD_VPSBOX_HARDENING_CONF="$SSHD_CONFIG_DIR/01-vpsbox-ssh-hardening.conf"
-        printf '%s\n' broken > "$SSHD_MAIN_CONF"
-        # shellcheck disable=SC2034 # 被测的 SSH 连接端口解析函数动态读取。
-        SSH_CONNECTION="192.0.2.10 50000 192.0.2.20 6384"
-        manifest_value() {
-            case "$1" in
-                APPLIED_SSH_CONFIG) printf '%s\n' 1 ;;
-                SSH_PORTS) printf '%s\n' 22 ;;
-                *) return 1 ;;
-            esac
-        }
-        ssh_listening_ports_csv() { printf '%s\n' 23333; }
-        ssh_effective_ports_csv() { forbid "损坏配置恢复入口不得调用 sshd -T"; }
-        ssh_firewall_transition_begin() { printf '%s\n' "$1" > "$transition_log"; }
-        restore_change_file() { return 0; }
+        printf '%s\n' 'Port 23333' > "$SSHD_MAIN_CONF"
+        : > "$log"
         sshd_binary() { printf '%s\n' /bin/true; }
-        restart_ssh_service() { return 0; }
-        wait_for_any_ssh_listener_csv() { return 0; }
-        ssh_firewall_transition_finish() { return 0; }
-        clear_ssh_change_tracking() { return 0; }
-        sync_fail2ban_sshd_port() { printf '%s\n' fail2ban-sync >> "$transition_log"; }
+        ss() { return 1; }
+        port_is_effective_ssh_port() { return 1; }
+        port_in_use_tcp() { return 1; }
+        docker_reserved_ports_for_port_choice() { printf '\n'; }
+        validate_ssh_access_controls() { return 0; }
+        ssh_effective_ports_csv() { printf '%s\n' 23333; }
+        apply_ssh_port_target_transaction() {
+            printf 'target=%s original=%s\n' "$SSH_TARGET_PORT" "$1" >> "$log"
+        }
+        write_vpsbox_ssh_hardening_config() { forbid "恢复端口不得改写 hardening"; }
 
-        restore_vpsbox_ssh_config <<< "YES" >/dev/null
-        assert_file_contains "$transition_log" '^22,6384,23333$'
-        assert_file_contains "$transition_log" '^fail2ban-sync$' \
-            "SSH 配置恢复成功后必须同步 Fail2ban 端口"
-        assert_no_forbidden "损坏配置恢复入口调用了 sshd -T"
+        restore_ssh_port_to_22 <<< "YES" >/dev/null
+        assert_eq 'target=22 original=23333' "$(cat "$log")" \
+            "恢复入口必须仅通过公共事务把目标设为 22"
+        assert_no_forbidden "恢复 SSH 端口时修改了 hardening"
     )
 }
 
-test_failed_ssh_restore_preserves_retry_snapshot() {
-    require_root_permission_semantics || return "$?"
-    (
-        local ssh_dir="$TEST_TMP/ssh-restore-snapshot/etc/ssh"
-        local snapshot
-        reset_change_store ssh-restore-snapshot
-        mkdir -p "$ssh_dir/sshd_config.d"
-        SSHD_MAIN_CONF="$ssh_dir/sshd_config"
-        SSHD_CONFIG_DIR="$ssh_dir/sshd_config.d"
-        SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
-        SSHD_VPSBOX_HARDENING_CONF="$SSHD_CONFIG_DIR/01-vpsbox-ssh-hardening.conf"
-        printf '%s\n' broken > "$SSHD_MAIN_CONF"
-        manifest_value() {
-            case "$1" in
-                APPLIED_SSH_CONFIG) printf '%s\n' 1 ;;
-                SSH_PORTS) printf '%s\n' 22 ;;
-                *) return 1 ;;
-            esac
-        }
-        ssh_listening_ports_csv() { printf '%s\n' 23333; }
-        ssh_firewall_transition_begin() { return 0; }
-        restore_change_file() { return 1; }
-        settle_failed_ssh_restore() { return 1; }
+test_ssh_restore_menu_copy_is_exact() {
+    assert_file_contains "$REPO_DIR/vpsbox.sh" '^ \[2\] 恢复 SSH 端口为 22$' \
+        "SSH 恢复菜单文案必须精确"
+    assert_file_contains "$REPO_DIR/vpsbox.sh" \
+        '^            2\) run_menu_action restore_ssh_port_to_22; pause ;;$'
+}
 
-        if restore_vpsbox_ssh_config <<< "YES" >/dev/null 2>&1; then
-            fail "SSH 配置恢复失败时不得报告成功"
-        fi
-        snapshot="$(find "$(ssh_restore_snapshot_root)" -maxdepth 1 -type d -name 'restore.*' -print -quit)"
-        [ -d "$snapshot" ] || fail "二次回滚失败后必须保留恢复前快照"
-        assert_file_contains "$snapshot/main" '^broken$'
+test_legacy_ssh_state_retires_only_after_success_and_preserves_history() {
+    (
+        local ssh_dir="$TEST_TMP/legacy-ssh-history/etc/ssh"
+        local sentinel="$ssh_dir/sshd_config.vpsbox.bak"
+        prepare_legacy_ssh_change_tracking legacy-retirement
+        mkdir -p "$ssh_dir"
+        printf '%s\n' historical > "$sentinel"
+
+        retire_legacy_ssh_change_tracking
+        assert_ssh_tracking_cleared
+        assert_file_contains "$sentinel" '^historical$' \
+            "退役旧状态不得删除历史 /etc/ssh/*.vpsbox.bak 文件"
     )
 }
 
@@ -2069,6 +2423,10 @@ test_ssh_restore_snapshot_integrity_is_verified() {
     (
         local ssh_dir="$TEST_TMP/ssh-snapshot-integrity/etc/ssh" snapshot=""
         reset_change_store ssh-snapshot-integrity
+        RUNTIME_DIR="$TEST_TMP/ssh-snapshot-integrity/runtime"
+        mkdir -p "$RUNTIME_DIR"
+        command chown root:root "$RUNTIME_DIR"
+        chmod 700 "$RUNTIME_DIR"
         mkdir -p "$ssh_dir/sshd_config.d"
         SSHD_MAIN_CONF="$ssh_dir/sshd_config"
         SSHD_CONFIG_DIR="$ssh_dir/sshd_config.d"
@@ -2078,8 +2436,8 @@ test_ssh_restore_snapshot_integrity_is_verified() {
         printf '%s\n' 'Port 23333' > "$SSHD_VPSBOX_PORT_CONF"
 
         create_ssh_restore_snapshot snapshot
-        [[ "$snapshot" == "$(ssh_restore_snapshot_root)"/restore.* ]] ||
-            fail "SSH 恢复快照必须位于 vpsbox 持久状态目录"
+        [[ "$snapshot" == "$RUNTIME_DIR"/ssh-transactions/transaction.* ]] ||
+            fail "SSH 快照必须位于运行期 ssh-transactions 根目录"
         ssh_restore_snapshot_dir_valid "$snapshot" ||
             fail "新建的 SSH 恢复快照应通过完整性校验"
 
@@ -2642,7 +3000,10 @@ main() {
     local -a required=(
         cancel_unmodified_change_transaction
         change_restore_state
+        create_dns_operation_snapshot
+        chrony_main_uses_source_dir
         chrony_sources_are_current
+        chrony_vpsbox_markers_valid
         disable_ipv6
         apply_tcp_buffer_tier
         enable_bbr_fq
@@ -2662,6 +3023,7 @@ main() {
         restore_vpsbox_system_changes
         restore_ipv6_system_change
         restore_tcp_buffer_system_change
+        restore_dns_operation_snapshot
         show_vpsbox_changes
         restore_recorded_ntp_change
         ssh_restore_snapshot_path_allowed
@@ -2686,11 +3048,15 @@ main() {
         test_alpine_update_uses_bounded_steps
         test_ntp_package_rollback_restores_timesyncd
         test_chrony_source_layout_detection
+        test_chrony_vpsbox_marker_validation
+        test_chrony_sourcedir_inside_managed_block_is_not_external
+        test_installed_chrony_config_drift_skips_package_manager
         test_enable_ntp_healthy_is_noop
         test_enable_ntp_rejects_incomplete_existing_metadata_before_backup
         test_ntp_unsynchronized_status_is_nonfatal
         test_ntp_service_drift_uses_light_repair
         test_ntp_light_repair_reports_restore_outcome
+        test_ntp_light_repair_is_covered_by_runtime_cleanup
         test_enable_ntp_failure_stages_enter_runtime_rollback
         test_ipv6_no_global_address_is_noop_and_detection_failure_is_fatal
         test_ipv6_addresses_are_displayed_and_cancel_is_read_only
@@ -2713,16 +3079,20 @@ main() {
         test_tcp_buffer_restore_rejects_invalid_metadata_before_mutation
         test_journald_healthy_is_noop
         test_journald_apply_and_failed_restart_restore_previous_config
-        test_first_ssh_port_rollback_clears_tracking
-        test_first_ssh_hardening_rollback_clears_tracking
-        test_existing_ssh_baseline_survives_later_rollback
-        test_ssh_hardening_requires_listener_after_restart
-        test_ssh_pre_mark_failure_cleans_first_baseline
-        test_ssh_port_change_failure_stages_rollback_and_success_syncs_fail2ban
-        test_runtime_cleanup_clears_interrupted_ssh_baseline
-        test_failed_ssh_tracking_cleanup_remains_retryable
-        test_stale_unapplied_ssh_baseline_is_removed_on_next_run
+        test_ssh_snapshot_root_and_transaction_names_are_restricted
+        test_ssh_port_transaction_stage_order_and_rollback
+        test_runtime_cleanup_rolls_back_active_ssh_transaction
+        test_finished_ssh_firewall_is_resynced_during_rollback
+        test_successful_ssh_transaction_uses_only_runtime_snapshot
+        test_effective_hardening_force_rewrite_consumes_one_confirmation
         test_absent_resolv_conf_is_created_successfully
+        test_identical_resolv_conf_is_side_effect_free
+        test_identical_systemd_resolved_config_repairs_only_service_state
+        test_dns_operation_snapshot_restores_existing_and_absent_targets
+        test_pending_dns_same_target_commits_without_rewrite
+        test_pending_dns_different_target_is_rejected_without_side_effects
+        test_pending_resolved_unsafe_directory_never_starts_service
+        test_runtime_cleanup_dispatches_active_dns_rollback
         test_systemd_resolved_restart_and_verification_failures_rollback
         test_systemd_resolved_rollback_failure_is_reported
         test_sshd_include_only_activates_vpsbox_files
@@ -2733,8 +3103,9 @@ main() {
         test_selinux_ssh_port_range_is_validated
         test_enabled_inactive_ssh_socket_is_detected
         test_multiple_ssh_socket_streams_are_parsed
-        test_ssh_restore_does_not_require_current_config_to_parse
-        test_failed_ssh_restore_preserves_retry_snapshot
+        test_ssh_restore_entry_targets_22_without_hardening_change
+        test_ssh_restore_menu_copy_is_exact
+        test_legacy_ssh_state_retires_only_after_success_and_preserves_history
         test_ssh_config_publish_failure_preserves_target
         test_ssh_restore_snapshot_integrity_is_verified
         test_ssh_restore_snapshot_path_enforces_owner_and_mode

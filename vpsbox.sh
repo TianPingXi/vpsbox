@@ -108,20 +108,31 @@ LOCK_RECLAIM_DIR="$RUNTIME_DIR/lockdir-reclaim"
 LOCK_USING_FLOCK=0
 LOCK_USING_DIR=0
 
-# ACTIVE_* 是各操作域的进程内生命周期句柄。所属节点、防火墙、SSH、Fail2ban 或
-# sing-box 更新流程负责写入。统一退出清理可以先接管并清空句柄再调用
+# ACTIVE_* 是各操作域的进程内生命周期句柄。所属节点、防火墙、SSH、NTP、DNS、
+# Fail2ban 或 sing-box 更新流程负责写入。统一退出清理可以先接管并清空句柄再调用
 # 对应恢复入口，也可以在操作完成后清空；失败后的保留与提示策略由各领域清理函数负责。
 ACTIVE_NODE_BACKUP=""
 ACTIVE_NODE_TRANSACTION_MUTATED=0
 ACTIVE_FIREWALL_TRANSITION_DIR=""
 ACTIVE_SSH_FIREWALL_TRANSITION=0
+ACTIVE_SSH_TRANSACTION_DIR=""
+ACTIVE_SSH_ORIGINAL_PORTS=""
+ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE=0
 ACTIVE_FIREWALL_ROLLBACK_DIR=""
 ACTIVE_FIREWALL_ADDITIVE_DIR=""
-ACTIVE_UNAPPLIED_SSH_TRACKING=0
 ACTIVE_FAIL2BAN_TEST_IP=""
 ACTIVE_FAIL2BAN_TEST_BACKENDS=""
 ACTIVE_FAIL2BAN_SYNC_BACKUP=""
 ACTIVE_FAIL2BAN_SYNC_WAS_RUNNING=""
+ACTIVE_DNS_OPERATION_NAME=""
+ACTIVE_DNS_OPERATION_SNAPSHOT=""
+ACTIVE_DNS_OPERATION_TARGET=""
+ACTIVE_DNS_OPERATION_CREATED=0
+ACTIVE_DNS_OPERATION_APPLIED_BEFORE=0
+ACTIVE_NTP_SNAPSHOT=""
+ACTIVE_NTP_ROLLBACK_ARGS=()
+ACTIVE_NTP_SERVICE_ROLLBACK=0
+ACTIVE_NTP_SERVICE_ROLLBACK_ARGS=()
 ACTIVE_SINGBOX_UPDATE_BINARY=""
 ACTIVE_SINGBOX_UPDATE_BACKUP=""
 ACTIVE_SINGBOX_UPDATE_DIR=""
@@ -640,6 +651,12 @@ cleanup_vpsbox_runtime() {
     if declare -F cleanup_active_bounded_command >/dev/null 2>&1; then
         cleanup_active_bounded_command
     fi
+    if { [ -n "${ACTIVE_NTP_SNAPSHOT:-}" ] ||
+        [ "${ACTIVE_NTP_SERVICE_ROLLBACK:-0}" = "1" ]; } &&
+        declare -F rollback_active_ntp_operation >/dev/null 2>&1; then
+        rollback_active_ntp_operation ||
+            warn "NTP 操作被中断，配置、软件包或服务状态未能完整恢复；临时快照已保留。"
+    fi
     if declare -F rollback_active_singbox_update >/dev/null 2>&1; then
         rollback_active_singbox_update ||
             warn "sing-box 更新被中断，旧版本或原服务状态未能完整恢复；更新备份已保留。"
@@ -653,6 +670,11 @@ cleanup_vpsbox_runtime() {
             restore_node_files "$NODE_TRANSACTION_BACKUP" ||
                 warn "节点操作被中断，自动恢复未完成；事务备份已保留：$NODE_TRANSACTION_DIR"
         fi
+    fi
+    if [ -n "${ACTIVE_SSH_TRANSACTION_DIR:-}" ] &&
+        declare -F rollback_active_ssh_transaction >/dev/null 2>&1; then
+        rollback_active_ssh_transaction ||
+            warn "SSH 操作被中断，配置、监听、Fail2ban 或防火墙未能完整恢复；运行期快照已保留。"
     fi
     if [ "${ACTIVE_SSH_FIREWALL_TRANSITION:-0}" = "1" ] &&
         declare -F ssh_firewall_transition_reconcile >/dev/null 2>&1; then
@@ -705,10 +727,10 @@ cleanup_vpsbox_runtime() {
         cleanup_active_fail2ban_sync ||
             warn "Fail2ban 同步被中断，配置或原服务状态未能完整恢复；恢复依据已保留。"
     fi
-    if [ "${ACTIVE_UNAPPLIED_SSH_TRACKING:-0}" = "1" ] &&
-        declare -F cleanup_unapplied_ssh_tracking >/dev/null 2>&1; then
-        cleanup_unapplied_ssh_tracking 0 ||
-            warn "SSH 首次事务被中断，未能完整清理尚未应用的恢复基线。"
+    if [ -n "${ACTIVE_DNS_OPERATION_NAME:-}" ] &&
+        declare -F rollback_active_dns_operation >/dev/null 2>&1; then
+        rollback_active_dns_operation ||
+            warn "DNS 修改被中断，配置或服务状态未能完整恢复；临时快照已保留。"
     fi
     cleanup_vpsbox_lock
     if declare -F rollback_pending_vpsbox_update >/dev/null 2>&1; then
@@ -1819,6 +1841,16 @@ manifest_value() {
     ensure_change_store || return 1
     # 值始终是单行 token；额外允许逗号保存已规范化的多字段 CSV。
     awk -F= -v key="$key" '$1 == key && $2 ~ /^[A-Za-z0-9_.:,-]+$/ { value=$2 } END { if (value != "") print value; else exit 1 }' "$CHANGE_MANIFEST"
+}
+
+manifest_value_readonly() {
+    local key="$1"
+
+    [[ "$key" =~ ^[A-Z0-9_]+$ ]] || return 1
+    [ -f "$CHANGE_MANIFEST" ] && [ ! -L "$CHANGE_MANIFEST" ] || return 1
+    awk -F= -v key="$key" \
+        '$1 == key && $2 ~ /^[A-Za-z0-9_.:,-]+$/ { value=$2 } END { if (value != "") print value; else exit 1 }' \
+        "$CHANGE_MANIFEST"
 }
 
 manifest_set() {
@@ -7315,15 +7347,78 @@ ntp_sync_state() {
     fi
 }
 
-remove_vpsbox_ntp_block() {
+chrony_vpsbox_markers_valid() {
+    local file="$1" begin_count end_count begin_line end_line
+
+    [ -f "$file" ] && [ ! -L "$file" ] || return 1
+    begin_count="$(grep -Fxc "$NTP_SOURCES_BEGIN" "$file" 2>/dev/null || true)"
+    end_count="$(grep -Fxc "$NTP_SOURCES_END" "$file" 2>/dev/null || true)"
+    if [ "$begin_count" = "0" ] && [ "$end_count" = "0" ]; then
+        return 0
+    fi
+    [ "$begin_count" = "1" ] && [ "$end_count" = "1" ] || return 1
+    begin_line="$(grep -Fnx "$NTP_SOURCES_BEGIN" "$file" | cut -d: -f1)"
+    end_line="$(grep -Fnx "$NTP_SOURCES_END" "$file" | cut -d: -f1)"
+    [ "$begin_line" -lt "$end_line" ]
+}
+
+render_chrony_main_without_vpsbox_block() {
     local file="$1"
 
-    [ -f "$file" ] || return 0
-    sed -i "/^# BEGIN VPSBOX NTP SOURCES$/,/^# END VPSBOX NTP SOURCES$/d" "$file"
+    chrony_vpsbox_markers_valid "$file" || return 1
+    awk -v begin="$NTP_SOURCES_BEGIN" -v end="$NTP_SOURCES_END" '
+        $0 == begin { skip=1; next }
+        $0 == end { skip=0; next }
+        !skip { print }
+    ' "$file"
+}
+
+chrony_main_uses_source_dir() {
+    local file="$1"
+
+    render_chrony_main_without_vpsbox_block "$file" |
+        grep -Eq '^[[:space:]]*sourcedir[[:space:]]+/etc/chrony/sources\.d([[:space:]]|$)'
+}
+
+stage_chrony_main_config() {
+    local conf="$1" use_source_dir="$2" output_var="$3"
+    local parent tmp owner group mode
+
+    chrony_vpsbox_markers_valid "$conf" || return 1
+    parent="$(dirname "$conf")"
+    [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+    owner="$(stat -c '%u' "$conf" 2>/dev/null)" || return 1
+    group="$(stat -c '%g' "$conf" 2>/dev/null)" || return 1
+    mode="$(stat -c '%a' "$conf" 2>/dev/null)" || return 1
+    tmp="$(mktemp "$parent/.vpsbox-chrony.XXXXXX")" || return 1
+    if ! render_chrony_main_without_vpsbox_block "$conf" > "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    if [ "$use_source_dir" = "0" ]; then
+        # --- BEGIN GENERATED TEMPLATE: chrony managed source block ---
+        if ! cat >> "$tmp" <<EOF
+
+$NTP_SOURCES_BEGIN
+pool time.cloudflare.com iburst maxsources 4
+pool pool.ntp.org iburst maxsources 4
+$NTP_SOURCES_END
+EOF
+        # --- END GENERATED TEMPLATE: chrony managed source block ---
+        then
+            rm -f -- "$tmp"
+            return 1
+        fi
+    fi
+    if ! chown "$owner:$group" "$tmp" || ! chmod "$mode" "$tmp"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    printf -v "$output_var" '%s' "$tmp"
 }
 
 write_chrony_sources() {
-    local conf tmp
+    local conf tmp main_tmp use_source_dir=0
     local source_file="$CHRONY_SOURCE_FILE"
 
     conf="$(chrony_conf_path)"
@@ -7332,7 +7427,12 @@ write_chrony_sources() {
         return 1
     fi
 
-    if grep -Eq '^[[:space:]]*sourcedir[[:space:]]+/etc/chrony/sources\.d([[:space:]]|$)' "$conf"; then
+    chrony_vpsbox_markers_valid "$conf" || {
+        err "chrony 配置中的 VPSBox NTP 标记不完整、重复或顺序错误，已拒绝修改：$conf"
+        return 1
+    }
+    if chrony_main_uses_source_dir "$conf"; then
+        use_source_dir=1
         ensure_public_config_dir "$(dirname "$source_file")" "$source_file" || return 1
         tmp="$(mktemp "$(dirname "$source_file")/.vpsbox.sources.XXXXXX")" || return 1
         # --- BEGIN GENERATED TEMPLATE: chrony source file ---
@@ -7345,28 +7445,31 @@ EOF
             rm -f -- "$tmp"
             return 1
         fi
-        if ! chown root:root "$tmp" || ! chmod 644 "$tmp" ||
-            ! mv -f -- "$tmp" "$source_file"; then
+        if ! chown root:root "$tmp" || ! chmod 644 "$tmp"; then
             rm -f -- "$tmp"
             return 1
         fi
-        remove_vpsbox_ntp_block "$conf" || return 1
-        info "已写入 NTP 源：$source_file"
-    else
-        remove_vpsbox_ntp_block "$conf" || return 1
-        # --- BEGIN GENERATED TEMPLATE: chrony managed source block ---
-        if ! cat >> "$conf" <<EOF
+    fi
 
-$NTP_SOURCES_BEGIN
-pool time.cloudflare.com iburst maxsources 4
-pool pool.ntp.org iburst maxsources 4
-$NTP_SOURCES_END
-EOF
-        # --- END GENERATED TEMPLATE: chrony managed source block ---
-        then
+    if ! stage_chrony_main_config "$conf" "$use_source_dir" main_tmp; then
+        [ -z "${tmp:-}" ] || rm -f -- "$tmp"
+        return 1
+    fi
+    if ! cmp -s "$main_tmp" "$conf" && ! mv -f -- "$main_tmp" "$conf"; then
+        rm -f -- "$main_tmp"
+        [ -z "${tmp:-}" ] || rm -f -- "$tmp"
+        return 1
+    fi
+    [ -e "$main_tmp" ] && rm -f -- "$main_tmp"
+
+    if [ "$use_source_dir" = "1" ]; then
+        if ! mv -f -- "$tmp" "$source_file"; then
+            rm -f -- "$tmp"
             return 1
         fi
-        rm -f "$source_file" || return 1
+        info "已写入 NTP 源：$source_file"
+    else
+        rm -f -- "$source_file" || return 1
         info "已写入 NTP 源：$conf"
     fi
 }
@@ -7386,8 +7489,9 @@ chrony_sources_are_current() {
 
     conf="$(chrony_conf_path)"
     [ -f "$conf" ] && [ ! -L "$conf" ] || return 1
+    chrony_vpsbox_markers_valid "$conf" || return 1
     expected="$(chrony_expected_sources)"
-    if grep -Eq '^[[:space:]]*sourcedir[[:space:]]+/etc/chrony/sources\.d([[:space:]]|$)' "$conf"; then
+    if chrony_main_uses_source_dir "$conf"; then
         [ -f "$source_file" ] && [ ! -L "$source_file" ] || return 1
         actual="$(cat "$source_file")"
         [ "$actual" = "$expected" ] || return 1
@@ -7442,8 +7546,24 @@ ntp_unit_state_matches() {
     esac
 }
 
+restore_ntp_service_runtime_state() {
+    local svc="$1" chrony_enabled="$2" chrony_active="$3"
+    local timesyncd_unit="$4" timesyncd_enabled="$5" timesyncd_active="$6"
+    local failed=0
+
+    restore_ntp_unit_state "$svc" present \
+        "$chrony_enabled" "$chrony_active" || failed=1
+    restore_ntp_unit_state systemd-timesyncd "$timesyncd_unit" \
+        "$timesyncd_enabled" "$timesyncd_active" || failed=1
+    ntp_unit_state_matches "$svc" present \
+        "$chrony_enabled" "$chrony_active" || failed=1
+    ntp_unit_state_matches systemd-timesyncd "$timesyncd_unit" \
+        "$timesyncd_enabled" "$timesyncd_active" || failed=1
+    return "$failed"
+}
+
 repair_ntp_service_state() {
-    local svc="$1" failed=0 restore_failed=0 timesyncd_unit="absent"
+    local svc="$1" failed=0 timesyncd_unit="absent"
     local chrony_enabled="disabled" chrony_active="inactive"
     local timesyncd_enabled="disabled" timesyncd_active="inactive"
 
@@ -7458,6 +7578,13 @@ repair_ntp_service_state() {
             timesyncd_active="active"
     fi
 
+    if ! arm_ntp_service_runtime_rollback "$svc" \
+        "$chrony_enabled" "$chrony_active" \
+        "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active"; then
+        err "无法登记 NTP 服务状态中断回滚，已取消轻量修复。"
+        return 1
+    fi
+
     systemctl enable "$svc" >/dev/null 2>&1 || failed=1
     if [ "$failed" -eq 0 ] && ! systemctl is-active --quiet "$svc" 2>/dev/null; then
         retry 3 2 systemctl start "$svc" || failed=1
@@ -7468,27 +7595,15 @@ repair_ntp_service_state() {
         systemctl disable --now systemd-timesyncd >/dev/null 2>&1 || failed=1
     fi
     if [ "$failed" -eq 0 ] && ntp_service_state_is_healthy "$svc"; then
+        clear_active_ntp_operation
         return 0
     fi
 
     warn "NTP 服务状态轻量修复失败，正在恢复修改前状态。"
-    if ! restore_ntp_unit_state "$svc" present \
-        "$chrony_enabled" "$chrony_active"; then
-        restore_failed=1
-    fi
-    if ! restore_ntp_unit_state systemd-timesyncd "$timesyncd_unit" \
-        "$timesyncd_enabled" "$timesyncd_active"; then
-        restore_failed=1
-    fi
-    if ! ntp_unit_state_matches "$svc" present \
-        "$chrony_enabled" "$chrony_active"; then
-        restore_failed=1
-    fi
-    if ! ntp_unit_state_matches systemd-timesyncd "$timesyncd_unit" \
-        "$timesyncd_enabled" "$timesyncd_active"; then
-        restore_failed=1
-    fi
-    if [ "$restore_failed" -eq 0 ]; then
+    if restore_ntp_service_runtime_state "$svc" \
+        "$chrony_enabled" "$chrony_active" \
+        "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active"; then
+        clear_active_ntp_operation
         info "NTP 服务状态已恢复修改前状态。"
     else
         err "NTP 服务状态未能完整恢复，请检查 chrony 与 systemd-timesyncd。"
@@ -7649,12 +7764,79 @@ restore_ntp_snapshot_file() {
     fi
 }
 
+ntp_snapshot_path_allowed() {
+    local snapshot_dir="$1" parent base
+
+    parent="$(dirname -- "$snapshot_dir")" || return 1
+    base="${snapshot_dir##*/}"
+    [ "$parent" = "/tmp" ] && [[ "$base" == vpsbox-chrony.* ]]
+}
+
 cleanup_ntp_snapshot() {
     local snapshot_dir="$1"
 
-    [[ "$snapshot_dir" == /tmp/vpsbox-chrony.* ]] &&
+    ntp_snapshot_path_allowed "$snapshot_dir" &&
         [ -d "$snapshot_dir" ] && [ ! -L "$snapshot_dir" ] || return 1
     rm -rf -- "$snapshot_dir"
+}
+
+arm_ntp_runtime_rollback() {
+    local snapshot_dir="$1"
+    shift
+
+    [ -z "${ACTIVE_NTP_SNAPSHOT:-}" ] &&
+        [ "${ACTIVE_NTP_SERVICE_ROLLBACK:-0}" = "0" ] || return 1
+    [ "$#" -eq 12 ] || return 1
+    ntp_snapshot_path_allowed "$snapshot_dir" &&
+        [ -d "$snapshot_dir" ] && [ ! -L "$snapshot_dir" ] || return 1
+    ACTIVE_NTP_ROLLBACK_ARGS=("$@")
+    # 最后登记目录作为活动标记；此前尚未修改软件包、配置或服务。
+    ACTIVE_NTP_SNAPSHOT="$snapshot_dir"
+}
+
+arm_ntp_service_runtime_rollback() {
+    local svc="$1"
+    shift
+
+    [ -z "${ACTIVE_NTP_SNAPSHOT:-}" ] &&
+        [ "${ACTIVE_NTP_SERVICE_ROLLBACK:-0}" = "0" ] || return 1
+    [ -n "$svc" ] && [ "$#" -eq 5 ] || return 1
+    case "$1:$2" in
+        enabled:active|enabled:inactive|disabled:active|disabled:inactive) ;;
+        *) return 1 ;;
+    esac
+    case "$3:$4:$5" in
+        absent:disabled:inactive|present:enabled:active|present:enabled:inactive|\
+            present:disabled:active|present:disabled:inactive) ;;
+        *) return 1 ;;
+    esac
+    ACTIVE_NTP_SERVICE_ROLLBACK_ARGS=("$svc" "$@")
+    # 最后登记活动标记；此前尚未修改任何服务状态。
+    ACTIVE_NTP_SERVICE_ROLLBACK=1
+}
+
+clear_active_ntp_operation() {
+    ACTIVE_NTP_SNAPSHOT=""
+    ACTIVE_NTP_ROLLBACK_ARGS=()
+    ACTIVE_NTP_SERVICE_ROLLBACK=0
+    ACTIVE_NTP_SERVICE_ROLLBACK_ARGS=()
+}
+
+rollback_active_ntp_operation() {
+    local snapshot_dir="${ACTIVE_NTP_SNAPSHOT:-}"
+    local -a rollback_args=("${ACTIVE_NTP_ROLLBACK_ARGS[@]}")
+    local -a service_args=("${ACTIVE_NTP_SERVICE_ROLLBACK_ARGS[@]}")
+
+    if [ "${ACTIVE_NTP_SERVICE_ROLLBACK:-0}" = "1" ]; then
+        [ -z "$snapshot_dir" ] && [ "${#service_args[@]}" -eq 6 ] || return 1
+        restore_ntp_service_runtime_state "${service_args[@]}" || return 1
+        clear_active_ntp_operation
+        return 0
+    fi
+
+    [ -n "$snapshot_dir" ] || return 0
+    [ "${#rollback_args[@]}" -eq 12 ] || return 1
+    settle_failed_ntp_change "$snapshot_dir" "${rollback_args[@]}"
 }
 
 rollback_ntp_runtime_state() {
@@ -7702,12 +7884,15 @@ settle_failed_ntp_change() {
         err "NTP 原状态未能完整恢复；恢复记录与临时快照已保留：$snapshot_dir"
         return 1
     fi
-    cleanup_ntp_snapshot "$snapshot_dir" ||
-        warn "NTP 已回滚，但临时快照清理失败：$snapshot_dir"
     if [ "$applied_before" != "1" ] && ! clear_ntp_change_tracking; then
         warn "NTP 已回滚，但变更清单清理失败；恢复菜单仍会保留该项目。"
         return 1
     fi
+    if [ "${ACTIVE_NTP_SNAPSHOT:-}" = "$snapshot_dir" ]; then
+        clear_active_ntp_operation
+    fi
+    cleanup_ntp_snapshot "$snapshot_dir" ||
+        warn "NTP 已回滚，但临时快照清理失败：$snapshot_dir"
 }
 
 ntp_restore_metadata_values_valid() {
@@ -7796,6 +7981,11 @@ enable_ntp_sync() {
     local timesyncd_active="inactive" timesyncd_enabled="disabled"
     local applied_before=0
 
+    { [ -z "${ACTIVE_NTP_SNAPSHOT:-}" ] &&
+        [ "${ACTIVE_NTP_SERVICE_ROLLBACK:-0}" = "0" ]; } || {
+        err "当前进程仍有未完成的 NTP 回滚，已拒绝开始新的修改。"
+        return 1
+    }
     detect_os
     if ! is_systemd; then
         if [ "$OS" = "alpine" ]; then
@@ -7829,6 +8019,10 @@ enable_ntp_sync() {
     if [ -L "$source_file" ] ||
         { [ -e "$source_file" ] && [ ! -f "$source_file" ]; }; then
         err "NTP 源配置不是普通文件，已拒绝修改：$source_file"
+        return 1
+    fi
+    if [ -f "$conf" ] && ! chrony_vpsbox_markers_valid "$conf"; then
+        err "chrony 配置中的 VPSBox NTP 标记不完整、重复或顺序错误，已拒绝修改：$conf"
         return 1
     fi
 
@@ -7904,45 +8098,58 @@ enable_ntp_sync() {
         err "NTP 源配置不是普通文件，已拒绝修改：$source_file"
         return 1
     fi
+    if ! arm_ntp_runtime_rollback "$backup_dir" "$conf" "$source_file" "$svc" \
+        "$chrony_package" "$timesyncd_package" \
+        "$chrony_unit" "$chrony_enabled" "$chrony_active" \
+        "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
+        "$applied_before"; then
+        cleanup_ntp_snapshot "$backup_dir" || true
+        err "无法登记 NTP 中断回滚状态，已取消修改。"
+        return 1
+    fi
 
-    info "正在安装 chrony..."
-    case "$OS" in
-        debian)
-            export DEBIAN_FRONTEND=noninteractive
-            if ! apt_get_bounded "$PACKAGE_UPDATE_TIMEOUT" update ||
-                ! apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y chrony; then
+    if [ "$chrony_package" = "absent" ]; then
+        info "正在安装 chrony..."
+        case "$OS" in
+            debian)
+                export DEBIAN_FRONTEND=noninteractive
+                if ! apt_get_bounded "$PACKAGE_UPDATE_TIMEOUT" update ||
+                    ! apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y chrony; then
+                    settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
+                        "$chrony_package" "$timesyncd_package" \
+                        "$chrony_unit" "$chrony_enabled" "$chrony_active" \
+                        "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
+                        "$applied_before" || true
+                    return 1
+                fi
+                ;;
+            redhat)
+                if command -v dnf >/dev/null 2>&1; then
+                    dnf_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y chrony
+                else
+                    yum_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y chrony
+                fi || {
+                    settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
+                        "$chrony_package" "$timesyncd_package" \
+                        "$chrony_unit" "$chrony_enabled" "$chrony_active" \
+                        "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
+                        "$applied_before" || true
+                    return 1
+                }
+                ;;
+            *)
                 settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
                     "$chrony_package" "$timesyncd_package" \
                     "$chrony_unit" "$chrony_enabled" "$chrony_active" \
                     "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
                     "$applied_before" || true
+                err "未识别系统类型，无法自动配置 chrony。"
                 return 1
-            fi
-            ;;
-        redhat)
-            if command -v dnf >/dev/null 2>&1; then
-                dnf_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y chrony
-            else
-                yum_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y chrony
-            fi || {
-                settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
-                    "$chrony_package" "$timesyncd_package" \
-                    "$chrony_unit" "$chrony_enabled" "$chrony_active" \
-                    "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
-                    "$applied_before" || true
-                return 1
-            }
-            ;;
-        *)
-            settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
-                "$chrony_package" "$timesyncd_package" \
-                "$chrony_unit" "$chrony_enabled" "$chrony_active" \
-                "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
-                "$applied_before" || true
-            err "未识别系统类型，无法自动配置 chrony。"
-            return 1
-            ;;
-    esac
+                ;;
+        esac
+    else
+        info "chrony 已安装，跳过包管理器，仅修复配置与服务。"
+    fi
 
     if [ ! -f "$conf" ] || [ -L "$conf" ]; then
         err "chrony 安装后未生成有效配置，正在恢复原 NTP 状态。"
@@ -8001,6 +8208,7 @@ enable_ntp_sync() {
             return 1
         fi
     fi
+    clear_active_ntp_operation
     cleanup_ntp_snapshot "$backup_dir" ||
         warn "NTP 配置已生效，但临时快照清理失败：$backup_dir"
 
@@ -8130,46 +8338,270 @@ verify_dns_resolution() {
     return 2
 }
 
+render_resolv_conf_dns() {
+    local dns1="$1" dns2="${2:-}" source="${3:-$RESOLV_CONF}"
+
+    printf 'nameserver %s\n' "$dns1"
+    [ -z "$dns2" ] || printf 'nameserver %s\n' "$dns2"
+    if [ -r "$source" ]; then
+        awk '$1 != "nameserver" { print }' "$source"
+    fi
+}
+
+render_systemd_resolved_dns() {
+    local dns1="$1" dns2="${2:-}"
+
+    # --- BEGIN GENERATED TEMPLATE: systemd-resolved DNS drop-in ---
+    cat <<EOF
+[Resolve]
+DNS=$(dns_values_line "$dns1" "$dns2")
+Domains=~.
+EOF
+    # --- END GENERATED TEMPLATE: systemd-resolved DNS drop-in ---
+}
+
+root_owned_config_file_is_safe_readonly() {
+    local path="$1" owner group mode
+
+    [ -f "$path" ] && [ ! -L "$path" ] || return 1
+    owner="$(stat -c '%u' "$path" 2>/dev/null)" || return 1
+    group="$(stat -c '%g' "$path" 2>/dev/null)" || return 1
+    mode="$(stat -c '%a' "$path" 2>/dev/null)" || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    [ "$owner" = "0" ] && [ "$group" = "0" ] && [ $((8#$mode & 8#022)) -eq 0 ]
+}
+
+root_owned_config_dir_is_safe_readonly() {
+    local path="$1" owner group mode
+
+    [ -d "$path" ] && [ ! -L "$path" ] || return 1
+    owner="$(stat -c '%u' "$path" 2>/dev/null)" || return 1
+    group="$(stat -c '%g' "$path" 2>/dev/null)" || return 1
+    mode="$(stat -c '%a' "$path" 2>/dev/null)" || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    [ "$owner" = "0" ] && [ "$group" = "0" ] && [ $((8#$mode & 8#022)) -eq 0 ]
+}
+
+create_dns_operation_snapshot() {
+    local target="$1" prefix="$2" output_var="$3" created_var="$4"
+    local parent snapshot_path="" created=0
+
+    parent="$(dirname "$target")"
+    [ -d "$parent" ] && [ ! -L "$parent" ] || return 1
+    if [ -f "$target" ] && [ ! -L "$target" ]; then
+        snapshot_path="$(mktemp "$parent/$prefix.XXXXXX")" || return 1
+        if ! cp -a -- "$target" "$snapshot_path"; then
+            rm -f -- "$snapshot_path"
+            return 1
+        fi
+    elif [ ! -e "$target" ] && [ ! -L "$target" ]; then
+        created=1
+    else
+        return 1
+    fi
+    printf -v "$output_var" '%s' "$snapshot_path"
+    printf -v "$created_var" '%s' "$created"
+}
+
+restore_dns_operation_snapshot() {
+    local snapshot="$1" target="$2" created="$3"
+
+    if [ -n "$snapshot" ]; then
+        [ -f "$snapshot" ] && [ ! -L "$snapshot" ] || return 1
+        restore_file_atomically_from_snapshot "$snapshot" "$target" || return 1
+    elif [ "$created" = "1" ]; then
+        remove_snapshot_target_file "$target"
+    else
+        return 1
+    fi
+}
+
+remove_dns_operation_snapshot() {
+    local snapshot="$1"
+
+    [ -z "$snapshot" ] || rm -f -- "$snapshot"
+}
+
+restore_dns_change_tracking() {
+    local name="$1" applied_before="$2" failed=0
+
+    if [ "$applied_before" = "1" ]; then
+        manifest_set "APPLIED_$name" 1 || failed=1
+        manifest_remove "PENDING_$name" || failed=1
+    else
+        manifest_remove "APPLIED_$name" || failed=1
+        cancel_unmodified_change_transaction "$name" || failed=1
+    fi
+    return "$failed"
+}
+
+rollback_dns_change() {
+    local name="$1" snapshot="$2" target="$3" created="$4" applied_before="$5"
+
+    restore_dns_operation_snapshot "$snapshot" "$target" "$created" || return 1
+    restore_dns_change_tracking "$name" "$applied_before"
+}
+
+arm_dns_operation_rollback() {
+    local name="$1" snapshot="$2" target="$3" created="$4" applied_before="$5"
+
+    [ -z "${ACTIVE_DNS_OPERATION_NAME:-}" ] || return 1
+    case "$name" in DNS_RESOLV|DNS_RESOLVED) ;; *) return 1 ;; esac
+    case "$created:$applied_before" in
+        0:0|0:1|1:0|1:1) ;;
+        *) return 1 ;;
+    esac
+    if [ -n "$snapshot" ]; then
+        [ -f "$snapshot" ] && [ ! -L "$snapshot" ] || return 1
+    else
+        [ "$created" = "1" ] || return 1
+    fi
+    ACTIVE_DNS_OPERATION_SNAPSHOT="$snapshot"
+    ACTIVE_DNS_OPERATION_TARGET="$target"
+    ACTIVE_DNS_OPERATION_CREATED="$created"
+    ACTIVE_DNS_OPERATION_APPLIED_BEFORE="$applied_before"
+    ACTIVE_DNS_OPERATION_NAME="$name"
+}
+
+clear_active_dns_operation() {
+    ACTIVE_DNS_OPERATION_NAME=""
+    ACTIVE_DNS_OPERATION_SNAPSHOT=""
+    ACTIVE_DNS_OPERATION_TARGET=""
+    ACTIVE_DNS_OPERATION_CREATED=0
+    ACTIVE_DNS_OPERATION_APPLIED_BEFORE=0
+}
+
+finish_active_dns_operation() {
+    local snapshot="${ACTIVE_DNS_OPERATION_SNAPSHOT:-}"
+
+    clear_active_dns_operation
+    remove_dns_operation_snapshot "$snapshot"
+}
+
+cancel_active_dns_operation_before_publish() {
+    local name="${ACTIVE_DNS_OPERATION_NAME:-}"
+    local snapshot="${ACTIVE_DNS_OPERATION_SNAPSHOT:-}"
+    local applied_before="${ACTIVE_DNS_OPERATION_APPLIED_BEFORE:-0}"
+
+    [ -n "$name" ] || return 0
+    restore_dns_change_tracking "$name" "$applied_before" || return 1
+    remove_dns_operation_snapshot "$snapshot" || return 1
+    clear_active_dns_operation
+}
+
+rollback_active_dns_operation() {
+    local name="${ACTIVE_DNS_OPERATION_NAME:-}"
+    local snapshot="${ACTIVE_DNS_OPERATION_SNAPSHOT:-}"
+    local target="${ACTIVE_DNS_OPERATION_TARGET:-}"
+    local created="${ACTIVE_DNS_OPERATION_CREATED:-0}"
+    local applied_before="${ACTIVE_DNS_OPERATION_APPLIED_BEFORE:-0}"
+
+    [ -n "$name" ] || return 0
+    rollback_dns_change "$name" "$snapshot" "$target" "$created" "$applied_before" ||
+        return 1
+    if [ "$name" = "DNS_RESOLVED" ]; then
+        retry 2 2 systemctl restart systemd-resolved >/dev/null 2>&1 || return 1
+    fi
+    remove_dns_operation_snapshot "$snapshot" || return 1
+    clear_active_dns_operation
+}
+
 write_resolv_conf_dns() {
     local dns1="$1"
     local dns2="${2:-}"
-    local backup
+    local snapshot=""
     local created_resolv="0"
+    local applied_before="0"
+    local pending_before="0"
+    local target_is_current=0
     local verify_status
     local tmp
 
-    backup_change_file_once DNS_RESOLV "$RESOLV_CONF" || { err "记录 DNS 原配置失败，已取消修改。"; return 1; }
-    backup="${RESOLV_CONF}.vpsbox.bak.$(date +%Y%m%d%H%M%S)"
-    if [ -e "$RESOLV_CONF" ]; then
-        if ! cp -a "$RESOLV_CONF" "$backup"; then
-            err "备份 $RESOLV_CONF 失败，已取消 DNS 修改。"
+    [ -z "${ACTIVE_DNS_OPERATION_NAME:-}" ] || {
+        err "当前进程仍有未完成的 DNS 回滚，已拒绝开始新的修改。"
+        return 1
+    }
+    applied_before="$(manifest_value_readonly APPLIED_DNS_RESOLV 2>/dev/null || true)"
+    pending_before="$(manifest_value_readonly PENDING_DNS_RESOLV 2>/dev/null || true)"
+    [ "$applied_before" = "1" ] || applied_before=0
+    [ "$pending_before" = "1" ] || pending_before=0
+    if root_owned_config_file_is_safe_readonly "$RESOLV_CONF" &&
+        render_resolv_conf_dns "$dns1" "$dns2" | cmp -s - "$RESOLV_CONF"; then
+        target_is_current=1
+    fi
+    if [ "$pending_before" = "1" ]; then
+        if ! change_backup_record_is_valid DNS_RESOLV; then
+            err "未完成的 IPv4 DNS 修改缺少可信恢复基线，已拒绝提交或覆盖。"
             return 1
         fi
-    else
-        created_resolv="1"
+        if [ "$target_is_current" -ne 1 ]; then
+            err "检测到未完成的 IPv4 DNS 修改，且当前配置与本次目标不一致。"
+            err "请先在系统优化恢复菜单中恢复 IPv4 DNS，再重新修改。"
+            return 1
+        fi
+        if verify_dns_resolution; then
+            info "未完成的 IPv4 DNS 配置已通过解析验证。"
+        else
+            verify_status=$?
+            if [ "$verify_status" -ne 2 ]; then
+                err "未完成的 IPv4 DNS 配置无法通过解析验证，已保留恢复记录。"
+                return 1
+            fi
+            warn "未找到 getent/resolvectl，无法自动验证 DNS 解析。"
+        fi
+        mark_change_applied DNS_RESOLV || {
+            err "IPv4 DNS 配置已存在，但未完成事务无法提交。"
+            return 1
+        }
+        info "已提交上次中断的 IPv4 DNS 修改，无需重复写入。"
+        return 0
     fi
-    begin_change_transaction DNS_RESOLV || { err "记录 DNS 修改事务失败，已取消修改。"; return 1; }
+    if [ "$target_is_current" -eq 1 ]; then
+        info "IPv4 DNS 已是目标配置，无需重复写入。"
+        return 0
+    fi
 
     tmp="$(mktemp "$(dirname "$RESOLV_CONF")/.resolv.conf.vpsbox.XXXXXX")" || return 1
-    if ! {
-        printf 'nameserver %s\n' "$dns1"
-        if [ -n "$dns2" ]; then
-            printf 'nameserver %s\n' "$dns2"
-        fi
-        if [ -r "$RESOLV_CONF" ]; then
-            awk '$1 != "nameserver" { print }' "$RESOLV_CONF"
-        fi
-        :
-    } > "$tmp"; then
+    if ! render_resolv_conf_dns "$dns1" "$dns2" > "$tmp"; then
         rm -f "$tmp"
         err "生成新的 $RESOLV_CONF 失败。"
         return 1
     fi
-
-    chown root:root "$tmp" || { rm -f "$tmp"; return 1; }
-    chmod 644 "$tmp" || { rm -f "$tmp"; return 1; }
+    if ! backup_change_file_once DNS_RESOLV "$RESOLV_CONF"; then
+        rm -f -- "$tmp"
+        err "记录 DNS 原配置失败，已取消修改。"
+        return 1
+    fi
+    if ! begin_change_transaction DNS_RESOLV; then
+        rm -f -- "$tmp"
+        remove_dns_operation_snapshot "$snapshot" || true
+        cancel_unmodified_change_transaction DNS_RESOLV || true
+        err "记录 DNS 修改事务失败，已取消修改。"
+        return 1
+    fi
+    if ! create_dns_operation_snapshot "$RESOLV_CONF" ".resolv.conf.vpsbox-rollback" \
+        snapshot created_resolv; then
+        rm -f -- "$tmp"
+        restore_dns_change_tracking DNS_RESOLV "$applied_before" || true
+        err "创建 DNS 临时回滚快照失败，已取消修改。"
+        return 1
+    fi
+    if ! arm_dns_operation_rollback DNS_RESOLV "$snapshot" "$RESOLV_CONF" \
+        "$created_resolv" "$applied_before"; then
+        rm -f -- "$tmp"
+        remove_dns_operation_snapshot "$snapshot" || true
+        restore_dns_change_tracking DNS_RESOLV "$applied_before" || true
+        err "登记 DNS 中断回滚状态失败，已取消修改。"
+        return 1
+    fi
+    if ! chown root:root "$tmp" || ! chmod 644 "$tmp"; then
+        rm -f -- "$tmp"
+        cancel_active_dns_operation_before_publish || true
+        return 1
+    fi
     if ! mv -f "$tmp" "$RESOLV_CONF"; then
         rm -f "$tmp"
+        cancel_active_dns_operation_before_publish || true
         err "原子替换 $RESOLV_CONF 失败。"
         return 1
     fi
@@ -8182,44 +8614,36 @@ write_resolv_conf_dns() {
             warn "未找到 getent/resolvectl，无法自动验证 DNS 解析。"
         else
             err "DNS 解析验证失败，正在恢复原配置。"
-            if [ -e "$backup" ]; then
-                restore_file_atomically_from_snapshot "$backup" "$RESOLV_CONF" ||
-                    warn "恢复 DNS 备份失败：$backup"
-            elif [ "$created_resolv" = "1" ]; then
-                remove_snapshot_target_file "$RESOLV_CONF" ||
-                    warn "删除新建 DNS 配置失败：$RESOLV_CONF"
+            if rollback_active_dns_operation; then
+                err "DNS 解析验证失败，已恢复修改前配置。"
+            else
+                err "DNS 解析验证失败，且临时快照未能完整恢复。"
+                [ -z "$snapshot" ] || warn "临时快照已保留：$snapshot"
             fi
             return 1
         fi
     fi
 
-    mark_change_applied DNS_RESOLV || return 1
-    if [ -e "$backup" ]; then
-        info "原配置备份：$backup"
+    if ! mark_change_applied DNS_RESOLV; then
+        err "DNS 配置已写入，但恢复记录提交失败，正在回滚。"
+        rollback_active_dns_operation ||
+            err "DNS 恢复记录提交失败，且临时快照未能完整恢复。"
+        return 1
     fi
+    finish_active_dns_operation ||
+        warn "DNS 已更新，但临时回滚快照清理失败：$snapshot"
     return 0
 }
 
 rollback_systemd_resolved_dns() {
     local conf_file="$1"
-    local backup="$2"
+    local snapshot="$2"
     local created_conf="$3"
+    local applied_before="$4"
 
-    if [ -n "$backup" ] && [ -e "$backup" ]; then
-        if restore_file_atomically_from_snapshot "$backup" "$conf_file"; then
-            warn "已恢复 systemd-resolved DNS 备份：$backup"
-        else
-            warn "恢复 systemd-resolved DNS 备份失败，请手动检查：$backup"
-        fi
-    elif [ "$created_conf" = "1" ]; then
-        if remove_snapshot_target_file "$conf_file"; then
-            warn "已删除新建的 systemd-resolved DNS 配置：$conf_file"
-        else
-            warn "删除新建的 systemd-resolved DNS 配置失败，请手动检查：$conf_file"
-        fi
-    else
-        warn "未找到可恢复的 systemd-resolved DNS 备份，请手动检查：$conf_file"
-    fi
+    rollback_dns_change DNS_RESOLVED "$snapshot" "$conf_file" "$created_conf" "$applied_before" ||
+        return 1
+    remove_dns_operation_snapshot "$snapshot"
 }
 
 write_systemd_resolved_dns() {
@@ -8227,52 +8651,139 @@ write_systemd_resolved_dns() {
     local dns2="${2:-}"
     local conf_dir="/etc/systemd/resolved.conf.d"
     local conf_file="$conf_dir/vpsbox.conf"
-    local backup=""
+    local snapshot=""
     local created_conf="0"
+    local applied_before="0"
+    local pending_before="0"
+    local target_is_current=0
     local tmp
     local verify_status
 
+    [ -z "${ACTIVE_DNS_OPERATION_NAME:-}" ] || {
+        err "当前进程仍有未完成的 DNS 回滚，已拒绝开始新的修改。"
+        return 1
+    }
     [ ! -L "$conf_file" ] || {
         err "$conf_file 是符号链接，已拒绝覆盖。"
         return 1
     }
 
-    ensure_public_config_dir "$conf_dir" "$conf_file" || return 1
-    backup_change_file_once DNS_RESOLVED "$conf_file" || { err "记录 DNS 原配置失败，已取消修改。"; return 1; }
-    if [ -e "$conf_file" ]; then
-        backup="${conf_file}.bak.$(date +%Y%m%d%H%M%S)"
-        if ! cp -a "$conf_file" "$backup"; then
-            err "备份 $conf_file 失败，已取消 DNS 修改。"
+    applied_before="$(manifest_value_readonly APPLIED_DNS_RESOLVED 2>/dev/null || true)"
+    pending_before="$(manifest_value_readonly PENDING_DNS_RESOLVED 2>/dev/null || true)"
+    [ "$applied_before" = "1" ] || applied_before=0
+    [ "$pending_before" = "1" ] || pending_before=0
+    if root_owned_config_dir_is_safe_readonly "$conf_dir" &&
+        root_owned_config_file_is_safe_readonly "$conf_file" &&
+        render_systemd_resolved_dns "$dns1" "$dns2" |
+        cmp -s - "$conf_file"; then
+        target_is_current=1
+    fi
+    if [ "$pending_before" = "1" ]; then
+        if ! change_backup_record_is_valid DNS_RESOLVED; then
+            err "未完成的 systemd-resolved DNS 修改缺少可信恢复基线，已拒绝提交或覆盖。"
             return 1
         fi
-    else
-        created_conf="1"
+        if [ "$target_is_current" -ne 1 ]; then
+            err "检测到未完成的 systemd-resolved DNS 修改，且当前配置与本次目标不一致。"
+            err "请先在系统优化恢复菜单中恢复 IPv4 DNS，再重新修改。"
+            return 1
+        fi
+        if ! systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+            info "systemd-resolved DNS 配置正确，正在恢复未完成事务的服务状态..."
+            retry 3 2 systemctl start systemd-resolved || {
+                err "systemd-resolved 服务启动失败，已保留未完成的 DNS 恢复记录。"
+                return 1
+            }
+        fi
+        systemctl is-active --quiet systemd-resolved 2>/dev/null || return 1
+        if verify_dns_resolution; then
+            info "未完成的 systemd-resolved DNS 配置已通过解析验证。"
+        else
+            verify_status=$?
+            if [ "$verify_status" -ne 2 ]; then
+                err "未完成的 systemd-resolved DNS 配置无法通过解析验证，已保留恢复记录。"
+                return 1
+            fi
+            warn "未找到可用命令，无法自动验证 DNS 解析。"
+        fi
+        mark_change_applied DNS_RESOLVED || {
+            err "systemd-resolved DNS 配置已存在，但未完成事务无法提交。"
+            return 1
+        }
+        info "已提交上次中断的 systemd-resolved DNS 修改，无需重复写入。"
+        return 0
     fi
-    begin_change_transaction DNS_RESOLVED || { err "记录 DNS 修改事务失败，已取消修改。"; return 1; }
+    if [ "$target_is_current" -eq 1 ]; then
+        if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+            info "systemd-resolved IPv4 DNS 已是目标配置，无需重复写入或重启。"
+            return 0
+        fi
+        info "systemd-resolved DNS 配置正确，正在轻量恢复服务..."
+        if retry 3 2 systemctl start systemd-resolved &&
+            systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+            info "systemd-resolved 服务已恢复，无需重写 DNS 配置。"
+            return 0
+        fi
+        err "systemd-resolved DNS 配置正确，但服务启动失败。"
+        return 1
+    fi
 
+    ensure_public_config_dir "$conf_dir" "$conf_file" || return 1
     tmp="$(mktemp "$conf_dir/.vpsbox.conf.XXXXXX")" || return 1
-    # --- BEGIN GENERATED TEMPLATE: systemd-resolved DNS drop-in ---
-    if ! cat > "$tmp" <<EOF
-[Resolve]
-DNS=$(dns_values_line "$dns1" "$dns2")
-Domains=~.
-EOF
-    # --- END GENERATED TEMPLATE: systemd-resolved DNS drop-in ---
-    then
+    if ! render_systemd_resolved_dns "$dns1" "$dns2" > "$tmp"; then
         rm -f "$tmp"
         err "写入 $conf_file 失败。"
         return 1
     fi
-    chmod 644 "$tmp" || { rm -f "$tmp"; return 1; }
-    mv -f "$tmp" "$conf_file" || { rm -f "$tmp"; return 1; }
+    if ! backup_change_file_once DNS_RESOLVED "$conf_file"; then
+        rm -f -- "$tmp"
+        err "记录 DNS 原配置失败，已取消修改。"
+        return 1
+    fi
+    if ! begin_change_transaction DNS_RESOLVED; then
+        rm -f -- "$tmp"
+        remove_dns_operation_snapshot "$snapshot" || true
+        cancel_unmodified_change_transaction DNS_RESOLVED || true
+        err "记录 DNS 修改事务失败，已取消修改。"
+        return 1
+    fi
+    if ! create_dns_operation_snapshot "$conf_file" ".vpsbox.conf.rollback" \
+        snapshot created_conf; then
+        rm -f -- "$tmp"
+        restore_dns_change_tracking DNS_RESOLVED "$applied_before" || true
+        err "创建 systemd-resolved DNS 临时回滚快照失败，已取消修改。"
+        return 1
+    fi
+    if ! arm_dns_operation_rollback DNS_RESOLVED "$snapshot" "$conf_file" \
+        "$created_conf" "$applied_before"; then
+        rm -f -- "$tmp"
+        remove_dns_operation_snapshot "$snapshot" || true
+        restore_dns_change_tracking DNS_RESOLVED "$applied_before" || true
+        err "登记 systemd-resolved DNS 中断回滚状态失败，已取消修改。"
+        return 1
+    fi
+    if ! chown root:root "$tmp" || ! chmod 644 "$tmp"; then
+        rm -f -- "$tmp"
+        cancel_active_dns_operation_before_publish || true
+        return 1
+    fi
+    if ! mv -f "$tmp" "$conf_file"; then
+        rm -f -- "$tmp"
+        cancel_active_dns_operation_before_publish || true
+        return 1
+    fi
 
     info "检测到 systemd-resolved，已写入：$conf_file"
     warn "Domains=~. 会让 systemd-resolved 将全局 DNS 查询交给上述服务器。"
     info "正在重启 systemd-resolved 以应用 DNS，不会重启 VPS..."
     if ! retry 3 2 systemctl restart systemd-resolved; then
         err "重启 systemd-resolved 失败，请检查 systemctl status systemd-resolved --no-pager。"
-        rollback_systemd_resolved_dns "$conf_file" "$backup" "$created_conf"
-        retry 2 2 systemctl restart systemd-resolved >/dev/null 2>&1 || true
+        if rollback_active_dns_operation; then
+            info "已恢复修改前的 systemd-resolved DNS 配置。"
+        else
+            err "systemd-resolved DNS 配置未能完整恢复。"
+            [ -z "$snapshot" ] || warn "临时快照已保留：$snapshot"
+        fi
         return 1
     fi
 
@@ -8285,15 +8796,24 @@ EOF
             warn "未找到可用命令，无法自动验证 DNS 解析。"
         else
             err "DNS 解析验证失败，正在恢复 systemd-resolved 配置。"
-            rollback_systemd_resolved_dns "$conf_file" "$backup" "$created_conf"
-            retry 2 2 systemctl restart systemd-resolved >/dev/null 2>&1 || true
+            if rollback_active_dns_operation; then
+                info "已恢复修改前的 systemd-resolved DNS 配置。"
+            else
+                err "systemd-resolved DNS 配置未能完整恢复。"
+                [ -z "$snapshot" ] || warn "临时快照已保留：$snapshot"
+            fi
             return 1
         fi
     fi
-    mark_change_applied DNS_RESOLVED || return 1
-    if [ -n "$backup" ] && [ -e "$backup" ]; then
-        info "原配置备份：$backup"
+    if ! mark_change_applied DNS_RESOLVED; then
+        err "systemd-resolved DNS 已写入，但恢复记录提交失败，正在回滚。"
+        if ! rollback_active_dns_operation; then
+            err "systemd-resolved DNS 恢复记录提交失败，且临时快照未能完整恢复。"
+        fi
+        return 1
     fi
+    finish_active_dns_operation ||
+        warn "DNS 已更新，但临时回滚快照清理失败：$snapshot"
     return 0
 }
 
@@ -8385,7 +8905,7 @@ EOF
         return "$apply_status"
     fi
 
-    info "IPv4 DNS 已更新："
+    info "当前 IPv4 DNS："
     ipv4_dns_lines
 }
 
@@ -8539,11 +9059,6 @@ sshd_main_has_active_port_directive() {
     ' "$SSHD_MAIN_CONF" 2>/dev/null
 }
 
-sshd_dropin_include_available() {
-    sshd_vpsbox_port_include_available &&
-        sshd_vpsbox_hardening_include_available
-}
-
 sshd_vpsbox_port_include_available() {
     sshd_main_has_dropin_wildcard ||
         sshd_main_includes_path "$SSHD_VPSBOX_PORT_CONF"
@@ -8584,27 +9099,15 @@ install_ssh_config_atomically() {
 
 ensure_sshd_dropin_include() {
     local tmp
-    local -a managed_includes=()
 
-    sshd_dropin_include_available && return 0
+    sshd_vpsbox_hardening_include_available && return 0
     mkdir -p "$SSHD_CONFIG_DIR" || return 1
     tmp="$(mktemp)" || return 1
-    sshd_main_includes_path "$SSHD_VPSBOX_PORT_CONF" ||
-        managed_includes+=("$SSHD_VPSBOX_PORT_CONF")
-    sshd_main_includes_path "$SSHD_VPSBOX_HARDENING_CONF" ||
-        managed_includes+=("$SSHD_VPSBOX_HARDENING_CONF")
-    [ "${#managed_includes[@]}" -gt 0 ] || {
-        rm -f "$tmp"
-        return 1
-    }
 
     # OpenSSH 对多数全局指令采用首个匹配值，因此 Include 必须位于主配置前部。
-    # 主配置原本没有通配 Include 时只引入 vpsbox 自己的两个文件，避免顺带
-    # 激活目录中由云镜像或管理员留下的其他休眠 drop-in。
+    # 基础加固只引入自己的文件，不能顺带激活休眠的端口或第三方 drop-in。
     {
-        printf 'Include'
-        printf ' %s' "${managed_includes[@]}"
-        printf '\n'
+        printf 'Include %s\n' "$SSHD_VPSBOX_HARDENING_CONF"
         cat "$SSHD_MAIN_CONF"
     } > "$tmp" || { rm -f "$tmp"; return 1; }
 
@@ -8613,45 +9116,7 @@ ensure_sshd_dropin_include() {
         return 1
     fi
     rm -f "$tmp"
-    sshd_dropin_include_available
-}
-
-backup_ssh_file() {
-    local path="$1"
-    local suffix="$2"
-
-    if [ -e "$path" ]; then
-        cp -a "$path" "${path}.vpsbox.bak.${suffix}" || return 1
-        printf '%s\n' "${path}.vpsbox.bak.${suffix}"
-    fi
-}
-
-restore_ssh_config_backup() {
-    local main_backup="$1"
-    local dropin_path="$2"
-    local dropin_backup="$3"
-    local failed=0 mode
-
-    if [ -n "$main_backup" ] && [ -e "$main_backup" ]; then
-        mode="$(stat -c '%a' "$main_backup" 2>/dev/null || true)"
-        install_ssh_config_atomically "$main_backup" "$SSHD_MAIN_CONF" "$mode" || {
-            warn "恢复 $SSHD_MAIN_CONF 失败。"
-            failed=1
-        }
-    fi
-    if [ -n "$dropin_backup" ] && [ -e "$dropin_backup" ]; then
-        mode="$(stat -c '%a' "$dropin_backup" 2>/dev/null || true)"
-        install_ssh_config_atomically "$dropin_backup" "$dropin_path" "$mode" || {
-            warn "恢复 $dropin_path 失败。"
-            failed=1
-        }
-    else
-        rm -f "$dropin_path" || {
-            warn "删除 $dropin_path 失败。"
-            failed=1
-        }
-    fi
-    return "$failed"
+    sshd_vpsbox_hardening_include_available
 }
 
 set_main_ssh_port_directives() {
@@ -8823,6 +9288,24 @@ wait_for_any_ssh_listener_csv() {
     return 1
 }
 
+wait_for_all_ssh_listeners_csv() {
+    local ports="$1" port
+    local IFS=,
+
+    for port in $ports; do
+        wait_for_ssh_listener "$port" || return 1
+    done
+}
+
+ssh_effective_ports_match_csv() {
+    local expected="$1" current
+
+    expected="$(normalize_port_csv "$expected")" || return 1
+    current="$(ssh_effective_ports_csv)" || return 1
+    current="$(normalize_port_csv "$current")" || return 1
+    [ "$current" = "$expected" ]
+}
+
 ssh_connection_server_port() {
     local client_ip client_port server_ip server_port extra
 
@@ -8910,15 +9393,21 @@ ssh_firewall_transition_finish() {
     ACTIVE_SSH_FIREWALL_TRANSITION=0
 }
 
-ssh_firewall_transition_reconcile() {
-    local configured_ports listening_ports safe_ports transition_dir
+ssh_firewall_sync_current_safe_ports() {
+    local configured_ports listening_ports safe_ports
 
-    [ "${ACTIVE_SSH_FIREWALL_TRANSITION:-0}" = "1" ] || return 0
     configured_ports="$(ssh_effective_ports_csv 2>/dev/null || true)"
     listening_ports="$(ssh_listening_ports_csv 2>/dev/null || true)"
     safe_ports="$(merge_port_csv "$configured_ports" "$listening_ports")" || return 1
     [ -n "$safe_ports" ] || return 1
-    firewall_sync_active_config "$safe_ports" "" 1 || return 1
+    firewall_sync_active_config "$safe_ports" "" 1
+}
+
+ssh_firewall_transition_reconcile() {
+    local transition_dir
+
+    [ "${ACTIVE_SSH_FIREWALL_TRANSITION:-0}" = "1" ] || return 0
+    ssh_firewall_sync_current_safe_ports || return 1
     transition_dir="${ACTIVE_FIREWALL_TRANSITION_DIR:-}"
     if [ -n "$transition_dir" ]; then
         firewall_discard_port_transition || return 1
@@ -9028,114 +9517,29 @@ clear_ssh_change_tracking() {
     clear_change_tracking SSHD_MAIN || failed=1
     clear_change_tracking SSHD_PORT || failed=1
     clear_change_tracking SSHD_HARDENING || failed=1
+    manifest_remove PENDING_SSH_CONFIG || failed=1
     manifest_remove APPLIED_SSH_CONFIG || failed=1
     manifest_remove SSH_PORTS || failed=1
     return "$failed"
 }
 
-cleanup_unapplied_ssh_tracking() {
-    local applied_before="$1"
-
-    if [ "$applied_before" = "1" ]; then
-        ACTIVE_UNAPPLIED_SSH_TRACKING=0
-        return 0
-    fi
-    if clear_ssh_change_tracking; then
-        ACTIVE_UNAPPLIED_SSH_TRACKING=0
-        return 0
-    fi
-    ACTIVE_UNAPPLIED_SSH_TRACKING=1
-    return 1
-}
-
-ssh_unapplied_tracking_present() {
+legacy_ssh_change_tracking_present() {
     local key
 
-    [ "$(manifest_value APPLIED_SSH_CONFIG 2>/dev/null || true)" != "1" ] || return 1
-    for key in BACKUP_SSHD_MAIN BACKUP_SSHD_PORT BACKUP_SSHD_HARDENING SSH_PORTS; do
-        manifest_value "$key" >/dev/null 2>&1 && return 0
+    for key in BACKUP_SSHD_MAIN BACKUP_SSHD_PORT BACKUP_SSHD_HARDENING \
+        PENDING_SSHD_MAIN PENDING_SSHD_PORT PENDING_SSHD_HARDENING \
+        APPLIED_SSHD_MAIN APPLIED_SSHD_PORT APPLIED_SSHD_HARDENING \
+        PENDING_SSH_CONFIG APPLIED_SSH_CONFIG SSH_PORTS; do
+        manifest_value_readonly "$key" >/dev/null 2>&1 && return 0
     done
     [ -e "$CHANGE_BACKUP_DIR/SSHD_MAIN" ] || [ -L "$CHANGE_BACKUP_DIR/SSHD_MAIN" ] ||
         [ -e "$CHANGE_BACKUP_DIR/SSHD_PORT" ] || [ -L "$CHANGE_BACKUP_DIR/SSHD_PORT" ] ||
         [ -e "$CHANGE_BACKUP_DIR/SSHD_HARDENING" ] || [ -L "$CHANGE_BACKUP_DIR/SSHD_HARDENING" ]
 }
 
-settle_stale_unapplied_ssh_tracking() {
-    if [ "${ACTIVE_UNAPPLIED_SSH_TRACKING:-0}" != "1" ] &&
-        ! ssh_unapplied_tracking_present; then
-        return 0
-    fi
-    # SSH 配置只会在 APPLIED_SSH_CONFIG 成功落盘后写入；因此无 APPLIED 标记的
-    # 残留仅是中断的首次基线，可安全清理后重新采集。
-    if cleanup_unapplied_ssh_tracking 0; then
-        return 0
-    fi
-    err "检测到未应用且无法清理的 SSH 恢复基线，已拒绝继续修改。"
-    return 1
-}
-
-rollback_ssh_port_change() {
-    local main_backup="$1" dropin_backup="$2" original_ports="$3"
-    local applied_before="${4:-1}" bin
-
-    if ! restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_PORT_CONF" "$dropin_backup"; then
-        err "SSH 配置文件回滚失败，请通过控制台恢复。"
-        ssh_firewall_transition_reconcile ||
-            warn "无法自动对账 SSH 端口；临时防火墙规则已保留，请勿关闭当前连接。"
-        return 1
-    fi
-    bin="$(sshd_binary)" || { err "SSH 回滚后未找到 sshd，请通过控制台恢复。"; return 1; }
-    if ! "$bin" -t; then
-        err "SSH 回滚后的配置校验失败，请通过控制台恢复。"
-        ssh_firewall_transition_reconcile ||
-            warn "无法自动对账 SSH 端口；临时防火墙规则已保留，请勿关闭当前连接。"
-        return 1
-    fi
-    if ! restart_ssh_service; then
-        err "SSH 回滚后服务无法重启，请通过控制台恢复。"
-        ssh_firewall_transition_reconcile ||
-            warn "无法自动对账 SSH 端口；临时防火墙规则已保留，请勿关闭当前连接。"
-        return 1
-    fi
-    if [ -n "$original_ports" ] && ! wait_for_any_ssh_listener_csv "$original_ports"; then
-        err "SSH 回滚后未恢复原端口监听（$original_ports），请通过控制台恢复。"
-        ssh_firewall_transition_reconcile ||
-            warn "无法自动对账 SSH 端口；临时防火墙规则已保留，请勿关闭当前连接。"
-        return 1
-    fi
-    if declare -F ssh_firewall_transition_abort >/dev/null 2>&1 && ! ssh_firewall_transition_abort; then
-        err "SSH 已回滚，但主机防火墙未能恢复修改前的端口规则。"
-        return 1
-    fi
-    if [ "$applied_before" != "1" ]; then
-        # 首次 SSH 事务失败时必须同时清掉备份基线和端口记录；若此前已成功应用过，
-        # 则保留 BACKUP_SSHD_* / SSH_PORTS，供恢复菜单继续回退。
-        if ! clear_ssh_change_tracking; then
-            err "SSH 已回滚，但无法清理首次事务记录；恢复菜单仍会保留该项目。"
-            return 1
-        fi
-    fi
-    return 0
-}
-
-rollback_ssh_hardening_change() {
-    local main_backup="$1" dropin_backup="$2" applied_before="$3"
-    local restart_required="${4:-0}"
-    local expected_ports="${5:-}"
-
-    restore_ssh_config_backup "$main_backup" "$SSHD_VPSBOX_HARDENING_CONF" "$dropin_backup" ||
-        return 1
-    if [ "$restart_required" = "1" ] && ! restart_ssh_service; then
-        return 1
-    fi
-    if [ "$restart_required" = "1" ] && [ -n "$expected_ports" ] &&
-        ! wait_for_any_ssh_listener_csv "$expected_ports"; then
-        return 1
-    fi
-    if [ "$applied_before" != "1" ]; then
-        # 与端口修改共用同一份恢复基线，首次加固失败也不能留下过期备份。
-        clear_ssh_change_tracking || return 1
-    fi
+retire_legacy_ssh_change_tracking() {
+    legacy_ssh_change_tracking_present || return 0
+    clear_ssh_change_tracking
 }
 
 validate_ssh_access_controls() {
@@ -9473,12 +9877,73 @@ sync_fail2ban_sshd_port() {
     fi
 }
 
+apply_ssh_port_target_transaction() {
+    local original_ports="$1" write_action
+
+    if ! begin_ssh_runtime_transaction "$original_ports" 1; then
+        err "无法创建可校验的 SSH 运行期回滚快照，已取消修改。"
+        return 1
+    fi
+    if ! ssh_firewall_transition_begin "$SSH_TARGET_PORT"; then
+        cancel_ssh_runtime_transaction ||
+            warn "SSH 尚未修改，但运行期快照未能清理。"
+        err "主机防火墙无法临时放行 SSH 目标端口，已取消修改。"
+        return 1
+    fi
+
+    if { [ -e "$SSHD_VPSBOX_PORT_CONF" ] && sshd_vpsbox_port_include_available; } ||
+        { ! sshd_main_has_active_port_directive && sshd_vpsbox_port_include_available; }; then
+        write_action="vpsbox drop-in"
+        if ! write_vpsbox_ssh_port_config; then
+            fail_ssh_runtime_transaction "写入 SSH drop-in 失败" || true
+            return 1
+        fi
+    else
+        write_action="主配置"
+        if ! set_main_ssh_port_directives; then
+            fail_ssh_runtime_transaction "写入 SSH 主配置失败" || true
+            return 1
+        fi
+    fi
+
+    if ! validate_ssh_port_effective_config; then
+        fail_ssh_runtime_transaction "SSH 端口配置验证失败" || true
+        return 1
+    fi
+    if ! restart_ssh_service; then
+        fail_ssh_runtime_transaction "SSH 服务重启失败" || true
+        return 1
+    fi
+    if ! wait_for_ssh_listener "$SSH_TARGET_PORT"; then
+        fail_ssh_runtime_transaction \
+            "SSH 重启后未检测到 sshd 监听端口 $SSH_TARGET_PORT" || true
+        return 1
+    fi
+    if ! sync_fail2ban_sshd_port; then
+        fail_ssh_runtime_transaction "Fail2ban sshd 端口同步或验收失败" || true
+        return 1
+    fi
+    if ! ssh_firewall_transition_finish; then
+        fail_ssh_runtime_transaction "主机防火墙无法同步 SSH 目标端口" || true
+        return 1
+    fi
+    if ! commit_ssh_runtime_transaction; then
+        err "SSH 运行期事务无法提交，正在回滚。"
+        rollback_active_ssh_transaction || true
+        return 1
+    fi
+
+    retire_legacy_ssh_change_tracking ||
+        warn "SSH 已成功提交，但旧版 SSH 恢复记录未能完整退役；不会再使用这些记录自动恢复。"
+    info "SSH 配置写入位置：$write_action"
+    if fail2ban_installed; then
+        info "Fail2ban sshd 端口已同步为 $SSH_TARGET_PORT。"
+    fi
+    return 0
+}
+
 apply_ssh_port_change() {
-    local confirm new_port original_ports retired_ports write_action
-    local suffix
-    local main_backup=""
-    local dropin_backup=""
-    local ssh_change_was_applied=0
+    local confirm new_port original_ports retired_ports
     local vpsbox_firewall_active=0
 
     if ! sshd_binary >/dev/null 2>&1; then
@@ -9496,8 +9961,6 @@ apply_ssh_port_change() {
         err "请先通过控制台处理 ssh.socket/sshd.socket，或关闭 socket activation 后重试。"
         return 1
     fi
-    settle_stale_unapplied_ssh_tracking || return 1
-
     new_port="$(choose_ssh_target_port)" || { info "已取消。"; return 0; }
     SSH_TARGET_PORT="$new_port"
 
@@ -9535,114 +9998,17 @@ apply_ssh_port_change() {
         return 0
     fi
 
-    [ "$(manifest_value APPLIED_SSH_CONFIG 2>/dev/null || true)" = "1" ] &&
-        ssh_change_was_applied=1
-    [ "$ssh_change_was_applied" = "1" ] || ACTIVE_UNAPPLIED_SSH_TRACKING=1
-    if ! backup_change_file_once SSHD_MAIN "$SSHD_MAIN_CONF" ||
-        ! backup_change_file_once SSHD_PORT "$SSHD_VPSBOX_PORT_CONF" ||
-        ! backup_change_file_once SSHD_HARDENING "$SSHD_VPSBOX_HARDENING_CONF"; then
-        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
-            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
-        return 1
-    fi
     original_ports="$(ssh_effective_ports_csv)" || {
-        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
-            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
         err "无法读取 SSH 当前生效端口，已取消修改。"
         return 1
     }
     retired_ports="$(csv_remove_port "$original_ports" "$SSH_TARGET_PORT")" || {
-        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
-            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
         err "无法计算 SSH 旧端口，已取消修改。"
         return 1
     }
-    if ! manifest_set_once SSH_PORTS "$original_ports"; then
-        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
-            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
-        return 1
-    fi
-
-    suffix="$(date +%F-%H%M%S)"
-    if ! main_backup="$(backup_ssh_file "$SSHD_MAIN_CONF" "$suffix")"; then
-        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
-            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
-        err "备份 $SSHD_MAIN_CONF 失败，已取消修改。"
-        return 1
-    fi
-    if ! dropin_backup="$(backup_ssh_file "$SSHD_VPSBOX_PORT_CONF" "$suffix")"; then
-        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
-            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
-        err "备份 $SSHD_VPSBOX_PORT_CONF 失败，已取消修改。"
-        return 1
-    fi
-    if ! ssh_firewall_transition_begin "$SSH_TARGET_PORT"; then
-        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
-            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
-        err "主机防火墙无法临时放行 SSH 新端口，已取消修改。"
-        return 1
-    fi
-    # 在首次写入 SSH 配置前可靠落盘；若 Ctrl+C 发生在写入、校验或重启期间，
-    # 恢复菜单仍能识别并恢复原配置，不会留下“已修改但未记录”的状态。
-    if ! mark_change_applied SSH_CONFIG; then
-        ssh_firewall_transition_abort || true
-        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
-            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
-        err "无法记录 SSH 配置事务，已取消修改。"
-        return 1
-    fi
-    ACTIVE_UNAPPLIED_SSH_TRACKING=0
-
-    if { [ -e "$SSHD_VPSBOX_PORT_CONF" ] && sshd_vpsbox_port_include_available; } || { ! sshd_main_has_active_port_directive && sshd_vpsbox_port_include_available; }; then
-        write_action="vpsbox drop-in"
-        write_vpsbox_ssh_port_config || {
-            err "写入 SSH drop-in 失败，正在回滚。"
-            rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" "$ssh_change_was_applied" || true
-            return 1
-        }
-    else
-        write_action="主配置"
-        set_main_ssh_port_directives || {
-            err "写入 SSH 主配置失败，正在回滚。"
-            rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" "$ssh_change_was_applied" || true
-            return 1
-        }
-    fi
-
-    if ! validate_ssh_port_effective_config; then
-        err "SSH 端口配置验证失败，正在回滚。"
-        rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" "$ssh_change_was_applied" || true
-        return 1
-    fi
-
-    if ! restart_ssh_service; then
-        err "SSH 服务重启失败，正在回滚配置。"
-        rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" "$ssh_change_was_applied" || true
-        return 1
-    fi
-
-    if ! wait_for_ssh_listener "$SSH_TARGET_PORT"; then
-        err "SSH 重启后未检测到 sshd 监听端口 $SSH_TARGET_PORT，正在回滚。"
-        rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" "$ssh_change_was_applied" || true
-        return 1
-    fi
-    if ! ssh_firewall_transition_finish; then
-        err "主机防火墙无法同步 SSH 新端口，正在回滚配置。"
-        rollback_ssh_port_change "$main_backup" "$dropin_backup" "$original_ports" "$ssh_change_was_applied" || true
-        return 1
-    fi
-
-    info "SSH 配置写入位置：$write_action"
-
-    if sync_fail2ban_sshd_port; then
-        fail2ban_installed && info "Fail2ban sshd 端口已同步为 $SSH_TARGET_PORT。"
-    else
-        warn "Fail2ban sshd 端口同步失败，请稍后检查 fail2ban-client status sshd。"
-    fi
+    apply_ssh_port_target_transaction "$original_ports" || return 1
 
     info "SSH 端口已修改为 $SSH_TARGET_PORT。"
-    [ -n "$main_backup" ] && info "主配置备份：$main_backup"
-    [ -n "$dropin_backup" ] && info "vpsbox SSH 端口配置备份：$dropin_backup"
     warn "不要关闭当前 SSH 窗口。"
     warn "请另开一个新窗口测试：ssh -p $SSH_TARGET_PORT root@你的服务器IP"
     if [ -n "$retired_ports" ]; then
@@ -9665,12 +10031,8 @@ ssh_port_change_firewall_hint() {
 }
 
 apply_ssh_basic_hardening() {
-    local confirm
-    local suffix
-    local main_backup=""
-    local dropin_backup=""
+    local confirm confirmed=0
     local original_ports
-    local ssh_change_was_applied=0
 
     if ! sshd_binary >/dev/null 2>&1; then
         err "未找到 sshd，无法修改 SSH 配置。"
@@ -9681,8 +10043,6 @@ apply_ssh_basic_hardening() {
         err "未找到 SSH 主配置：$SSHD_MAIN_CONF"
         return 1
     fi
-    settle_stale_unapplied_ssh_tracking || return 1
-
     if ssh_basic_hardening_effective; then
         info "SSH 基础加固已经生效，无需重复应用。"
         if ! read -r -p "仍要重新写入并重启 SSH？[y/N]: " confirm; then
@@ -9690,95 +10050,64 @@ apply_ssh_basic_hardening() {
             return 0
         fi
         case "$confirm" in
-            y|Y|yes|YES) ;;
+            y|Y|yes|YES) confirmed=1 ;;
             *) info "已取消重复应用。"; return 0 ;;
         esac
     fi
 
-    if ! read -r -p "确认应用 SSH 基础加固并重启 SSH？[y/N]: " confirm; then
-        info "输入已结束，已取消，未修改 SSH 配置。"
-        return 0
+    if [ "$confirmed" -eq 0 ]; then
+        if ! read -r -p "确认应用 SSH 基础加固并重启 SSH？[y/N]: " confirm; then
+            info "输入已结束，已取消，未修改 SSH 配置。"
+            return 0
+        fi
+        case "$confirm" in
+            y|Y|yes|YES) ;;
+            *) info "已取消，未修改 SSH 配置。"; return 0 ;;
+        esac
     fi
-    case "$confirm" in
-        y|Y|yes|YES) ;;
-        *) info "已取消，未修改 SSH 配置。"; return 0 ;;
-    esac
 
-    [ "$(manifest_value APPLIED_SSH_CONFIG 2>/dev/null || true)" = "1" ] &&
-        ssh_change_was_applied=1
-    [ "$ssh_change_was_applied" = "1" ] || ACTIVE_UNAPPLIED_SSH_TRACKING=1
-    if ! backup_change_file_once SSHD_MAIN "$SSHD_MAIN_CONF" ||
-        ! backup_change_file_once SSHD_PORT "$SSHD_VPSBOX_PORT_CONF" ||
-        ! backup_change_file_once SSHD_HARDENING "$SSHD_VPSBOX_HARDENING_CONF"; then
-        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
-            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
-        return 1
-    fi
     original_ports="$(ssh_effective_ports_csv)" || {
-        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
-            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
         err "无法读取 SSH 当前生效端口，已取消加固。"
         return 1
     }
-    if ! manifest_set_once SSH_PORTS "$original_ports"; then
-        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
-            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
+    if ! begin_ssh_runtime_transaction "$original_ports"; then
+        err "无法创建可校验的 SSH 运行期回滚快照，已取消加固。"
         return 1
     fi
-
-    suffix="$(date +%F-%H%M%S)"
-    if ! main_backup="$(backup_ssh_file "$SSHD_MAIN_CONF" "$suffix")"; then
-        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
-            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
-        err "备份 $SSHD_MAIN_CONF 失败，已取消修改。"
-        return 1
-    fi
-    if ! dropin_backup="$(backup_ssh_file "$SSHD_VPSBOX_HARDENING_CONF" "$suffix")"; then
-        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
-            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
-        err "备份 $SSHD_VPSBOX_HARDENING_CONF 失败，已取消修改。"
-        return 1
-    fi
-    # 与端口修改使用同一恢复标记，确保交互中断后仍可从恢复菜单回到原配置。
-    mark_change_applied SSH_CONFIG || {
-        cleanup_unapplied_ssh_tracking "$ssh_change_was_applied" ||
-            warn "SSH 尚未修改，但首次恢复基线清理不完整。"
-        err "无法记录 SSH 配置事务，已取消修改。"
-        return 1
-    }
-    ACTIVE_UNAPPLIED_SSH_TRACKING=0
 
     if ! write_vpsbox_ssh_hardening_config || ! ensure_sshd_dropin_include; then
-        err "写入 SSH 基础加固配置失败，正在回滚。"
-        rollback_ssh_hardening_change "$main_backup" "$dropin_backup" "$ssh_change_was_applied" 0 "$original_ports" ||
-            warn "SSH 配置未能完整回滚，恢复标记已保留。"
+        fail_ssh_runtime_transaction "写入 SSH 基础加固配置失败" || true
         return 1
     fi
 
     if ! validate_ssh_hardening_effective_config; then
-        err "SSH 基础加固配置验证失败，正在回滚。"
-        rollback_ssh_hardening_change "$main_backup" "$dropin_backup" "$ssh_change_was_applied" 0 "$original_ports" ||
-            warn "SSH 配置未能完整回滚，恢复标记已保留。"
+        fail_ssh_runtime_transaction "SSH 基础加固配置验证失败" || true
+        return 1
+    fi
+    if ! ssh_effective_ports_match_csv "$original_ports"; then
+        fail_ssh_runtime_transaction "SSH 基础加固意外改变了生效端口" || true
         return 1
     fi
 
     if ! restart_ssh_service; then
-        err "SSH 服务重启失败，正在回滚配置并尝试恢复服务。"
-        rollback_ssh_hardening_change "$main_backup" "$dropin_backup" "$ssh_change_was_applied" 1 "$original_ports" ||
-            warn "SSH 配置或服务未能完整回滚，恢复标记已保留。"
+        fail_ssh_runtime_transaction "SSH 服务重启失败" || true
         return 1
     fi
 
-    if ! wait_for_any_ssh_listener_csv "$original_ports"; then
-        err "SSH 服务重启后未恢复原端口监听（$original_ports），正在回滚配置并尝试恢复服务。"
-        rollback_ssh_hardening_change "$main_backup" "$dropin_backup" "$ssh_change_was_applied" 1 "$original_ports" ||
-            warn "SSH 配置或服务未能完整回滚，恢复标记已保留。"
+    if ! wait_for_all_ssh_listeners_csv "$original_ports"; then
+        fail_ssh_runtime_transaction \
+            "SSH 服务重启后未恢复原端口监听（$original_ports）" || true
+        return 1
+    fi
+    if ! commit_ssh_runtime_transaction; then
+        err "SSH 加固事务无法提交，正在回滚。"
+        rollback_active_ssh_transaction || true
         return 1
     fi
 
+    retire_legacy_ssh_change_tracking ||
+        warn "SSH 加固已成功提交，但旧版 SSH 恢复记录未能完整退役。"
     info "SSH 基础加固已应用。"
-    [ -n "$main_backup" ] && info "主配置备份：$main_backup"
-    [ -n "$dropin_backup" ] && info "vpsbox SSH 加固配置备份：$dropin_backup"
     warn "当前 SSH 连接通常不会断开，建议另开一个新窗口测试 SSH 登录。"
 }
 
@@ -9855,7 +10184,7 @@ EOF
 }
 
 ssh_restore_snapshot_root() {
-    printf '%s\n' "$VPSBOX_STATE_DIR/ssh-restore-snapshots"
+    printf '%s\n' "$RUNTIME_DIR/ssh-transactions"
 }
 
 ssh_restore_snapshot_path_allowed() {
@@ -9865,7 +10194,7 @@ ssh_restore_snapshot_path_allowed() {
     parent="$(dirname -- "$snapshot_dir")"
     base="${snapshot_dir##*/}"
     [ "$parent" = "$root" ] &&
-        [[ "$base" == restore.* || "$base" == .building.* ]]
+        [[ "$base" == transaction.* || "$base" == .building.* ]]
 }
 
 remove_ssh_restore_snapshot() {
@@ -9904,7 +10233,7 @@ ssh_restore_snapshot_dir_valid() {
     ssh_restore_snapshot_path_allowed "$snapshot_dir" &&
         [ -d "$snapshot_dir" ] && [ ! -L "$snapshot_dir" ] || return 1
     root="$(ssh_restore_snapshot_root)"
-    [[ "$snapshot_dir" == "$root"/restore.* ]] || return 1
+    [[ "$snapshot_dir" == "$root"/transaction.* ]] || return 1
     [ -d "$root" ] && [ ! -L "$root" ] &&
         ssh_restore_snapshot_path_is_secure "$root" 700 || return 1
     ssh_restore_snapshot_path_is_secure "$snapshot_dir" 700 || return 1
@@ -9944,8 +10273,9 @@ create_ssh_restore_snapshot() {
     local output_var="$1" root build final suffix manifest name path mode digest
 
     command -v sha256sum >/dev/null 2>&1 || return 1
-    ensure_change_store || return 1
     root="$(ssh_restore_snapshot_root)"
+    [ -d "$RUNTIME_DIR" ] && [ ! -L "$RUNTIME_DIR" ] &&
+        ssh_restore_snapshot_path_is_secure "$RUNTIME_DIR" 700 || return 1
     [ ! -L "$root" ] || return 1
     mkdir -p "$root" || return 1
     chown root:root "$root" || return 1
@@ -10005,7 +10335,7 @@ create_ssh_restore_snapshot() {
         return 1
     }
     suffix="${build##*.building.}"
-    final="$root/restore.$suffix"
+    final="$root/transaction.$suffix"
     [ ! -e "$final" ] && mv -- "$build" "$final" || {
         remove_ssh_restore_snapshot "$build" || true
         return 1
@@ -10041,109 +10371,180 @@ restore_ssh_runtime_snapshot() {
     bin="$(sshd_binary)" || return 1
     "$bin" -t || return 1
     restart_ssh_service || return 1
-    [ -z "$expected_ports" ] || wait_for_any_ssh_listener_csv "$expected_ports"
+    [ -z "$expected_ports" ] || wait_for_all_ssh_listeners_csv "$expected_ports"
 }
 
-settle_failed_ssh_restore() {
-    local snapshot_dir="$1" expected_ports="$2"
+begin_ssh_runtime_transaction() {
+    local original_ports="$1" has_port_change="${2:-0}" snapshot_dir=""
 
-    if restore_ssh_runtime_snapshot "$snapshot_dir" "$expected_ports"; then
-        if ssh_firewall_transition_abort; then
-            return 0
-        fi
-        warn "SSH 配置与监听已回滚，但防火墙快照未能直接恢复，正在安全对账。"
-    else
-        warn "SSH 运行状态未完整回滚，正在保留配置端口与实际监听端口的安全并集。"
-    fi
-    if ssh_firewall_transition_reconcile; then
-        warn "已按 SSH 配置端口与实际监听端口的并集保留防火墙放行。"
+    [ -z "${ACTIVE_SSH_TRANSACTION_DIR:-}" ] || return 1
+    case "$has_port_change" in 0|1) ;; *) return 1 ;; esac
+    original_ports="$(normalize_port_csv "$original_ports")" || return 1
+    [ -n "$original_ports" ] || return 1
+    create_ssh_restore_snapshot snapshot_dir || return 1
+    ACTIVE_SSH_ORIGINAL_PORTS="$original_ports"
+    ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE="$has_port_change"
+    # 最后登记目录作为活动标记；在此之前尚未修改正式配置。
+    ACTIVE_SSH_TRANSACTION_DIR="$snapshot_dir"
+}
+
+cancel_ssh_runtime_transaction() {
+    local snapshot_dir="${ACTIVE_SSH_TRANSACTION_DIR:-}"
+
+    [ -n "$snapshot_dir" ] || return 0
+    ACTIVE_SSH_TRANSACTION_DIR=""
+    ACTIVE_SSH_ORIGINAL_PORTS=""
+    ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE=0
+    remove_ssh_restore_snapshot "$snapshot_dir"
+}
+
+commit_ssh_runtime_transaction() {
+    local snapshot_dir="${ACTIVE_SSH_TRANSACTION_DIR:-}"
+    local original_ports="${ACTIVE_SSH_ORIGINAL_PORTS:-}"
+    local has_port_change="${ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE:-0}"
+
+    [ -n "$snapshot_dir" ] || return 1
+    # 先撤销活动标记，提交后即使收到信号也不应回滚已验收的健康配置。
+    ACTIVE_SSH_TRANSACTION_DIR=""
+    ACTIVE_SSH_ORIGINAL_PORTS=""
+    ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE=0
+    if remove_ssh_restore_snapshot "$snapshot_dir"; then
         return 0
     fi
-    warn "无法自动对账 SSH 端口；临时防火墙规则已保留，请勿关闭当前连接。"
+    ACTIVE_SSH_ORIGINAL_PORTS="$original_ports"
+    ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE="$has_port_change"
+    ACTIVE_SSH_TRANSACTION_DIR="$snapshot_dir"
     return 1
 }
 
-restore_vpsbox_ssh_config() {
-    local confirm tmp original_ports current_ports transition_ports
+rollback_active_ssh_transaction() {
+    local snapshot_dir="${ACTIVE_SSH_TRANSACTION_DIR:-}"
+    local original_ports="${ACTIVE_SSH_ORIGINAL_PORTS:-}"
+    local has_port_change="${ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE:-0}"
+    local restored=0 failed=0
 
-    [ "$(manifest_value APPLIED_SSH_CONFIG 2>/dev/null || true)" = "1" ] || {
-        warn "没有已记录的 vpsbox SSH 配置可恢复。"
-        return 0
-    }
-    original_ports="$(manifest_value SSH_PORTS 2>/dev/null || true)"
-    original_ports="$(normalize_port_csv "$original_ports")" || {
-        err "记录的 SSH 原端口无效，已拒绝自动恢复。"
-        return 1
-    }
-    [ -n "$original_ports" ] || {
-        err "未记录可恢复的 SSH 原端口，已拒绝自动恢复。"
-        return 1
-    }
-    # 恢复入口必须在当前 sshd_config 已损坏时仍可使用，因此安全端口取自
-    # 实际监听和当前 SSH 连接，不再依赖 sshd -T 成功。
-    current_ports="$(ssh_listening_ports_csv 2>/dev/null || true)"
-    current_ports="$(merge_port_csv "$current_ports" "$(ssh_connection_server_port 2>/dev/null || true)")" ||
-        return 1
-    transition_ports="$(merge_port_csv "$original_ports" "$current_ports")" || return 1
-    [ -n "$transition_ports" ] || {
-        err "无法确定待恢复或当前连接使用的 SSH 安全端口，已拒绝自动恢复。"
-        return 1
-    }
-    echo "将恢复 SSH 主配置及 vpsbox 端口/加固 drop-in。"
-    echo "预期恢复端口：${original_ports:-未知}；当前连接可能断开。"
-    if ! read -r -p "请确认已有控制台或备用连接。输入 YES 执行 SSH 恢复：" confirm; then
-        info "输入已结束，已取消 SSH 恢复。"
-        return 0
+    [ -n "$snapshot_dir" ] || return 0
+    if [ -n "${ACTIVE_FAIL2BAN_SYNC_WAS_RUNNING:-}" ]; then
+        cleanup_active_fail2ban_sync || failed=1
     fi
-    [ "$confirm" = "YES" ] || { info "已取消 SSH 恢复。"; return 0; }
-    if ! ssh_firewall_transition_begin "$transition_ports"; then
-        err "主机防火墙无法临时放行待恢复的 SSH 端口，已取消恢复。"
+    if restore_ssh_runtime_snapshot "$snapshot_dir" "$original_ports"; then
+        restored=1
+    else
+        failed=1
+    fi
+    if [ "$restored" -eq 1 ] && ! sync_fail2ban_sshd_port; then
+        failed=1
+    fi
+    if [ "${ACTIVE_SSH_FIREWALL_TRANSITION:-0}" = "1" ]; then
+        if ! ssh_firewall_transition_abort; then
+            failed=1
+        fi
+    elif [ -n "${ACTIVE_FIREWALL_TRANSITION_DIR:-}" ]; then
+        if ! firewall_abort_port_transition; then
+            failed=1
+        fi
+    elif [ "$has_port_change" = "1" ] && firewall_runtime_enabled; then
+        if ! ssh_firewall_sync_current_safe_ports; then
+            failed=1
+        fi
+    fi
+    if [ "$failed" -ne 0 ]; then
         return 1
     fi
 
-    if ! create_ssh_restore_snapshot tmp; then
-        ssh_firewall_transition_abort || true
-        err "无法创建可校验的 SSH 恢复前快照，已取消恢复。"
+    ACTIVE_SSH_TRANSACTION_DIR=""
+    ACTIVE_SSH_ORIGINAL_PORTS=""
+    ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE=0
+    if remove_ssh_restore_snapshot "$snapshot_dir"; then
+        return 0
+    fi
+    ACTIVE_SSH_ORIGINAL_PORTS="$original_ports"
+    ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE="$has_port_change"
+    ACTIVE_SSH_TRANSACTION_DIR="$snapshot_dir"
+    return 1
+}
+
+fail_ssh_runtime_transaction() {
+    local reason="$1" snapshot_dir="${ACTIVE_SSH_TRANSACTION_DIR:-}"
+
+    err "$reason，正在恢复修改前的 SSH 状态。"
+    if rollback_active_ssh_transaction; then
+        info "已恢复修改前的 SSH 配置、监听、Fail2ban 与防火墙状态。"
+        return 0
+    fi
+    err "SSH 自动回滚未完成；请勿关闭当前连接，并通过控制台检查。"
+    [ -z "$snapshot_dir" ] || warn "运行期快照已保留：$snapshot_dir"
+    return 1
+}
+
+restore_ssh_port_to_22() {
+    local confirm original_ports docker_ports status
+
+    if ! sshd_binary >/dev/null 2>&1; then
+        err "未找到 sshd，无法恢复 SSH 端口。"
         return 1
     fi
-    if ! restore_change_file SSHD_MAIN "$SSHD_MAIN_CONF" || ! restore_change_file SSHD_PORT "$SSHD_VPSBOX_PORT_CONF" || ! restore_change_file SSHD_HARDENING "$SSHD_VPSBOX_HARDENING_CONF" || ! "$(sshd_binary)" -t; then
-        err "SSH 恢复配置校验失败，正在回滚当前配置。"
-        if settle_failed_ssh_restore "$tmp" "$current_ports"; then
-            remove_ssh_restore_snapshot "$tmp" ||
-                warn "SSH 已回滚，但恢复前快照未能清理：$tmp"
-        else
-            err "SSH 自动回滚未完成，已保留本次恢复前快照：$tmp"
+    [ -f "$SSHD_MAIN_CONF" ] && [ ! -L "$SSHD_MAIN_CONF" ] || {
+        err "SSH 主配置不存在或不是安全的普通文件：$SSHD_MAIN_CONF"
+        return 1
+    }
+    if ssh_socket_activation_enabled_or_active; then
+        err "检测到 SSH socket activation 正在运行或已启用，已拒绝自动恢复端口。"
+        return 1
+    fi
+    command -v ss >/dev/null 2>&1 || {
+        err "缺少 ss，无法可靠检查 SSH 端口占用。"
+        return 1
+    }
+
+    SSH_TARGET_PORT=22
+    if port_is_effective_ssh_port 22; then
+        :
+    else
+        status=$?
+        if [ "$status" -ne 1 ]; then
+            err "无法读取 SSH 当前生效端口，已取消恢复。"
+            return 1
         fi
-        return 1
-    fi
-    if ! restart_ssh_service || ! wait_for_any_ssh_listener_csv "$original_ports"; then
-        err "SSH 服务未能在原端口恢复监听，正在回滚当前配置。"
-        if settle_failed_ssh_restore "$tmp" "$current_ports"; then
-            remove_ssh_restore_snapshot "$tmp" ||
-                warn "SSH 已回滚，但恢复前快照未能清理：$tmp"
+        if port_in_use_tcp 22; then
+            err "TCP 22 已被其他服务占用，无法恢复 SSH 端口。"
+            return 1
         else
-            err "SSH 自动回滚未完成，已保留本次恢复前快照：$tmp"
+            status=$?
+            [ "$status" -eq 1 ] || {
+                err "无法检查 TCP 22 的监听状态，已取消恢复。"
+                return 1
+            }
         fi
-        return 1
-    fi
-    if ! ssh_firewall_transition_finish; then
-        err "主机防火墙无法同步恢复后的 SSH 端口，正在回滚当前配置。"
-        if settle_failed_ssh_restore "$tmp" "$current_ports"; then
-            remove_ssh_restore_snapshot "$tmp" ||
-                warn "SSH 已回滚，但恢复前快照未能清理：$tmp"
-        else
-            err "SSH 自动回滚未完成，已保留本次恢复前快照：$tmp"
+        docker_ports="$(docker_reserved_ports_for_port_choice tcp)" || {
+            err "无法可靠读取 Docker 已发布端口，已取消恢复。"
+            return 1
+        }
+        if csv_contains_port "$docker_ports" 22; then
+            err "TCP 22 已被 Docker 发布规则占用，无法恢复 SSH 端口。"
+            return 1
         fi
-        return 1
     fi
-    remove_ssh_restore_snapshot "$tmp" ||
-        warn "SSH 已恢复，但恢复前快照未能清理：$tmp"
-    if ! clear_ssh_change_tracking; then
-        err "SSH 配置已恢复，但变更清单清理失败；已保留剩余记录供人工核验。"
+    validate_ssh_access_controls || {
+        err "本机访问控制检查未通过，未修改 SSH 配置。"
         return 1
+    }
+    original_ports="$(ssh_effective_ports_csv)" || {
+        err "无法读取 SSH 当前生效端口，已取消恢复。"
+        return 1
+    }
+
+    echo "将仅把 SSH 端口恢复为 22；现有 SSH 基础加固配置保持不变。"
+    echo "请先确认商家安全组及其他外部防火墙已放行 TCP 22。"
+    if ! read -r -p "请确认已有控制台或备用连接。输入 YES 恢复 SSH 端口为 22：" confirm; then
+        info "输入已结束，已取消 SSH 端口恢复。"
+        return 0
     fi
-    sync_fail2ban_sshd_port || warn "SSH 已恢复，但 Fail2ban 端口同步失败，请手动检查。"
-    info "SSH 配置已恢复，请立即用新窗口验证原端口连接。"
+    [ "$confirm" = "YES" ] || { info "已取消 SSH 端口恢复。"; return 0; }
+
+    apply_ssh_port_target_transaction "$original_ports" || return 1
+    info "SSH 端口已恢复为 22，SSH 基础加固配置未修改。"
+    warn "不要关闭当前 SSH 窗口，请另开新窗口测试 TCP 22 登录。"
 }
 
 ssh_port_change_menu() {
@@ -10162,7 +10563,7 @@ ssh_port_change_menu() {
 $(ssh_port_change_firewall_hint)
 ----------------------------------------
  [1] 应用 SSH 端口修改
- [2] 恢复 vpsbox SSH 配置（高风险）
+ [2] 恢复 SSH 端口为 22
 ----------------------------------------
  [0] 返回系统优化
 ========================================
@@ -10172,7 +10573,7 @@ EOF
 
         case "$opt" in
             1) run_menu_action apply_ssh_port_change; pause ;;
-            2) run_menu_action restore_vpsbox_ssh_config; pause ;;
+            2) run_menu_action restore_ssh_port_to_22; pause ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
