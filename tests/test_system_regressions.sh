@@ -312,6 +312,17 @@ test_chrony_source_layout_detection() {
         chrony_expected_sources > "$CHRONY_SOURCE_FILE"
         chrony_sources_are_current || fail "独立 sources.d 配置应识别为当前状态"
 
+        printf 'sourcedir /etc/chrony/sources.d/ # trailing slash\n' > "$test_conf"
+        chrony_sources_are_current || fail "带尾部斜杠的 sources.d 配置应识别为当前状态"
+        printf 'sourcedir /etc/chrony/sources.d//\n' > "$test_conf"
+        if chrony_main_uses_source_dir "$test_conf"; then
+            fail "双尾部斜杠不得被识别为规范 sources.d 路径"
+        fi
+        printf 'sourcedir /etc/chrony/sources.d/extra\n' > "$test_conf"
+        if chrony_main_uses_source_dir "$test_conf"; then
+            fail "sources.d 子路径不得被识别为规范目录"
+        fi
+
         rm -f "$CHRONY_SOURCE_FILE"
         printf 'driftfile /var/lib/chrony/drift\n\n%s\n' "$NTP_SOURCES_BEGIN" > "$test_conf"
         chrony_expected_sources >> "$test_conf"
@@ -367,7 +378,7 @@ test_chrony_sourcedir_inside_managed_block_is_not_external() {
         local conf="$TEST_TMP/chrony-sourcedir-inside-block.conf"
 
         printf '%s\n' "$NTP_SOURCES_BEGIN" \
-            'sourcedir /etc/chrony/sources.d' "$NTP_SOURCES_END" > "$conf"
+            'sourcedir /etc/chrony/sources.d/' "$NTP_SOURCES_END" > "$conf"
 
         if chrony_main_uses_source_dir "$conf"; then
             fail "旧管理块内的 sourcedir 不得被识别为用户的外部 sourcedir"
@@ -776,6 +787,153 @@ test_enable_ntp_failure_stages_enter_runtime_rollback() {
     done
 }
 
+test_ntp_pre_mutation_snapshot_failures_clear_new_tracking() {
+    local stage
+
+    for stage in directory conf-copy sources-copy arm; do
+        (
+            local case_dir="$TEST_TMP/ntp-pre-mutation-$stage"
+            local conf_path="$case_dir/chrony.conf" cp_target
+
+            mkdir -p "$case_dir"
+            reset_change_store "ntp-pre-mutation-$stage"
+            CHRONY_SOURCE_FILE="$case_dir/vpsbox.sources"
+            printf '%s\n' old-conf > "$conf_path"
+            printf '%s\n' old-sources > "$CHRONY_SOURCE_FILE"
+
+            detect_os() { OS=debian; }
+            is_systemd() { return 0; }
+            chrony_service_name() { printf '%s\n' chrony; }
+            chrony_conf_path() { printf '%s\n' "$conf_path"; }
+            chrony_sources_are_current() { return 1; }
+            ntp_package_installed() { [ "$1" = chrony ]; }
+            systemd_unit_exists() { [ "$1" = chrony.service ]; }
+            systemctl() {
+                case "$*" in
+                    'is-active --quiet chrony'|'is-enabled --quiet chrony') return 0 ;;
+                    *) forbid "NTP 快照建立前不得修改服务：$*" ;;
+                esac
+            }
+            apt_get_bounded() { forbid "NTP 快照建立前不得调用包管理器"; }
+            write_chrony_sources() { forbid "NTP 快照建立前不得写配置"; }
+            show_ntp_runtime_details() { forbid "NTP 快照失败后不得进入成功展示"; }
+            sleep() { forbid "NTP 快照失败后不得等待服务"; }
+            mktemp() {
+                if [ "$stage" = directory ] && [ "${1:-}" = -d ] &&
+                    [ "${2:-}" = /tmp/vpsbox-chrony.XXXXXX ]; then
+                    return 41
+                fi
+                command mktemp "$@"
+            }
+            cp() {
+                cp_target="${*: -1}"
+                case "$cp_target" in
+                    "$CHANGE_BACKUP_DIR"/NTP_*)
+                        assert_eq 1 "${ACTIVE_NTP_TRACKING_CANCEL:-0}" \
+                            "NTP 必须在写第一份持久恢复记录前登记退出清理" || return 44
+                        ;;
+                esac
+                if { [ "$stage" = conf-copy ] && [[ "$cp_target" == */conf ]]; } ||
+                    { [ "$stage" = sources-copy ] && [[ "$cp_target" == */sources ]]; }; then
+                    return 42
+                fi
+                command cp "$@"
+            }
+            if [ "$stage" = arm ]; then
+                arm_ntp_runtime_rollback() { return 43; }
+            fi
+
+            forbid_init
+            if enable_ntp_sync > "$case_dir/output" 2>&1; then
+                fail "NTP 的 $stage 快照阶段失败时入口不得报告成功"
+            fi
+            assert_file_not_contains "$CHANGE_MANIFEST" \
+                '^(BACKUP_NTP_|PENDING_NTP_|APPLIED_NTP_|NTP_)' \
+                "NTP 尚未修改时不得留下首次恢复记录"
+            if find "$CHANGE_BACKUP_DIR" -maxdepth 1 -type f -name 'NTP_*' -print -quit |
+                grep -q .; then
+                fail "NTP 尚未修改时不得留下首次配置备份"
+            fi
+            assert_file_contains "$conf_path" '^old-conf$'
+            assert_file_contains "$CHRONY_SOURCE_FILE" '^old-sources$'
+            assert_eq "" "${ACTIVE_NTP_SNAPSHOT:-}" "NTP 快照失败后不得留下活动句柄"
+            assert_eq 0 "${ACTIVE_NTP_TRACKING_CANCEL:-0}" \
+                "NTP 快照失败后不得留下首次记录清理句柄"
+            assert_no_forbidden "NTP 快照建立失败后产生了系统修改"
+        )
+    done
+}
+
+test_ntp_pre_mutation_tracking_is_covered_by_runtime_cleanup() {
+    (
+        local case_dir="$TEST_TMP/ntp-pre-mutation-cleanup"
+        local conf_path="$case_dir/chrony.conf"
+
+        mkdir -p "$case_dir"
+        reset_change_store ntp-pre-mutation-cleanup
+        CHRONY_SOURCE_FILE="$case_dir/vpsbox.sources"
+        printf '%s\n' old-conf > "$conf_path"
+        printf '%s\n' old-sources > "$CHRONY_SOURCE_FILE"
+
+        ACTIVE_NTP_SNAPSHOT=""
+        # shellcheck disable=SC2034 # 被测统一退出清理通过动态作用域读取。
+        ACTIVE_NTP_ROLLBACK_ARGS=()
+        ACTIVE_NTP_SERVICE_ROLLBACK=0
+        ACTIVE_NTP_SERVICE_ROLLBACK_ARGS=()
+        ACTIVE_NTP_TRACKING_CANCEL=1
+        backup_change_file_once NTP_CONF "$conf_path"
+        manifest_set NTP_CHRONY_ACTIVE active
+        mark_change_applied NTP_CONF
+        cleanup_vpsbox_lock() { :; }
+
+        cleanup_vpsbox_runtime
+
+        assert_file_not_contains "$CHANGE_MANIFEST" \
+            '^(BACKUP_NTP_|PENDING_NTP_|APPLIED_NTP_|NTP_)' \
+            "NTP 受控退出必须清除尚未修改系统的首次恢复记录"
+        [ ! -e "$CHANGE_BACKUP_DIR/NTP_CONF" ] ||
+            fail "NTP 受控退出必须清除尚未使用的首次配置备份"
+        assert_eq 0 "${ACTIVE_NTP_TRACKING_CANCEL:-0}" \
+            "NTP 受控退出清理成功后必须清除活动句柄"
+        assert_file_contains "$conf_path" '^old-conf$'
+        assert_file_contains "$CHRONY_SOURCE_FILE" '^old-sources$'
+    )
+}
+
+test_cancel_unmodified_ntp_tracking_preserves_existing_baseline() {
+    (
+        local case_dir="$TEST_TMP/ntp-existing-baseline"
+        local conf="$case_dir/chrony.conf" before_manifest before_conf before_sources
+
+        mkdir -p "$case_dir"
+        reset_change_store ntp-existing-baseline
+        CHRONY_SOURCE_FILE="$case_dir/vpsbox.sources"
+        printf '%s\n' original-conf > "$conf"
+        printf '%s\n' original-sources > "$CHRONY_SOURCE_FILE"
+        backup_change_file_once NTP_CONF "$conf"
+        backup_change_file_once NTP_SOURCES "$CHRONY_SOURCE_FILE"
+        manifest_set NTP_CHRONY_ACTIVE active
+        manifest_set NTP_CHRONY_ENABLED enabled
+        manifest_set NTP_CHRONY_PACKAGE installed
+        manifest_set NTP_CHRONY_UNIT present
+        manifest_set NTP_TIMESYNCD_ACTIVE inactive
+        manifest_set NTP_TIMESYNCD_ENABLED disabled
+        manifest_set NTP_TIMESYNCD_PACKAGE absent
+        manifest_set NTP_TIMESYNCD_UNIT absent
+        mark_change_applied NTP_CONF
+        before_manifest="$(cksum < "$CHANGE_MANIFEST")"
+        before_conf="$(cksum < "$CHANGE_BACKUP_DIR/NTP_CONF")"
+        before_sources="$(cksum < "$CHANGE_BACKUP_DIR/NTP_SOURCES")"
+
+        cancel_unmodified_ntp_tracking 1
+
+        assert_eq "$before_manifest" "$(cksum < "$CHANGE_MANIFEST")" \
+            "既有 NTP 恢复清单不得被首次失败清理"
+        assert_eq "$before_conf" "$(cksum < "$CHANGE_BACKUP_DIR/NTP_CONF")"
+        assert_eq "$before_sources" "$(cksum < "$CHANGE_BACKUP_DIR/NTP_SOURCES")"
+    )
+}
+
 test_bbr_fq_healthy_is_noop() {
     (
         local log="$TEST_TMP/bbr-healthy.log"
@@ -1044,6 +1202,53 @@ test_tcp_buffer_cancel_invalid_default_and_healthy_noop_are_read_only() {
     )
 }
 
+test_tcp_buffer_abnormal_managed_config_is_rejected_read_only() {
+    local mode
+
+    for mode in comment extra unknown-tier; do
+        (
+            local output="$TEST_TMP/tcp-buffer-abnormal-$mode.out" before after
+
+            setup_tcp_buffer_case "abnormal-$mode"
+            case "$mode" in
+                comment)
+                    {
+                        printf '%s\n' '# operator note'
+                        render_tcp_buffer_config \
+                            '8388608 8388608 4096,131072,8388608 4096,16384,8388608'
+                    } > "$TCP_BUFFER_CONF"
+                    ;;
+                extra)
+                    render_tcp_buffer_config \
+                        '8388608 8388608 4096,131072,8388608 4096,16384,8388608' \
+                        > "$TCP_BUFFER_CONF"
+                    printf '%s\n' 'net.ipv4.tcp_no_metrics_save = 1' >> "$TCP_BUFFER_CONF"
+                    ;;
+                unknown-tier)
+                    render_tcp_buffer_config \
+                        '10485760 10485760 4096,131072,10485760 4096,16384,10485760' \
+                        > "$TCP_BUFFER_CONF"
+                    ;;
+            esac
+            before="$(cksum < "$TCP_BUFFER_CONF")"
+            forbid_init
+            sysctl() { forbid "异常 TCP 配置不得读取或修改运行参数"; }
+            confirm_default_yes() { forbid "异常 TCP 配置不得询问覆盖确认"; }
+            backup_change_file_once() { forbid "异常 TCP 配置不得创建恢复备份"; }
+            mktemp() { forbid "异常 TCP 配置不得创建发布临时文件"; }
+
+            if apply_tcp_buffer_tier 1 > "$output" 2>&1; then
+                fail "TCP 的 $mode 异常受管配置不得被覆盖"
+            fi
+            after="$(cksum < "$TCP_BUFFER_CONF")"
+            assert_eq "$before" "$after" "异常 TCP 配置必须逐字节保持不变"
+            assert_file_contains "$output" '内容不符合 VPSBox TCP 四项档位模板，已拒绝覆盖'
+            [ ! -e "$CHANGE_MANIFEST" ] || fail "拒绝异常 TCP 配置后不得创建恢复记录"
+            assert_no_forbidden "异常 TCP 配置拒绝路径仍产生了副作用"
+        )
+    done
+}
+
 test_tcp_buffer_failures_restore_runtime_or_keep_pending_record() {
     (
         local output="$TEST_TMP/tcp-buffer-apply-failure.out"
@@ -1079,9 +1284,13 @@ test_tcp_buffer_failures_restore_runtime_or_keep_pending_record() {
 test_tcp_buffer_publish_failure_preserves_existing_file() {
     (
         local output="$TEST_TMP/tcp-buffer-publish-failure.out"
+        local before after
 
         setup_tcp_buffer_case publish-failure
-        printf '%s\n' 'custom-setting=keep' > "$TCP_BUFFER_CONF"
+        render_tcp_buffer_config \
+            '16777216 16777216 4096,131072,16777216 4096,16384,16777216' \
+            > "$TCP_BUFFER_CONF"
+        before="$(cksum < "$TCP_BUFFER_CONF")"
         mv() {
             local last="${!#}"
             [ "$last" != "$TCP_BUFFER_CONF" ] || return 42
@@ -1091,7 +1300,8 @@ test_tcp_buffer_publish_failure_preserves_existing_file() {
         if apply_tcp_buffer_tier 1 <<< "" > "$output" 2>&1; then
             fail "TCP 缓冲区配置发布失败时不得报告成功"
         fi
-        assert_file_contains "$TCP_BUFFER_CONF" '^custom-setting=keep$'
+        after="$(cksum < "$TCP_BUFFER_CONF")"
+        assert_eq "$before" "$after" "TCP 发布失败时必须逐字节保留原受管配置"
         assert_eq "212992 212992 4096 131072 6291456 4096 16384 4194304" \
             "$TCP_TEST_CORE_RMEM $TCP_TEST_CORE_WMEM $TCP_TEST_TCP_RMEM $TCP_TEST_TCP_WMEM"
         assert_file_not_contains "$CHANGE_MANIFEST" \
@@ -1137,6 +1347,7 @@ setup_ipv6_disable_case() {
     IPV6_TEST_APPLY_FAIL=0
     IPV6_TEST_KEEP_ADDRESSES=0
     IPV6_TEST_RESTORE_FAIL_KEY=""
+    IPV6_TEST_WRITE_FAIL_ONCE_KEY=""
     IPV6_TEST_ADDRESSES=$'2: ens17 inet6 2001:db8:100::7f/64 scope global\n2: ens17 inet6 2001:db8:100::80/64 scope global'
     IPV6_TEST_SYSCTL_LOG="$IPV6_TEST_DIR/sysctl.log"
     mkdir -p "$IPV6_TEST_DIR"
@@ -1176,6 +1387,10 @@ setup_ipv6_disable_case() {
                 printf 'w:%s\n' "$2" >> "$IPV6_TEST_SYSCTL_LOG"
                 key="${2%%=*}"
                 value="${2#*=}"
+                if [ "$key" = "$IPV6_TEST_WRITE_FAIL_ONCE_KEY" ]; then
+                    IPV6_TEST_WRITE_FAIL_ONCE_KEY=""
+                    return 42
+                fi
                 [ "$key" != "$IPV6_TEST_RESTORE_FAIL_KEY" ] || return 43
                 case "$key" in
                     net.ipv6.conf.all.disable_ipv6) IPV6_TEST_ALL="$value" ;;
@@ -1447,6 +1662,68 @@ test_ipv6_untracked_config_uses_explicit_reenable_path() {
         assert_file_contains "$output" '不属于精确还原'
         assert_file_contains "$output" 'all/default/lo 已设置为 0'
         assert_file_contains "$output" '已重新检测到全局 IPv6 地址'
+        assert_eq "" "${ACTIVE_IPV6_REENABLE_SNAPSHOT:-}" \
+            "IPv6 重新启用成功后必须清除活动回滚句柄"
+        if find "$IPV6_TEST_DIR" -maxdepth 1 -name '.vpsbox-enable-ipv6.*' -print -quit |
+            grep -q .; then
+            fail "IPv6 重新启用成功后不得残留临时快照"
+        fi
+    )
+}
+
+test_ipv6_untracked_reenable_failure_restores_original_state() {
+    (
+        local output="$TEST_TMP/ipv6-untracked-reenable-failure.out"
+
+        setup_ipv6_disable_case untracked-reenable-failure
+        render_ipv6_disable_config > "$IPV6_DISABLE_CONF"
+        IPV6_TEST_ALL=1
+        IPV6_TEST_DEFAULT=1
+        IPV6_TEST_LO=1
+        IPV6_TEST_WRITE_FAIL_ONCE_KEY=net.ipv6.conf.default.disable_ipv6
+
+        if reenable_untracked_ipv6 > "$output" 2>&1; then
+            fail "IPv6 运行参数部分写入失败时不得报告重新启用成功"
+        fi
+        ipv6_disable_config_is_current || fail "IPv6 重新启用失败后必须保留禁用配置"
+        assert_eq "1 1 1" "$IPV6_TEST_ALL $IPV6_TEST_DEFAULT $IPV6_TEST_LO" \
+            "IPv6 重新启用失败后必须恢复原运行参数"
+        assert_eq "" "${ACTIVE_IPV6_REENABLE_SNAPSHOT:-}" \
+            "IPv6 回滚成功后必须清除活动句柄"
+        assert_file_contains "$output" '已恢复原禁用配置和运行参数'
+        if find "$IPV6_TEST_DIR" -maxdepth 1 -name '.vpsbox-enable-ipv6.*' -print -quit |
+            grep -q .; then
+            fail "IPv6 回滚成功后不得残留临时快照"
+        fi
+    )
+}
+
+test_runtime_cleanup_rolls_back_active_untracked_ipv6_reenable() {
+    (
+        local snapshot
+
+        setup_ipv6_disable_case untracked-reenable-cleanup
+        render_ipv6_disable_config > "$IPV6_DISABLE_CONF"
+        IPV6_TEST_ALL=1
+        IPV6_TEST_DEFAULT=1
+        IPV6_TEST_LO=1
+        snapshot="$(mktemp "$IPV6_TEST_DIR/.vpsbox-enable-ipv6.XXXXXX")"
+        cp -a -- "$IPV6_DISABLE_CONF" "$snapshot"
+        arm_untracked_ipv6_reenable_rollback "$snapshot" 1 1 1
+        IPV6_TEST_ALL=0
+        IPV6_TEST_DEFAULT=1
+        IPV6_TEST_LO=0
+        rm -f -- "$IPV6_DISABLE_CONF"
+        cleanup_vpsbox_lock() { return 0; }
+
+        cleanup_vpsbox_runtime
+
+        ipv6_disable_config_is_current || fail "统一退出清理必须恢复 IPv6 禁用配置"
+        assert_eq "1 1 1" "$IPV6_TEST_ALL $IPV6_TEST_DEFAULT $IPV6_TEST_LO" \
+            "统一退出清理必须恢复 IPv6 原运行参数"
+        assert_eq "" "${ACTIVE_IPV6_REENABLE_SNAPSHOT:-}" \
+            "统一退出清理成功后必须清除 IPv6 活动句柄"
+        [ ! -e "$snapshot" ] || fail "统一退出回滚成功后必须清理 IPv6 临时快照"
     )
 }
 
@@ -1649,6 +1926,47 @@ test_ssh_port_transaction_stage_order_and_rollback() {
     done
 }
 
+test_ssh_port_conflicting_main_and_dropin_converge_to_main() {
+    (
+        local ssh_dir="$TEST_TMP/ssh-port-source-conflict" output
+
+        mkdir -p "$ssh_dir/sshd_config.d"
+        SSHD_MAIN_CONF="$ssh_dir/sshd_config"
+        SSHD_CONFIG_DIR="$ssh_dir/sshd_config.d"
+        SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
+        SSHD_VPSBOX_HARDENING_CONF="$SSHD_CONFIG_DIR/01-vpsbox-ssh-hardening.conf"
+        SSH_TARGET_PORT=49222
+        output="$ssh_dir/output"
+        printf '%s\n' "Include $SSHD_VPSBOX_PORT_CONF" 'Port 22' > "$SSHD_MAIN_CONF"
+        printf '%s\n' '# Managed by vpsbox' 'Port 23333' > "$SSHD_VPSBOX_PORT_CONF"
+
+        begin_ssh_runtime_transaction() { [ "$1" = "22,23333" ] && [ "$2" = 1 ]; }
+        ssh_firewall_transition_begin() { [ "$1" = "$SSH_TARGET_PORT" ]; }
+        write_vpsbox_ssh_port_config() { forbid "双来源冲突不得继续写入端口 drop-in"; }
+        validate_ssh_port_effective_config() {
+            assert_file_contains "$SSHD_MAIN_CONF" "^Include $SSHD_VPSBOX_PORT_CONF$"
+            assert_file_contains "$SSHD_MAIN_CONF" '^Port 49222$'
+            assert_eq 1 "$(grep -Eic '^[[:space:]]*port[[:space:]]+' "$SSHD_MAIN_CONF")"
+            [ ! -e "$SSHD_VPSBOX_PORT_CONF" ] ||
+                fail "主配置成为权威来源后必须停用已加载的 VPSBox 端口 drop-in"
+        }
+        restart_ssh_service() { return 0; }
+        wait_for_ssh_listener() { [ "$1" = "$SSH_TARGET_PORT" ]; }
+        sync_fail2ban_sshd_port() { return 0; }
+        ssh_firewall_transition_finish() { return 0; }
+        commit_ssh_runtime_transaction() { return 0; }
+        retire_legacy_ssh_change_tracking() { return 0; }
+        fail2ban_installed() { return 1; }
+        fail_ssh_runtime_transaction() { forbid "SSH 双来源收敛不应进入回滚：$1"; }
+
+        forbid_init
+        apply_ssh_port_target_transaction 22,23333 > "$output"
+
+        assert_file_contains "$output" 'SSH 配置写入位置：主配置（已停用 VPSBox 端口 drop-in）'
+        assert_no_forbidden "SSH 双来源收敛走错写入或回滚分支"
+    )
+}
+
 test_runtime_cleanup_rolls_back_active_ssh_transaction() {
     (
         local log="$TEST_TMP/ssh-cleanup-active.log"
@@ -1774,6 +2092,27 @@ test_absent_resolv_conf_is_created_successfully() {
         assert_file_contains "$RESOLV_CONF" '^nameserver 1\.1\.1\.1$'
         assert_file_contains "$RESOLV_CONF" '^nameserver 8\.8\.8\.8$'
         assert_file_contains "$CHANGE_MANIFEST" '^APPLIED_DNS_RESOLV=1$'
+    )
+}
+
+test_resolv_conf_ipv4_replacement_preserves_ipv6_and_other_lines() {
+    (
+        local source="$TEST_TMP/resolv-preserve-ipv6.conf" actual expected
+
+        printf '%s\n' \
+            '# resolver note' \
+            ' nameserver 9.9.9.9 # replace valid IPv4' \
+            'nameserver 2001:db8::53' \
+            'nameserver 999.1.1.1' \
+            'nameserver 01.1.1.1' \
+            'search example.test' \
+            'options timeout:2' \
+            '' > "$source"
+
+        actual="$(render_resolv_conf_dns 1.1.1.1 8.8.8.8 "$source")"
+        expected=$'nameserver 1.1.1.1\nnameserver 8.8.8.8\n# resolver note\nnameserver 2001:db8::53\nnameserver 999.1.1.1\nnameserver 01.1.1.1\nsearch example.test\noptions timeout:2'
+        assert_eq "$expected" "$actual" \
+            "修改 IPv4 DNS 必须保留 IPv6、非法地址行和其他 resolv.conf 内容"
     )
 }
 
@@ -2999,12 +3338,15 @@ main() {
     local name
     local -a required=(
         cancel_unmodified_change_transaction
+        cancel_unmodified_ntp_tracking
         change_restore_state
         create_dns_operation_snapshot
         chrony_main_uses_source_dir
         chrony_sources_are_current
         chrony_vpsbox_markers_valid
         disable_ipv6
+        rollback_active_untracked_ipv6_reenable
+        resolv_conf_line_is_ipv4_nameserver
         apply_tcp_buffer_tier
         enable_bbr_fq
         ensure_public_config_dir
@@ -3058,6 +3400,9 @@ main() {
         test_ntp_light_repair_reports_restore_outcome
         test_ntp_light_repair_is_covered_by_runtime_cleanup
         test_enable_ntp_failure_stages_enter_runtime_rollback
+        test_ntp_pre_mutation_snapshot_failures_clear_new_tracking
+        test_ntp_pre_mutation_tracking_is_covered_by_runtime_cleanup
+        test_cancel_unmodified_ntp_tracking_preserves_existing_baseline
         test_ipv6_no_global_address_is_noop_and_detection_failure_is_fatal
         test_ipv6_addresses_are_displayed_and_cancel_is_read_only
         test_ipv6_ssh_session_is_rejected_before_confirmation
@@ -3068,12 +3413,15 @@ main() {
         test_ipv6_failed_runtime_restore_reports_manual_recovery
         test_ipv6_recorded_restore_recovers_file_and_runtime
         test_ipv6_untracked_config_uses_explicit_reenable_path
+        test_ipv6_untracked_reenable_failure_restores_original_state
+        test_runtime_cleanup_rolls_back_active_untracked_ipv6_reenable
         test_bbr_fq_healthy_is_noop
         test_bbr_fq_runtime_drift_uses_light_repair
         test_unsupported_kernel_leaves_no_phantom_pending_change
         test_failed_bbr_runtime_restore_keeps_recovery_transaction
         test_tcp_buffer_tiers_preserve_defaults_and_restore_first_baseline
         test_tcp_buffer_cancel_invalid_default_and_healthy_noop_are_read_only
+        test_tcp_buffer_abnormal_managed_config_is_rejected_read_only
         test_tcp_buffer_failures_restore_runtime_or_keep_pending_record
         test_tcp_buffer_publish_failure_preserves_existing_file
         test_tcp_buffer_restore_rejects_invalid_metadata_before_mutation
@@ -3081,11 +3429,13 @@ main() {
         test_journald_apply_and_failed_restart_restore_previous_config
         test_ssh_snapshot_root_and_transaction_names_are_restricted
         test_ssh_port_transaction_stage_order_and_rollback
+        test_ssh_port_conflicting_main_and_dropin_converge_to_main
         test_runtime_cleanup_rolls_back_active_ssh_transaction
         test_finished_ssh_firewall_is_resynced_during_rollback
         test_successful_ssh_transaction_uses_only_runtime_snapshot
         test_effective_hardening_force_rewrite_consumes_one_confirmation
         test_absent_resolv_conf_is_created_successfully
+        test_resolv_conf_ipv4_replacement_preserves_ipv6_and_other_lines
         test_identical_resolv_conf_is_side_effect_free
         test_identical_systemd_resolved_config_repairs_only_service_state
         test_dns_operation_snapshot_restores_existing_and_absent_targets

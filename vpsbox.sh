@@ -133,6 +133,9 @@ ACTIVE_NTP_SNAPSHOT=""
 ACTIVE_NTP_ROLLBACK_ARGS=()
 ACTIVE_NTP_SERVICE_ROLLBACK=0
 ACTIVE_NTP_SERVICE_ROLLBACK_ARGS=()
+ACTIVE_NTP_TRACKING_CANCEL=0
+ACTIVE_IPV6_REENABLE_SNAPSHOT=""
+ACTIVE_IPV6_REENABLE_OLD_VALUES=""
 ACTIVE_SINGBOX_UPDATE_BINARY=""
 ACTIVE_SINGBOX_UPDATE_BACKUP=""
 ACTIVE_SINGBOX_UPDATE_DIR=""
@@ -652,10 +655,16 @@ cleanup_vpsbox_runtime() {
         cleanup_active_bounded_command
     fi
     if { [ -n "${ACTIVE_NTP_SNAPSHOT:-}" ] ||
-        [ "${ACTIVE_NTP_SERVICE_ROLLBACK:-0}" = "1" ]; } &&
+        [ "${ACTIVE_NTP_SERVICE_ROLLBACK:-0}" = "1" ] ||
+        [ "${ACTIVE_NTP_TRACKING_CANCEL:-0}" = "1" ]; } &&
         declare -F rollback_active_ntp_operation >/dev/null 2>&1; then
         rollback_active_ntp_operation ||
-            warn "NTP 操作被中断，配置、软件包或服务状态未能完整恢复；临时快照已保留。"
+            warn "NTP 操作被中断，首次恢复记录清理或原状态恢复未能完整完成。"
+    fi
+    if [ -n "${ACTIVE_IPV6_REENABLE_SNAPSHOT:-}" ] &&
+        declare -F rollback_active_untracked_ipv6_reenable >/dev/null 2>&1; then
+        rollback_active_untracked_ipv6_reenable ||
+            warn "IPv6 重新启用被中断，配置或运行参数未能完整恢复；临时快照已保留。"
     fi
     if declare -F rollback_active_singbox_update >/dev/null 2>&1; then
         rollback_active_singbox_update ||
@@ -7377,7 +7386,7 @@ chrony_main_uses_source_dir() {
     local file="$1"
 
     render_chrony_main_without_vpsbox_block "$file" |
-        grep -Eq '^[[:space:]]*sourcedir[[:space:]]+/etc/chrony/sources\.d([[:space:]]|$)'
+        grep -Eq '^[[:space:]]*sourcedir[[:space:]]+/etc/chrony/sources\.d/?([[:space:]]|$)'
 }
 
 stage_chrony_main_config() {
@@ -7820,6 +7829,7 @@ clear_active_ntp_operation() {
     ACTIVE_NTP_ROLLBACK_ARGS=()
     ACTIVE_NTP_SERVICE_ROLLBACK=0
     ACTIVE_NTP_SERVICE_ROLLBACK_ARGS=()
+    ACTIVE_NTP_TRACKING_CANCEL=0
 }
 
 rollback_active_ntp_operation() {
@@ -7834,9 +7844,14 @@ rollback_active_ntp_operation() {
         return 0
     fi
 
-    [ -n "$snapshot_dir" ] || return 0
-    [ "${#rollback_args[@]}" -eq 12 ] || return 1
-    settle_failed_ntp_change "$snapshot_dir" "${rollback_args[@]}"
+    if [ -n "$snapshot_dir" ]; then
+        [ "${#rollback_args[@]}" -eq 12 ] || return 1
+        settle_failed_ntp_change "$snapshot_dir" "${rollback_args[@]}"
+        return
+    fi
+    if [ "${ACTIVE_NTP_TRACKING_CANCEL:-0}" = "1" ]; then
+        cancel_unmodified_ntp_tracking 0
+    fi
 }
 
 rollback_ntp_runtime_state() {
@@ -7870,6 +7885,19 @@ clear_ntp_change_tracking() {
     return "$failed"
 }
 
+cancel_unmodified_ntp_tracking() {
+    local applied_before="$1"
+
+    case "$applied_before" in
+        0)
+            clear_ntp_change_tracking || return 1
+            ACTIVE_NTP_TRACKING_CANCEL=0
+            ;;
+        1) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 settle_failed_ntp_change() {
     local snapshot_dir="$1" conf="$2" source_file="$3" svc="$4"
     local chrony_package="$5" timesyncd_package="$6"
@@ -7884,7 +7912,7 @@ settle_failed_ntp_change() {
         err "NTP 原状态未能完整恢复；恢复记录与临时快照已保留：$snapshot_dir"
         return 1
     fi
-    if [ "$applied_before" != "1" ] && ! clear_ntp_change_tracking; then
+    if ! cancel_unmodified_ntp_tracking "$applied_before"; then
         warn "NTP 已回滚，但变更清单清理失败；恢复菜单仍会保留该项目。"
         return 1
     fi
@@ -7982,7 +8010,8 @@ enable_ntp_sync() {
     local applied_before=0
 
     { [ -z "${ACTIVE_NTP_SNAPSHOT:-}" ] &&
-        [ "${ACTIVE_NTP_SERVICE_ROLLBACK:-0}" = "0" ]; } || {
+        [ "${ACTIVE_NTP_SERVICE_ROLLBACK:-0}" = "0" ] &&
+        [ "${ACTIVE_NTP_TRACKING_CANCEL:-0}" = "0" ]; } || {
         err "当前进程仍有未完成的 NTP 回滚，已拒绝开始新的修改。"
         return 1
     }
@@ -8046,20 +8075,26 @@ enable_ntp_sync() {
     [ "$(manifest_value APPLIED_NTP_CONF 2>/dev/null || true)" = "1" ] &&
         applied_before=1
     if [ "$applied_before" -eq 0 ]; then
-        backup_change_file_once NTP_CONF "$conf" ||
-            { err "记录 chrony 原配置失败，已取消修改。"; return 1; }
-        backup_change_file_once NTP_SOURCES "$source_file" ||
-            { err "记录 NTP 源原配置失败，已取消修改。"; return 1; }
-        manifest_set_once NTP_CHRONY_ACTIVE "$chrony_active" || return 1
-        manifest_set_once NTP_CHRONY_ENABLED "$chrony_enabled" || return 1
-        manifest_set_once NTP_CHRONY_PACKAGE "$chrony_package" || return 1
-        manifest_set_once NTP_CHRONY_UNIT "$chrony_unit" || return 1
-        manifest_set_once NTP_TIMESYNCD_ACTIVE "$timesyncd_active" || return 1
-        manifest_set_once NTP_TIMESYNCD_ENABLED "$timesyncd_enabled" || return 1
-        manifest_set_once NTP_TIMESYNCD_PACKAGE "$timesyncd_package" || return 1
-        manifest_set_once NTP_TIMESYNCD_UNIT "$timesyncd_unit" || return 1
+        # 在第一份持久恢复记录前登记只清理记录的活动阶段；此时尚未修改系统。
+        ACTIVE_NTP_TRACKING_CANCEL=1
+        if ! backup_change_file_once NTP_CONF "$conf" ||
+            ! backup_change_file_once NTP_SOURCES "$source_file" ||
+            ! manifest_set_once NTP_CHRONY_ACTIVE "$chrony_active" ||
+            ! manifest_set_once NTP_CHRONY_ENABLED "$chrony_enabled" ||
+            ! manifest_set_once NTP_CHRONY_PACKAGE "$chrony_package" ||
+            ! manifest_set_once NTP_CHRONY_UNIT "$chrony_unit" ||
+            ! manifest_set_once NTP_TIMESYNCD_ACTIVE "$timesyncd_active" ||
+            ! manifest_set_once NTP_TIMESYNCD_ENABLED "$timesyncd_enabled" ||
+            ! manifest_set_once NTP_TIMESYNCD_PACKAGE "$timesyncd_package" ||
+            ! manifest_set_once NTP_TIMESYNCD_UNIT "$timesyncd_unit"; then
+            cancel_unmodified_ntp_tracking "$applied_before" ||
+                warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
+            err "记录 NTP 原状态失败，已取消修改。"
+            return 1
+        fi
         mark_change_applied NTP_CONF || {
-            clear_ntp_change_tracking || true
+            cancel_unmodified_ntp_tracking "$applied_before" ||
+                warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
             err "无法记录 NTP 事务，已取消修改。"
             return 1
         }
@@ -8071,30 +8106,59 @@ enable_ntp_sync() {
         }
     fi
 
-    backup_dir="$(mktemp -d /tmp/vpsbox-chrony.XXXXXX)" || return 1
+    backup_dir="$(mktemp -d /tmp/vpsbox-chrony.XXXXXX)" || {
+        cancel_unmodified_ntp_tracking "$applied_before" ||
+            warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
+        err "创建 NTP 临时快照目录失败，已取消修改。"
+        return 1
+    }
     if [ -f "$conf" ] && [ ! -L "$conf" ]; then
         cp -a "$conf" "$backup_dir/conf" &&
             : > "$backup_dir/conf.present" || {
-            cleanup_ntp_snapshot "$backup_dir" || true
+            cleanup_ntp_snapshot "$backup_dir" ||
+                warn "NTP 尚未修改，但临时快照清理失败：$backup_dir"
+            cancel_unmodified_ntp_tracking "$applied_before" ||
+                warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
             return 1
         }
     elif [ ! -e "$conf" ] && [ ! -L "$conf" ]; then
-        : > "$backup_dir/conf.absent"
+        if ! : > "$backup_dir/conf.absent"; then
+            cleanup_ntp_snapshot "$backup_dir" ||
+                warn "NTP 尚未修改，但临时快照清理失败：$backup_dir"
+            cancel_unmodified_ntp_tracking "$applied_before" ||
+                warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
+            return 1
+        fi
     else
-        cleanup_ntp_snapshot "$backup_dir" || true
+        cleanup_ntp_snapshot "$backup_dir" ||
+            warn "NTP 尚未修改，但临时快照清理失败：$backup_dir"
+        cancel_unmodified_ntp_tracking "$applied_before" ||
+            warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
         err "chrony 配置不是普通文件，已拒绝修改：$conf"
         return 1
     fi
     if [ -f "$source_file" ] && [ ! -L "$source_file" ]; then
         cp -a "$source_file" "$backup_dir/sources" &&
             : > "$backup_dir/sources.present" || {
-            cleanup_ntp_snapshot "$backup_dir" || true
+            cleanup_ntp_snapshot "$backup_dir" ||
+                warn "NTP 尚未修改，但临时快照清理失败：$backup_dir"
+            cancel_unmodified_ntp_tracking "$applied_before" ||
+                warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
             return 1
         }
     elif [ ! -e "$source_file" ] && [ ! -L "$source_file" ]; then
-        : > "$backup_dir/sources.absent"
+        if ! : > "$backup_dir/sources.absent"; then
+            cleanup_ntp_snapshot "$backup_dir" ||
+                warn "NTP 尚未修改，但临时快照清理失败：$backup_dir"
+            cancel_unmodified_ntp_tracking "$applied_before" ||
+                warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
+            return 1
+        fi
     else
-        cleanup_ntp_snapshot "$backup_dir" || true
+        cleanup_ntp_snapshot "$backup_dir" ||
+            warn "NTP 尚未修改，但临时快照清理失败：$backup_dir"
+        cancel_unmodified_ntp_tracking "$applied_before" ||
+            warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
         err "NTP 源配置不是普通文件，已拒绝修改：$source_file"
         return 1
     fi
@@ -8103,7 +8167,10 @@ enable_ntp_sync() {
         "$chrony_unit" "$chrony_enabled" "$chrony_active" \
         "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
         "$applied_before"; then
-        cleanup_ntp_snapshot "$backup_dir" || true
+        cleanup_ntp_snapshot "$backup_dir" ||
+            warn "NTP 尚未修改，但临时快照清理失败：$backup_dir"
+        cancel_unmodified_ntp_tracking "$applied_before" ||
+            warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
         err "无法登记 NTP 中断回滚状态，已取消修改。"
         return 1
     fi
@@ -8338,13 +8405,23 @@ verify_dns_resolution() {
     return 2
 }
 
+resolv_conf_line_is_ipv4_nameserver() {
+    local line="$1" keyword="" address="" rest=""
+
+    read -r keyword address rest <<< "$line"
+    [ "$keyword" = "nameserver" ] && is_ipv4_address "$address"
+}
+
 render_resolv_conf_dns() {
-    local dns1="$1" dns2="${2:-}" source="${3:-$RESOLV_CONF}"
+    local dns1="$1" dns2="${2:-}" source="${3:-$RESOLV_CONF}" line
 
     printf 'nameserver %s\n' "$dns1"
     [ -z "$dns2" ] || printf 'nameserver %s\n' "$dns2"
     if [ -r "$source" ]; then
-        awk '$1 != "nameserver" { print }' "$source"
+        while IFS= read -r line || [ -n "$line" ]; do
+            resolv_conf_line_is_ipv4_nameserver "$line" && continue
+            printf '%s\n' "$line"
+        done < "$source"
     fi
 }
 
@@ -9891,8 +9968,20 @@ apply_ssh_port_target_transaction() {
         return 1
     fi
 
-    if { [ -e "$SSHD_VPSBOX_PORT_CONF" ] && sshd_vpsbox_port_include_available; } ||
-        { ! sshd_main_has_active_port_directive && sshd_vpsbox_port_include_available; }; then
+    if sshd_main_has_active_port_directive; then
+        write_action="主配置"
+        if [ -e "$SSHD_VPSBOX_PORT_CONF" ] && sshd_vpsbox_port_include_available; then
+            if ! rm -f -- "$SSHD_VPSBOX_PORT_CONF"; then
+                fail_ssh_runtime_transaction "停用冲突的 SSH 端口 drop-in 失败" || true
+                return 1
+            fi
+            write_action="主配置（已停用 VPSBox 端口 drop-in）"
+        fi
+        if ! set_main_ssh_port_directives; then
+            fail_ssh_runtime_transaction "写入 SSH 主配置失败" || true
+            return 1
+        fi
+    elif sshd_vpsbox_port_include_available; then
         write_action="vpsbox drop-in"
         if ! write_vpsbox_ssh_port_config; then
             fail_ssh_runtime_transaction "写入 SSH drop-in 失败" || true
@@ -10926,8 +11015,60 @@ report_ipv6_reenable_address_state() {
     fi
 }
 
+ipv6_reenable_snapshot_path_allowed() {
+    local snapshot="$1" parent expected_parent base
+
+    [ -n "$snapshot" ] || return 1
+    parent="$(dirname -- "$snapshot")" || return 1
+    expected_parent="$(dirname -- "$IPV6_DISABLE_CONF")" || return 1
+    base="${snapshot##*/}"
+    [ "$parent" = "$expected_parent" ] && [[ "$base" == .vpsbox-enable-ipv6.* ]]
+}
+
+arm_untracked_ipv6_reenable_rollback() {
+    local snapshot="$1" old_all="$2" old_default="$3" old_lo="$4"
+
+    [ -z "${ACTIVE_IPV6_REENABLE_SNAPSHOT:-}" ] || return 1
+    ipv6_reenable_snapshot_path_allowed "$snapshot" &&
+        [ -f "$snapshot" ] && [ ! -L "$snapshot" ] || return 1
+    [[ "$old_all" =~ ^[01]$ ]] && [[ "$old_default" =~ ^[01]$ ]] &&
+        [[ "$old_lo" =~ ^[01]$ ]] || return 1
+    ACTIVE_IPV6_REENABLE_OLD_VALUES="$old_all $old_default $old_lo"
+    # 最后登记快照作为活动标记；在此之前尚未修改配置或运行参数。
+    ACTIVE_IPV6_REENABLE_SNAPSHOT="$snapshot"
+}
+
+clear_active_untracked_ipv6_reenable() {
+    ACTIVE_IPV6_REENABLE_SNAPSHOT=""
+    ACTIVE_IPV6_REENABLE_OLD_VALUES=""
+}
+
+rollback_active_untracked_ipv6_reenable() {
+    local snapshot="${ACTIVE_IPV6_REENABLE_SNAPSHOT:-}"
+    local old_values="${ACTIVE_IPV6_REENABLE_OLD_VALUES:-}"
+    local old_all old_default old_lo failed=0
+
+    [ -n "$snapshot" ] || return 0
+    ipv6_reenable_snapshot_path_allowed "$snapshot" &&
+        [ -f "$snapshot" ] && [ ! -L "$snapshot" ] || return 1
+    read -r old_all old_default old_lo <<< "$old_values"
+    [[ "$old_all" =~ ^[01]$ ]] && [[ "$old_default" =~ ^[01]$ ]] &&
+        [[ "$old_lo" =~ ^[01]$ ]] || return 1
+
+    if [ -e "$IPV6_DISABLE_CONF" ] || [ -L "$IPV6_DISABLE_CONF" ]; then
+        ipv6_disable_config_is_current || failed=1
+    else
+        restore_file_atomically_from_snapshot "$snapshot" "$IPV6_DISABLE_CONF" || failed=1
+    fi
+    restore_ipv6_runtime_values "$old_all" "$old_default" "$old_lo" || failed=1
+    [ "$failed" -eq 0 ] || return 1
+
+    clear_active_untracked_ipv6_reenable
+    rm -f -- "$snapshot" || warn "IPv6 原状态已恢复，但临时快照清理失败：$snapshot"
+}
+
 reenable_untracked_ipv6() {
-    local runtime_values old_all old_default old_lo parent snapshot failed=0 rollback_failed=0
+    local runtime_values old_all old_default old_lo parent snapshot failed=0
 
     ipv6_disable_config_is_current || {
         err "未找到可安全识别的 VPSBox IPv6 禁用配置，已拒绝自动处理。"
@@ -10948,10 +11089,15 @@ reenable_untracked_ipv6() {
         return 1
     }
     snapshot="$(mktemp "$parent/.vpsbox-enable-ipv6.XXXXXX")" || return 1
-    if ! cp -a -- "$IPV6_DISABLE_CONF" "$snapshot" ||
-        ! rm -f -- "$IPV6_DISABLE_CONF"; then
+    if ! cp -a -- "$IPV6_DISABLE_CONF" "$snapshot"; then
         rm -f -- "$snapshot"
-        err "准备移除 IPv6 禁用配置失败，未修改运行参数。"
+        err "创建 IPv6 重新启用快照失败，未修改系统。"
+        return 1
+    fi
+    if ! arm_untracked_ipv6_reenable_rollback "$snapshot" \
+        "$old_all" "$old_default" "$old_lo"; then
+        rm -f -- "$snapshot"
+        err "登记 IPv6 中断回滚状态失败，未修改系统。"
         return 1
     fi
 
@@ -10959,18 +11105,27 @@ reenable_untracked_ipv6() {
     sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || failed=1
     sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1 || failed=1
     if [ "$failed" -ne 0 ] || ! ipv6_runtime_matches_values 0 0 0; then
-        restore_file_atomically_from_snapshot "$snapshot" "$IPV6_DISABLE_CONF" || rollback_failed=1
-        restore_ipv6_runtime_values "$old_all" "$old_default" "$old_lo" || rollback_failed=1
-        if [ "$rollback_failed" -ne 0 ]; then
+        if ! rollback_active_untracked_ipv6_reenable; then
             err "重新启用 IPv6 失败，且禁用配置或原运行参数未能完整恢复。"
             err "请通过 IPv4 或 VPS 控制台检查 IPv6 配置。"
         else
             err "重新启用 IPv6 失败，已恢复原禁用配置和运行参数。"
         fi
-        rm -f -- "$snapshot"
         return 1
     fi
 
+    if ! rm -f -- "$IPV6_DISABLE_CONF"; then
+        if ! rollback_active_untracked_ipv6_reenable; then
+            err "移除 IPv6 禁用配置失败，且原配置或运行参数未能完整恢复。"
+            err "请通过 IPv4 或 VPS 控制台检查 IPv6 配置。"
+        else
+            err "移除 IPv6 禁用配置失败，已恢复原禁用配置和运行参数。"
+        fi
+        return 1
+    fi
+
+    # 文件移除且运行参数已验收即提交；此后中断不应回滚成功状态。
+    clear_active_untracked_ipv6_reenable
     rm -f -- "$snapshot" || warn "IPv6 已重新启用，但临时快照清理失败：$snapshot"
     info "VPSBox IPv6 禁用配置已移除，all/default/lo 已设置为 0。"
     report_ipv6_reenable_address_state
@@ -11255,12 +11410,25 @@ tcp_buffer_values_have_max_above() {
 
 apply_tcp_buffer_tier() {
     local tier="$1" target_max tier_description runtime_values source_values target_values
-    local config_values="" auto_values parent tmp tracking_state
+    local config_values="" current_config_values="" config_present=0
+    local auto_values parent tmp tracking_state
     local old_core_rmem old_core_wmem old_tcp_rmem old_tcp_wmem
     local auto_moderate auto_window
 
     target_max="$(tcp_buffer_tier_max "$tier")" || return 2
     tier_description="$(tcp_buffer_tier_description "$tier")" || return 2
+    if [ -e "$TCP_BUFFER_CONF" ] || [ -L "$TCP_BUFFER_CONF" ]; then
+        [ -f "$TCP_BUFFER_CONF" ] && [ ! -L "$TCP_BUFFER_CONF" ] || {
+            err "$TCP_BUFFER_CONF 不是安全的普通文件，已拒绝覆盖。"
+            return 1
+        }
+        if ! config_values="$(tcp_buffer_config_values)" ||
+            ! tcp_buffer_tier_from_values "$config_values" >/dev/null 2>&1; then
+            err "$TCP_BUFFER_CONF 内容不符合 VPSBox TCP 四项档位模板，已拒绝覆盖。"
+            return 1
+        fi
+        config_present=1
+    fi
     runtime_values="$(tcp_buffer_runtime_values)" || {
         err "无法读取 TCP 缓冲区运行参数，未修改系统。"
         return 1
@@ -11278,8 +11446,7 @@ apply_tcp_buffer_tier() {
     fi
 
     source_values="$runtime_values"
-    if config_values="$(tcp_buffer_config_values 2>/dev/null)" &&
-        tcp_buffer_tier_from_values "$config_values" >/dev/null 2>&1; then
+    if [ "$config_present" -eq 1 ]; then
         source_values="$config_values"
     fi
     if ! target_values="$(tcp_buffer_target_values "$source_values" "$target_max")"; then
@@ -11316,11 +11483,17 @@ apply_tcp_buffer_tier() {
         err "TCP 缓冲区配置目录不存在或不安全：$parent"
         return 1
     }
-    if [ -e "$TCP_BUFFER_CONF" ] || [ -L "$TCP_BUFFER_CONF" ]; then
-        [ -f "$TCP_BUFFER_CONF" ] && [ ! -L "$TCP_BUFFER_CONF" ] || {
-            err "$TCP_BUFFER_CONF 不是安全的普通文件，已拒绝覆盖。"
+    if [ "$config_present" -eq 1 ]; then
+        if [ ! -f "$TCP_BUFFER_CONF" ] || [ -L "$TCP_BUFFER_CONF" ] ||
+            ! current_config_values="$(tcp_buffer_config_values)" ||
+            ! tcp_buffer_tier_from_values "$current_config_values" >/dev/null 2>&1 ||
+            [ "$current_config_values" != "$config_values" ]; then
+            err "$TCP_BUFFER_CONF 在确认期间发生变化，已拒绝覆盖。"
             return 1
-        }
+        fi
+    elif [ -e "$TCP_BUFFER_CONF" ] || [ -L "$TCP_BUFFER_CONF" ]; then
+        err "$TCP_BUFFER_CONF 在确认期间出现，已拒绝覆盖。"
+        return 1
     fi
 
     tracking_state="$(change_restore_state TCP_BUFFER_CONF)" || return 1
