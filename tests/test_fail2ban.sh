@@ -50,6 +50,8 @@ reset_mock() {
     # Read by the production cleanup function through shared global state.
     # shellcheck disable=SC2034
     ACTIVE_FAIL2BAN_TEST_BACKENDS=""
+    ACTIVE_FAIL2BAN_SYNC_BACKUP=""
+    ACTIVE_FAIL2BAN_SYNC_WAS_RUNNING=""
     fail2ban_local_ipv4_text() {
         printf '%s\n' 10.0.0.1
     }
@@ -703,7 +705,7 @@ test_install_fail2ban_residual_deep_check_warns_and_succeeds() {
 
 test_sync_restores_initial_stopped_state() {
     local sync_dir="$TEST_TMP/sync-stopped" systemctl_log="$TEST_TMP/systemctl-stopped.log"
-    local running=0
+    local completed_log running=0
     reset_mock
     mkdir -p "$sync_dir"
     # shellcheck disable=SC2034 # 被测同步函数动态读取。
@@ -735,6 +737,168 @@ test_sync_restores_initial_stopped_state() {
     assert_file_contains "$systemctl_log" '^stop fail2ban$' "验证后应恢复原停止状态"
     assert_file_contains "$systemctl_log" '^marked$'
     assert_eq 0 "$running" "同步后不得把原本停止的 Fail2ban 留在运行状态"
+    assert_eq "" "$ACTIVE_FAIL2BAN_SYNC_BACKUP" "同步完成后不得保留中断恢复备份句柄"
+    assert_eq "" "$ACTIVE_FAIL2BAN_SYNC_WAS_RUNNING" "同步完成后不得保留中断恢复活动标记"
+
+    completed_log="$(cat "$systemctl_log")"
+    cleanup_vpsbox_runtime >/dev/null 2>&1
+    assert_eq "$completed_log" "$(cat "$systemctl_log")" \
+        "同步完成后的退出清理不得再次停止服务或回滚配置"
+    assert_file_contains "$FAIL2BAN_VPSBOX_SSHD_CONF" '^port = 2222$' \
+        "同步完成后的退出清理必须保留已验收配置"
+}
+
+run_interrupted_fail2ban_sync_case() {
+    local case_name="$1" initial_state="$2" original_config="$3"
+    local sync_dir="$TEST_TMP/$case_name"
+    local service_state="$sync_dir/service.state"
+    local systemctl_log="$sync_dir/systemctl.log"
+    local output="$sync_dir/output"
+    local status
+
+    reset_mock
+    mkdir -p "$sync_dir"
+    case "$original_config" in
+        present) printf 'old-config\n' > "$sync_dir/99-vpsbox-sshd.local" ;;
+        absent) rm -f -- "$sync_dir/99-vpsbox-sshd.local" ;;
+        *) fail "未知的 Fail2ban 原配置夹具：$original_config" ;;
+    esac
+    printf '%s\n' "$initial_state" > "$service_state"
+    : > "$systemctl_log"
+    MOCK_ACTION_PORTS="2222"
+
+    if (
+        FAIL2BAN_CONFIG_DIR="$sync_dir"
+        FAIL2BAN_VPSBOX_SSHD_CONF="$sync_dir/99-vpsbox-sshd.local"
+        fail2ban_installed() { return 0; }
+        fail2ban_sshd_configuration_healthy() { return 1; }
+        ensure_fail2ban_nftables_dependency() { return 0; }
+        fail2ban_service_state() {
+            [ "$(cat "$service_state")" = "running" ] &&
+                printf '运行中\n' || printf '未运行\n'
+        }
+        fail2ban_service_is_enabled() { return 1; }
+        manifest_set_once() { return 0; }
+        backup_change_file_once() { return 0; }
+        begin_change_transaction() { return 0; }
+        ssh_effective_ports_csv() { printf '2222\n'; }
+        is_systemd() { return 0; }
+        chown() { return 0; }
+        systemctl() {
+            printf '%s\n' "$*" >> "$systemctl_log"
+            case "${1:-}" in
+                start|restart) printf 'running\n' > "$service_state" ;;
+                stop) printf 'stopped\n' > "$service_state" ;;
+            esac
+        }
+        fail2ban_sshd_state() { printf '已启用\n'; }
+        fail2ban_sshd_uses_only_nftables() { return 0; }
+        verify_fail2ban_real_ban_advisory() { exit 130; }
+        mark_change_applied() { printf 'marked\n' >> "$systemctl_log"; }
+
+        trap cleanup_vpsbox_runtime EXIT
+        sync_fail2ban_sshd_port
+    ) > "$output" 2>&1; then
+        fail "Fail2ban 同步在注入退出后不得报告成功：$case_name"
+    else
+        status=$?
+    fi
+
+    assert_eq 130 "$status" "中断同步应保留原退出码：$case_name"
+    if [ "$original_config" = "present" ]; then
+        assert_file_contains "$sync_dir/99-vpsbox-sshd.local" '^old-config$' \
+            "中断退出后必须恢复同步前配置：$case_name"
+        assert_file_not_contains "$sync_dir/99-vpsbox-sshd.local" '^port = 2222$' \
+            "中断退出后不得保留未提交配置：$case_name"
+    elif [ -e "$sync_dir/99-vpsbox-sshd.local" ]; then
+        fail "中断退出后必须删除同步前不存在的配置：$case_name"
+    fi
+    assert_eq "$initial_state" "$(cat "$service_state")" \
+        "中断退出后必须恢复原服务状态：$case_name"
+    assert_file_not_contains "$systemctl_log" '^marked$' \
+        "中断同步不得标记变更已应用：$case_name"
+}
+
+test_interrupted_sync_restores_initial_stopped_state() {
+    run_interrupted_fail2ban_sync_case interrupted-sync-stopped stopped absent
+    assert_eq $'start fail2ban\nstop fail2ban' \
+        "$(cat "$TEST_TMP/interrupted-sync-stopped/systemctl.log")" \
+        "原停止服务应只在验收期间启动，中断清理后恢复停止"
+}
+
+test_interrupted_sync_restores_initial_running_state() {
+    run_interrupted_fail2ban_sync_case interrupted-sync-running running present
+    assert_eq $'restart fail2ban\nrestart fail2ban' \
+        "$(cat "$TEST_TMP/interrupted-sync-running/systemctl.log")" \
+        "原运行服务应在中断清理后重新加载旧配置并保持运行"
+}
+
+test_interrupted_sync_cleanup_failure_is_consumed_once() {
+    (
+        local backup="$TEST_TMP/interrupted-sync-cleanup-failure.backup"
+        local restore_calls=0
+        reset_mock
+        printf 'old-config\n' > "$backup"
+        ACTIVE_FAIL2BAN_SYNC_BACKUP="$backup"
+        ACTIVE_FAIL2BAN_SYNC_WAS_RUNNING=0
+        restore_fail2ban_sshd_sync_state() {
+            restore_calls=$((restore_calls + 1))
+            return 23
+        }
+
+        if cleanup_active_fail2ban_sync; then
+            fail "Fail2ban 中断恢复失败时不得报告成功"
+        fi
+        assert_eq "" "$ACTIVE_FAIL2BAN_SYNC_BACKUP" \
+            "中断恢复失败后必须消费进程内备份句柄，避免重复回滚"
+        assert_eq "" "$ACTIVE_FAIL2BAN_SYNC_WAS_RUNNING" \
+            "中断恢复失败后必须消费进程内活动标记，避免重复回滚"
+        [ -f "$backup" ] || fail "中断恢复失败后必须保留磁盘备份"
+        cleanup_active_fail2ban_sync || fail "已消费的中断恢复再次清理应为空操作"
+        assert_eq 1 "$restore_calls" "中断恢复失败后不得重复执行同一回滚"
+    )
+}
+
+test_invalid_restored_config_still_stops_initially_stopped_service() {
+    (
+        local systemctl_log="$TEST_TMP/fail2ban-invalid-restore-stopped.log"
+        local running=1
+        : > "$systemctl_log"
+        restore_fail2ban_sshd_config_file() { return 0; }
+        fail2ban-client() { return 1; }
+        is_systemd() { return 0; }
+        systemctl() {
+            printf '%s\n' "$*" >> "$systemctl_log"
+            [ "${1:-}" != "stop" ] || running=0
+        }
+        fail2ban_service_state() {
+            [ "$running" -eq 1 ] && printf '运行中\n' || printf '未运行\n'
+        }
+
+        if restore_fail2ban_sshd_sync_state "" 0; then
+            fail "旧配置预检失败时不得报告完整恢复"
+        fi
+        assert_file_contains "$systemctl_log" '^stop fail2ban$' \
+            "旧配置预检失败也必须停止同步期间临时启动的服务"
+        assert_eq 0 "$running" "旧配置预检失败后不得留下临时运行的 Fail2ban"
+    )
+}
+
+test_invalid_restored_config_does_not_restart_initially_running_service() {
+    (
+        local systemctl_log="$TEST_TMP/fail2ban-invalid-restore-running.log"
+        : > "$systemctl_log"
+        restore_fail2ban_sshd_config_file() { return 0; }
+        fail2ban-client() { return 1; }
+        is_systemd() { return 0; }
+        systemctl() { printf '%s\n' "$*" >> "$systemctl_log"; }
+
+        if restore_fail2ban_sshd_sync_state "" 1; then
+            fail "旧配置预检失败时不得报告完整恢复"
+        fi
+        assert_eq "" "$(cat "$systemctl_log")" \
+            "旧配置预检失败时不得重启原本运行的服务"
+    )
 }
 
 test_sync_healthy_configuration_only_checks_nftables_dependency() {
@@ -1012,15 +1176,59 @@ test_fail2ban_atomic_restore_preserves_current_on_failure() {
 
 test_fail2ban_rollback_failure_is_reported() {
     (
+        local backup="$TEST_TMP/fail2ban-rollback-failure.backup"
         local output="$TEST_TMP/fail2ban-rollback-failure.out"
-        restore_fail2ban_sshd_sync_state() { return 23; }
+        printf 'old-config\n' > "$backup"
+        restore_fail2ban_sshd_sync_state() {
+            assert_eq "$backup" "$ACTIVE_FAIL2BAN_SYNC_BACKUP" \
+                "显式回滚必须在恢复期间保持中断恢复备份句柄"
+            assert_eq 0 "$ACTIVE_FAIL2BAN_SYNC_WAS_RUNNING" \
+                "显式回滚必须在恢复期间保持原服务状态"
+            return 23
+        }
 
-        if fail2ban_sync_failure_with_rollback "Fail2ban 测试失败" "" 0 >"$output" 2>&1; then
+        if fail2ban_sync_failure_with_rollback \
+            "Fail2ban 测试失败" "$backup" 0 >"$output" 2>&1; then
             fail "Fail2ban 回滚失败路径不得报告成功"
         fi
         assert_file_contains "$output" '同步前状态未能完整恢复'
         assert_file_not_contains "$output" '已恢复同步前的配置与服务状态'
+        assert_eq "" "$ACTIVE_FAIL2BAN_SYNC_BACKUP" \
+            "显式回滚返回后必须消费中断恢复备份句柄"
+        assert_eq "" "$ACTIVE_FAIL2BAN_SYNC_WAS_RUNNING" \
+            "显式回滚返回后必须消费中断恢复活动标记"
     )
+}
+
+test_interrupted_explicit_rollback_is_finished_by_exit_cleanup() {
+    local backup="$TEST_TMP/fail2ban-interrupted-rollback.backup"
+    local restore_count="$TEST_TMP/fail2ban-interrupted-rollback.count"
+    local status
+    printf 'old-config\n' > "$backup"
+    printf '0\n' > "$restore_count"
+
+    if (
+        reset_mock
+        restore_fail2ban_sshd_sync_state() {
+            local count
+            count="$(cat "$restore_count")"
+            count=$((count + 1))
+            printf '%s\n' "$count" > "$restore_count"
+            [ "$count" -gt 1 ] || exit 130
+        }
+
+        trap cleanup_vpsbox_runtime EXIT
+        fail2ban_sync_failure_with_rollback \
+            "Fail2ban 测试失败" "$backup" 0
+    ) > "$TEST_TMP/fail2ban-interrupted-rollback.out" 2>&1; then
+        fail "显式回滚中断后不得报告成功"
+    else
+        status=$?
+    fi
+
+    assert_eq 130 "$status" "显式回滚中断应保留原退出码"
+    assert_eq 2 "$(cat "$restore_count")" \
+        "显式回滚被中断后 EXIT 清理必须接管并完成一次恢复"
 }
 
 main() {
@@ -1033,6 +1241,8 @@ main() {
         verify_fail2ban_real_ban
         verify_fail2ban_real_ban_advisory
         cleanup_active_fail2ban_test
+        cleanup_active_fail2ban_sync
+        arm_fail2ban_sync_rollback
     )
     local name
     local -a tests=(
@@ -1057,6 +1267,11 @@ main() {
         test_sync_residual_test_ip_warns_and_commits
         test_install_fail2ban_residual_deep_check_warns_and_succeeds
         test_sync_restores_initial_stopped_state
+        test_interrupted_sync_restores_initial_stopped_state
+        test_interrupted_sync_restores_initial_running_state
+        test_interrupted_sync_cleanup_failure_is_consumed_once
+        test_invalid_restored_config_still_stops_initially_stopped_service
+        test_invalid_restored_config_does_not_restart_initially_running_service
         test_sync_healthy_configuration_only_checks_nftables_dependency
         test_fail2ban_health_requires_canonical_current_config
         test_install_fail2ban_healthy_only_checks_nftables_dependency
@@ -1068,6 +1283,7 @@ main() {
         test_fail2ban_backup_rotation_keeps_five
         test_fail2ban_atomic_restore_preserves_current_on_failure
         test_fail2ban_rollback_failure_is_reported
+        test_interrupted_explicit_rollback_is_finished_by_exit_cleanup
     )
 
     for name in "${required[@]}"; do

@@ -115,6 +115,8 @@ ACTIVE_FIREWALL_ADDITIVE_DIR=""
 ACTIVE_UNAPPLIED_SSH_TRACKING=0
 ACTIVE_FAIL2BAN_TEST_IP=""
 ACTIVE_FAIL2BAN_TEST_BACKENDS=""
+ACTIVE_FAIL2BAN_SYNC_BACKUP=""
+ACTIVE_FAIL2BAN_SYNC_WAS_RUNNING=""
 ACTIVE_SINGBOX_UPDATE_BINARY=""
 ACTIVE_SINGBOX_UPDATE_BACKUP=""
 ACTIVE_SINGBOX_UPDATE_DIR=""
@@ -693,6 +695,10 @@ cleanup_vpsbox_runtime() {
     if declare -F cleanup_active_fail2ban_test >/dev/null 2>&1; then
         cleanup_active_fail2ban_test ||
             warn "Fail2ban 测试地址自动解封失败，请按错误提示手动清理。"
+    fi
+    if declare -F cleanup_active_fail2ban_sync >/dev/null 2>&1; then
+        cleanup_active_fail2ban_sync ||
+            warn "Fail2ban 同步被中断，配置或原服务状态未能完整恢复；恢复依据已保留。"
     fi
     if [ "${ACTIVE_UNAPPLIED_SSH_TRACKING:-0}" = "1" ] &&
         declare -F cleanup_unapplied_ssh_tracking >/dev/null 2>&1; then
@@ -9185,33 +9191,108 @@ restore_fail2ban_sshd_config_file() {
 
 restore_fail2ban_sshd_sync_state() {
     local backup="$1" was_running="$2"
+    local config_ready=1
+    local failed=0
 
-    restore_fail2ban_sshd_config_file "$backup" || return 1
-    fail2ban-client -t -c /etc/fail2ban >/dev/null 2>&1 || return 1
+    case "$was_running" in
+        0|1) ;;
+        *) return 1 ;;
+    esac
+    if ! restore_fail2ban_sshd_config_file "$backup"; then
+        config_ready=0
+        failed=1
+    elif ! fail2ban-client -t -c /etc/fail2ban >/dev/null 2>&1; then
+        config_ready=0
+        failed=1
+    fi
+
+    # 原服务在运行时，只有旧配置已安全恢复并通过预检才允许重启；否则保留
+    # 当前进程并报告回滚不完整。原服务停止时，即使配置恢复失败也必须继续
+    # 尝试停止同步期间临时启动的服务。
+    if [ "$was_running" -eq 1 ] && [ "$config_ready" -ne 1 ]; then
+        return 1
+    fi
 
     if is_systemd; then
         if [ "$was_running" -eq 1 ]; then
-            retry 3 1 systemctl restart fail2ban >/dev/null
+            retry 3 1 systemctl restart fail2ban >/dev/null || failed=1
         else
-            retry 3 1 systemctl stop fail2ban >/dev/null
+            retry 3 1 systemctl stop fail2ban >/dev/null || failed=1
         fi
     elif command -v rc-service >/dev/null 2>&1; then
         if [ "$was_running" -eq 1 ]; then
-            retry 3 1 rc-service fail2ban restart >/dev/null
+            retry 3 1 rc-service fail2ban restart >/dev/null || failed=1
         else
-            retry 3 1 rc-service fail2ban stop >/dev/null
+            retry 3 1 rc-service fail2ban stop >/dev/null || failed=1
         fi
     else
-        return 1
+        failed=1
     fi
+    if [ "$was_running" -eq 0 ] && [ "$(fail2ban_service_state)" = "运行中" ]; then
+        failed=1
+    fi
+    return "$failed"
+}
+
+clear_active_fail2ban_sync() {
+    # WAS_RUNNING 是活动标记，必须先清除；若信号卡在两次赋值之间，退出清理
+    # 看到空标记就不会把已清空的 BACKUP 误判为“原配置不存在”。
+    ACTIVE_FAIL2BAN_SYNC_WAS_RUNNING=""
+    ACTIVE_FAIL2BAN_SYNC_BACKUP=""
+}
+
+arm_fail2ban_sync_rollback() {
+    local backup="$1" was_running="$2"
+
+    [ -z "${ACTIVE_FAIL2BAN_SYNC_WAS_RUNNING:-}" ] || return 1
+    case "$was_running" in
+        0|1) ;;
+        *) return 1 ;;
+    esac
+    if [ -n "$backup" ]; then
+        [ -f "$backup" ] && [ ! -L "$backup" ] || return 1
+    fi
+    ACTIVE_FAIL2BAN_SYNC_BACKUP="$backup"
+    # 最后写入运行状态作为活动标记；在此之前正式配置尚未替换。
+    ACTIVE_FAIL2BAN_SYNC_WAS_RUNNING="$was_running"
+}
+
+cleanup_active_fail2ban_sync() {
+    local backup="${ACTIVE_FAIL2BAN_SYNC_BACKUP:-}"
+    local was_running="${ACTIVE_FAIL2BAN_SYNC_WAS_RUNNING:-}"
+
+    [ -n "$was_running" ] || return 0
+    case "$was_running" in
+        0|1) ;;
+        *) clear_active_fail2ban_sync; return 1 ;;
+    esac
+
+    # 先消费活动标记，避免重复执行退出清理时再次覆盖配置或重启服务。
+    # 回滚失败时，时间戳备份与 PENDING 变更记录仍会保留恢复依据。
+    clear_active_fail2ban_sync
+    restore_fail2ban_sshd_sync_state "$backup" "$was_running"
 }
 
 fail2ban_sync_failure_with_rollback() {
     local reason="$1" backup="$2" was_running="$3"
 
+    if [ -z "${ACTIVE_FAIL2BAN_SYNC_WAS_RUNNING:-}" ]; then
+        if ! arm_fail2ban_sync_rollback "$backup" "$was_running"; then
+            err "$reason，且无法登记 Fail2ban 回滚的中断恢复状态。"
+            return 1
+        fi
+    elif [ "${ACTIVE_FAIL2BAN_SYNC_BACKUP:-}" != "$backup" ] ||
+        [ "$ACTIVE_FAIL2BAN_SYNC_WAS_RUNNING" != "$was_running" ]; then
+        err "$reason，且 Fail2ban 回滚的中断恢复状态不一致。"
+        return 1
+    fi
+
+    # 显式回滚完成前保持活动标记；若恢复本身再被信号中断，EXIT 清理仍可接管。
     if restore_fail2ban_sshd_sync_state "$backup" "$was_running"; then
+        clear_active_fail2ban_sync
         err "$reason，已恢复同步前的配置与服务状态。"
     else
+        clear_active_fail2ban_sync
         err "$reason，且同步前状态未能完整恢复，请检查服务与配置。"
     fi
     return 1
@@ -9298,7 +9379,13 @@ sync_fail2ban_sshd_port() {
     }
     chmod 644 "$tmp" || { rm -f "$tmp"; return 1; }
 
+    if ! arm_fail2ban_sync_rollback "$backup" "$was_running"; then
+        rm -f -- "$tmp"
+        err "无法登记 Fail2ban 同步的中断恢复状态，已取消修改。"
+        return 1
+    fi
     if ! mv -f "$tmp" "$FAIL2BAN_VPSBOX_SSHD_CONF"; then
+        clear_active_fail2ban_sync
         rm -f -- "$tmp"
         return 1
     fi
@@ -9359,9 +9446,13 @@ sync_fail2ban_sshd_port() {
         deep_check_status=$?
     fi
     if ! restore_fail2ban_runtime_after_sync "$was_running"; then
-        err "Fail2ban 配置验证通过，但无法恢复同步前的停止状态。"
+        fail2ban_sync_failure_with_rollback \
+            "Fail2ban 配置验证通过，但无法恢复同步前的停止状态" \
+            "$backup" "$was_running" || true
         return 1
     fi
+    # 配置与运行态均已通过验收；此后即使记录提交被中断，也不应回滚健康配置。
+    clear_active_fail2ban_sync
     if ! mark_change_applied FAIL2BAN_SSHD; then
         if [ "$deep_check_status" -eq 2 ] || [ -n "${ACTIVE_FAIL2BAN_TEST_IP:-}" ]; then
             err "Fail2ban 基础配置已通过，但测试地址仍有残留且无法记录已应用状态；当前配置未回滚。"
