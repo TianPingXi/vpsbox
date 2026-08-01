@@ -1682,6 +1682,7 @@ test_menu_dispatch_and_system_status_wiring() {
         clear() { :; }
         detect_os() { OS=debian; }
         bbr_fq_summary_state() { :; }
+        tcp_buffer_summary_state() { :; }
         ipv4_priority_state() { :; }
         ssh_port_state() { :; }
         ssh_hardening_state() { :; }
@@ -1693,11 +1694,12 @@ test_menu_dispatch_and_system_status_wiring() {
         run_menu_action() { printf '%s\n' "$1" >> "$submenu_log"; }
         ssh_port_change_menu() { printf '%s\n' ssh_port_change_menu >> "$submenu_log"; }
         ssh_basic_hardening_menu() { printf '%s\n' ssh_basic_hardening_menu >> "$submenu_log"; }
+        tcp_buffer_menu() { printf '%s\n' tcp_buffer_menu >> "$submenu_log"; }
         system_changes_menu() { printf '%s\n' system_changes_menu >> "$submenu_log"; }
 
-        system_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n0' >/dev/null
+        system_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n0' >/dev/null
     )
-    assert_eq $'update_system_packages\ncleanup_system_garbage\nchange_system_hostname\nenable_ntp_sync\nchange_ipv4_dns\nenable_ipv4_priority\nenable_bbr_fq\ndisable_ipv6\nssh_port_change_menu\nssh_basic_hardening_menu\nshow_current_ssh_config\ninstall_fail2ban\nlimit_systemd_journal\nsystem_changes_menu' \
+    assert_eq $'update_system_packages\ncleanup_system_garbage\nchange_system_hostname\nenable_ntp_sync\nchange_ipv4_dns\nenable_ipv4_priority\nenable_bbr_fq\ndisable_ipv6\ntcp_buffer_menu\nssh_port_change_menu\nssh_basic_hardening_menu\nshow_current_ssh_config\ninstall_fail2ban\nlimit_systemd_journal\nsystem_changes_menu' \
         "$(cat "$submenu_log")" "系统菜单全部编号必须分发到对应操作"
 
     : > "$submenu_log"
@@ -1707,10 +1709,10 @@ test_menu_dispatch_and_system_status_wiring() {
         system_change_state_text() { printf '%s\n' "无记录"; }
         run_menu_action() { printf '%s\n' "$*" >> "$submenu_log"; }
 
-        system_changes_menu <<< $'1\n2\n3\n4\n5\n6\n7\n0' >/dev/null
+        system_changes_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n0' >/dev/null
     )
-    assert_eq $'restore_vpsbox_system_changes\nrestore_vpsbox_system_change_interactive dns\nrestore_vpsbox_system_change_interactive bbr\nrestore_vpsbox_system_change_interactive ipv4_priority\nrestore_vpsbox_system_change_interactive fail2ban\nrestore_vpsbox_system_change_interactive journald\nrestore_vpsbox_system_change_interactive ntp' \
-        "$(cat "$submenu_log")" "系统改动菜单必须把恢复全部和六个单项分发到对应操作"
+    assert_eq $'restore_vpsbox_system_changes\nrestore_vpsbox_system_change_interactive dns\nrestore_vpsbox_system_change_interactive bbr\nrestore_vpsbox_system_change_interactive ipv4_priority\nrestore_vpsbox_system_change_interactive fail2ban\nrestore_vpsbox_system_change_interactive journald\nrestore_vpsbox_system_change_interactive ntp\nrestore_vpsbox_system_change_interactive ipv6\nrestore_vpsbox_system_change_interactive tcp_buffer' \
+        "$(cat "$submenu_log")" "系统改动菜单必须把恢复全部和八个单项分发到对应操作"
 
     for entry in "${third_party_cases[@]}"; do
         read -r choice action <<< "$entry"
@@ -1738,6 +1740,7 @@ test_menu_dispatch_and_system_status_wiring() {
             OS=debian
         }
         bbr_fq_summary_state() { printf '已开启\n'; }
+        tcp_buffer_summary_state() { printf '第一档（100–300 Mbps / 最大 8 MiB）\n'; }
         ipv4_priority_state() { printf '已启用\n'; }
         ssh_port_state() { printf '23333\n'; }
         ssh_hardening_state() { printf '已配置\n'; }
@@ -1748,6 +1751,7 @@ test_menu_dispatch_and_system_status_wiring() {
 
         system_menu <<< "0" > "$system_output"
         assert_file_contains "$system_output" 'BBR.*已开启'
+        assert_file_contains "$system_output" 'TCP 缓冲区.*第一档.*8 MiB'
         assert_file_contains "$system_output" 'IPv4.*已启用'
         assert_file_contains "$system_output" 'SSH.*23333.*已配置'
         assert_file_contains "$system_output" 'Fail2ban.*运行中.*已启用'

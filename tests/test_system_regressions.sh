@@ -759,6 +759,227 @@ test_failed_bbr_runtime_restore_keeps_recovery_transaction() {
     )
 }
 
+setup_tcp_buffer_case() {
+    local name="$1"
+
+    TCP_TEST_DIR="$TEST_TMP/tcp-buffer-$name"
+    TCP_BUFFER_CONF="$TCP_TEST_DIR/99-vpsbox-tcp-buffer.conf"
+    VPSBOX_STATE_DIR="$TCP_TEST_DIR/state"
+    CHANGE_MANIFEST="$VPSBOX_STATE_DIR/changes.env"
+    CHANGE_BACKUP_DIR="$VPSBOX_STATE_DIR/backups"
+    TCP_TEST_CORE_RMEM=212992
+    TCP_TEST_CORE_WMEM=212992
+    TCP_TEST_TCP_RMEM="4096 131072 6291456"
+    TCP_TEST_TCP_WMEM="4096 16384 4194304"
+    TCP_TEST_MODERATE=1
+    TCP_TEST_WINDOW_SCALING=1
+    TCP_TEST_APPLY_FAIL=0
+    TCP_TEST_KEEP_RUNTIME=0
+    TCP_TEST_RESTORE_FAIL_KEY=""
+    TCP_TEST_SYSCTL_LOG="$TCP_TEST_DIR/sysctl.log"
+    mkdir -p "$TCP_TEST_DIR"
+    : > "$TCP_TEST_SYSCTL_LOG"
+
+    sysctl() {
+        local key value
+
+        case "$1" in
+            -n)
+                case "$2" in
+                    net.core.rmem_max) printf '%s\n' "$TCP_TEST_CORE_RMEM" ;;
+                    net.core.wmem_max) printf '%s\n' "$TCP_TEST_CORE_WMEM" ;;
+                    net.ipv4.tcp_rmem) printf '%s\n' "$TCP_TEST_TCP_RMEM" ;;
+                    net.ipv4.tcp_wmem) printf '%s\n' "$TCP_TEST_TCP_WMEM" ;;
+                    net.ipv4.tcp_moderate_rcvbuf) printf '%s\n' "$TCP_TEST_MODERATE" ;;
+                    net.ipv4.tcp_window_scaling) printf '%s\n' "$TCP_TEST_WINDOW_SCALING" ;;
+                    *) return 2 ;;
+                esac
+                ;;
+            -p)
+                printf 'p:%s\n' "$2" >> "$TCP_TEST_SYSCTL_LOG"
+                [ "$TCP_TEST_KEEP_RUNTIME" -eq 0 ] || return 0
+                TCP_TEST_CORE_RMEM="$(awk '$1 == "net.core.rmem_max" { print $3 }' "$2")"
+                if [ "$TCP_TEST_APPLY_FAIL" -eq 1 ]; then
+                    return 41
+                fi
+                TCP_TEST_CORE_WMEM="$(awk '$1 == "net.core.wmem_max" { print $3 }' "$2")"
+                TCP_TEST_TCP_RMEM="$(awk '$1 == "net.ipv4.tcp_rmem" { print $3, $4, $5 }' "$2")"
+                TCP_TEST_TCP_WMEM="$(awk '$1 == "net.ipv4.tcp_wmem" { print $3, $4, $5 }' "$2")"
+                ;;
+            -w)
+                printf 'w:%s\n' "$2" >> "$TCP_TEST_SYSCTL_LOG"
+                key="${2%%=*}"
+                value="${2#*=}"
+                [ "$key" != "$TCP_TEST_RESTORE_FAIL_KEY" ] || return 43
+                case "$key" in
+                    net.core.rmem_max) TCP_TEST_CORE_RMEM="$value" ;;
+                    net.core.wmem_max) TCP_TEST_CORE_WMEM="$value" ;;
+                    net.ipv4.tcp_rmem) TCP_TEST_TCP_RMEM="$value" ;;
+                    net.ipv4.tcp_wmem) TCP_TEST_TCP_WMEM="$value" ;;
+                    *) return 2 ;;
+                esac
+                ;;
+            *) return 2 ;;
+        esac
+    }
+}
+
+test_tcp_buffer_tiers_preserve_defaults_and_restore_first_baseline() {
+    (
+        local output="$TEST_TMP/tcp-buffer-tier.out"
+
+        setup_tcp_buffer_case tiers
+        apply_tcp_buffer_tier 1 <<< "" > "$output"
+
+        assert_file_contains "$TCP_BUFFER_CONF" '^net[.]core[.]rmem_max = 8388608$'
+        assert_file_contains "$TCP_BUFFER_CONF" '^net[.]core[.]wmem_max = 8388608$'
+        assert_file_contains "$TCP_BUFFER_CONF" '^net[.]ipv4[.]tcp_rmem = 4096 131072 8388608$'
+        assert_file_contains "$TCP_BUFFER_CONF" '^net[.]ipv4[.]tcp_wmem = 4096 16384 8388608$'
+        assert_eq "8388608 8388608 4096 131072 8388608 4096 16384 8388608" \
+            "$TCP_TEST_CORE_RMEM $TCP_TEST_CORE_WMEM $TCP_TEST_TCP_RMEM $TCP_TEST_TCP_WMEM"
+        assert_file_contains "$CHANGE_MANIFEST" '^BACKUP_TCP_BUFFER_CONF=absent$'
+        assert_file_contains "$CHANGE_MANIFEST" '^TCP_BUFFER_RMEM_MAX=212992$'
+        assert_file_contains "$CHANGE_MANIFEST" '^TCP_BUFFER_WMEM_MAX=212992$'
+        assert_file_contains "$CHANGE_MANIFEST" '^TCP_BUFFER_TCP_RMEM=4096,131072,6291456$'
+        assert_file_contains "$CHANGE_MANIFEST" '^TCP_BUFFER_TCP_WMEM=4096,16384,4194304$'
+        assert_file_contains "$CHANGE_MANIFEST" '^APPLIED_TCP_BUFFER_CONF=1$'
+        assert_file_contains "$output" '系统接收缓冲区上限：208 KiB'
+        assert_file_contains "$output" '目标参数'
+        assert_file_contains "$output" '当前档位：第一档'
+
+        apply_tcp_buffer_tier 2 <<< "" >/dev/null
+        assert_file_contains "$TCP_BUFFER_CONF" '^net[.]ipv4[.]tcp_rmem = 4096 131072 16777216$'
+        assert_file_contains "$TCP_BUFFER_CONF" '^net[.]ipv4[.]tcp_wmem = 4096 16384 16777216$'
+        assert_file_contains "$CHANGE_MANIFEST" '^TCP_BUFFER_RMEM_MAX=212992$' \
+            "切换档位不得覆盖首次修改前的恢复基线"
+
+        restore_vpsbox_system_change tcp_buffer >/dev/null
+        [ ! -e "$TCP_BUFFER_CONF" ] || fail "恢复后应移除首次创建的 TCP 缓冲区配置"
+        assert_eq "212992 212992 4096 131072 6291456 4096 16384 4194304" \
+            "$TCP_TEST_CORE_RMEM $TCP_TEST_CORE_WMEM $TCP_TEST_TCP_RMEM $TCP_TEST_TCP_WMEM"
+        assert_file_not_contains "$CHANGE_MANIFEST" \
+            '^(BACKUP_TCP_BUFFER_CONF|PENDING_TCP_BUFFER_CONF|APPLIED_TCP_BUFFER_CONF|TCP_BUFFER_.*)='
+    )
+}
+
+test_tcp_buffer_cancel_invalid_default_and_healthy_noop_are_read_only() {
+    (
+        local output="$TEST_TMP/tcp-buffer-cancel.out"
+
+        setup_tcp_buffer_case cancel
+        apply_tcp_buffer_tier 1 <<< "n" > "$output"
+        assert_file_contains "$output" '已取消 TCP 缓冲区调优'
+        [ ! -e "$TCP_BUFFER_CONF" ] || fail "取消时不得创建 TCP 缓冲区配置"
+        [ ! -e "$CHANGE_MANIFEST" ] || fail "取消时不得创建恢复记录"
+        assert_empty_file "$TCP_TEST_SYSCTL_LOG" "取消时不得修改 TCP 运行参数"
+    )
+    (
+        local output="$TEST_TMP/tcp-buffer-invalid-default.out"
+
+        setup_tcp_buffer_case invalid-default
+        TCP_TEST_TCP_RMEM="4096 16777216 33554432"
+        if apply_tcp_buffer_tier 1 > "$output" 2>&1; then
+            fail "默认值高于档位上限时不得生成配置"
+        fi
+        assert_file_contains "$output" '当前 TCP 最小值或默认值高于所选档位上限'
+        [ ! -e "$TCP_BUFFER_CONF" ] || fail "非法目标不得创建配置"
+        [ ! -e "$CHANGE_MANIFEST" ] || fail "非法目标不得创建恢复记录"
+    )
+    (
+        local output="$TEST_TMP/tcp-buffer-noop.out"
+        local values='8388608 8388608 4096,131072,8388608 4096,16384,8388608'
+
+        setup_tcp_buffer_case noop
+        render_tcp_buffer_config "$values" > "$TCP_BUFFER_CONF"
+        TCP_TEST_CORE_RMEM=8388608
+        TCP_TEST_CORE_WMEM=8388608
+        TCP_TEST_TCP_RMEM="4096 131072 8388608"
+        TCP_TEST_TCP_WMEM="4096 16384 8388608"
+        apply_tcp_buffer_tier 1 </dev/null > "$output"
+        assert_file_contains "$output" '无需重复应用'
+        assert_file_not_contains "$output" '是否应用所选 TCP 缓冲区参数'
+        assert_empty_file "$TCP_TEST_SYSCTL_LOG" "健康档位不得重复应用 sysctl"
+    )
+}
+
+test_tcp_buffer_failures_restore_runtime_or_keep_pending_record() {
+    (
+        local output="$TEST_TMP/tcp-buffer-apply-failure.out"
+
+        setup_tcp_buffer_case apply-failure
+        TCP_TEST_APPLY_FAIL=1
+        if apply_tcp_buffer_tier 1 <<< "" > "$output" 2>&1; then
+            fail "TCP 缓冲区部分应用失败时不得报告成功"
+        fi
+        assert_eq "212992 212992 4096 131072 6291456 4096 16384 4194304" \
+            "$TCP_TEST_CORE_RMEM $TCP_TEST_CORE_WMEM $TCP_TEST_TCP_RMEM $TCP_TEST_TCP_WMEM"
+        [ ! -e "$TCP_BUFFER_CONF" ] || fail "应用失败不得发布配置"
+        assert_file_not_contains "$CHANGE_MANIFEST" \
+            '^(BACKUP_TCP_BUFFER_CONF|PENDING_TCP_BUFFER_CONF|APPLIED_TCP_BUFFER_CONF|TCP_BUFFER_.*)='
+        assert_file_contains "$output" '运行参数已恢复，持久配置未改动'
+    )
+    (
+        local output="$TEST_TMP/tcp-buffer-restore-failure.out"
+
+        setup_tcp_buffer_case restore-failure
+        TCP_TEST_APPLY_FAIL=1
+        TCP_TEST_RESTORE_FAIL_KEY=net.core.rmem_max
+        if apply_tcp_buffer_tier 1 <<< "" > "$output" 2>&1; then
+            fail "TCP 缓冲区回退失败时不得报告成功"
+        fi
+        assert_file_contains "$CHANGE_MANIFEST" '^PENDING_TCP_BUFFER_CONF=1$'
+        assert_file_contains "$CHANGE_MANIFEST" '^BACKUP_TCP_BUFFER_CONF=absent$'
+        assert_file_contains "$CHANGE_MANIFEST" '^TCP_BUFFER_RMEM_MAX=212992$'
+        assert_file_contains "$output" '已保留事务记录'
+    )
+}
+
+test_tcp_buffer_publish_failure_preserves_existing_file() {
+    (
+        local output="$TEST_TMP/tcp-buffer-publish-failure.out"
+
+        setup_tcp_buffer_case publish-failure
+        printf '%s\n' 'custom-setting=keep' > "$TCP_BUFFER_CONF"
+        mv() {
+            local last="${!#}"
+            [ "$last" != "$TCP_BUFFER_CONF" ] || return 42
+            command mv "$@"
+        }
+
+        if apply_tcp_buffer_tier 1 <<< "" > "$output" 2>&1; then
+            fail "TCP 缓冲区配置发布失败时不得报告成功"
+        fi
+        assert_file_contains "$TCP_BUFFER_CONF" '^custom-setting=keep$'
+        assert_eq "212992 212992 4096 131072 6291456 4096 16384 4194304" \
+            "$TCP_TEST_CORE_RMEM $TCP_TEST_CORE_WMEM $TCP_TEST_TCP_RMEM $TCP_TEST_TCP_WMEM"
+        assert_file_not_contains "$CHANGE_MANIFEST" \
+            '^(BACKUP_TCP_BUFFER_CONF|PENDING_TCP_BUFFER_CONF|APPLIED_TCP_BUFFER_CONF|TCP_BUFFER_.*)='
+        assert_file_contains "$output" '原配置未改动'
+    )
+}
+
+test_tcp_buffer_restore_rejects_invalid_metadata_before_mutation() {
+    (
+        setup_tcp_buffer_case invalid-restore-metadata
+        reset_change_store tcp-buffer-invalid-restore-metadata
+        TCP_BUFFER_CONF="$TEST_TMP/tcp-buffer-invalid-restore-metadata/99-vpsbox-tcp-buffer.conf"
+        backup_change_file_once TCP_BUFFER_CONF "$TCP_BUFFER_CONF"
+        manifest_set TCP_BUFFER_RMEM_MAX 212992
+        manifest_set TCP_BUFFER_WMEM_MAX 212992
+        manifest_set TCP_BUFFER_TCP_RMEM 4096,131072
+        manifest_set TCP_BUFFER_TCP_WMEM 4096,16384,4194304
+        mark_change_applied TCP_BUFFER_CONF
+        forbid_init
+        restore_change_file() { forbid "TCP 恢复元数据异常时不得恢复文件"; }
+        sysctl() { forbid "TCP 恢复元数据异常时不得修改运行参数"; }
+
+        if restore_tcp_buffer_system_change >/dev/null 2>&1; then
+            fail "TCP 缓冲区恢复元数据异常时必须失败"
+        fi
+        assert_no_forbidden "TCP 恢复必须先完整校验元数据"
+    )
+}
+
 setup_ipv6_disable_case() {
     local name="$1"
 
@@ -902,7 +1123,6 @@ test_ipv6_default_confirmation_applies_and_repeated_run_is_noop() {
         forbid_init
         systemctl() { forbid "禁用 IPv6 不得调用 systemd"; }
         rc-service() { forbid "禁用 IPv6 不得调用 OpenRC"; }
-        backup_change_file_once() { forbid "禁用 IPv6 不得登记通用恢复事务"; }
 
         disable_ipv6 <<< "" > "$output"
 
@@ -913,8 +1133,13 @@ test_ipv6_default_confirmation_applies_and_repeated_run_is_noop() {
         assert_eq "1 1 1" "$IPV6_TEST_ALL $IPV6_TEST_DEFAULT $IPV6_TEST_LO" \
             "默认确认后必须禁用 all/default/lo"
         assert_file_contains "$output" 'IPv6 已禁用，重启后仍会保持禁用'
-        [ ! -e "$CHANGE_MANIFEST" ] || fail "成功禁用不应创建通用恢复记录"
-        assert_no_forbidden "禁用 IPv6 不得重启服务或登记通用恢复事务"
+        assert_file_contains "$CHANGE_MANIFEST" '^BACKUP_IPV6_CONF=absent$'
+        assert_file_contains "$CHANGE_MANIFEST" '^IPV6_ALL=0$'
+        assert_file_contains "$CHANGE_MANIFEST" '^IPV6_DEFAULT=0$'
+        assert_file_contains "$CHANGE_MANIFEST" '^IPV6_LO=0$'
+        assert_file_contains "$CHANGE_MANIFEST" '^APPLIED_IPV6_CONF=1$'
+        assert_file_contains "$output" '可通过 vpsbox 系统改动恢复菜单恢复禁用前状态'
+        assert_no_forbidden "禁用 IPv6 不得重启服务"
 
         IPV6_TEST_ALL=0
         IPV6_TEST_DEFAULT=0
@@ -976,6 +1201,8 @@ test_ipv6_runtime_apply_or_verification_failure_restores_values() {
             assert_file_contains "$output" '已恢复记录的运行参数，持久配置未改动'
             assert_eq 3 "$(grep -c '^w:' "$IPV6_TEST_SYSCTL_LOG")" \
                 "IPv6 ${mode} 失败后应回退三个运行参数"
+            assert_file_not_contains "$CHANGE_MANIFEST" \
+                '^(BACKUP_IPV6_CONF|PENDING_IPV6_CONF|APPLIED_IPV6_CONF|IPV6_ALL|IPV6_DEFAULT|IPV6_LO)='
         )
     done
 }
@@ -999,6 +1226,8 @@ test_ipv6_publish_failure_restores_runtime_and_preserves_target() {
             "发布失败后应恢复记录的运行参数"
         [ ! -e "$IPV6_DISABLE_CONF" ] || fail "发布失败不得留下正式配置"
         assert_file_contains "$output" '保存 IPv6 配置失败；已恢复记录的运行参数'
+        assert_file_not_contains "$CHANGE_MANIFEST" \
+            '^(BACKUP_IPV6_CONF|PENDING_IPV6_CONF|APPLIED_IPV6_CONF|IPV6_ALL|IPV6_DEFAULT|IPV6_LO)='
         if find "$IPV6_TEST_DIR" -maxdepth 1 -name '.vpsbox-disable-ipv6.*' -print -quit | grep -q .; then
             fail "发布失败后不得残留 IPv6 临时配置"
         fi
@@ -1019,8 +1248,62 @@ test_ipv6_failed_runtime_restore_reports_manual_recovery() {
 
         assert_eq 1 "$IPV6_TEST_ALL" "夹具必须保留未恢复的 all.disable_ipv6"
         assert_file_contains "$output" '记录的运行参数未能确认完整恢复'
-        assert_file_contains "$output" '请通过 IPv4 或 VPS 控制台检查 IPv6 地址、路由'
+        assert_file_contains "$output" '已保留事务记录'
+        assert_file_contains "$CHANGE_MANIFEST" '^PENDING_IPV6_CONF=1$'
+        assert_file_contains "$CHANGE_MANIFEST" '^BACKUP_IPV6_CONF=absent$'
+        assert_file_contains "$CHANGE_MANIFEST" '^IPV6_ALL=0$'
         [ ! -e "$IPV6_DISABLE_CONF" ] || fail "回退失败也不得发布持久配置"
+    )
+}
+
+test_ipv6_recorded_restore_recovers_file_and_runtime() {
+    (
+        local output="$TEST_TMP/ipv6-recorded-restore.out"
+
+        setup_ipv6_disable_case recorded-restore
+        disable_ipv6 <<< "" >/dev/null
+
+        restore_vpsbox_system_change ipv6 > "$output"
+
+        [ ! -e "$IPV6_DISABLE_CONF" ] || fail "恢复后应移除首次创建的 IPv6 禁用配置"
+        assert_eq "0 0 0" "$IPV6_TEST_ALL $IPV6_TEST_DEFAULT $IPV6_TEST_LO" \
+            "IPv6 恢复必须还原禁用前的三个运行参数"
+        assert_file_not_contains "$CHANGE_MANIFEST" \
+            '^(BACKUP_IPV6_CONF|PENDING_IPV6_CONF|APPLIED_IPV6_CONF|IPV6_ALL|IPV6_DEFAULT|IPV6_LO)='
+        assert_file_contains "$output" '已重新检测到全局 IPv6 地址'
+        assert_file_contains "$output" 'IPv6 禁用 已恢复'
+    )
+}
+
+test_ipv6_untracked_config_uses_explicit_reenable_path() {
+    (
+        local output="$TEST_TMP/ipv6-untracked-reenable.out"
+        local disable_output="$TEST_TMP/ipv6-untracked-disable.out"
+
+        setup_ipv6_disable_case untracked-reenable
+        render_ipv6_disable_config > "$IPV6_DISABLE_CONF"
+        if disable_ipv6 <<< "" > "$disable_output" 2>&1; then
+            fail "无原始记录的旧版 IPv6 配置不得建立错误恢复基线"
+        fi
+        assert_file_contains "$disable_output" '请先在系统改动菜单中重新启用 IPv6'
+        assert_empty_file "$IPV6_TEST_SYSCTL_LOG" \
+            "拒绝旧版 IPv6 配置时不得重新应用运行参数"
+        IPV6_TEST_ALL=1
+        IPV6_TEST_DEFAULT=1
+        IPV6_TEST_LO=1
+
+        assert_eq legacy "$(system_change_state ipv6)" \
+            "无原始记录的 VPSBox IPv6 配置应显示单独重新启用状态"
+        if recorded_system_changes_present; then
+            fail "无原始记录的 IPv6 配置不得进入恢复全部"
+        fi
+        restore_vpsbox_system_change_interactive ipv6 <<< "YES" > "$output"
+
+        [ ! -e "$IPV6_DISABLE_CONF" ] || fail "重新启用后应移除无记录的 VPSBox 禁用配置"
+        assert_eq "0 0 0" "$IPV6_TEST_ALL $IPV6_TEST_DEFAULT $IPV6_TEST_LO"
+        assert_file_contains "$output" '不属于精确还原'
+        assert_file_contains "$output" 'all/default/lo 已设置为 0'
+        assert_file_contains "$output" '已重新检测到全局 IPv6 地址'
     )
 }
 
@@ -1956,7 +2239,7 @@ test_hostname_change_does_not_create_restore_record() {
         [ ! -e "$CHANGE_BACKUP_DIR/HOSTNAME_FILE" ] &&
             [ ! -e "$CHANGE_BACKUP_DIR/HOSTS_FILE" ] ||
             fail "主机名修改不应创建持久备份"
-        assert_eq 'dns bbr ipv4_priority fail2ban journald ntp' \
+        assert_eq 'dns bbr ipv4_priority fail2ban journald ntp ipv6 tcp_buffer' \
             "$(system_change_items | paste -sd ' ' -)" \
             "系统恢复项目不应再包含主机名"
     )
@@ -2259,7 +2542,7 @@ test_restore_system_changes_clears_success_and_preserves_failed_group() {
             fail "成功项目必须立即清理自己的备份"
         assert_file_contains "$output" '恢复成功：1 项'
         assert_file_contains "$output" '恢复失败：1 项'
-        assert_file_contains "$output" '无记录：4 项'
+        assert_file_contains "$output" '无记录：6 项'
         assert_no_forbidden "失败组预检后仍执行了系统服务修改"
     )
 }
@@ -2361,6 +2644,7 @@ main() {
         change_restore_state
         chrony_sources_are_current
         disable_ipv6
+        apply_tcp_buffer_tier
         enable_bbr_fq
         ensure_public_config_dir
         set_main_ssh_port_directives
@@ -2376,6 +2660,8 @@ main() {
         restore_vpsbox_system_change
         restore_vpsbox_system_change_interactive
         restore_vpsbox_system_changes
+        restore_ipv6_system_change
+        restore_tcp_buffer_system_change
         show_vpsbox_changes
         restore_recorded_ntp_change
         ssh_restore_snapshot_path_allowed
@@ -2414,10 +2700,17 @@ main() {
         test_ipv6_runtime_apply_or_verification_failure_restores_values
         test_ipv6_publish_failure_restores_runtime_and_preserves_target
         test_ipv6_failed_runtime_restore_reports_manual_recovery
+        test_ipv6_recorded_restore_recovers_file_and_runtime
+        test_ipv6_untracked_config_uses_explicit_reenable_path
         test_bbr_fq_healthy_is_noop
         test_bbr_fq_runtime_drift_uses_light_repair
         test_unsupported_kernel_leaves_no_phantom_pending_change
         test_failed_bbr_runtime_restore_keeps_recovery_transaction
+        test_tcp_buffer_tiers_preserve_defaults_and_restore_first_baseline
+        test_tcp_buffer_cancel_invalid_default_and_healthy_noop_are_read_only
+        test_tcp_buffer_failures_restore_runtime_or_keep_pending_record
+        test_tcp_buffer_publish_failure_preserves_existing_file
+        test_tcp_buffer_restore_rejects_invalid_metadata_before_mutation
         test_journald_healthy_is_noop
         test_journald_apply_and_failed_restart_restore_previous_config
         test_first_ssh_port_rollback_clears_tracking

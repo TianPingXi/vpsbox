@@ -10,7 +10,7 @@ umask 077
 # 2. 平台适配与通用持久化：系统识别、启动更新探测、下载、依赖与变更记录
 # 3. 节点与 sing-box：依赖、服务、监听检查、状态、配置、事务及版本更新
 # 4. vpsbox 自更新发布与回滚事务
-# 5. 系统优化与安全：BBR、IPv6、Fail2ban、NTP、DNS、SSH 与系统维护
+# 5. 系统优化与安全：BBR、IPv6、TCP、Fail2ban、NTP、DNS、SSH 与系统维护
 # 6. 主机防火墙：端口发现、nftables、Docker 转发、回滚与菜单
 # 7. 检测：一键检测
 # 8. 维护、恢复与末端菜单动作
@@ -44,6 +44,10 @@ SS_URI_FILE="$CONFIG_DIR/vpsbox-ss-uri.txt"
 VLESS_URI_FILE="$CONFIG_DIR/vpsbox-vless-uri.txt"
 BBR_CONF="/etc/sysctl.d/99-vpsbox-bbr.conf"
 IPV6_DISABLE_CONF="/etc/sysctl.d/99-vpsbox-disable-ipv6.conf"
+TCP_BUFFER_CONF="/etc/sysctl.d/99-vpsbox-tcp-buffer.conf"
+TCP_BUFFER_TIER_1_MAX=8388608
+TCP_BUFFER_TIER_2_MAX=16777216
+TCP_BUFFER_TIER_3_MAX=33554432
 JOURNALD_VPSBOX_CONF="/etc/systemd/journald.conf.d/99-vpsbox.conf"
 VPSBOX_STATE_DIR="/etc/vpsbox"
 # 独立于系统改动清单保存，卸载管理命令时继续保留。
@@ -1813,7 +1817,7 @@ ensure_change_store() {
 manifest_value() {
     local key="$1"
     ensure_change_store || return 1
-    # 值始终是单行 token；额外允许逗号保存已规范化的 SSH 多端口 CSV。
+    # 值始终是单行 token；额外允许逗号保存已规范化的多字段 CSV。
     awk -F= -v key="$key" '$1 == key && $2 ~ /^[A-Za-z0-9_.:,-]+$/ { value=$2 } END { if (value != "") print value; else exit 1 }' "$CHANGE_MANIFEST"
 }
 
@@ -6735,7 +6739,7 @@ reexec_updated_vpsbox() {
 }
 
 # ==============================================================================
-# 5. 系统优化与安全：BBR、Fail2ban、NTP、DNS、SSH 与系统维护
+# 5. 系统优化与安全：BBR、IPv6、TCP、Fail2ban、NTP、DNS、SSH 与系统维护
 # ==============================================================================
 bbr_state() {
     local cc
@@ -10321,6 +10325,11 @@ EOF
     # --- END GENERATED TEMPLATE: disable IPv6 sysctl drop-in ---
 }
 
+ipv6_disable_config_is_current() {
+    [ -f "$IPV6_DISABLE_CONF" ] && [ ! -L "$IPV6_DISABLE_CONF" ] || return 1
+    render_ipv6_disable_config | cmp -s - "$IPV6_DISABLE_CONF"
+}
+
 ipv6_disable_runtime_values() {
     local all default lo
 
@@ -10356,9 +10365,17 @@ restore_ipv6_runtime_values() {
     [ "$failed" -eq 0 ] && ipv6_runtime_matches_values "$old_all" "$old_default" "$old_lo"
 }
 
+cancel_unmodified_ipv6_change() {
+    if ! cancel_unmodified_change_transaction \
+        IPV6_CONF IPV6_ALL IPV6_DEFAULT IPV6_LO; then
+        err "清理尚未应用的 IPv6 修改记录失败，请先使用恢复菜单检查系统改动。"
+        return 1
+    fi
+}
+
 disable_ipv6() {
     local addresses runtime_values old_all old_default old_lo
-    local parent tmp interface address
+    local parent tmp interface address tracking_state
 
     if ! addresses="$(global_ipv6_addresses)"; then
         err "无法读取全局 IPv6 地址，已取消禁用。"
@@ -10398,10 +10415,29 @@ disable_ipv6() {
             err "$IPV6_DISABLE_CONF 不是安全的普通文件，已拒绝覆盖。"
             return 1
         }
-        if ! render_ipv6_disable_config | cmp -s - "$IPV6_DISABLE_CONF"; then
+        if ! ipv6_disable_config_is_current; then
             err "$IPV6_DISABLE_CONF 已存在且内容不属于当前配置，已拒绝覆盖。"
             return 1
         fi
+    fi
+
+    tracking_state="$(change_restore_state IPV6_CONF)" || return 1
+    if [ "$tracking_state" = "pending" ]; then
+        err "检测到尚未处理的 IPv6 修改事务，请先在恢复菜单中检查或恢复。"
+        return 1
+    fi
+    if [ "$tracking_state" = "none" ] && ipv6_disable_config_is_current; then
+        err "检测到没有原始恢复记录的 VPSBox IPv6 禁用配置。"
+        err "请先在系统改动菜单中重新启用 IPv6，再重新执行禁用以建立恢复基线。"
+        return 1
+    fi
+    if [ "$tracking_state" = "none" ] && {
+        [ -n "$(manifest_value BACKUP_IPV6_CONF 2>/dev/null || true)" ] ||
+            [ -n "$(manifest_value IPV6_ALL 2>/dev/null || true)" ] ||
+            [ -n "$(manifest_value IPV6_DEFAULT 2>/dev/null || true)" ] ||
+            [ -n "$(manifest_value IPV6_LO 2>/dev/null || true)" ];
+    }; then
+        cancel_unmodified_ipv6_change || return 1
     fi
 
     runtime_values="$(ipv6_disable_runtime_values)" || {
@@ -10410,11 +10446,29 @@ disable_ipv6() {
     }
     read -r old_all old_default old_lo <<< "$runtime_values"
 
-    tmp="$(mktemp "$parent/.vpsbox-disable-ipv6.XXXXXX")" || return 1
+    if ! backup_change_file_once IPV6_CONF "$IPV6_DISABLE_CONF" ||
+        ! manifest_set_once IPV6_ALL "$old_all" ||
+        ! manifest_set_once IPV6_DEFAULT "$old_default" ||
+        ! manifest_set_once IPV6_LO "$old_lo"; then
+        cancel_unmodified_ipv6_change || true
+        err "记录 IPv6 原配置失败，已取消修改。"
+        return 1
+    fi
+    if ! begin_change_transaction IPV6_CONF; then
+        cancel_unmodified_ipv6_change || true
+        err "记录 IPv6 修改事务失败，已取消修改。"
+        return 1
+    fi
+
+    tmp="$(mktemp "$parent/.vpsbox-disable-ipv6.XXXXXX")" || {
+        cancel_unmodified_ipv6_change || true
+        return 1
+    }
     if ! render_ipv6_disable_config > "$tmp" ||
         ! chown root:root "$tmp" ||
         ! chmod 644 "$tmp"; then
         rm -f -- "$tmp" || warn "清理 IPv6 临时配置失败：$tmp"
+        cancel_unmodified_ipv6_change || true
         err "生成 IPv6 配置失败，未修改系统。"
         return 1
     fi
@@ -10422,10 +10476,14 @@ disable_ipv6() {
     if ! sysctl -p "$tmp" >/dev/null 2>&1 || ! ipv6_disabled_runtime_is_current; then
         rm -f -- "$tmp" || warn "清理 IPv6 临时配置失败：$tmp"
         if restore_ipv6_runtime_values "$old_all" "$old_default" "$old_lo"; then
-            err "禁用 IPv6 失败；已恢复记录的运行参数，持久配置未改动。"
+            if cancel_unmodified_ipv6_change; then
+                err "禁用 IPv6 失败；已恢复记录的运行参数，持久配置未改动。"
+            else
+                err "禁用 IPv6 失败；运行参数已恢复，但事务记录清理失败。"
+            fi
         else
             err "禁用 IPv6 失败，且记录的运行参数未能确认完整恢复。"
-            err "请通过 IPv4 或 VPS 控制台检查 IPv6 地址、路由及 net.ipv6.conf.*.disable_ipv6。"
+            err "已保留事务记录，请通过恢复菜单或 IPv4/VPS 控制台处理。"
         fi
         return 1
     fi
@@ -10433,16 +10491,548 @@ disable_ipv6() {
     if ! mv -f -- "$tmp" "$IPV6_DISABLE_CONF"; then
         rm -f -- "$tmp" || warn "清理 IPv6 临时配置失败：$tmp"
         if restore_ipv6_runtime_values "$old_all" "$old_default" "$old_lo"; then
-            err "保存 IPv6 配置失败；已恢复记录的运行参数，持久配置未改动。"
+            if cancel_unmodified_ipv6_change; then
+                err "保存 IPv6 配置失败；已恢复记录的运行参数，持久配置未改动。"
+            else
+                err "保存 IPv6 配置失败；运行参数已恢复，但事务记录清理失败。"
+            fi
         else
             err "保存 IPv6 配置失败，且记录的运行参数未能确认完整恢复。"
-            err "请通过 IPv4 或 VPS 控制台检查 IPv6 地址、路由及 net.ipv6.conf.*.disable_ipv6。"
+            err "已保留事务记录，请通过恢复菜单或 IPv4/VPS 控制台处理。"
         fi
         return 1
     fi
 
+    if ! mark_change_applied IPV6_CONF; then
+        err "IPv6 已禁用，但恢复记录提交失败；已保留待恢复记录。"
+        return 1
+    fi
+
     info "IPv6 已禁用，重启后仍会保持禁用。"
-    info "该设置不会加入 vpsbox 系统改动恢复菜单。"
+    info "可通过 vpsbox 系统改动恢复菜单恢复禁用前状态。"
+}
+
+report_ipv6_reenable_address_state() {
+    local addresses
+
+    if ! addresses="$(global_ipv6_addresses)"; then
+        warn "IPv6 开关已恢复，但无法读取全局 IPv6 地址；请通过 IPv4 或 VPS 控制台检查。"
+    elif [ -z "$addresses" ]; then
+        warn "IPv6 开关已恢复，但全局 IPv6 地址尚未重新出现。"
+        warn "请保持 IPv4 或控制台连接，并在方便时重启 VPS。"
+    else
+        info "已重新检测到全局 IPv6 地址。"
+    fi
+}
+
+reenable_untracked_ipv6() {
+    local runtime_values old_all old_default old_lo parent snapshot failed=0 rollback_failed=0
+
+    ipv6_disable_config_is_current || {
+        err "未找到可安全识别的 VPSBox IPv6 禁用配置，已拒绝自动处理。"
+        return 1
+    }
+    [ "$(change_restore_state IPV6_CONF)" = "none" ] || {
+        err "检测到 IPv6 恢复记录，请使用正常恢复流程。"
+        return 1
+    }
+    runtime_values="$(ipv6_disable_runtime_values)" || {
+        err "无法读取 IPv6 内核运行参数，未修改系统。"
+        return 1
+    }
+    read -r old_all old_default old_lo <<< "$runtime_values"
+    parent="$(dirname "$IPV6_DISABLE_CONF")"
+    [ -d "$parent" ] && [ ! -L "$parent" ] || {
+        err "IPv6 配置目录不存在或不安全：$parent"
+        return 1
+    }
+    snapshot="$(mktemp "$parent/.vpsbox-enable-ipv6.XXXXXX")" || return 1
+    if ! cp -a -- "$IPV6_DISABLE_CONF" "$snapshot" ||
+        ! rm -f -- "$IPV6_DISABLE_CONF"; then
+        rm -f -- "$snapshot"
+        err "准备移除 IPv6 禁用配置失败，未修改运行参数。"
+        return 1
+    fi
+
+    sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || failed=1
+    sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || failed=1
+    sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1 || failed=1
+    if [ "$failed" -ne 0 ] || ! ipv6_runtime_matches_values 0 0 0; then
+        restore_file_atomically_from_snapshot "$snapshot" "$IPV6_DISABLE_CONF" || rollback_failed=1
+        restore_ipv6_runtime_values "$old_all" "$old_default" "$old_lo" || rollback_failed=1
+        if [ "$rollback_failed" -ne 0 ]; then
+            err "重新启用 IPv6 失败，且禁用配置或原运行参数未能完整恢复。"
+            err "请通过 IPv4 或 VPS 控制台检查 IPv6 配置。"
+        else
+            err "重新启用 IPv6 失败，已恢复原禁用配置和运行参数。"
+        fi
+        rm -f -- "$snapshot"
+        return 1
+    fi
+
+    rm -f -- "$snapshot" || warn "IPv6 已重新启用，但临时快照清理失败：$snapshot"
+    info "VPSBox IPv6 禁用配置已移除，all/default/lo 已设置为 0。"
+    report_ipv6_reenable_address_state
+}
+
+tcp_buffer_tier_max() {
+    case "$1" in
+        1) printf '%s\n' "$TCP_BUFFER_TIER_1_MAX" ;;
+        2) printf '%s\n' "$TCP_BUFFER_TIER_2_MAX" ;;
+        3) printf '%s\n' "$TCP_BUFFER_TIER_3_MAX" ;;
+        *) return 2 ;;
+    esac
+}
+
+tcp_buffer_tier_description() {
+    case "$1" in
+        1) printf '%s\n' "第一档（100–300 Mbps / 最大 8 MiB）" ;;
+        2) printf '%s\n' "第二档（301–600 Mbps / 最大 16 MiB）" ;;
+        3) printf '%s\n' "第三档（601–1000 Mbps / 最大 32 MiB）" ;;
+        *) return 2 ;;
+    esac
+}
+
+tcp_buffer_format_bytes() {
+    local raw="$1" value
+
+    [[ "$raw" =~ ^[0-9]+$ ]] || return 1
+    value=$((10#$raw))
+    if [ $((value % 1048576)) -eq 0 ]; then
+        printf '%s MiB\n' "$((value / 1048576))"
+    elif [ $((value % 1024)) -eq 0 ]; then
+        printf '%s KiB\n' "$((value / 1024))"
+    else
+        printf '%s B\n' "$value"
+    fi
+}
+
+normalize_tcp_buffer_vector() {
+    local raw="$1" minimum default maximum extra
+
+    read -r minimum default maximum extra <<< "$raw"
+    [ -z "${extra:-}" ] &&
+        [[ "$minimum" =~ ^[0-9]+$ ]] &&
+        [[ "$default" =~ ^[0-9]+$ ]] &&
+        [[ "$maximum" =~ ^[0-9]+$ ]] || return 1
+    [ $((10#$minimum)) -le $((10#$default)) ] &&
+        [ $((10#$default)) -le $((10#$maximum)) ] || return 1
+    printf '%s,%s,%s\n' "$minimum" "$default" "$maximum"
+}
+
+tcp_buffer_vector_to_spaces() {
+    local csv="$1" minimum default maximum extra
+
+    IFS=, read -r minimum default maximum extra <<< "$csv"
+    [ -z "${extra:-}" ] &&
+        [[ "$minimum" =~ ^[0-9]+$ ]] &&
+        [[ "$default" =~ ^[0-9]+$ ]] &&
+        [[ "$maximum" =~ ^[0-9]+$ ]] || return 1
+    [ $((10#$minimum)) -le $((10#$default)) ] &&
+        [ $((10#$default)) -le $((10#$maximum)) ] || return 1
+    printf '%s %s %s\n' "$minimum" "$default" "$maximum"
+}
+
+tcp_buffer_runtime_values() {
+    local core_rmem core_wmem tcp_rmem tcp_wmem
+
+    core_rmem="$(sysctl -n net.core.rmem_max 2>/dev/null)" || return 1
+    core_wmem="$(sysctl -n net.core.wmem_max 2>/dev/null)" || return 1
+    [[ "$core_rmem" =~ ^[0-9]+$ ]] && [[ "$core_wmem" =~ ^[0-9]+$ ]] || return 1
+    tcp_rmem="$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null)" || return 1
+    tcp_wmem="$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null)" || return 1
+    tcp_rmem="$(normalize_tcp_buffer_vector "$tcp_rmem")" || return 1
+    tcp_wmem="$(normalize_tcp_buffer_vector "$tcp_wmem")" || return 1
+    printf '%s %s %s %s\n' "$core_rmem" "$core_wmem" "$tcp_rmem" "$tcp_wmem"
+}
+
+tcp_buffer_autotuning_values() {
+    local moderate window_scaling
+
+    moderate="$(sysctl -n net.ipv4.tcp_moderate_rcvbuf 2>/dev/null)" || return 1
+    window_scaling="$(sysctl -n net.ipv4.tcp_window_scaling 2>/dev/null)" || return 1
+    [[ "$moderate" =~ ^[01]$ ]] && [[ "$window_scaling" =~ ^[01]$ ]] || return 1
+    printf '%s %s\n' "$moderate" "$window_scaling"
+}
+
+tcp_buffer_autotuning_is_ready() {
+    [ "$(tcp_buffer_autotuning_values 2>/dev/null)" = "1 1" ]
+}
+
+tcp_buffer_target_values() {
+    local source="$1" target_max="$2"
+    local _core_rmem _core_wmem tcp_rmem tcp_wmem
+    local rmem_min rmem_default _rmem_max wmem_min wmem_default _wmem_max
+
+    [[ "$target_max" =~ ^[0-9]+$ ]] || return 1
+    read -r _core_rmem _core_wmem tcp_rmem tcp_wmem <<< "$source"
+    tcp_buffer_vector_to_spaces "$tcp_rmem" >/dev/null || return 1
+    tcp_buffer_vector_to_spaces "$tcp_wmem" >/dev/null || return 1
+    IFS=, read -r rmem_min rmem_default _rmem_max <<< "$tcp_rmem"
+    IFS=, read -r wmem_min wmem_default _wmem_max <<< "$tcp_wmem"
+    [ $((10#$rmem_default)) -le $((10#$target_max)) ] &&
+        [ $((10#$wmem_default)) -le $((10#$target_max)) ] || return 2
+    printf '%s %s %s,%s,%s %s,%s,%s\n' \
+        "$target_max" "$target_max" \
+        "$rmem_min" "$rmem_default" "$target_max" \
+        "$wmem_min" "$wmem_default" "$target_max"
+}
+
+render_tcp_buffer_config() {
+    local values="$1" core_rmem core_wmem tcp_rmem tcp_wmem
+    local tcp_rmem_spaces tcp_wmem_spaces
+
+    read -r core_rmem core_wmem tcp_rmem tcp_wmem <<< "$values"
+    [[ "$core_rmem" =~ ^[0-9]+$ ]] && [[ "$core_wmem" =~ ^[0-9]+$ ]] || return 1
+    tcp_rmem_spaces="$(tcp_buffer_vector_to_spaces "$tcp_rmem")" || return 1
+    tcp_wmem_spaces="$(tcp_buffer_vector_to_spaces "$tcp_wmem")" || return 1
+    # --- BEGIN GENERATED TEMPLATE: TCP buffer sysctl drop-in ---
+    cat <<EOF
+net.core.rmem_max = $core_rmem
+net.core.wmem_max = $core_wmem
+net.ipv4.tcp_rmem = $tcp_rmem_spaces
+net.ipv4.tcp_wmem = $tcp_wmem_spaces
+EOF
+    # --- END GENERATED TEMPLATE: TCP buffer sysctl drop-in ---
+}
+
+tcp_buffer_config_values() {
+    [ -f "$TCP_BUFFER_CONF" ] && [ ! -L "$TCP_BUFFER_CONF" ] || return 1
+    awk '
+        function extract_value(line, value) {
+            value = line
+            sub(/^[^=]*=[[:space:]]*/, "", value)
+            sub(/[[:space:]]*$/, "", value)
+            return value
+        }
+        /^[[:space:]]*$/ { next }
+        {
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            count++
+            if (line ~ /^net[.]core[.]rmem_max[[:space:]]*=[[:space:]]*[0-9]+[[:space:]]*$/ && !seen_core_rmem++) {
+                core_rmem = extract_value(line)
+            } else if (line ~ /^net[.]core[.]wmem_max[[:space:]]*=[[:space:]]*[0-9]+[[:space:]]*$/ && !seen_core_wmem++) {
+                core_wmem = extract_value(line)
+            } else if (line ~ /^net[.]ipv4[.]tcp_rmem[[:space:]]*=[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]*$/ && !seen_tcp_rmem++) {
+                tcp_rmem = extract_value(line)
+                gsub(/[[:space:]]+/, ",", tcp_rmem)
+            } else if (line ~ /^net[.]ipv4[.]tcp_wmem[[:space:]]*=[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]*$/ && !seen_tcp_wmem++) {
+                tcp_wmem = extract_value(line)
+                gsub(/[[:space:]]+/, ",", tcp_wmem)
+            } else {
+                invalid = 1
+            }
+        }
+        END {
+            if (invalid || count != 4 || seen_core_rmem != 1 || seen_core_wmem != 1 || seen_tcp_rmem != 1 || seen_tcp_wmem != 1) {
+                exit 1
+            }
+            print core_rmem, core_wmem, tcp_rmem, tcp_wmem
+        }
+    ' "$TCP_BUFFER_CONF"
+}
+
+tcp_buffer_tier_from_values() {
+    local values="$1" core_rmem core_wmem tcp_rmem tcp_wmem
+    local _rmem_min _rmem_default rmem_max _wmem_min _wmem_default wmem_max
+    local tier target_max
+
+    read -r core_rmem core_wmem tcp_rmem tcp_wmem <<< "$values"
+    [[ "$core_rmem" =~ ^[0-9]+$ ]] && [[ "$core_wmem" =~ ^[0-9]+$ ]] || return 1
+    tcp_buffer_vector_to_spaces "$tcp_rmem" >/dev/null || return 1
+    tcp_buffer_vector_to_spaces "$tcp_wmem" >/dev/null || return 1
+    IFS=, read -r _rmem_min _rmem_default rmem_max <<< "$tcp_rmem"
+    IFS=, read -r _wmem_min _wmem_default wmem_max <<< "$tcp_wmem"
+    for tier in 1 2 3; do
+        target_max="$(tcp_buffer_tier_max "$tier")" || return 1
+        if [ "$core_rmem" = "$target_max" ] && [ "$core_wmem" = "$target_max" ] &&
+            [ "$rmem_max" = "$target_max" ] && [ "$wmem_max" = "$target_max" ]; then
+            printf '%s\n' "$tier"
+            return 0
+        fi
+    done
+    return 1
+}
+
+tcp_buffer_persistent_matches_values() {
+    local expected="$1" actual
+
+    actual="$(tcp_buffer_config_values)" || return 1
+    [ "$actual" = "$expected" ]
+}
+
+tcp_buffer_runtime_matches_values() {
+    local expected="$1" actual
+
+    actual="$(tcp_buffer_runtime_values)" || return 1
+    [ "$actual" = "$expected" ]
+}
+
+tcp_buffer_summary_state() {
+    local values tier
+
+    if ! values="$(tcp_buffer_config_values 2>/dev/null)"; then
+        if [ -e "$TCP_BUFFER_CONF" ] || [ -L "$TCP_BUFFER_CONF" ]; then
+            printf '%s\n' "配置异常"
+        else
+            printf '%s\n' "未配置"
+        fi
+        return 0
+    fi
+    tier="$(tcp_buffer_tier_from_values "$values" 2>/dev/null)" || {
+        printf '%s\n' "配置异常"
+        return 0
+    }
+    if ! tcp_buffer_runtime_matches_values "$values"; then
+        printf '%s\n' "第${tier}档配置存在但未生效"
+    elif ! tcp_buffer_autotuning_is_ready; then
+        printf '%s\n' "第${tier}档已配置，自动调节未开启"
+    else
+        tcp_buffer_tier_description "$tier"
+    fi
+}
+
+print_tcp_buffer_values() {
+    local title="$1" values="$2" core_rmem core_wmem tcp_rmem tcp_wmem
+    local rmem_min rmem_default rmem_max wmem_min wmem_default wmem_max
+
+    read -r core_rmem core_wmem tcp_rmem tcp_wmem <<< "$values"
+    tcp_buffer_vector_to_spaces "$tcp_rmem" >/dev/null || return 1
+    tcp_buffer_vector_to_spaces "$tcp_wmem" >/dev/null || return 1
+    IFS=, read -r rmem_min rmem_default rmem_max <<< "$tcp_rmem"
+    IFS=, read -r wmem_min wmem_default wmem_max <<< "$tcp_wmem"
+    printf ' %s\n' "$title"
+    printf ' 系统接收缓冲区上限：%s\n' "$(tcp_buffer_format_bytes "$core_rmem")"
+    printf ' 系统发送缓冲区上限：%s\n' "$(tcp_buffer_format_bytes "$core_wmem")"
+    printf ' TCP 接收缓冲区：最小 %s / 默认 %s / 最大 %s\n' \
+        "$(tcp_buffer_format_bytes "$rmem_min")" \
+        "$(tcp_buffer_format_bytes "$rmem_default")" \
+        "$(tcp_buffer_format_bytes "$rmem_max")"
+    printf ' TCP 发送缓冲区：最小 %s / 默认 %s / 最大 %s\n' \
+        "$(tcp_buffer_format_bytes "$wmem_min")" \
+        "$(tcp_buffer_format_bytes "$wmem_default")" \
+        "$(tcp_buffer_format_bytes "$wmem_max")"
+}
+
+restore_tcp_buffer_runtime_values() {
+    local values="$1" core_rmem core_wmem tcp_rmem tcp_wmem failed=0
+    local tcp_rmem_spaces tcp_wmem_spaces
+
+    read -r core_rmem core_wmem tcp_rmem tcp_wmem <<< "$values"
+    [[ "$core_rmem" =~ ^[0-9]+$ ]] && [[ "$core_wmem" =~ ^[0-9]+$ ]] || return 1
+    tcp_rmem_spaces="$(tcp_buffer_vector_to_spaces "$tcp_rmem")" || return 1
+    tcp_wmem_spaces="$(tcp_buffer_vector_to_spaces "$tcp_wmem")" || return 1
+    sysctl -w "net.core.rmem_max=$core_rmem" >/dev/null 2>&1 || failed=1
+    sysctl -w "net.core.wmem_max=$core_wmem" >/dev/null 2>&1 || failed=1
+    sysctl -w "net.ipv4.tcp_rmem=$tcp_rmem_spaces" >/dev/null 2>&1 || failed=1
+    sysctl -w "net.ipv4.tcp_wmem=$tcp_wmem_spaces" >/dev/null 2>&1 || failed=1
+    [ "$failed" -eq 0 ] && tcp_buffer_runtime_matches_values "$values"
+}
+
+cancel_unmodified_tcp_buffer_change() {
+    if ! cancel_unmodified_change_transaction \
+        TCP_BUFFER_CONF TCP_BUFFER_RMEM_MAX TCP_BUFFER_WMEM_MAX \
+        TCP_BUFFER_TCP_RMEM TCP_BUFFER_TCP_WMEM; then
+        err "清理尚未应用的 TCP 缓冲区修改记录失败，请先使用恢复菜单检查系统改动。"
+        return 1
+    fi
+}
+
+tcp_buffer_values_have_max_above() {
+    local values="$1" target_max="$2" core_rmem core_wmem tcp_rmem tcp_wmem
+    local _a _b rmem_max _c _d wmem_max
+
+    read -r core_rmem core_wmem tcp_rmem tcp_wmem <<< "$values"
+    IFS=, read -r _a _b rmem_max <<< "$tcp_rmem"
+    IFS=, read -r _c _d wmem_max <<< "$tcp_wmem"
+    [ $((10#$core_rmem)) -gt $((10#$target_max)) ] ||
+        [ $((10#$core_wmem)) -gt $((10#$target_max)) ] ||
+        [ $((10#$rmem_max)) -gt $((10#$target_max)) ] ||
+        [ $((10#$wmem_max)) -gt $((10#$target_max)) ]
+}
+
+apply_tcp_buffer_tier() {
+    local tier="$1" target_max tier_description runtime_values source_values target_values
+    local config_values="" auto_values parent tmp tracking_state
+    local old_core_rmem old_core_wmem old_tcp_rmem old_tcp_wmem
+    local auto_moderate auto_window
+
+    target_max="$(tcp_buffer_tier_max "$tier")" || return 2
+    tier_description="$(tcp_buffer_tier_description "$tier")" || return 2
+    runtime_values="$(tcp_buffer_runtime_values)" || {
+        err "无法读取 TCP 缓冲区运行参数，未修改系统。"
+        return 1
+    }
+    auto_values="$(tcp_buffer_autotuning_values)" || {
+        err "无法读取 TCP 自动调节或窗口缩放状态，未修改系统。"
+        return 1
+    }
+    if [ "$auto_values" != "1 1" ]; then
+        read -r auto_moderate auto_window <<< "$auto_values"
+        err "TCP 自动调节条件未满足，未修改系统。"
+        info "net.ipv4.tcp_moderate_rcvbuf=$auto_moderate"
+        info "net.ipv4.tcp_window_scaling=$auto_window"
+        return 1
+    fi
+
+    source_values="$runtime_values"
+    if config_values="$(tcp_buffer_config_values 2>/dev/null)" &&
+        tcp_buffer_tier_from_values "$config_values" >/dev/null 2>&1; then
+        source_values="$config_values"
+    fi
+    if ! target_values="$(tcp_buffer_target_values "$source_values" "$target_max")"; then
+        err "当前 TCP 最小值或默认值高于所选档位上限，请选择更高档位。"
+        return 1
+    fi
+
+    echo "========================================"
+    echo " TCP 缓冲区调优"
+    echo "========================================"
+    printf ' 已选择：%s\n' "$tier_description"
+    echo "----------------------------------------"
+    print_tcp_buffer_values "当前参数" "$runtime_values" || return 1
+    echo "----------------------------------------"
+    print_tcp_buffer_values "目标参数" "$target_values" || return 1
+    echo "----------------------------------------"
+    echo "缓冲区最大值是动态上限，不会立即占用对应大小的内存。"
+    if tcp_buffer_values_have_max_above "$runtime_values" "$target_max"; then
+        warn "所选档位低于当前部分最大值，本次应用会下调这些上限。"
+    fi
+
+    if tcp_buffer_persistent_matches_values "$target_values" &&
+        tcp_buffer_runtime_matches_values "$target_values"; then
+        info "当前 TCP 缓冲区配置和运行状态已是所选档位，无需重复应用。"
+        return 0
+    fi
+    if ! confirm_default_yes "是否应用所选 TCP 缓冲区参数？"; then
+        info "已取消 TCP 缓冲区调优。"
+        return 0
+    fi
+
+    parent="$(dirname "$TCP_BUFFER_CONF")"
+    [ -d "$parent" ] && [ ! -L "$parent" ] || {
+        err "TCP 缓冲区配置目录不存在或不安全：$parent"
+        return 1
+    }
+    if [ -e "$TCP_BUFFER_CONF" ] || [ -L "$TCP_BUFFER_CONF" ]; then
+        [ -f "$TCP_BUFFER_CONF" ] && [ ! -L "$TCP_BUFFER_CONF" ] || {
+            err "$TCP_BUFFER_CONF 不是安全的普通文件，已拒绝覆盖。"
+            return 1
+        }
+    fi
+
+    tracking_state="$(change_restore_state TCP_BUFFER_CONF)" || return 1
+    if [ "$tracking_state" = "pending" ]; then
+        err "检测到尚未处理的 TCP 缓冲区修改事务，请先在恢复菜单中检查或恢复。"
+        return 1
+    fi
+    if [ "$tracking_state" = "none" ] && {
+        [ -n "$(manifest_value BACKUP_TCP_BUFFER_CONF 2>/dev/null || true)" ] ||
+            [ -n "$(manifest_value TCP_BUFFER_RMEM_MAX 2>/dev/null || true)" ] ||
+            [ -n "$(manifest_value TCP_BUFFER_WMEM_MAX 2>/dev/null || true)" ] ||
+            [ -n "$(manifest_value TCP_BUFFER_TCP_RMEM 2>/dev/null || true)" ] ||
+            [ -n "$(manifest_value TCP_BUFFER_TCP_WMEM 2>/dev/null || true)" ];
+    }; then
+        cancel_unmodified_tcp_buffer_change || return 1
+    fi
+
+    read -r old_core_rmem old_core_wmem old_tcp_rmem old_tcp_wmem <<< "$runtime_values"
+    if ! backup_change_file_once TCP_BUFFER_CONF "$TCP_BUFFER_CONF" ||
+        ! manifest_set_once TCP_BUFFER_RMEM_MAX "$old_core_rmem" ||
+        ! manifest_set_once TCP_BUFFER_WMEM_MAX "$old_core_wmem" ||
+        ! manifest_set_once TCP_BUFFER_TCP_RMEM "$old_tcp_rmem" ||
+        ! manifest_set_once TCP_BUFFER_TCP_WMEM "$old_tcp_wmem"; then
+        cancel_unmodified_tcp_buffer_change || true
+        err "记录 TCP 缓冲区原配置失败，已取消修改。"
+        return 1
+    fi
+    if ! begin_change_transaction TCP_BUFFER_CONF; then
+        cancel_unmodified_tcp_buffer_change || true
+        err "记录 TCP 缓冲区修改事务失败，已取消修改。"
+        return 1
+    fi
+
+    tmp="$(mktemp "$parent/.vpsbox-tcp-buffer.XXXXXX")" || {
+        cancel_unmodified_tcp_buffer_change || true
+        return 1
+    }
+    if ! render_tcp_buffer_config "$target_values" > "$tmp" ||
+        ! chown root:root "$tmp" ||
+        ! chmod 644 "$tmp"; then
+        rm -f -- "$tmp"
+        cancel_unmodified_tcp_buffer_change || true
+        err "生成 TCP 缓冲区配置失败，未修改系统。"
+        return 1
+    fi
+
+    if ! sysctl -p "$tmp" >/dev/null 2>&1 ||
+        ! tcp_buffer_runtime_matches_values "$target_values" ||
+        ! tcp_buffer_autotuning_is_ready; then
+        rm -f -- "$tmp"
+        if restore_tcp_buffer_runtime_values "$runtime_values"; then
+            if cancel_unmodified_tcp_buffer_change; then
+                err "TCP 缓冲区调优未能完整生效；运行参数已恢复，持久配置未改动。"
+            else
+                err "TCP 缓冲区调优失败；运行参数已恢复，但事务记录清理失败。"
+            fi
+        else
+            err "TCP 缓冲区调优失败，且运行参数未能确认完整恢复。"
+            err "已保留事务记录，请使用恢复菜单处理。"
+        fi
+        return 1
+    fi
+
+    if ! mv -f -- "$tmp" "$TCP_BUFFER_CONF"; then
+        rm -f -- "$tmp"
+        if restore_tcp_buffer_runtime_values "$runtime_values"; then
+            if cancel_unmodified_tcp_buffer_change; then
+                err "保存 TCP 缓冲区配置失败；运行参数已恢复，原配置未改动。"
+            else
+                err "保存 TCP 缓冲区配置失败；运行参数已恢复，但事务记录清理失败。"
+            fi
+        else
+            err "保存 TCP 缓冲区配置失败，且运行参数未能确认完整恢复。"
+            err "已保留事务记录，请使用恢复菜单处理。"
+        fi
+        return 1
+    fi
+
+    if ! mark_change_applied TCP_BUFFER_CONF; then
+        err "TCP 缓冲区参数已应用，但恢复记录提交失败；已保留待恢复记录。"
+        return 1
+    fi
+    info "TCP 缓冲区调优已应用。"
+    info "当前档位：$tier_description"
+    info "配置重启后仍会生效，可通过系统改动恢复菜单恢复。"
+}
+
+tcp_buffer_menu() {
+    local opt
+
+    while true; do
+        clear 2>/dev/null || true
+        cat <<EOF
+========================================
+ TCP 缓冲区调优
+========================================
+ 当前状态：$(tcp_buffer_summary_state)
+----------------------------------------
+ [1] 第一档（100–300 Mbps / 最大 8 MiB）
+ [2] 第二档（301–600 Mbps / 最大 16 MiB）
+ [3] 第三档（601–1000 Mbps / 最大 32 MiB）
+----------------------------------------
+ [0] 返回系统优化菜单
+========================================
+EOF
+        read -r -p "请输入选项: " opt || return 0
+        echo ""
+        case "$opt" in
+            1|2|3) run_menu_action apply_tcp_buffer_tier "$opt"; pause ;;
+            0) return 0 ;;
+            *) warn "无效选项：$opt"; pause ;;
+        esac
+    done
 }
 
 render_bbr_fq_config() {
@@ -14879,6 +15469,12 @@ EOF
     else
         check_info "fq" "$state"
     fi
+    state="$(tcp_buffer_summary_state)"
+    case "$state" in
+        *未生效*|*未开启*|配置异常) check_fail "TCP 缓冲区" "$state" ;;
+        第一档*|第二档*|第三档*) check_ok "TCP 缓冲区" "$state" ;;
+        *) check_info "TCP 缓冲区" "$state" ;;
+    esac
     state="$(ipv4_priority_state)"
     if [ "$state" = "已启用" ]; then
         check_ok "IPv4 优先" "$state"
@@ -15440,7 +16036,7 @@ cleanup_system_garbage() {
 }
 
 system_change_items() {
-    printf '%s\n' dns bbr ipv4_priority fail2ban journald ntp
+    printf '%s\n' dns bbr ipv4_priority fail2ban journald ntp ipv6 tcp_buffer
 }
 
 system_change_label() {
@@ -15451,6 +16047,8 @@ system_change_label() {
         fail2ban) printf '%s\n' "Fail2ban" ;;
         journald) printf '%s\n' "journald 日志限制" ;;
         ntp) printf '%s\n' "NTP 时间同步" ;;
+        ipv6) printf '%s\n' "IPv6 禁用" ;;
+        tcp_buffer) printf '%s\n' "TCP 缓冲区" ;;
         *) return 2 ;;
     esac
 }
@@ -15463,6 +16061,8 @@ system_change_members() {
         fail2ban) printf '%s\n' FAIL2BAN_SSHD ;;
         journald) printf '%s\n' JOURNALD_CONF ;;
         ntp) printf '%s\n' NTP_CONF ;;
+        ipv6) printf '%s\n' IPV6_CONF ;;
+        tcp_buffer) printf '%s\n' TCP_BUFFER_CONF ;;
         *) return 2 ;;
     esac
 }
@@ -15482,13 +16082,19 @@ system_change_state() {
             applied) result=applied ;;
         esac
     done <<< "$members"
-    printf '%s\n' "$result"
+    if [ "$result" = "none" ] && [ "$item" = "ipv6" ] &&
+        ipv6_disable_config_is_current; then
+        printf '%s\n' legacy
+    else
+        printf '%s\n' "$result"
+    fi
 }
 
 system_change_state_text() {
     case "$(system_change_state "$1")" in
         pending) printf '%s\n' "未完成，可恢复" ;;
         applied) printf '%s\n' "可恢复" ;;
+        legacy) printf '%s\n' "可重新启用（无原始记录）" ;;
         none) printf '%s\n' "无记录" ;;
         *) return 1 ;;
     esac
@@ -15506,6 +16112,9 @@ show_vpsbox_changes() {
         found=1
     done < <(system_change_items)
     [ "$found" -eq 1 ] || echo " - 无"
+    if [ "$(system_change_state ipv6 2>/dev/null || true)" = "legacy" ]; then
+        echo "未记录原始值的 IPv6 配置只支持单项重新启用，不包含在恢复全部中。"
+    fi
     echo "SSH 配置不会由此功能自动恢复，请保持当前连接并手动核验后处理。"
 }
 
@@ -15513,7 +16122,9 @@ recorded_system_changes_present() {
     local item
 
     while IFS= read -r item; do
-        [ "$(system_change_state "$item")" = none ] || return 0
+        case "$(system_change_state "$item")" in
+            pending|applied) return 0 ;;
+        esac
     done < <(system_change_items)
     return 1
 }
@@ -15564,6 +16175,57 @@ restore_bbr_system_change() {
     clear_change_tracking BBR_CONF || failed=1
     manifest_remove BBR_CC || failed=1
     manifest_remove BBR_FQ || failed=1
+    return "$failed"
+}
+
+restore_ipv6_system_change() {
+    local all default lo failed=0
+
+    all="$(manifest_value IPV6_ALL 2>/dev/null || true)"
+    default="$(manifest_value IPV6_DEFAULT 2>/dev/null || true)"
+    lo="$(manifest_value IPV6_LO 2>/dev/null || true)"
+    change_backup_record_is_valid IPV6_CONF &&
+        [[ "$all" =~ ^[01]$ ]] &&
+        [[ "$default" =~ ^[01]$ ]] &&
+        [[ "$lo" =~ ^[01]$ ]] || {
+        err "IPv6 禁用恢复记录不完整，已拒绝修改系统。"
+        return 1
+    }
+    restore_change_file IPV6_CONF "$IPV6_DISABLE_CONF" || return 1
+    restore_ipv6_runtime_values "$all" "$default" "$lo" || return 1
+
+    clear_change_tracking IPV6_CONF || failed=1
+    manifest_remove IPV6_ALL || failed=1
+    manifest_remove IPV6_DEFAULT || failed=1
+    manifest_remove IPV6_LO || failed=1
+    [ "$failed" -eq 0 ] || return 1
+    report_ipv6_reenable_address_state
+}
+
+restore_tcp_buffer_system_change() {
+    local core_rmem core_wmem tcp_rmem tcp_wmem values failed=0
+
+    core_rmem="$(manifest_value TCP_BUFFER_RMEM_MAX 2>/dev/null || true)"
+    core_wmem="$(manifest_value TCP_BUFFER_WMEM_MAX 2>/dev/null || true)"
+    tcp_rmem="$(manifest_value TCP_BUFFER_TCP_RMEM 2>/dev/null || true)"
+    tcp_wmem="$(manifest_value TCP_BUFFER_TCP_WMEM 2>/dev/null || true)"
+    change_backup_record_is_valid TCP_BUFFER_CONF &&
+        [[ "$core_rmem" =~ ^[0-9]+$ ]] &&
+        [[ "$core_wmem" =~ ^[0-9]+$ ]] &&
+        tcp_buffer_vector_to_spaces "$tcp_rmem" >/dev/null &&
+        tcp_buffer_vector_to_spaces "$tcp_wmem" >/dev/null || {
+        err "TCP 缓冲区恢复记录不完整，已拒绝修改系统。"
+        return 1
+    }
+    values="$core_rmem $core_wmem $tcp_rmem $tcp_wmem"
+    restore_change_file TCP_BUFFER_CONF "$TCP_BUFFER_CONF" || return 1
+    restore_tcp_buffer_runtime_values "$values" || return 1
+
+    clear_change_tracking TCP_BUFFER_CONF || failed=1
+    manifest_remove TCP_BUFFER_RMEM_MAX || failed=1
+    manifest_remove TCP_BUFFER_WMEM_MAX || failed=1
+    manifest_remove TCP_BUFFER_TCP_RMEM || failed=1
+    manifest_remove TCP_BUFFER_TCP_WMEM || failed=1
     return "$failed"
 }
 
@@ -15654,9 +16316,10 @@ restore_ntp_system_change() {
 }
 
 restore_vpsbox_system_change() {
-    local item="$1" label
+    local item="$1" label state
 
-    [ "$(system_change_state "$item")" != none ] || return 2
+    state="$(system_change_state "$item")" || return 1
+    [ "$state" != none ] && [ "$state" != legacy ] || return 2
     label="$(system_change_label "$item")" || return 2
     case "$item" in
         dns) restore_dns_system_change ;;
@@ -15665,6 +16328,8 @@ restore_vpsbox_system_change() {
         fail2ban) restore_fail2ban_system_change ;;
         journald) restore_journald_system_change ;;
         ntp) restore_ntp_system_change ;;
+        ipv6) restore_ipv6_system_change ;;
+        tcp_buffer) restore_tcp_buffer_system_change ;;
         *) return 2 ;;
     esac || {
         err "$label 未能完整恢复；未清理的记录已保留，请检查后重试。"
@@ -15681,6 +16346,17 @@ restore_vpsbox_system_change_interactive() {
     if [ "$state" = none ]; then
         info "$label 没有可恢复记录。"
         return 0
+    fi
+    if [ "$item" = "ipv6" ] && [ "$state" = "legacy" ]; then
+        warn "未找到禁用前的原始记录，只能移除 VPSBox 配置并将 all/default/lo 设置为 0。"
+        warn "这会重新启用 IPv6，但不属于精确还原。"
+        if ! read -r -p "重新启用 IPv6？请输入 YES：" confirm; then
+            info "输入已结束，已取消重新启用 IPv6。"
+            return 0
+        fi
+        [ "$confirm" = "YES" ] || { info "已取消重新启用 IPv6。"; return 0; }
+        reenable_untracked_ipv6
+        return
     fi
     if ! read -r -p "恢复 $label？请输入 YES：" confirm; then
         info "输入已结束，已取消恢复。"
@@ -15713,6 +16389,10 @@ restore_vpsbox_system_changes() {
             continue
         }
         if [ "$state" = none ]; then
+            absent=$((absent + 1))
+            continue
+        fi
+        if [ "$state" = legacy ]; then
             absent=$((absent + 1))
             continue
         fi
@@ -15768,6 +16448,8 @@ system_changes_menu() {
  [5] Fail2ban：$(system_change_state_text fail2ban)
  [6] journald 日志限制：$(system_change_state_text journald)
  [7] NTP 时间同步：$(system_change_state_text ntp)
+ [8] IPv6 禁用：$(system_change_state_text ipv6)
+ [9] TCP 缓冲区：$(system_change_state_text tcp_buffer)
 ----------------------------------------
  [0] 返回系统优化菜单
 ========================================
@@ -15783,6 +16465,8 @@ EOF
             5) run_menu_action restore_vpsbox_system_change_interactive fail2ban; pause ;;
             6) run_menu_action restore_vpsbox_system_change_interactive journald; pause ;;
             7) run_menu_action restore_vpsbox_system_change_interactive ntp; pause ;;
+            8) run_menu_action restore_vpsbox_system_change_interactive ipv6; pause ;;
+            9) run_menu_action restore_vpsbox_system_change_interactive tcp_buffer; pause ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
@@ -16196,6 +16880,7 @@ system_menu() {
  系统优化
 ========================================
  BBR + fq：$(bbr_fq_summary_state)
+ TCP 缓冲区：$(tcp_buffer_summary_state)
  IPv4 优先：$(ipv4_priority_state)
  SSH：端口 $(ssh_port_state) / 加固$(ssh_hardening_state)
  Fail2ban：$(fail2ban_service_state) / SSH 防护$(fail2ban_sshd_state)
@@ -16213,16 +16898,17 @@ system_menu() {
  [6] 开启 IPv4 优先
  [7] 开启 BBR + fq
  [8] 禁用 IPv6
+ [9] TCP 缓冲区调优
 
  SSH 安全
- [9] 修改 SSH 端口
- [10] SSH 基础加固
- [11] 查看 SSH 生效配置
- [12] 安装 Fail2ban
+ [10] 修改 SSH 端口
+ [11] SSH 基础加固
+ [12] 查看 SSH 生效配置
+ [13] 安装 Fail2ban
 
  维护
- [13] $journal_label
- [14] 查看/恢复 vpsbox 系统改动
+ [14] $journal_label
+ [15] 查看/恢复 vpsbox 系统改动
 ----------------------------------------
  [0] 返回主菜单
 ========================================
@@ -16239,12 +16925,13 @@ EOF
             6) run_menu_action enable_ipv4_priority; pause ;;
             7) run_menu_action enable_bbr_fq; pause ;;
             8) run_menu_action disable_ipv6; pause ;;
-            9) ssh_port_change_menu ;;
-            10) ssh_basic_hardening_menu ;;
-            11) run_menu_action show_current_ssh_config; pause ;;
-            12) run_menu_action install_fail2ban; pause ;;
-            13) run_menu_action limit_systemd_journal; pause ;;
-            14) system_changes_menu ;;
+            9) tcp_buffer_menu ;;
+            10) ssh_port_change_menu ;;
+            11) ssh_basic_hardening_menu ;;
+            12) run_menu_action show_current_ssh_config; pause ;;
+            13) run_menu_action install_fail2ban; pause ;;
+            14) run_menu_action limit_systemd_journal; pause ;;
+            15) system_changes_menu ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
