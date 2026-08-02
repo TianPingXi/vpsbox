@@ -10,6 +10,7 @@ source "$REPO_DIR/vpsbox.sh"
 
 # 更新用例会用事件桩替换命令入口安装；先保留生产实现，避免成功路径永久被桩遮蔽。
 eval "production_install_command_alias() $(declare -f install_command_alias | sed '1d')"
+eval "production_start_vpsbox_update_watchdog() $(declare -f start_vpsbox_update_watchdog | sed '1d')"
 
 # 更新夹具通过 install_deps 记录依赖阶段，不访问测试宿主机的软件源。
 ensure_node_dependencies() { install_deps; }
@@ -549,6 +550,9 @@ test_real_reexec_failure_returns_without_option_or_env_leaks() {
         reexec_updated_vpsbox "$CASE_DIR/previous"
         rc=$?
         set -e
+        [ -f "$VPSBOX_UPDATE_WATCHDOG_DIR/handoff" ] &&
+            [ ! -L "$VPSBOX_UPDATE_WATCHDOG_DIR/handoff" ] &&
+            printf "handoff:present\n"
         kill -TERM "$VPSBOX_UPDATE_WATCHDOG_PID" 2>/dev/null || true
         wait "$VPSBOX_UPDATE_WATCHDOG_PID" 2>/dev/null || true
         VPSBOX_UPDATE_WATCHDOG_PID=""
@@ -564,6 +568,8 @@ test_real_reexec_failure_returns_without_option_or_env_leaks() {
     assert_file_contains "$output" '^reached:126$' \
         "不可执行文件必须以 126 返回控制权"
     assert_file_not_contains "$output" 'command not found|missing:reexec_updated_vpsbox'
+    assert_file_contains "$output" '^handoff:present$' \
+        "production reexec 必须在 exec 前通知 watchdog 进入新版启动阶段"
     assert_file_contains "$output" '^execfail:off$'
     assert_file_contains "$output" '^backup-env:clear$'
     assert_file_contains "$output" '^ready-env:clear$'
@@ -752,6 +758,82 @@ test_pending_update_confirmation_prevents_rollback() {
     assert_eq "" "$PENDING_VPSBOX_UPDATE_READY_FILE"
     assert_eq 1 "$VPSBOX_UPDATE_STARTUP_CONFIRMED"
     [ -f "$ready" ] || fail "确认新版启动时应通知父进程 watchdog"
+}
+
+test_update_watchdog_late_ready_cannot_cancel_rollback() {
+    (
+        local event_log="$TEST_TMP/watchdog-late-ready.log" watchdog_pid
+
+        reset_update_case watchdog-late-ready
+        write_fixture "$CMD_PATH" "$UPDATE_TEST_NEWER" remote
+        write_fixture "${CMD_PATH}.previous" "$UPDATE_TEST_CURRENT" installed
+        : > "$event_log"
+        VPSBOX_UPDATE_PREPARE_TIMEOUT=0
+        VPSBOX_UPDATE_STARTUP_TIMEOUT=0
+        process_start_ticks() { printf '%s\n' 12345; }
+        sleep() { :; }
+        kill() {
+            local dir
+            printf 'kill:%s\n' "$*" >> "$event_log"
+            if [ "${1:-}" = -TERM ]; then
+                for dir in "$RUNTIME_DIR"/update-startup.*; do
+                    [ -d "$dir" ] || continue
+                    : > "$dir/ready"
+                done
+            fi
+        }
+        restore_previous_vpsbox() {
+            printf 'restore:%s\n' "$1" >> "$event_log"
+        }
+
+        production_start_vpsbox_update_watchdog "${CMD_PATH}.previous"
+        watchdog_pid="$VPSBOX_UPDATE_WATCHDOG_PID"
+        wait "$watchdog_pid"
+
+        assert_file_contains "$event_log" '^kill:-TERM '
+        assert_file_contains "$event_log" '^restore:' \
+            "进入回滚阶段后迟到的 ready 不得把已终止候选重新判为成功"
+    )
+}
+
+test_update_watchdog_handoff_resets_startup_timer() {
+    (
+        local event_log="$TEST_TMP/watchdog-handoff.log" watchdog_pid="" watchdog_dir
+        cleanup_handoff_watchdog() {
+            [ -n "$watchdog_pid" ] || return 0
+            builtin kill -TERM "$watchdog_pid" 2>/dev/null || true
+            wait "$watchdog_pid" 2>/dev/null || true
+        }
+        trap cleanup_handoff_watchdog EXIT
+
+        reset_update_case watchdog-handoff
+        write_fixture "$CMD_PATH" "$UPDATE_TEST_NEWER" remote
+        write_fixture "${CMD_PATH}.previous" "$UPDATE_TEST_CURRENT" installed
+        : > "$event_log"
+        [ "$VPSBOX_UPDATE_STARTUP_TIMEOUT" -gt "$PACKAGE_INSTALL_TIMEOUT" ] ||
+            fail "新版启动预算必须覆盖合法的包恢复上限"
+        VPSBOX_UPDATE_PREPARE_TIMEOUT=7
+        VPSBOX_UPDATE_STARTUP_TIMEOUT=4
+        process_start_ticks() { printf '%s\n' 12345; }
+        kill() { printf 'kill:%s\n' "$*" >> "$event_log"; }
+        restore_previous_vpsbox() { printf 'restore:%s\n' "$1" >> "$event_log"; }
+
+        production_start_vpsbox_update_watchdog "${CMD_PATH}.previous"
+        watchdog_pid="$VPSBOX_UPDATE_WATCHDOG_PID"
+        watchdog_dir="$VPSBOX_UPDATE_WATCHDOG_DIR"
+        command sleep 4
+        builtin kill -0 "$watchdog_pid" 2>/dev/null ||
+            fail "handoff 前的准备期不应消耗新版启动预算"
+        assert_empty_file "$event_log" "handoff 前 watchdog 不应终止或恢复仍存活的更新进程"
+
+        mark_vpsbox_update_handoff "$watchdog_dir/handoff"
+        command sleep 2
+        mark_vpsbox_update_ready "$watchdog_dir/ready"
+        wait "$watchdog_pid"
+        watchdog_pid=""
+        assert_empty_file "$event_log" "handoff 后及时 ready 不应触发终止或恢复"
+        trap - EXIT
+    )
 }
 
 test_stale_previous_without_handshake_is_ignored() {
@@ -1095,11 +1177,14 @@ main() {
         auto_update_vpsbox_on_start
         rollback_pending_vpsbox_update
         reexec_updated_vpsbox
+        start_vpsbox_update_watchdog
+        mark_vpsbox_update_handoff
         settle_vpsbox_update_watchdog_after_safe_restore
         recover_pending_singbox_update
         remove_singbox_update_transaction_dir
         current_singbox_update_binary_usable
         production_install_command_alias
+        production_start_vpsbox_update_watchdog
     )
     local -a tests=(
         test_production_install_command_alias_wires_target
@@ -1123,6 +1208,8 @@ main() {
         test_pending_update_startup_failure_restores_previous
         test_top_level_startup_failure_restores_previous
         test_pending_update_confirmation_prevents_rollback
+        test_update_watchdog_late_ready_cannot_cancel_rollback
+        test_update_watchdog_handoff_resets_startup_timer
         test_stale_previous_without_handshake_is_ignored
         test_pending_update_rejects_unexpected_backup_path
         test_singbox_version_noop_guards

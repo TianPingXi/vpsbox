@@ -76,7 +76,7 @@ test_absent_file_restores_to_absent() {
     [ ! -e "$GAI_CONF" ] || fail "恢复后应删除原本不存在的 gai.conf"
 }
 
-test_failed_atomic_replace_preserves_original_and_is_recoverable() {
+test_failed_atomic_replace_preserves_original_and_cleans_tracking() {
     local original="$TEST_TMP/atomic-original.conf"
     local changes="$TEST_TMP/atomic-changes.out"
 
@@ -96,11 +96,43 @@ test_failed_atomic_replace_preserves_original_and_is_recoverable() {
     fi
 
     cmp -s "$original" "$GAI_CONF" || fail "原子替换失败不得破坏原 gai.conf"
+    [ ! -e "$CHANGE_BACKUP_DIR/GAI_CONF" ] ||
+        fail "正式文件尚未发布时不应保留本次新建的恢复备份"
+    assert_file_not_contains "$CHANGE_MANIFEST" '^BACKUP_GAI_CONF='
+    assert_file_not_contains "$CHANGE_MANIFEST" '^PENDING_GAI_CONF='
+    assert_file_not_contains "$CHANGE_MANIFEST" '^APPLIED_GAI_CONF='
+    show_vpsbox_changes > "$changes"
+    assert_file_contains "$changes" '^ - 无$'
+    assert_file_not_contains "$changes" 'IPv4 优先：' \
+        "发布前失败不得留下 IPv4 优先恢复项目"
+}
+
+test_applied_file_with_manifest_commit_failure_keeps_recovery() {
+    local original="$TEST_TMP/commit-original.conf"
+
+    reset_case commit-failure
+    printf '# original\nprecedence ::ffff:0:0/96 50\n' > "$GAI_CONF"
+    cp "$GAI_CONF" "$original"
+    mark_change_applied() { return 42; }
+
+    if enable_ipv4_priority >"$TEST_TMP/commit-enable.out" 2>&1; then
+        fail "正式文件发布后清单提交失败时不得报告成功"
+    fi
+
+    assert_file_contains "$GAI_CONF" '^precedence ::ffff:0:0/96 100$' \
+        "清单提交失败发生在正式配置发布之后"
+    cmp -s "$original" "$CHANGE_BACKUP_DIR/GAI_CONF" ||
+        fail "正式配置已发布时必须保留修改前恢复基线"
     assert_file_contains "$CHANGE_MANIFEST" '^BACKUP_GAI_CONF=file$'
     assert_file_contains "$CHANGE_MANIFEST" '^PENDING_GAI_CONF=1$'
     assert_file_not_contains "$CHANGE_MANIFEST" '^APPLIED_GAI_CONF='
-    show_vpsbox_changes > "$changes"
-    assert_file_contains "$changes" 'IPv4 优先：未完成，可恢复'
+
+    if enable_ipv4_priority >"$TEST_TMP/commit-retry.out" 2>&1; then
+        fail "已有 pending 时不得按当前配置已生效快速返回成功"
+    fi
+    assert_file_contains "$TEST_TMP/commit-retry.out" '尚未处理的 IPv4 优先修改事务'
+    assert_file_contains "$CHANGE_MANIFEST" '^PENDING_GAI_CONF=1$' \
+        "重试入口必须保留待恢复事务"
 }
 
 test_symlink_target_is_rejected() {
@@ -125,7 +157,8 @@ main() {
         test_repeated_enable_is_idempotent
         test_preconfigured_state_is_noop
         test_absent_file_restores_to_absent
-        test_failed_atomic_replace_preserves_original_and_is_recoverable
+        test_failed_atomic_replace_preserves_original_and_cleans_tracking
+        test_applied_file_with_manifest_commit_failure_keeps_recovery
         test_symlink_target_is_rejected
     )
 

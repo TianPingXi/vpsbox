@@ -1996,6 +1996,102 @@ test_committed_transaction_is_not_rolled_back() {
     )
 }
 
+test_node_commit_cleanup_sync_failure_keeps_committed_state() {
+    (
+        local sync_calls=0
+
+        forbid_init
+        set_node_paths "$TEST_TMP/committed-cleanup-sync-failure"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_uri_files
+        service_is_running() { return 1; }
+        service_is_enabled() { return 1; }
+        begin_node_transaction
+        mark_node_transaction_mutated
+        printf 'committed-new-state\n' > "$SS_CONFIG_PATH"
+        sync_node_transaction_store() {
+            sync_calls=$((sync_calls + 1))
+            [ "$sync_calls" -eq 1 ]
+        }
+        service_stop() { forbid "committed 后的清理同步失败不得触发节点回滚"; }
+
+        commit_node_transaction >/dev/null ||
+            fail "committed 已持久化后，清理同步失败不得把提交改判为失败"
+        assert_eq "" "$ACTIVE_NODE_BACKUP" "提交点后必须立即清除活动事务句柄"
+        assert_eq 0 "$ACTIVE_NODE_TRANSACTION_MUTATED" "提交点后必须清除 mutated 运行状态"
+        [ -f "$NODE_TRANSACTION_DIR/committed" ] ||
+            fail "清理同步失败时应保留 committed 事务供启动清理"
+        [ ! -e "$NODE_TRANSACTION_DIR/pending" ] ||
+            fail "清理同步失败发生前 pending 应已删除"
+
+        recover_pending_node_transaction >/dev/null
+
+        assert_file_contains "$SS_CONFIG_PATH" '^committed-new-state$'
+        [ ! -e "$NODE_TRANSACTION_DIR" ] || fail "启动恢复应只清理 committed 残留目录"
+        assert_no_forbidden "committed 后的清理同步失败触发了节点回滚"
+    )
+}
+
+test_node_commit_pending_cleanup_failure_keeps_committed_state() {
+    (
+        forbid_init
+        set_node_paths "$TEST_TMP/committed-pending-cleanup-failure"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_uri_files
+        service_is_running() { return 1; }
+        service_is_enabled() { return 1; }
+        begin_node_transaction
+        mark_node_transaction_mutated
+        printf 'committed-new-state\n' > "$SS_CONFIG_PATH"
+        rm() {
+            if [ "$#" -eq 3 ] && [ "$1" = -f ] && [ "$2" = -- ] &&
+                [ "$3" = "$NODE_TRANSACTION_DIR/pending" ]; then
+                return 42
+            fi
+            command rm "$@"
+        }
+        service_stop() { forbid "committed 后 pending 清理失败不得触发节点回滚"; }
+
+        commit_node_transaction >/dev/null ||
+            fail "committed 已持久化后，pending 清理失败不得把提交改判为失败"
+        assert_eq "" "$ACTIVE_NODE_BACKUP" "提交点后必须立即清除活动事务句柄"
+        [ -f "$NODE_TRANSACTION_DIR/committed" ] || fail "必须保留 committed 标记"
+        [ -f "$NODE_TRANSACTION_DIR/pending" ] || fail "失败的 pending 清理应保留原标记"
+
+        recover_pending_node_transaction >/dev/null
+
+        assert_file_contains "$SS_CONFIG_PATH" '^committed-new-state$'
+        [ ! -e "$NODE_TRANSACTION_DIR" ] || fail "启动恢复应清理 committed 残留目录"
+        assert_no_forbidden "committed 后 pending 清理失败触发了节点回滚"
+    )
+}
+
+test_node_commit_marker_sync_failure_keeps_active_transaction() {
+    (
+        set_node_paths "$TEST_TMP/commit-marker-sync-failure"
+        mkdir -p "$NODE_CONFIG_DIR"
+        write_ss_config_fixture "$SS_CONFIG_PATH"
+        write_ss_state_fixture "$SS_STATE_FILE"
+        write_uri_files
+        service_is_running() { return 1; }
+        service_is_enabled() { return 1; }
+        begin_node_transaction
+        mark_node_transaction_mutated
+        sync_node_transaction_store() { return 42; }
+
+        if commit_node_transaction >/dev/null 2>&1; then
+            fail "committed 标记未持久化时事务提交必须失败"
+        fi
+        assert_eq "$NODE_TRANSACTION_DIR" "$ACTIVE_NODE_BACKUP" \
+            "越过提交点前失败必须保留活动事务供调用者回滚"
+        [ -f "$NODE_TRANSACTION_DIR/pending" ] || fail "提交点前失败必须保留 pending 标记"
+    )
+}
+
 test_config_state_identity_and_credentials_must_match() {
     (
         set_node_paths "$TEST_TMP/mismatch-ss-id"
@@ -2543,6 +2639,9 @@ main() {
         test_corrupted_node_backup_is_rejected_before_overwrite
         test_failed_recovery_keeps_transaction_backup
         test_committed_transaction_is_not_rolled_back
+        test_node_commit_cleanup_sync_failure_keeps_committed_state
+        test_node_commit_pending_cleanup_failure_keeps_committed_state
+        test_node_commit_marker_sync_failure_keeps_active_transaction
         test_config_state_identity_and_credentials_must_match
         test_protocol_status_distinguishes_template_drift_from_damage
         test_self_check_warns_for_template_drift_without_integrity_failure

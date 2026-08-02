@@ -194,6 +194,38 @@ test_orphan_cleanup_rejects_symlinked_backup_directory() {
     assert_file_contains "$victim/ORPHAN" '^keep$' "不得删除链接目录中的外部文件"
 }
 
+test_orphan_cleanup_preserves_backups_when_manifest_is_damaged() {
+    local backup
+
+    reset_change_store orphan-damaged-manifest
+    backup="$CHANGE_BACKUP_DIR/ORPHAN"
+    printf 'keep\n' > "$backup"
+    touch -t 202001010000 "$backup"
+    printf 'BROKEN MANIFEST LINE\n' > "$CHANGE_MANIFEST"
+
+    if cleanup_orphaned_change_backups >/dev/null 2>&1; then
+        fail "变更清单损坏时孤儿备份清理不得报告成功"
+    fi
+    assert_file_contains "$backup" '^keep$' "清单损坏时必须保留可能仍被引用的恢复备份"
+}
+
+test_orphan_cleanup_removes_only_unreferenced_old_backup() {
+    local orphan referenced
+
+    reset_change_store orphan-unreferenced
+    orphan="$CHANGE_BACKUP_DIR/ORPHAN"
+    referenced="$CHANGE_BACKUP_DIR/REFERENCED"
+    printf 'remove\n' > "$orphan"
+    printf 'keep\n' > "$referenced"
+    touch -t 202001010000 "$orphan" "$referenced"
+    manifest_set BACKUP_REFERENCED file
+
+    cleanup_orphaned_change_backups >/dev/null
+
+    [ ! -e "$orphan" ] || fail "有效清单中确实没有引用的过期备份应被清理"
+    assert_file_contains "$referenced" '^keep$' "有效清单引用的恢复备份不得被清理"
+}
+
 test_ntp_rejects_dangling_config_before_tracking_or_install() {
     (
         local base="$TEST_TMP/ntp-dangling-config"
@@ -1826,6 +1858,27 @@ test_journald_healthy_is_noop() {
 
         limit_systemd_journal >/dev/null
         assert_empty_file "$log" "健康的 journald 限制不得备份、写配置或重启服务"
+    )
+}
+
+test_journald_fallback_prefers_managed_dropin() {
+    (
+        local case_dir="$TEST_TMP/journald-fallback" value
+
+        mkdir -p "$case_dir"
+        JOURNALD_VPSBOX_CONF="$case_dir/99-vpsbox.conf"
+        printf '%s\n' 'SystemMaxUse=500M' > "$JOURNALD_VPSBOX_CONF"
+        systemd-analyze() { return 42; }
+        grep() {
+            [ "${1:-}" = -E ] &&
+                [ "${3:-}" = /etc/systemd/journald.conf ] &&
+                [ "${4:-}" = "$JOURNALD_VPSBOX_CONF" ] || return 42
+            printf '%s\n' 'SystemMaxUse=100M' 'SystemMaxUse=500M'
+        }
+
+        value="$(journald_conf_value SystemMaxUse)" ||
+            fail "旧 systemd fallback 应能读取 journald 配置"
+        assert_eq 500M "$value" "VPSBox drop-in 必须覆盖 journald 主配置中的旧值"
     )
 }
 
@@ -3542,6 +3595,8 @@ main() {
         test_backup_rejects_dangling_symlink_without_absent_record
         test_backup_rejects_untracked_destination_symlink
         test_orphan_cleanup_rejects_symlinked_backup_directory
+        test_orphan_cleanup_preserves_backups_when_manifest_is_damaged
+        test_orphan_cleanup_removes_only_unreferenced_old_backup
         test_ntp_rejects_dangling_config_before_tracking_or_install
         test_atomic_snapshot_restore_move_failure_preserves_target
         test_debian_update_stops_after_first_failure
@@ -3587,6 +3642,7 @@ main() {
         test_tcp_buffer_publish_failure_preserves_existing_file
         test_tcp_buffer_restore_rejects_invalid_metadata_before_mutation
         test_journald_healthy_is_noop
+        test_journald_fallback_prefers_managed_dropin
         test_journald_apply_and_failed_restart_restore_previous_config
         test_ssh_snapshot_root_and_transaction_names_are_restricted
         test_ssh_port_transaction_stage_order_and_rollback

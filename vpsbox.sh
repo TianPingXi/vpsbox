@@ -88,7 +88,8 @@ PACKAGE_CONNECT_TIMEOUT=15
 PACKAGE_UPDATE_TIMEOUT=120
 PACKAGE_INSTALL_TIMEOUT=600
 SYSTEM_UPGRADE_TIMEOUT=7200
-VPSBOX_UPDATE_STARTUP_TIMEOUT=60
+VPSBOX_UPDATE_PREPARE_TIMEOUT=60
+VPSBOX_UPDATE_STARTUP_TIMEOUT=$((PACKAGE_INSTALL_TIMEOUT + 120))
 PACKAGE_KILL_GRACE=10
 PACKAGE_RETRY_MAX=2
 PACKAGE_RETRY_DELAY=2
@@ -4244,10 +4245,18 @@ commit_node_transaction() {
     chown root:root "$NODE_TRANSACTION_DIR/committed" &&
         chmod 600 "$NODE_TRANSACTION_DIR/committed" || return 1
     sync_node_transaction_store || return 1
-    rm -f -- "$NODE_TRANSACTION_DIR/pending" || return 1
-    sync_node_transaction_store || return 1
+    # committed 标记完成持久化后即越过核心提交点。后续只清理事务痕迹，
+    # 即使失败也必须保留新节点状态，并交由下次启动按 committed 语义清理。
     ACTIVE_NODE_BACKUP=""
     ACTIVE_NODE_TRANSACTION_MUTATED=0
+    if ! rm -f -- "$NODE_TRANSACTION_DIR/pending"; then
+        warn "节点事务已提交，但 pending 标记未能清理：$NODE_TRANSACTION_DIR/pending"
+        return 0
+    fi
+    if ! sync_node_transaction_store; then
+        warn "节点事务已提交，但清理状态未能持久化：$NODE_TRANSACTION_DIR"
+        return 0
+    fi
     remove_node_transaction_dir || {
         warn "节点事务已提交，但临时目录未能清理：$NODE_TRANSACTION_DIR"
         return 0
@@ -6573,6 +6582,30 @@ vpsbox_update_ready_path_valid() {
     [ -d "$dir" ] && [ ! -L "$dir" ] && [ ! -L "$ready" ]
 }
 
+vpsbox_update_handoff_path_valid() {
+    local handoff="$1" dir
+
+    [ -n "$handoff" ] || return 1
+    dir="${handoff%/handoff}"
+    [ "$handoff" = "$dir/handoff" ] || return 1
+    [[ "$dir" == "$RUNTIME_DIR"/update-startup.* ]] || return 1
+    [ -d "$dir" ] && [ ! -L "$dir" ] && [ ! -L "$handoff" ]
+}
+
+mark_vpsbox_update_handoff() {
+    local handoff="$1" dir tmp
+
+    vpsbox_update_handoff_path_valid "$handoff" || return 1
+    dir="${handoff%/handoff}"
+    tmp="$(mktemp "$dir/.handoff.XXXXXX")" || return 1
+    if ! printf '%s\n' "$$" > "$tmp" ||
+        ! chmod 600 "$tmp" ||
+        ! mv -f -- "$tmp" "$handoff"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
 mark_vpsbox_update_ready() {
     local ready="$1" dir tmp
 
@@ -6588,7 +6621,7 @@ mark_vpsbox_update_ready() {
 }
 
 start_vpsbox_update_watchdog() {
-    local backup="$1" dir ready owner_pid owner_start
+    local backup="$1" dir handoff ready owner_pid owner_start
 
     # 当前更新协议由旧进程先启动独立 watchdog，再 exec 新脚本。这样即使候选脚本
     # 在解析完毕后、进入 vpsbox_main 之前顶层退出，也能依据 PID 启动时间恢复 .previous。
@@ -6601,6 +6634,7 @@ start_vpsbox_update_watchdog() {
     [ -d "$RUNTIME_DIR" ] && [ ! -L "$RUNTIME_DIR" ] || return 1
     dir="$(mktemp -d "$RUNTIME_DIR/update-startup.XXXXXX")" || return 1
     chmod 700 "$dir" || { rm -rf -- "$dir"; return 1; }
+    handoff="$dir/handoff"
     ready="$dir/ready"
     owner_pid="$$"
     owner_start="$(process_start_ticks "$owner_pid" 2>/dev/null || true)"
@@ -6610,10 +6644,15 @@ start_vpsbox_update_watchdog() {
         local elapsed=0 current_start i
 
         trap - EXIT HUP INT TERM QUIT
-        while [ "$elapsed" -lt "$VPSBOX_UPDATE_STARTUP_TIMEOUT" ]; do
+        # 准备期覆盖脚本替换和命令入口安装；exec 前由 handoff 重新开始计算
+        # 新版启动验收时间，避免准备工作消耗恢复事务所需的启动预算。
+        while [ "$elapsed" -lt "$VPSBOX_UPDATE_PREPARE_TIMEOUT" ]; do
             if [ -f "$ready" ] && [ ! -L "$ready" ]; then
                 rm -rf -- "$dir"
                 exit 0
+            fi
+            if [ -f "$handoff" ] && [ ! -L "$handoff" ]; then
+                break
             fi
             current_start="$(process_start_ticks "$owner_pid" 2>/dev/null || true)"
             [ "$current_start" = "$owner_start" ] || break
@@ -6625,6 +6664,26 @@ start_vpsbox_update_watchdog() {
             rm -rf -- "$dir"
             exit 0
         fi
+        if [ -f "$handoff" ] && [ ! -L "$handoff" ]; then
+            elapsed=0
+            while [ "$elapsed" -lt "$VPSBOX_UPDATE_STARTUP_TIMEOUT" ]; do
+                if [ -f "$ready" ] && [ ! -L "$ready" ]; then
+                    rm -rf -- "$dir"
+                    exit 0
+                fi
+                current_start="$(process_start_ticks "$owner_pid" 2>/dev/null || true)"
+                [ "$current_start" = "$owner_start" ] || break
+                sleep 1
+                elapsed=$((elapsed + 1))
+            done
+            if [ -f "$ready" ] && [ ! -L "$ready" ]; then
+                rm -rf -- "$dir"
+                exit 0
+            fi
+        fi
+
+        # 从这里开始只允许回滚。即使 TERM/KILL 期间出现迟到的 ready，
+        # 也不能把已经终止候选进程的结果重新解释为启动成功。
         current_start="$(process_start_ticks "$owner_pid" 2>/dev/null || true)"
         if [ "$current_start" = "$owner_start" ]; then
             kill -TERM "$owner_pid" 2>/dev/null || true
@@ -6635,10 +6694,6 @@ start_vpsbox_update_watchdog() {
             done
             [ "$current_start" != "$owner_start" ] ||
                 kill -KILL "$owner_pid" 2>/dev/null || true
-        fi
-        if [ -f "$ready" ] && [ ! -L "$ready" ]; then
-            rm -rf -- "$dir"
-            exit 0
         fi
         if restore_previous_vpsbox "$backup"; then
             if [ -w /dev/tty ]; then
@@ -6830,7 +6885,7 @@ update_vpsbox() {
 }
 
 reexec_updated_vpsbox() {
-    local backup="$1" ready status execfail_was_set=0
+    local backup="$1" handoff ready status execfail_was_set=0
 
     # 正常更新路径会在替换正式脚本前启动监护。保留此降级分支供独立调用与旧测试夹具使用。
     if [ -z "${VPSBOX_UPDATE_WATCHDOG_PID:-}" ] ||
@@ -6840,7 +6895,12 @@ reexec_updated_vpsbox() {
             return 1
         }
     fi
+    handoff="$VPSBOX_UPDATE_WATCHDOG_DIR/handoff"
     ready="$VPSBOX_UPDATE_WATCHDOG_DIR/ready"
+    if ! mark_vpsbox_update_handoff "$handoff"; then
+        err "无法通知更新监护进入新版启动阶段，已取消切换。"
+        return 1
+    fi
     vpsbox_update_ready_path_valid "$ready" || return 1
     shopt -q execfail && execfail_was_set=1
     shopt -s execfail
@@ -9059,8 +9119,24 @@ EOF
     ipv4_dns_lines
 }
 
+cancel_unpublished_ipv4_priority_change() {
+    local prior_state="$1"
+
+    [ "$prior_state" = "pending" ] && return 0
+    if ! cancel_unmodified_change_transaction GAI_CONF; then
+        warn "IPv4 优先尚未修改，但本次恢复记录未能完整清理。"
+    fi
+    return 0
+}
+
 enable_ipv4_priority() {
-    local parent tmp
+    local parent tmp prior_state
+
+    prior_state="$(change_restore_state_readonly GAI_CONF)" || return 1
+    if [ "$prior_state" = "pending" ]; then
+        err "检测到尚未处理的 IPv4 优先修改事务，请先在恢复菜单中检查或恢复。"
+        return 1
+    fi
 
     info "正在开启 IPv4 优先，不会禁用 IPv6。"
     if [ "$(ipv4_priority_state)" = "已启用" ]; then
@@ -9068,34 +9144,58 @@ enable_ipv4_priority() {
         return 0
     fi
     [ ! -L "$GAI_CONF" ] || { err "$GAI_CONF 是符号链接，已拒绝修改。"; return 1; }
+    prior_state="$(change_restore_state GAI_CONF)" || return 1
+    if [ "$prior_state" = "pending" ]; then
+        err "检测到尚未处理的 IPv4 优先修改事务，请先在恢复菜单中检查或恢复。"
+        return 1
+    fi
     backup_change_file_once GAI_CONF "$GAI_CONF" || { err "记录 IPv4 优先原配置失败，已取消修改。"; return 1; }
-    begin_change_transaction GAI_CONF || { err "记录 IPv4 优先事务失败，已取消修改。"; return 1; }
+    begin_change_transaction GAI_CONF || {
+        cancel_unpublished_ipv4_priority_change "$prior_state"
+        err "记录 IPv4 优先事务失败，已取消修改。"
+        return 1
+    }
 
     parent="$(dirname "$GAI_CONF")"
     [ -d "$parent" ] && [ ! -L "$parent" ] || {
+        cancel_unpublished_ipv4_priority_change "$prior_state"
         err "IPv4 优先配置目录无效或为符号链接：$parent"
         return 1
     }
-    tmp="$(mktemp "$parent/.gai.conf.vpsbox.XXXXXX")" || return 1
+    tmp="$(mktemp "$parent/.gai.conf.vpsbox.XXXXXX")" || {
+        cancel_unpublished_ipv4_priority_change "$prior_state"
+        return 1
+    }
     if [ -f "$GAI_CONF" ]; then
-        cp -a -- "$GAI_CONF" "$tmp" || { rm -f -- "$tmp"; return 1; }
+        cp -a -- "$GAI_CONF" "$tmp" || {
+            rm -f -- "$tmp"
+            cancel_unpublished_ipv4_priority_change "$prior_state"
+            return 1
+        }
     else
-        chmod 644 "$tmp" || { rm -f -- "$tmp"; return 1; }
+        chmod 644 "$tmp" || {
+            rm -f -- "$tmp"
+            cancel_unpublished_ipv4_priority_change "$prior_state"
+            return 1
+        }
     fi
 
     if ! sed -i '/^[#[:space:]]*precedence[[:space:]]\+::ffff:0:0\/96[[:space:]]\+/d' "$tmp"; then
         rm -f -- "$tmp"
+        cancel_unpublished_ipv4_priority_change "$prior_state"
         err "清理旧 IPv4 优先配置失败。"
         return 1
     fi
 
     if ! printf '%s\n' 'precedence ::ffff:0:0/96 100' >> "$tmp"; then
         rm -f -- "$tmp"
+        cancel_unpublished_ipv4_priority_change "$prior_state"
         err "写入 IPv4 优先配置失败。"
         return 1
     fi
     if ! chown root:root "$tmp" || ! mv -f -- "$tmp" "$GAI_CONF"; then
         rm -f -- "$tmp"
+        cancel_unpublished_ipv4_priority_change "$prior_state"
         err "原子替换 IPv4 优先配置失败。"
         return 1
     fi
@@ -16737,8 +16837,26 @@ cleanup_old_temp_dirs() {
     )
 }
 
+manifest_value_for_backup_cleanup() {
+    local key="$1"
+
+    [[ "$key" =~ ^[A-Z0-9_]+$ ]] || return 2
+    [ -f "$CHANGE_MANIFEST" ] && [ ! -L "$CHANGE_MANIFEST" ] &&
+        [ -r "$CHANGE_MANIFEST" ] || return 2
+    awk -F= -v key="$key" '
+        $0 !~ /^[A-Z0-9_]+=[A-Za-z0-9_.:,-]+$/ { invalid=1; next }
+        seen[$1]++ { invalid=1; next }
+        $1 == key { value=$2; found=1 }
+        END {
+            if (invalid) exit 2
+            if (found) print value
+            else exit 1
+        }
+    ' "$CHANGE_MANIFEST"
+}
+
 cleanup_orphaned_change_backups() {
-    local backup name state old_file
+    local backup name state old_file status
     if [ -L "$CHANGE_BACKUP_DIR" ]; then
         err "vpsbox 备份目录是符号链接，已拒绝清理：$CHANGE_BACKUP_DIR"
         return 1
@@ -16748,8 +16866,22 @@ cleanup_orphaned_change_backups() {
         [ -f "$backup" ] && [ ! -L "$backup" ] || continue
         name="${backup##*/}"
         [[ "$name" =~ ^[A-Z0-9_]+$ ]] || continue
-        state="$(manifest_value "BACKUP_$name" 2>/dev/null || true)"
-        [ "$state" = "file" ] && continue
+        if state="$(manifest_value_for_backup_cleanup "BACKUP_$name" 2>/dev/null)"; then
+            case "$state" in
+                file) continue ;;
+                absent) ;;
+                *)
+                    err "vpsbox 变更清单中的备份状态无效，已停止清理：BACKUP_$name=$state"
+                    return 1
+                    ;;
+            esac
+        else
+            status=$?
+            if [ "$status" -ne 1 ]; then
+                err "vpsbox 变更清单不可读、损坏或包含重复记录，已停止清理：$CHANGE_MANIFEST"
+                return 1
+            fi
+        fi
         old_file="$(find "$backup" -xdev -type f -mtime +30 -print -quit 2>/dev/null || true)"
         [ -n "$old_file" ] || continue
         if find "$backup" -xdev -type f -mtime +30 -delete 2>/dev/null; then
@@ -17409,12 +17541,13 @@ journal_disk_usage() {
 
 journald_conf_value() {
     local key="$1"
-    local value
+    local rendered value
 
-    if command -v systemd-analyze >/dev/null 2>&1; then
-        value="$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null | awk -F= -v key="$key" '$0 ~ "^[[:space:]]*" key "=" { value=$2 } END { print value }' || true)"
+    if command -v systemd-analyze >/dev/null 2>&1 &&
+        rendered="$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null)"; then
+        value="$(awk -F= -v key="$key" '$0 ~ "^[[:space:]]*" key "=" { value=$2 } END { print value }' <<< "$rendered")"
     else
-        value="$(grep -E "^[[:space:]]*$key=" "$JOURNALD_VPSBOX_CONF" /etc/systemd/journald.conf 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+        value="$(grep -E "^[[:space:]]*$key=" /etc/systemd/journald.conf "$JOURNALD_VPSBOX_CONF" 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
     fi
     [ -n "$value" ] || return 1
     printf '%s\n' "$value"
