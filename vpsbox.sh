@@ -25,7 +25,7 @@ umask 077
 # ==============================================================================
 # 产品、版本、受管路径和超时均在加载时确定，业务函数只读取这些配置。
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.47"
+VPSBOX_VERSION="v1.0.48"
 # 只从当前仓库下载并识别可执行脚本。
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
