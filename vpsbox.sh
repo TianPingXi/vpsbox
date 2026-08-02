@@ -17535,7 +17535,9 @@ EOF
 ----------------------------------------
 $(singbox_summary_line)
 $(ssh_port_summary_line)
-$(node_summary)
+EOF
+    node_summary
+    cat <<EOF
 ----------------------------------------
  IPv4 DNS：
 $(ipv4_dns_lines)

@@ -1494,6 +1494,14 @@ test_main_menu_update_notice_spacing_and_entries() {
 
         show_menu > "$output"
         awk '
+            /^ SSH 端口：22$/ {
+                found = 1
+                getline
+                exit($0 != "----------------------------------------")
+            }
+            END { if (!found) exit 1 }
+        ' "$output" || fail "未创建节点时，SSH 端口后必须直接显示分隔线"
+        awk '
             /提示：输入 vpsbox 打开管理面板/ {
                 found = 1
                 getline
