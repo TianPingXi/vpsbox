@@ -812,7 +812,7 @@ test_update_watchdog_handoff_resets_startup_timer() {
         : > "$event_log"
         [ "$VPSBOX_UPDATE_STARTUP_TIMEOUT" -gt "$PACKAGE_INSTALL_TIMEOUT" ] ||
             fail "新版启动预算必须覆盖合法的包恢复上限"
-        VPSBOX_UPDATE_PREPARE_TIMEOUT=7
+        export VPSBOX_UPDATE_PREPARE_TIMEOUT=7
         VPSBOX_UPDATE_STARTUP_TIMEOUT=4
         process_start_ticks() { printf '%s\n' 12345; }
         kill() { printf 'kill:%s\n' "$*" >> "$event_log"; }
