@@ -157,6 +157,43 @@ test_backup_rejects_dangling_symlink_without_absent_record() {
     assert_file_not_contains "$CHANGE_MANIFEST" '^BACKUP_TEST_FILE='
 }
 
+test_backup_rejects_untracked_destination_symlink() {
+    local target victim backup
+
+    require_real_symlink file || return "$?"
+    reset_change_store backup-destination-symlink
+    target="$TEST_TMP/backup-destination-symlink/target"
+    victim="$TEST_TMP/backup-destination-symlink/victim"
+    backup="$CHANGE_BACKUP_DIR/TEST_FILE"
+    printf 'source\n' > "$target"
+    printf 'victim\n' > "$victim"
+    ln -s "$victim" "$backup"
+
+    if backup_change_file_once TEST_FILE "$target" >/dev/null 2>&1; then
+        fail "没有清单记录的备份符号链接不得被覆盖"
+    fi
+    [ -L "$backup" ] || fail "拒绝备份后应保留异常备份链接供人工检查"
+    assert_file_contains "$victim" '^victim$' "不得覆盖备份链接指向的外部文件"
+    assert_file_not_contains "$CHANGE_MANIFEST" '^BACKUP_TEST_FILE='
+}
+
+test_orphan_cleanup_rejects_symlinked_backup_directory() {
+    local victim
+
+    require_real_symlink directory || return "$?"
+    reset_change_store orphan-backup-directory
+    victim="$TEST_TMP/orphan-backup-directory/victim"
+    rm -rf -- "$CHANGE_BACKUP_DIR"
+    mkdir -p "$victim"
+    printf 'keep\n' > "$victim/ORPHAN"
+    ln -s "$victim" "$CHANGE_BACKUP_DIR"
+
+    if cleanup_orphaned_change_backups >/dev/null 2>&1; then
+        fail "孤儿备份清理不得跟随备份目录符号链接"
+    fi
+    assert_file_contains "$victim/ORPHAN" '^keep$' "不得删除链接目录中的外部文件"
+}
+
 test_ntp_rejects_dangling_config_before_tracking_or_install() {
     (
         local base="$TEST_TMP/ntp-dangling-config"
@@ -1202,6 +1239,50 @@ test_tcp_buffer_cancel_invalid_default_and_healthy_noop_are_read_only() {
     )
 }
 
+test_pending_system_change_blocks_fast_return_paths() {
+    (
+        local output="$TEST_TMP/ipv6-pending-fast-return.out"
+
+        reset_change_store ipv6-pending-fast-return
+        manifest_set PENDING_IPV6_CONF 1
+        global_ipv6_addresses() { forbid "IPv6 pending 应在地址检测前被拦截"; }
+        forbid_init
+        if disable_ipv6 > "$output" 2>&1; then
+            fail "IPv6 存在未完成事务时不得按无地址路径返回成功"
+        fi
+        assert_file_contains "$output" '尚未处理的 IPv6 修改事务'
+        assert_no_forbidden "IPv6 pending 检查顺序错误"
+    )
+    (
+        local output="$TEST_TMP/tcp-pending-fast-return.out"
+
+        reset_change_store tcp-pending-fast-return
+        manifest_set PENDING_TCP_BUFFER_CONF 1
+        tcp_buffer_tier_max() { printf '%s\n' 8388608; }
+        tcp_buffer_tier_description() { printf '%s\n' 第一档; }
+        tcp_buffer_runtime_values() { forbid "TCP pending 应在读取运行参数前被拦截"; }
+        forbid_init
+        if apply_tcp_buffer_tier 1 > "$output" 2>&1; then
+            fail "TCP 缓冲区存在未完成事务时不得按健康档位返回成功"
+        fi
+        assert_file_contains "$output" '尚未处理的 TCP 缓冲区修改事务'
+        assert_no_forbidden "TCP pending 检查顺序错误"
+    )
+    (
+        local output="$TEST_TMP/bbr-pending-fast-return.out"
+
+        reset_change_store bbr-pending-fast-return
+        manifest_set PENDING_BBR_CONF 1
+        bbr_fq_persistent_config_is_current() { forbid "BBR pending 应在健康检查前被拦截"; }
+        forbid_init
+        if enable_bbr_fq > "$output" 2>&1; then
+            fail "BBR 存在未完成事务时不得按健康配置返回成功"
+        fi
+        assert_file_contains "$output" '尚未处理的 BBR 修改事务'
+        assert_no_forbidden "BBR pending 检查顺序错误"
+    )
+}
+
 test_tcp_buffer_abnormal_managed_config_is_rejected_read_only() {
     local mode
 
@@ -1991,6 +2072,9 @@ test_finished_ssh_firewall_is_resynced_during_rollback() {
         ACTIVE_SSH_TRANSACTION_DIR="$TEST_TMP/runtime/ssh-transactions/transaction.finished"
         ACTIVE_SSH_ORIGINAL_PORTS=22
         ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE=1
+        ACTIVE_SSH_FAIL2BAN_INSTALLED=1
+        ACTIVE_SSH_FAIL2BAN_WAS_RUNNING=1
+        ACTIVE_SSH_FAIL2BAN_MUTATED=1
         # shellcheck disable=SC2034 # 被测 SSH 回滚通过动态作用域读取。
         ACTIVE_SSH_FIREWALL_TRANSITION=0
         # shellcheck disable=SC2034 # 被测 SSH 回滚通过动态作用域读取。
@@ -1998,16 +2082,48 @@ test_finished_ssh_firewall_is_resynced_during_rollback() {
         # shellcheck disable=SC2034 # 被测 Fail2ban 清理通过动态作用域读取。
         ACTIVE_FAIL2BAN_SYNC_WAS_RUNNING=""
         restore_ssh_runtime_snapshot() { printf '%s\n' restore >> "$log"; }
-        sync_fail2ban_sshd_port() { printf '%s\n' fail2ban >> "$log"; }
+        restore_ssh_fail2ban_snapshot() {
+            [ "$1" = "$ACTIVE_SSH_TRANSACTION_DIR" ] && [ "$2" = 1 ] && [ "$3" = 1 ] || return 1
+            printf '%s\n' fail2ban-restore >> "$log"
+        }
         firewall_runtime_enabled() { return 0; }
         ssh_firewall_sync_current_safe_ports() { printf '%s\n' firewall-sync >> "$log"; }
         remove_ssh_restore_snapshot() { printf '%s\n' snapshot-remove >> "$log"; }
 
         rollback_active_ssh_transaction
-        assert_eq $'restore\nfail2ban\nfirewall-sync\nsnapshot-remove' "$(cat "$log")" \
-            "finish 后的端口事务回滚必须按恢复配置、Fail2ban、重同步防火墙顺序执行"
+        assert_eq $'restore\nfail2ban-restore\nfirewall-sync\nsnapshot-remove' "$(cat "$log")" \
+            "finish 后的端口事务回滚必须按恢复 SSH、精确恢复 Fail2ban、重同步防火墙顺序执行"
         assert_eq "" "$ACTIVE_SSH_TRANSACTION_DIR"
         assert_eq 0 "$ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE"
+        assert_eq 0 "$ACTIVE_SSH_FAIL2BAN_INSTALLED"
+        assert_eq 0 "$ACTIVE_SSH_FAIL2BAN_WAS_RUNNING"
+        assert_eq 0 "$ACTIVE_SSH_FAIL2BAN_MUTATED"
+    )
+    (
+        local log="$TEST_TMP/ssh-before-fail2ban-rollback.log"
+        : > "$log"
+        ACTIVE_SSH_TRANSACTION_DIR="$TEST_TMP/runtime/ssh-transactions/transaction.before-fail2ban"
+        ACTIVE_SSH_ORIGINAL_PORTS=22
+        ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE=0
+        ACTIVE_SSH_FAIL2BAN_INSTALLED=1
+        ACTIVE_SSH_FAIL2BAN_WAS_RUNNING=1
+        ACTIVE_SSH_FAIL2BAN_MUTATED=0
+        # shellcheck disable=SC2034 # 被测 SSH 回滚通过动态作用域读取。
+        ACTIVE_FAIL2BAN_SYNC_WAS_RUNNING=""
+        # shellcheck disable=SC2034 # 被测 SSH 回滚通过动态作用域读取。
+        ACTIVE_SSH_FIREWALL_TRANSITION=0
+        # shellcheck disable=SC2034 # 被测 SSH 回滚通过动态作用域读取。
+        ACTIVE_FIREWALL_TRANSITION_DIR=""
+        restore_ssh_runtime_snapshot() { printf '%s\n' restore >> "$log"; }
+        restore_ssh_fail2ban_snapshot() { forbid "未修改 Fail2ban 时不得重启或恢复它"; }
+        remove_ssh_restore_snapshot() { printf '%s\n' snapshot-remove >> "$log"; }
+        forbid_init
+
+        rollback_active_ssh_transaction
+
+        assert_eq $'restore\nsnapshot-remove' "$(cat "$log")" \
+            "Fail2ban 尚未同步时，SSH 回滚只能恢复实际修改过的领域"
+        assert_no_forbidden "SSH 提前失败仍触碰了未修改的 Fail2ban"
     )
 }
 
@@ -2771,6 +2887,7 @@ test_ssh_restore_snapshot_integrity_is_verified() {
         SSHD_CONFIG_DIR="$ssh_dir/sshd_config.d"
         SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
         SSHD_VPSBOX_HARDENING_CONF="$SSHD_CONFIG_DIR/01-vpsbox-ssh-hardening.conf"
+        FAIL2BAN_VPSBOX_SSHD_CONF="$TEST_TMP/ssh-snapshot-integrity/etc/fail2ban/jail.d/vpsbox-sshd.local"
         printf '%s\n' original > "$SSHD_MAIN_CONF"
         printf '%s\n' 'Port 23333' > "$SSHD_VPSBOX_PORT_CONF"
 
@@ -2787,6 +2904,45 @@ test_ssh_restore_snapshot_integrity_is_verified() {
         fi
         assert_file_contains "$SSHD_MAIN_CONF" '^current$' \
             "快照校验失败时不得修改现有 SSH 配置"
+    )
+}
+
+test_ssh_snapshot_restores_exact_fail2ban_state() {
+    require_root_permission_semantics || return "$?"
+    (
+        local base="$TEST_TMP/ssh-fail2ban-snapshot" snapshot="" log
+
+        reset_change_store ssh-fail2ban-snapshot
+        RUNTIME_DIR="$base/runtime"
+        SSHD_MAIN_CONF="$base/etc/ssh/sshd_config"
+        SSHD_CONFIG_DIR="$base/etc/ssh/sshd_config.d"
+        SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
+        SSHD_VPSBOX_HARDENING_CONF="$SSHD_CONFIG_DIR/01-vpsbox-ssh-hardening.conf"
+        FAIL2BAN_VPSBOX_SSHD_CONF="$base/etc/fail2ban/jail.d/vpsbox-sshd.local"
+        log="$base/service.log"
+        mkdir -p "$RUNTIME_DIR" "$SSHD_CONFIG_DIR" "$(dirname "$FAIL2BAN_VPSBOX_SSHD_CONF")"
+        command chown root:root "$RUNTIME_DIR"
+        chmod 700 "$RUNTIME_DIR"
+        printf '%s\n' 'Port 22' > "$SSHD_MAIN_CONF"
+        printf '%s\n' 'custom-before-ssh' > "$FAIL2BAN_VPSBOX_SSHD_CONF"
+        chmod 640 "$FAIL2BAN_VPSBOX_SSHD_CONF"
+        : > "$log"
+
+        create_ssh_restore_snapshot snapshot
+        printf '%s\n' 'canonical-after-sync' > "$FAIL2BAN_VPSBOX_SSHD_CONF"
+        is_systemd() { return 0; }
+        fail2ban-client() { [ "$*" = '-t -c /etc/fail2ban' ]; }
+        systemctl() { printf '%s\n' "$*" >> "$log"; }
+        fail2ban_service_state() { printf '%s\n' 运行中; }
+
+        restore_ssh_fail2ban_snapshot "$snapshot" 1 1
+
+        assert_file_contains "$FAIL2BAN_VPSBOX_SSHD_CONF" '^custom-before-ssh$' \
+            "SSH 回滚必须恢复操作前的 Fail2ban 文件，而不是重新生成标准配置"
+        assert_eq 640 "$(stat -c '%a' "$FAIL2BAN_VPSBOX_SSHD_CONF")" \
+            "SSH 回滚必须恢复 Fail2ban 文件原权限"
+        assert_file_contains "$log" '^restart fail2ban$' \
+            "操作前运行中的 Fail2ban 必须恢复为运行状态"
     )
 }
 
@@ -3340,6 +3496,7 @@ main() {
         cancel_unmodified_change_transaction
         cancel_unmodified_ntp_tracking
         change_restore_state
+        change_restore_state_readonly
         create_dns_operation_snapshot
         chrony_main_uses_source_dir
         chrony_sources_are_current
@@ -3370,6 +3527,7 @@ main() {
         restore_recorded_ntp_change
         ssh_restore_snapshot_path_allowed
         ssh_restore_snapshot_path_is_secure
+        restore_ssh_fail2ban_snapshot
         write_systemd_resolved_dns
         write_chrony_sources
     )
@@ -3382,6 +3540,8 @@ main() {
         test_atomic_snapshot_restore_rejects_directory_symlink
         test_atomic_snapshot_restore_replaces_dangling_symlink
         test_backup_rejects_dangling_symlink_without_absent_record
+        test_backup_rejects_untracked_destination_symlink
+        test_orphan_cleanup_rejects_symlinked_backup_directory
         test_ntp_rejects_dangling_config_before_tracking_or_install
         test_atomic_snapshot_restore_move_failure_preserves_target
         test_debian_update_stops_after_first_failure
@@ -3421,6 +3581,7 @@ main() {
         test_failed_bbr_runtime_restore_keeps_recovery_transaction
         test_tcp_buffer_tiers_preserve_defaults_and_restore_first_baseline
         test_tcp_buffer_cancel_invalid_default_and_healthy_noop_are_read_only
+        test_pending_system_change_blocks_fast_return_paths
         test_tcp_buffer_abnormal_managed_config_is_rejected_read_only
         test_tcp_buffer_failures_restore_runtime_or_keep_pending_record
         test_tcp_buffer_publish_failure_preserves_existing_file
@@ -3458,6 +3619,7 @@ main() {
         test_legacy_ssh_state_retires_only_after_success_and_preserves_history
         test_ssh_config_publish_failure_preserves_target
         test_ssh_restore_snapshot_integrity_is_verified
+        test_ssh_snapshot_restores_exact_fail2ban_state
         test_ssh_restore_snapshot_path_enforces_owner_and_mode
         test_public_config_dirs_are_repaired_only_for_managed_files
         test_public_config_dir_rejects_symlink

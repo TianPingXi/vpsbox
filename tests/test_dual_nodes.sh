@@ -1868,6 +1868,27 @@ test_absent_backup_entry_removes_target_and_invalid_entry_is_rejected() {
     )
 }
 
+test_absent_node_directory_backup_removes_dangling_link() {
+    (
+        local base="$TEST_TMP/restore-dangling-node-dir" backup_dir missing
+
+        require_real_symlink directory || return "$?"
+        set_node_paths "$base"
+        backup_dir="$base/backup"
+        missing="$base/missing-vpsbox.d"
+        mkdir -p "$backup_dir" "$(dirname "$NODE_CONFIG_DIR")"
+        : > "$backup_dir/manifest"
+        ln -s "$missing" "$NODE_CONFIG_DIR"
+        node_backup_entry_is_present() { return 1; }
+
+        restore_node_config_dir_from_backup "$backup_dir" full
+
+        [ ! -e "$NODE_CONFIG_DIR" ] && [ ! -L "$NODE_CONFIG_DIR" ] ||
+            fail "原目录不存在时，回滚必须移除事务期间出现的悬空节点目录链接"
+        [ ! -e "$missing" ] || fail "回滚不得创建悬空链接原本指向的目录"
+    )
+}
+
 test_unmodified_pending_transaction_is_discarded_without_service_stop() {
     (
         forbid_init
@@ -2516,6 +2537,7 @@ main() {
         test_firewall_sync_failure_does_not_block_node_transaction_completion
         test_unrecovered_pending_transaction_blocks_new_operation
         test_absent_backup_entry_removes_target_and_invalid_entry_is_rejected
+        test_absent_node_directory_backup_removes_dangling_link
         test_pending_transaction_recovers_after_hard_interruption
         test_unmodified_pending_transaction_is_discarded_without_service_stop
         test_corrupted_node_backup_is_rejected_before_overwrite

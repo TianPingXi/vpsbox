@@ -711,6 +711,43 @@ EOF
     cleanup_case_pids
 }
 
+test_provisional_bounded_cleanup_terminates_direct_child_session() {
+    local marker pid parent
+
+    require_command setsid || return "$?"
+    require_linux_proc || return "$?"
+    marker="$(mktemp /tmp/vpsbox-command-timeout.test.XXXXXX)"
+    printf '%s\n' pending > "$marker"
+    parent="${BASHPID:-$$}"
+    setsid sh -c 'sleep 30' &
+    pid=$!
+    record_case_pid "$pid"
+    for _ in {1..50}; do
+        bounded_process_group_is_direct_child "$pid" "$parent" && break
+        sleep 0.02
+    done
+    bounded_process_group_is_direct_child "$pid" "$parent" ||
+        fail "测试未观察到 bounded 直属独立会话"
+
+    ACTIVE_BOUNDED_PID="$pid"
+    # shellcheck disable=SC2034 # 被测清理函数通过动态作用域读取。
+    ACTIVE_BOUNDED_START=""
+    # shellcheck disable=SC2034 # 被测清理函数通过动态作用域读取。
+    ACTIVE_BOUNDED_TIMER_PID=""
+    # shellcheck disable=SC2034 # 被测清理函数通过动态作用域读取。
+    ACTIVE_BOUNDED_MARKER="$marker"
+    ACTIVE_BOUNDED_PARENT_PID="$parent"
+    cleanup_active_bounded_command
+
+    if bounded_session_has_processes "$pid"; then
+        fail "身份登记完成前的退出清理必须终止 bounded 会话"
+    fi
+    [ ! -e "$marker" ] || fail "身份登记完成前的退出清理必须删除超时标记"
+    assert_eq "" "$ACTIVE_BOUNDED_PID"
+    assert_eq "" "$ACTIVE_BOUNDED_PARENT_PID"
+    cleanup_case_pids
+}
+
 run_timeout_lock_case() {
     local name="$1" mode="$2"
     local case_dir="$TEST_TMP/$name" driver ready lock driver_pid pid
@@ -1475,6 +1512,34 @@ test_extra_port_remove_and_clear_commit_expected_state() {
         assert_eq "53" "$FW_EXTRA_UDP" "取消清空必须保留 UDP 额外端口"
         assert_eq 0 "$commit_calls" "取消清空不得提交防火墙状态"
     )
+    (
+        local load_calls=0 desired_checks=0
+        FW_EXTRA_TCP=""
+        FW_EXTRA_UDP=""
+        firewall_settle_pending_port_transition() { :; }
+        detect_os() { OS=debian; }
+        firewall_recover_pending_rollbacks() { :; }
+        firewall_check_conflicts() { :; }
+        ensure_nftables() { :; }
+        firewall_load_state() {
+            load_calls=$((load_calls + 1))
+            FW_EXTRA_TCP="80,443"
+            FW_EXTRA_UDP="53"
+        }
+        firewall_detect_allowed_ports() { :; }
+        firewall_desired_state_is_current() {
+            desired_checks=$((desired_checks + 1))
+            assert_eq "80" "$FW_EXTRA_TCP" "应用阶段不得用磁盘旧值覆盖待删除的 TCP 端口"
+            assert_eq "53" "$FW_EXTRA_UDP"
+            [ "$desired_checks" -eq 2 ]
+        }
+        firewall_show_port_summary() { :; }
+        read() { printf -v "${@: -1}" '%s' YES; }
+
+        firewall_apply_desired_state 80 53 >/dev/null
+        assert_eq 2 "$load_calls" "确认前后都应重新读取防火墙状态"
+        assert_eq 2 "$desired_checks" "两次实时采集后都必须重新应用用户请求的额外端口"
+    )
 }
 
 test_lightweight_add_does_not_rescan_docker_or_ssh() {
@@ -1785,6 +1850,7 @@ main() {
         test_openrc_enabled_inactive_firewalld_conflict
         test_case_pid_registry_survives_nested_subshell
         test_bounded_background_processes_release_lock
+        test_provisional_bounded_cleanup_terminates_direct_child_session
         test_timeout_processes_release_lock
         test_busybox_timeout_fallback_releases_lock
         test_watchdog_survives_parent_without_holding_lock

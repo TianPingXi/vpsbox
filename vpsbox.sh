@@ -99,6 +99,7 @@ ACTIVE_BOUNDED_PID=""
 ACTIVE_BOUNDED_START=""
 ACTIVE_BOUNDED_TIMER_PID=""
 ACTIVE_BOUNDED_MARKER=""
+ACTIVE_BOUNDED_PARENT_PID=""
 
 # 实例锁状态由 acquire_lock 与 cleanup_vpsbox_runtime 管理。
 RUNTIME_DIR="/run/vpsbox"
@@ -118,6 +119,9 @@ ACTIVE_SSH_FIREWALL_TRANSITION=0
 ACTIVE_SSH_TRANSACTION_DIR=""
 ACTIVE_SSH_ORIGINAL_PORTS=""
 ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE=0
+ACTIVE_SSH_FAIL2BAN_INSTALLED=0
+ACTIVE_SSH_FAIL2BAN_WAS_RUNNING=0
+ACTIVE_SSH_FAIL2BAN_MUTATED=0
 ACTIVE_FIREWALL_ROLLBACK_DIR=""
 ACTIVE_FIREWALL_ADDITIVE_DIR=""
 ACTIVE_FAIL2BAN_TEST_IP=""
@@ -259,9 +263,12 @@ run_bounded_in_new_session() {
     shift
     marker="$(mktemp /tmp/vpsbox-command-timeout.XXXXXX)" || return 1
     printf '%s\n' pending > "$marker"
+    ACTIVE_BOUNDED_MARKER="$marker"
+    ACTIVE_BOUNDED_PARENT_PID="${BASHPID:-$$}"
     # 后台命令必须关闭菜单锁描述符；否则父菜单被 SIGKILL 后，子进程会继续占用 flock。
     setsid "$@" 200>&- &
     pid=$!
+    ACTIVE_BOUNDED_PID="$pid"
 
     for i in {1..50}; do
         if ! process_alive "$pid" || process_is_zombie "$pid"; then
@@ -269,6 +276,7 @@ run_bounded_in_new_session() {
             if [ "$status" -ne 0 ] && bounded_session_has_processes "$pid"; then
                 terminate_bounded_session "$pid" 1
             fi
+            clear_active_bounded_state
             rm -f -- "$marker"
             return "$status"
         fi
@@ -282,14 +290,13 @@ run_bounded_in_new_session() {
     if [ -z "$start" ]; then
         kill -TERM "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
+        clear_active_bounded_state
         rm -f -- "$marker"
         err "无法为命令建立独立进程组，已取消执行：$1"
         return 125
     fi
 
-    ACTIVE_BOUNDED_PID="$pid"
     ACTIVE_BOUNDED_START="$start"
-    ACTIVE_BOUNDED_MARKER="$marker"
     (
         sleep "$limit"
         if bounded_process_group_matches "$pid" "$start"; then
@@ -313,10 +320,7 @@ run_bounded_in_new_session() {
         fi
     fi
 
-    ACTIVE_BOUNDED_PID=""
-    ACTIVE_BOUNDED_START=""
-    ACTIVE_BOUNDED_TIMER_PID=""
-    ACTIVE_BOUNDED_MARKER=""
+    clear_active_bounded_state
     rm -f -- "$marker"
     return "$status"
 }
@@ -571,14 +575,29 @@ terminate_bounded_session() {
     fi
 }
 
-cleanup_active_bounded_command() {
-    local pid="${ACTIVE_BOUNDED_PID:-}" start="${ACTIVE_BOUNDED_START:-}"
-    local timer="${ACTIVE_BOUNDED_TIMER_PID:-}" marker="${ACTIVE_BOUNDED_MARKER:-}"
+bounded_process_group_is_direct_child() {
+    local pid="$1" expected_parent="$2" stat _state ppid pgrp session
 
+    stat="$(cat "/proc/$pid/stat" 2>/dev/null)" || return 1
+    stat="${stat##*) }"
+    read -r _state ppid pgrp session _ <<< "$stat"
+    [ "$ppid" = "$expected_parent" ] && [ "$pgrp" = "$pid" ] && [ "$session" = "$pid" ]
+}
+
+clear_active_bounded_state() {
     ACTIVE_BOUNDED_PID=""
     ACTIVE_BOUNDED_START=""
     ACTIVE_BOUNDED_TIMER_PID=""
     ACTIVE_BOUNDED_MARKER=""
+    ACTIVE_BOUNDED_PARENT_PID=""
+}
+
+cleanup_active_bounded_command() {
+    local pid="${ACTIVE_BOUNDED_PID:-}" start="${ACTIVE_BOUNDED_START:-}"
+    local timer="${ACTIVE_BOUNDED_TIMER_PID:-}" marker="${ACTIVE_BOUNDED_MARKER:-}"
+    local parent="${ACTIVE_BOUNDED_PARENT_PID:-}" provisional_start=""
+
+    clear_active_bounded_state
     if is_pid "$timer"; then
         kill -TERM "$timer" 2>/dev/null || true
         wait "$timer" 2>/dev/null || true
@@ -588,6 +607,14 @@ cleanup_active_bounded_command() {
             { ! process_alive "$pid" && bounded_session_has_processes "$pid"; }; }; then
         terminate_bounded_session "$pid" 1
         wait "$pid" 2>/dev/null || true
+    elif is_pid "$pid" && is_pid "$parent" &&
+        bounded_process_group_is_direct_child "$pid" "$parent"; then
+        provisional_start="$(process_start_ticks "$pid" 2>/dev/null || true)"
+        if [[ "$provisional_start" =~ ^[0-9]+$ ]] &&
+            bounded_process_group_identity_matches "$pid" "$provisional_start"; then
+            terminate_bounded_session "$pid" 1
+            wait "$pid" 2>/dev/null || true
+        fi
     fi
     if [[ "$marker" == /tmp/vpsbox-command-timeout.* ]] && [ -f "$marker" ] && [ ! -L "$marker" ]; then
         rm -f -- "$marker"
@@ -1897,17 +1924,32 @@ manifest_remove() {
 }
 
 backup_change_file_once() {
-    local name="$1" target="$2" state
+    local name="$1" target="$2" state backup
     [[ "$name" =~ ^[A-Z0-9_]+$ ]] || return 1
     state="$(manifest_value "BACKUP_$name" 2>/dev/null || true)"
     [ -n "$state" ] && return 0
+    backup="$CHANGE_BACKUP_DIR/$name"
+    if [ -e "$backup" ] || [ -L "$backup" ]; then
+        err "备份保存位置已存在但没有对应记录，已拒绝覆盖：$backup"
+        return 1
+    fi
     [ ! -L "$target" ] || {
         err "备份目标是符号链接，已拒绝：$target"
         return 1
     }
     if [ -e "$target" ]; then
-        cp -a "$target" "$CHANGE_BACKUP_DIR/$name" || return 1
-        manifest_set "BACKUP_$name" file
+        if ! cp -a "$target" "$backup"; then
+            if [ ! -L "$backup" ] && [ -f "$backup" ]; then
+                rm -f -- "$backup" || true
+            fi
+            return 1
+        fi
+        if ! manifest_set "BACKUP_$name" file; then
+            if [ ! -L "$backup" ] && [ -f "$backup" ]; then
+                rm -f -- "$backup" || true
+            fi
+            return 1
+        fi
     else
         manifest_set "BACKUP_$name" absent
     fi
@@ -1968,6 +2010,18 @@ change_restore_state() {
         printf '%s\n' pending
     # APPLIED 表示当前版本已经提交、仍可由恢复菜单处理的变更。
     elif [ "$(manifest_value "APPLIED_$name" 2>/dev/null || true)" = "1" ]; then
+        printf '%s\n' applied
+    else
+        printf '%s\n' none
+    fi
+}
+
+change_restore_state_readonly() {
+    local name="$1"
+
+    if [ "$(manifest_value_readonly "PENDING_$name" 2>/dev/null || true)" = "1" ]; then
+        printf '%s\n' pending
+    elif [ "$(manifest_value_readonly "APPLIED_$name" 2>/dev/null || true)" = "1" ]; then
         printf '%s\n' applied
     else
         printf '%s\n' none
@@ -4216,12 +4270,19 @@ restore_node_file_from_backup() {
 restore_node_config_dir_from_backup() {
     local backup_dir="$1" validation_spec="${2:-full}" status
 
-    if [ -e "$NODE_CONFIG_DIR" ] &&
+    if [ -L "$NODE_CONFIG_DIR" ] && [ -e "$NODE_CONFIG_DIR" ]; then
+        err "当前节点配置目录是符号链接，已拒绝覆盖：$NODE_CONFIG_DIR"
+        return 1
+    fi
+    if [ -e "$NODE_CONFIG_DIR" ] && [ ! -L "$NODE_CONFIG_DIR" ] &&
         ! node_config_dir_restore_target_safe "$validation_spec"; then
         err "当前节点配置目录不安全或包含未知文件，已拒绝覆盖：$NODE_CONFIG_DIR"
         return 1
     fi
     if node_backup_entry_is_present "$backup_dir/manifest" vpsbox.d; then
+        if [ -L "$NODE_CONFIG_DIR" ]; then
+            rm -f -- "$NODE_CONFIG_DIR" || return 1
+        fi
         if [ ! -e "$NODE_CONFIG_DIR" ]; then
             install -d -o root -g root -m 700 "$NODE_CONFIG_DIR" || return 1
         fi
@@ -4240,7 +4301,11 @@ restore_node_config_dir_from_backup() {
         "$backup_dir/vpsbox.d/${SS_CONFIG_PATH##*/}" "$SS_CONFIG_PATH" || return 1
     restore_node_file_from_backup "$backup_dir" "vpsbox.d/${VLESS_CONFIG_PATH##*/}" \
         "$backup_dir/vpsbox.d/${VLESS_CONFIG_PATH##*/}" "$VLESS_CONFIG_PATH" || return 1
-    [ ! -e "$NODE_CONFIG_DIR" ] || rmdir -- "$NODE_CONFIG_DIR"
+    if [ -L "$NODE_CONFIG_DIR" ]; then
+        rm -f -- "$NODE_CONFIG_DIR"
+    elif [ -e "$NODE_CONFIG_DIR" ]; then
+        rmdir -- "$NODE_CONFIG_DIR"
+    fi
 }
 
 node_config_dir_restore_target_safe() {
@@ -6690,6 +6755,14 @@ update_vpsbox() {
         err "未找到可备份的当前 vpsbox 主脚本，已取消更新。"
         return 1
     }
+    if [ -e "$backup" ] || [ -L "$backup" ]; then
+        if [ ! -f "$backup" ] || [ -L "$backup" ]; then
+            rm -f "$candidate"
+            err "旧版本备份路径不是安全的普通文件，已取消更新：$backup"
+            return 1
+        fi
+        rm -f -- "$backup" || { rm -f "$candidate"; return 1; }
+    fi
     cp -a "$CMD_PATH" "$backup" || {
         rm -f "$candidate"
         err "备份当前 vpsbox 脚本失败，已取消更新。"
@@ -9875,6 +9948,9 @@ sync_fail2ban_sshd_port() {
         rm -f -- "$tmp"
         return 1
     fi
+    if [ -n "${ACTIVE_SSH_TRANSACTION_DIR:-}" ]; then
+        ACTIVE_SSH_FAIL2BAN_MUTATED=1
+    fi
     if ! fail2ban-client -t -c /etc/fail2ban >/dev/null 2>&1; then
         fail2ban_sync_failure_with_rollback "Fail2ban 配置预检失败" "$backup" "$was_running" || true
         return 1
@@ -10329,8 +10405,8 @@ ssh_restore_snapshot_dir_valid() {
     manifest="$snapshot_dir/manifest"
     [ -f "$manifest" ] && [ ! -L "$manifest" ] &&
         ssh_restore_snapshot_path_is_secure "$manifest" 600 || return 1
-    [ "$(awk 'END { print NR + 0 }' "$manifest")" = "3" ] || return 1
-    for name in main port hardening; do
+    [ "$(awk 'END { print NR + 0 }' "$manifest")" = "4" ] || return 1
+    for name in main port hardening fail2ban; do
         entry="$(ssh_restore_snapshot_manifest_entry "$manifest" "$name")" || return 1
         IFS='|' read -r _ state mode digest <<< "$entry"
         case "$state" in
@@ -10375,11 +10451,12 @@ create_ssh_restore_snapshot() {
         return 1
     }
     manifest="$build/manifest"
-    for name in main port hardening; do
+    for name in main port hardening fail2ban; do
         case "$name" in
             main) path="$SSHD_MAIN_CONF" ;;
             port) path="$SSHD_VPSBOX_PORT_CONF" ;;
             hardening) path="$SSHD_VPSBOX_HARDENING_CONF" ;;
+            fail2ban) path="$FAIL2BAN_VPSBOX_SSHD_CONF" ;;
         esac
         if [ -f "$path" ] && [ ! -L "$path" ]; then
             mode="$(stat -c '%a' "$path" 2>/dev/null)" &&
@@ -10463,16 +10540,71 @@ restore_ssh_runtime_snapshot() {
     [ -z "$expected_ports" ] || wait_for_all_ssh_listeners_csv "$expected_ports"
 }
 
+restore_ssh_fail2ban_snapshot() {
+    local snapshot_dir="$1" was_installed="$2" was_running="$3"
+    local entry state mode path="$FAIL2BAN_VPSBOX_SSHD_CONF" failed=0
+
+    case "$was_installed:$was_running" in
+        0:0|1:0|1:1) ;;
+        *) return 1 ;;
+    esac
+    ssh_restore_snapshot_dir_valid "$snapshot_dir" || return 1
+    entry="$(ssh_restore_snapshot_manifest_entry "$snapshot_dir/manifest" fail2ban)" || return 1
+    IFS='|' read -r _ state mode _ <<< "$entry"
+    case "$state" in
+        file)
+            install_root_file_atomically "$snapshot_dir/fail2ban" "$path" "$mode" || return 1
+            ;;
+        absent)
+            remove_snapshot_target_file "$path" || return 1
+            ;;
+        *) return 1 ;;
+    esac
+
+    [ "$was_installed" -eq 1 ] || return 0
+    if is_systemd; then
+        if [ "$was_running" -eq 1 ]; then
+            fail2ban-client -t -c /etc/fail2ban >/dev/null 2>&1 || return 1
+            retry 3 1 systemctl restart fail2ban >/dev/null || failed=1
+        else
+            retry 3 1 systemctl stop fail2ban >/dev/null || failed=1
+        fi
+    elif command -v rc-service >/dev/null 2>&1; then
+        if [ "$was_running" -eq 1 ]; then
+            fail2ban-client -t -c /etc/fail2ban >/dev/null 2>&1 || return 1
+            retry 3 1 rc-service fail2ban restart >/dev/null || failed=1
+        else
+            retry 3 1 rc-service fail2ban stop >/dev/null || failed=1
+        fi
+    else
+        failed=1
+    fi
+    if [ "$was_running" -eq 1 ]; then
+        [ "$(fail2ban_service_state)" = "运行中" ] || failed=1
+    else
+        [ "$(fail2ban_service_state)" != "运行中" ] || failed=1
+    fi
+    return "$failed"
+}
+
 begin_ssh_runtime_transaction() {
     local original_ports="$1" has_port_change="${2:-0}" snapshot_dir=""
+    local fail2ban_installed_before=0 fail2ban_running_before=0
 
     [ -z "${ACTIVE_SSH_TRANSACTION_DIR:-}" ] || return 1
     case "$has_port_change" in 0|1) ;; *) return 1 ;; esac
     original_ports="$(normalize_port_csv "$original_ports")" || return 1
     [ -n "$original_ports" ] || return 1
     create_ssh_restore_snapshot snapshot_dir || return 1
+    if fail2ban_installed; then
+        fail2ban_installed_before=1
+        [ "$(fail2ban_service_state)" = "运行中" ] && fail2ban_running_before=1
+    fi
     ACTIVE_SSH_ORIGINAL_PORTS="$original_ports"
     ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE="$has_port_change"
+    ACTIVE_SSH_FAIL2BAN_INSTALLED="$fail2ban_installed_before"
+    ACTIVE_SSH_FAIL2BAN_WAS_RUNNING="$fail2ban_running_before"
+    ACTIVE_SSH_FAIL2BAN_MUTATED=0
     # 最后登记目录作为活动标记；在此之前尚未修改正式配置。
     ACTIVE_SSH_TRANSACTION_DIR="$snapshot_dir"
 }
@@ -10484,6 +10616,9 @@ cancel_ssh_runtime_transaction() {
     ACTIVE_SSH_TRANSACTION_DIR=""
     ACTIVE_SSH_ORIGINAL_PORTS=""
     ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE=0
+    ACTIVE_SSH_FAIL2BAN_INSTALLED=0
+    ACTIVE_SSH_FAIL2BAN_WAS_RUNNING=0
+    ACTIVE_SSH_FAIL2BAN_MUTATED=0
     remove_ssh_restore_snapshot "$snapshot_dir"
 }
 
@@ -10491,17 +10626,26 @@ commit_ssh_runtime_transaction() {
     local snapshot_dir="${ACTIVE_SSH_TRANSACTION_DIR:-}"
     local original_ports="${ACTIVE_SSH_ORIGINAL_PORTS:-}"
     local has_port_change="${ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE:-0}"
+    local fail2ban_installed_before="${ACTIVE_SSH_FAIL2BAN_INSTALLED:-0}"
+    local fail2ban_running_before="${ACTIVE_SSH_FAIL2BAN_WAS_RUNNING:-0}"
+    local fail2ban_mutated="${ACTIVE_SSH_FAIL2BAN_MUTATED:-0}"
 
     [ -n "$snapshot_dir" ] || return 1
     # 先撤销活动标记，提交后即使收到信号也不应回滚已验收的健康配置。
     ACTIVE_SSH_TRANSACTION_DIR=""
     ACTIVE_SSH_ORIGINAL_PORTS=""
     ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE=0
+    ACTIVE_SSH_FAIL2BAN_INSTALLED=0
+    ACTIVE_SSH_FAIL2BAN_WAS_RUNNING=0
+    ACTIVE_SSH_FAIL2BAN_MUTATED=0
     if remove_ssh_restore_snapshot "$snapshot_dir"; then
         return 0
     fi
     ACTIVE_SSH_ORIGINAL_PORTS="$original_ports"
     ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE="$has_port_change"
+    ACTIVE_SSH_FAIL2BAN_INSTALLED="$fail2ban_installed_before"
+    ACTIVE_SSH_FAIL2BAN_WAS_RUNNING="$fail2ban_running_before"
+    ACTIVE_SSH_FAIL2BAN_MUTATED="$fail2ban_mutated"
     ACTIVE_SSH_TRANSACTION_DIR="$snapshot_dir"
     return 1
 }
@@ -10510,18 +10654,24 @@ rollback_active_ssh_transaction() {
     local snapshot_dir="${ACTIVE_SSH_TRANSACTION_DIR:-}"
     local original_ports="${ACTIVE_SSH_ORIGINAL_PORTS:-}"
     local has_port_change="${ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE:-0}"
-    local restored=0 failed=0
+    local fail2ban_installed_before="${ACTIVE_SSH_FAIL2BAN_INSTALLED:-0}"
+    local fail2ban_running_before="${ACTIVE_SSH_FAIL2BAN_WAS_RUNNING:-0}"
+    local fail2ban_mutated="${ACTIVE_SSH_FAIL2BAN_MUTATED:-0}"
+    local failed=0
 
     [ -n "$snapshot_dir" ] || return 0
     if [ -n "${ACTIVE_FAIL2BAN_SYNC_WAS_RUNNING:-}" ]; then
         cleanup_active_fail2ban_sync || failed=1
     fi
-    if restore_ssh_runtime_snapshot "$snapshot_dir" "$original_ports"; then
-        restored=1
-    else
+    if ! restore_ssh_runtime_snapshot "$snapshot_dir" "$original_ports"; then
         failed=1
     fi
-    if [ "$restored" -eq 1 ] && ! sync_fail2ban_sshd_port; then
+    if [ "$fail2ban_mutated" = "1" ]; then
+        if ! restore_ssh_fail2ban_snapshot \
+            "$snapshot_dir" "$fail2ban_installed_before" "$fail2ban_running_before"; then
+            failed=1
+        fi
+    elif [ "$fail2ban_mutated" != "0" ]; then
         failed=1
     fi
     if [ "${ACTIVE_SSH_FIREWALL_TRANSITION:-0}" = "1" ]; then
@@ -10544,11 +10694,17 @@ rollback_active_ssh_transaction() {
     ACTIVE_SSH_TRANSACTION_DIR=""
     ACTIVE_SSH_ORIGINAL_PORTS=""
     ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE=0
+    ACTIVE_SSH_FAIL2BAN_INSTALLED=0
+    ACTIVE_SSH_FAIL2BAN_WAS_RUNNING=0
+    ACTIVE_SSH_FAIL2BAN_MUTATED=0
     if remove_ssh_restore_snapshot "$snapshot_dir"; then
         return 0
     fi
     ACTIVE_SSH_ORIGINAL_PORTS="$original_ports"
     ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE="$has_port_change"
+    ACTIVE_SSH_FAIL2BAN_INSTALLED="$fail2ban_installed_before"
+    ACTIVE_SSH_FAIL2BAN_WAS_RUNNING="$fail2ban_running_before"
+    ACTIVE_SSH_FAIL2BAN_MUTATED="$fail2ban_mutated"
     ACTIVE_SSH_TRANSACTION_DIR="$snapshot_dir"
     return 1
 }
@@ -10866,6 +11022,12 @@ cancel_unmodified_ipv6_change() {
 disable_ipv6() {
     local addresses runtime_values old_all old_default old_lo
     local parent tmp interface address tracking_state
+
+    tracking_state="$(change_restore_state_readonly IPV6_CONF)" || return 1
+    if [ "$tracking_state" = "pending" ]; then
+        err "检测到尚未处理的 IPv6 修改事务，请先在恢复菜单中检查或恢复。"
+        return 1
+    fi
 
     if ! addresses="$(global_ipv6_addresses)"; then
         err "无法读取全局 IPv6 地址，已取消禁用。"
@@ -11417,6 +11579,11 @@ apply_tcp_buffer_tier() {
 
     target_max="$(tcp_buffer_tier_max "$tier")" || return 2
     tier_description="$(tcp_buffer_tier_description "$tier")" || return 2
+    tracking_state="$(change_restore_state_readonly TCP_BUFFER_CONF)" || return 1
+    if [ "$tracking_state" = "pending" ]; then
+        err "检测到尚未处理的 TCP 缓冲区修改事务，请先在恢复菜单中检查或恢复。"
+        return 1
+    fi
     if [ -e "$TCP_BUFFER_CONF" ] || [ -L "$TCP_BUFFER_CONF" ]; then
         [ -f "$TCP_BUFFER_CONF" ] && [ ! -L "$TCP_BUFFER_CONF" ] || {
             err "$TCP_BUFFER_CONF 不是安全的普通文件，已拒绝覆盖。"
@@ -11676,6 +11843,12 @@ cancel_unmodified_bbr_change() {
 
 enable_bbr_fq() {
     local old_cc old_fq tmp parent tracking_state
+
+    tracking_state="$(change_restore_state_readonly BBR_CONF)" || return 1
+    if [ "$tracking_state" = "pending" ]; then
+        err "检测到尚未处理的 BBR 修改事务，请先在恢复菜单中检查或恢复。"
+        return 1
+    fi
 
     if bbr_fq_persistent_config_is_current; then
         if bbr_fq_runtime_is_current; then
@@ -14362,7 +14535,15 @@ EOF
 
 firewall_apply_desired_state() {
     local work_dir rollback_dir answer service_file service_target service_mode
-    local detect_status
+    local detect_status requested_extra_tcp="" requested_extra_udp="" override_extra_ports=0
+
+    if [ "$#" -eq 2 ]; then
+        requested_extra_tcp="$1"
+        requested_extra_udp="$2"
+        override_extra_ports=1
+    elif [ "$#" -ne 0 ]; then
+        return 2
+    fi
 
     firewall_settle_pending_port_transition || return 1
     detect_os
@@ -14375,6 +14556,10 @@ firewall_apply_desired_state() {
     ensure_nftables || return 1
     firewall_check_conflicts || return 1
     firewall_load_state || return 1
+    if [ "$override_extra_ports" -eq 1 ]; then
+        FW_EXTRA_TCP="$requested_extra_tcp"
+        FW_EXTRA_UDP="$requested_extra_udp"
+    fi
     FW_DOCKER_STOPPED_IGNORED=0
     if firewall_detect_allowed_ports initial; then
         :
@@ -14397,6 +14582,10 @@ firewall_apply_desired_state() {
         err "确认后防火墙状态文件发生异常，未修改防火墙。"
         return 1
     }
+    if [ "$override_extra_ports" -eq 1 ]; then
+        FW_EXTRA_TCP="$requested_extra_tcp"
+        FW_EXTRA_UDP="$requested_extra_udp"
+    fi
     if ! firewall_detect_allowed_ports confirmed; then
         err "确认后端口状态发生异常，未修改防火墙。"
         return 1
@@ -15523,7 +15712,7 @@ firewall_save_inactive_state() {
 
 firewall_commit_port_state() {
     if firewall_control_plane_present; then
-        firewall_apply_desired_state
+        firewall_apply_desired_state "$FW_EXTRA_TCP" "$FW_EXTRA_UDP"
     else
         firewall_save_inactive_state
         info "额外端口已保存；启用主机防火墙时会自动使用。"
@@ -15875,7 +16064,7 @@ run_self_check() {
     local node_integrity_failed="0"
     local max_use
     local max_file
-    local state node_protocols protocol protocol_status label ips detail ports_report uri_cache_state
+    local state node_protocols protocol protocol_status label detail ports_report uri_cache_state
     local install_metadata installed_version installed_at
     local bbr_config_expected=0 ipv4_priority_expected=0 ssh_hardening_expected=0
     local singbox_available=0
@@ -15959,14 +16148,7 @@ EOF
         fi
         if is_ip_address "$DOMAIN"; then
             check_ok "$label 地址" "$DOMAIN"
-        elif is_valid_node_host "$DOMAIN"; then
-            ips="$(resolve_host_ips "$DOMAIN" | tr '\n' ' ')"
-            if [ -n "$ips" ]; then
-                check_ok "$label 解析" "$ips"
-            else
-                check_warn "$label 解析" "未解析到 IP"
-            fi
-        else
+        elif ! is_valid_node_host "$DOMAIN"; then
             check_fail "$label 地址" "格式不正确：$DOMAIN"
         fi
     done
@@ -16557,9 +16739,13 @@ cleanup_old_temp_dirs() {
 
 cleanup_orphaned_change_backups() {
     local backup name state old_file
+    if [ -L "$CHANGE_BACKUP_DIR" ]; then
+        err "vpsbox 备份目录是符号链接，已拒绝清理：$CHANGE_BACKUP_DIR"
+        return 1
+    fi
     [ -d "$CHANGE_BACKUP_DIR" ] || return 0
     for backup in "$CHANGE_BACKUP_DIR"/*; do
-        [ -f "$backup" ] || continue
+        [ -f "$backup" ] && [ ! -L "$backup" ] || continue
         name="${backup##*/}"
         [[ "$name" =~ ^[A-Z0-9_]+$ ]] || continue
         state="$(manifest_value "BACKUP_$name" 2>/dev/null || true)"

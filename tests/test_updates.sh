@@ -355,6 +355,27 @@ test_vpsbox_watchdog_start_failure_preserves_current() {
     assert_file_contains "$output" '无法启动新版 vpsbox 启动监护'
 }
 
+test_vpsbox_update_rejects_unsafe_previous_target() {
+    local output="$TEST_TMP/unsafe-previous.out" victim
+
+    require_real_symlink file || return "$?"
+    reset_update_case unsafe-previous
+    write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
+    write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_NEWER" remote
+    victim="$CASE_DIR/victim"
+    printf '%s\n' keep > "$victim"
+    ln -s "$victim" "${CMD_PATH}.previous"
+
+    if update_vpsbox > "$output" 2>&1; then
+        fail "自更新不得覆盖异常的 .previous 符号链接"
+    fi
+    assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_CURRENT"
+    [ -L "${CMD_PATH}.previous" ] || fail "拒绝更新后应保留异常链接供人工检查"
+    assert_file_contains "$victim" '^keep$' "不得覆盖 .previous 链接指向的外部文件"
+    assert_file_contains "$output" '旧版本备份路径不是安全的普通文件'
+    assert_empty_file "$MOCK_EVENT_LOG" "拒绝异常备份路径后不得启动 watchdog 或替换命令入口"
+}
+
 test_vpsbox_never_fetches_old_owner_url() {
     local primary_count
 
@@ -1089,6 +1110,7 @@ main() {
         test_vpsbox_older_is_noop
         test_vpsbox_newer_updates_once
         test_vpsbox_watchdog_start_failure_preserves_current
+        test_vpsbox_update_rejects_unsafe_previous_target
         test_vpsbox_never_fetches_old_owner_url
         test_primary_url_failure_preserves_current
         test_vpsbox_invalid_download_preserves_current

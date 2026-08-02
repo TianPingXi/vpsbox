@@ -1390,6 +1390,7 @@ test_self_check_classifies_and_summarizes_results() {
         local output="$TEST_TMP/self-check-node-unavailable.out"
         local unsafe_output="$TEST_TMP/self-check-node-uri-unsafe.out"
         local current_output="$TEST_TMP/self-check-node-uri-current.out"
+        local resolver_log="$TEST_TMP/self-check-node-resolver.log"
         local mock_uri_cache_state=stale
 
         detect_os() { OS=debian; }
@@ -1400,14 +1401,29 @@ test_self_check_classifies_and_summarizes_results() {
         require_valid_node_state_if_present() { return 0; }
         node_uri_cache_status() { printf '%s\n' "$mock_uri_cache_state"; }
         protocol_node_status() {
-            [ "$1" = vless ] && printf '%s\n' normal || printf '%s\n' absent
+            case "$1" in
+                vless|ss) printf '%s\n' normal ;;
+                *) printf '%s\n' absent ;;
+            esac
         }
         load_protocol_state() {
-            [ "$1" = vless ] || return 1
-            DOMAIN=192.0.2.10
-            PORT=20001
-            # shellcheck disable=SC2034 # run_self_check 在状态加载后动态读取。
-            REALITY_SERVER_NAME=example.com
+            case "$1" in
+                vless)
+                    DOMAIN=vless.example.com
+                    PORT=20001
+                    # shellcheck disable=SC2034 # run_self_check 在状态加载后动态读取。
+                    REALITY_SERVER_NAME=example.com
+                    ;;
+                ss)
+                    DOMAIN=ss.example.com
+                    PORT=20002
+                    ;;
+                *) return 1 ;;
+            esac
+        }
+        resolve_host_ips() {
+            printf '%s\n' "$1" >> "$resolver_log"
+            printf '%s\n' 192.0.2.10
         }
         singbox_installed() { return 0; }
         singbox_version() { printf '%s\n' 1.13.14; }
@@ -1436,10 +1452,15 @@ test_self_check_classifies_and_summarizes_results() {
         URI_FILE="$TEST_TMP/missing-node-uri.txt"
         VPSBOX_STATE_DIR="$TEST_TMP/self-check-node-state"
         INSTALL_METADATA_FILE="$VPSBOX_STATE_DIR/install.env"
+        : > "$resolver_log"
 
         run_self_check > "$output" 2>&1 ||
             fail "节点监听和链接缺失时仍应完成状态报告"
         assert_file_contains "$output" 'FAIL[[:space:]]+[|] VLESS Reality 监听[[:space:]]+[|] 20001 未监听'
+        assert_file_contains "$output" 'FAIL[[:space:]]+[|] Shadowsocks 监听[[:space:]]+[|] 20002 未监听'
+        assert_file_not_contains "$output" 'VLESS Reality 解析|Shadowsocks 解析|未解析到 IP' \
+            "一键检测不应显示节点域名解析结果"
+        assert_empty_file "$resolver_log" "一键检测不应查询 VLESS 或 Shadowsocks 节点域名"
         assert_file_contains "$output" 'WARN[[:space:]]+[|] 节点链接[[:space:]]+[|] 缺失或已过期'
         assert_file_not_contains "$output" 'FAIL[[:space:]]+[|] 配置完整性'
 
