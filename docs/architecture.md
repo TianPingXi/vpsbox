@@ -200,10 +200,16 @@ git diff --check
 
 只修改文档时复核最终差异并运行 `git diff --check` 即可。涉及 Linux 权限、`/proc`、服务管理器、真实防火墙或 SSH 连通性的行为，在本机测试无法覆盖时再使用隔离 Linux 环境或已明确授权的 VPS。
 
-正式发布前在 Windows PowerShell 运行：
+正式发布或推送前，先在 Windows PowerShell 同步提升版本号：
+
+```powershell
+.\tools\release.ps1 -Bump
+```
+
+检查版本差异并统一暂存所有待发布改动后，再运行最终静态检查：
 
 ```powershell
 .\tools\release.ps1
 ```
 
-版本同步、仓库状态和发布文件检查由该工具负责，具体实现不在本文重复维护。
+两次调用均不会自动提交或推送。版本同步、仓库状态和发布文件检查由该工具负责，具体实现不在本文重复维护。
