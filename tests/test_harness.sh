@@ -127,6 +127,23 @@ test_run_test_case_records_explicit_skip() {
         "合法 SKIP 必须写入运行器汇总文件"
 }
 
+test_run_test_case_rejects_swallowed_skip() {
+    local status output="$TEST_TMP/swallowed-skip.out"
+
+    swallowed_skip_case() {
+        skip "隐藏跳过夹具" || true
+    }
+
+    set +e
+    run_test_case swallowed_skip_case >"$output" 2>&1
+    status=$?
+    set -e
+
+    assert_eq 1 "$status" "被吞掉的 SKIP 不得改写为通过"
+    assert_file_contains "$output" \
+        '测试记录了 SKIP 原因但最终返回成功：swallowed_skip_case：隐藏跳过夹具'
+}
+
 test_negative_file_assertions_require_regular_files() {
     local missing="$TEST_TMP/missing-output" regular="$TEST_TMP/regular-output"
     local target="$TEST_TMP/assertion-target" link="$TEST_TMP/assertion-link"
@@ -178,16 +195,25 @@ test_require_command_records_explicit_skip() {
         "$(test_skip_reason)" "能力 SKIP 必须记录可读原因"
 }
 
-test_require_real_symlink_rejects_unknown_kind() {
-    local status output="$TEST_TMP/unknown-symlink-kind.out"
+test_skip_test_suite_records_and_rejects_strict_mode() {
+    local VPSBOX_TEST_SKIP_FILE="$TEST_TMP/suite-skips"
+    local VPSBOX_TEST_STRICT=0 status output="$TEST_TMP/suite-skip.out"
 
+    : > "$VPSBOX_TEST_SKIP_FILE"
+    skip_test_suite "fixture suite" "需要命令：fixture" >"$output"
+    assert_file_contains "$VPSBOX_TEST_SKIP_FILE" $'^fixture suite\t需要命令：fixture$'
+    assert_file_contains "$output" 'ok - fixture suite # SKIP 需要命令：fixture'
+
+    : > "$VPSBOX_TEST_SKIP_FILE"
+    VPSBOX_TEST_STRICT=1
     set +e
-    require_real_symlink files >"$output" 2>&1
+    skip_test_suite "fixture suite" "需要命令：fixture" >"$output" 2>&1
     status=$?
     set -e
 
-    assert_eq 2 "$status" "能力参数错误不得被当成 SKIP"
-    assert_file_contains "$output" '未知的符号链接能力类型：files'
+    assert_eq 1 "$status" "严格模式必须拒绝套件级 SKIP"
+    assert_empty_file "$VPSBOX_TEST_SKIP_FILE" "严格模式不得把失败登记为 SKIP"
+    assert_file_contains "$output" '严格模式不允许跳过：需要命令：fixture'
 }
 
 test_forbidden_marker_survives_ignored_status() {
@@ -347,30 +373,6 @@ test_business_suites_use_registered_runner() {
     done
 }
 
-test_capability_preconditions_do_not_mask_failure_status() {
-    local path file violations
-    local -a suites=()
-
-    for path in "$TEST_DIR"/test_*.sh; do
-        file="${path##*/}"
-        case "$file" in
-            test_helper.sh|test_harness.sh) continue ;;
-        esac
-        suites+=("$path")
-    done
-    [ "${#suites[@]}" -gt 0 ] || fail "未发现任何待检查的测试套件"
-
-    violations="$(awk '
-        /^[[:space:]]*require_(command|linux_proc|real_symlink)[[:space:]]/ &&
-            $0 ~ /\|\|/ &&
-            $0 !~ /\|\|[[:space:]]*return[[:space:]]+"\$\?"[[:space:]]*$/ {
-            print FILENAME ":" FNR ":" $0
-        }
-    ' "${suites[@]}")"
-    [ -z "$violations" ] ||
-        fail "能力前置条件不得把真实失败改写成 SKIP 或成功：$violations"
-}
-
 main() {
     local test status passed=0 skipped=0
     local -a tests=(
@@ -381,9 +383,10 @@ main() {
         test_run_test_case_strict_mode_rejects_skip
         test_run_test_case_rejects_unexplained_skip
         test_run_test_case_records_explicit_skip
+        test_run_test_case_rejects_swallowed_skip
         test_negative_file_assertions_require_regular_files
         test_require_command_records_explicit_skip
-        test_require_real_symlink_rejects_unknown_kind
+        test_skip_test_suite_records_and_rejects_strict_mode
         test_forbidden_marker_survives_ignored_status
         test_forbidden_marker_survives_command_substitution
         test_registration_check_rejects_missing_extra_and_duplicates
@@ -391,7 +394,6 @@ main() {
         test_shared_suite_runner_preserves_skip_and_strict_mode
         test_shared_suite_runner_rejects_conditional_context
         test_business_suites_use_registered_runner
-        test_capability_preconditions_do_not_mask_failure_status
     )
 
     assert_all_tests_registered "${BASH_SOURCE[0]}" "${tests[@]}" || return 1

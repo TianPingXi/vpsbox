@@ -3312,12 +3312,9 @@ assert_ntp_restore_rejects_metadata() {
     )
 }
 
-test_ntp_restore_requires_complete_current_metadata() {
+test_ntp_restore_rejects_incomplete_or_invalid_current_metadata() {
     assert_ntp_restore_rejects_metadata missing \
         "缺少当前格式的 NTP 文件备份状态时恢复必须失败"
-}
-
-test_ntp_restore_rejects_invalid_current_metadata() {
     assert_ntp_restore_rejects_metadata invalid \
         "NTP 恢复记录包含非法枚举值时必须失败"
 }
@@ -3355,12 +3352,9 @@ assert_fail2ban_restore_rejects_metadata() {
     )
 }
 
-test_fail2ban_restore_requires_complete_service_metadata() {
+test_fail2ban_restore_rejects_incomplete_or_invalid_service_metadata() {
     assert_fail2ban_restore_rejects_metadata missing \
         "缺少当前格式的 Fail2ban 服务状态时恢复必须失败"
-}
-
-test_fail2ban_restore_rejects_invalid_service_metadata() {
     assert_fail2ban_restore_rejects_metadata invalid \
         "Fail2ban 恢复记录包含非法枚举值时必须失败"
 }
@@ -3686,10 +3680,8 @@ main() {
         test_signal_traps_preserve_exit_status
         test_ssh_restore_rejects_legacy_tmp_snapshot
         test_ntp_restore_accepts_complete_current_metadata
-        test_ntp_restore_requires_complete_current_metadata
-        test_ntp_restore_rejects_invalid_current_metadata
-        test_fail2ban_restore_requires_complete_service_metadata
-        test_fail2ban_restore_rejects_invalid_service_metadata
+        test_ntp_restore_rejects_incomplete_or_invalid_current_metadata
+        test_fail2ban_restore_rejects_incomplete_or_invalid_service_metadata
         test_fail2ban_restore_accepts_complete_service_metadata
         test_restore_system_changes_clears_success_and_preserves_failed_group
         test_single_system_change_restore_is_isolated

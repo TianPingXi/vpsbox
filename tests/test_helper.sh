@@ -216,6 +216,28 @@ test_skip_reason() {
     fi
 }
 
+record_test_skip() {
+    local name="$1" reason="$2"
+
+    [ -n "${VPSBOX_TEST_SKIP_FILE:-}" ] || return 0
+    [ -f "$VPSBOX_TEST_SKIP_FILE" ] && [ ! -L "$VPSBOX_TEST_SKIP_FILE" ] || {
+        printf 'SKIP 汇总文件不安全或不存在：%s\n' "$VPSBOX_TEST_SKIP_FILE" >&2
+        return 1
+    }
+    printf '%s\t%s\n' "$name" "$reason" >> "$VPSBOX_TEST_SKIP_FILE"
+}
+
+skip_test_suite() {
+    local name="$1" reason="$2"
+
+    if [ "${VPSBOX_TEST_STRICT:-0}" = "1" ]; then
+        printf '严格模式不允许跳过：%s\n' "$reason" >&2
+        return 1
+    fi
+    record_test_skip "$name" "$reason" || return 1
+    printf 'ok - %s # SKIP %s\n' "$name" "$reason"
+}
+
 run_test_case() {
     local name="$1" status=0
     # Shell 选项默认是全局状态；限制在函数作用域，避免 set +/-e 泄漏给调用方。
@@ -230,19 +252,17 @@ run_test_case() {
         "$name"
     )
     status=$?
+    if [ "$status" -eq 0 ] && [ -s "$SKIP_REASON_FILE" ]; then
+        printf '测试记录了 SKIP 原因但最终返回成功：%s：%s\n' \
+            "$name" "$(test_skip_reason)" >&2
+        return 1
+    fi
     if [ "$status" -eq "$SKIP_STATUS" ]; then
         if [ ! -s "$SKIP_REASON_FILE" ]; then
             printf '测试返回 SKIP 状态但未记录原因：%s\n' "$name" >&2
             return 1
         fi
-        if [ -n "${VPSBOX_TEST_SKIP_FILE:-}" ]; then
-            [ -f "$VPSBOX_TEST_SKIP_FILE" ] && [ ! -L "$VPSBOX_TEST_SKIP_FILE" ] || {
-                printf 'SKIP 汇总文件不安全或不存在：%s\n' "$VPSBOX_TEST_SKIP_FILE" >&2
-                return 1
-            }
-            printf '%s\t%s\n' "$name" "$(test_skip_reason)" >> "$VPSBOX_TEST_SKIP_FILE" ||
-                return 1
-        fi
+        record_test_skip "$name" "$(test_skip_reason)" || return 1
         if [ "${VPSBOX_TEST_STRICT:-0}" = "1" ]; then
             printf '严格模式不允许跳过：%s\n' "$(test_skip_reason)" >&2
             return 1

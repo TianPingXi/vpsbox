@@ -711,8 +711,10 @@ EOF
     cleanup_case_pids
 }
 
-test_provisional_bounded_cleanup_terminates_direct_child_session() {
+run_provisional_bounded_cleanup_case() (
     local marker pid parent
+
+    trap '[ -z "${marker:-}" ] || rm -f -- "$marker"' EXIT
 
     require_command setsid || return "$?"
     require_linux_proc || return "$?"
@@ -746,6 +748,10 @@ test_provisional_bounded_cleanup_terminates_direct_child_session() {
     assert_eq "" "$ACTIVE_BOUNDED_PID"
     assert_eq "" "$ACTIVE_BOUNDED_PARENT_PID"
     cleanup_case_pids
+)
+
+test_provisional_bounded_cleanup_terminates_direct_child_session() {
+    run_provisional_bounded_cleanup_case
 }
 
 run_timeout_lock_case() {

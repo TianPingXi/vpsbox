@@ -2655,7 +2655,10 @@ main() {
         test_self_check_keeps_valid_sibling_visible
     )
 
-    require_command jq || return "$?"
+    if ! command -v jq >/dev/null 2>&1; then
+        skip_test_suite "dual node tests" "需要命令：jq" || return "$?"
+        return 0
+    fi
     for name in "${required[@]}"; do
         require_function "$name"
     done
