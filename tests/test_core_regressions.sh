@@ -863,20 +863,70 @@ test_reality_checks_require_bounded_dns_and_openssl() {
         }
         run_bounded_command() {
             printf '%s\n' "$*" > "$log"
+            printf '%s\n' \
+                'New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256' \
+                'ALPN protocol: h2'
         }
 
         check_reality_server example.com ||
-            fail "带 SNI 与 ALPN 的 Reality TLS 检查应成功"
+            fail "TLS 1.3 且实际协商 H2 的 Reality 检查应成功"
         assert_eq \
-            '12 openssl s_client -connect example.com:443 -servername example.com -alpn h2,http/1.1' \
+            '12 openssl s_client -connect example.com:443 -servername example.com -tls1_3 -alpn h2,http/1.1' \
             "$(cat "$log")" \
-            "Reality TLS 检查必须发送常用 HTTPS ALPN"
+            "Reality TLS 检查必须限定 TLS 1.3 并发送常用 HTTPS ALPN"
+    )
+    (
+        local negotiated status=0
+
+        resolve_host_ips() { printf '%s\n' 192.0.2.1; }
+        command() {
+            if [ "${1:-}" = "-v" ] && [ "${2:-}" = "openssl" ]; then
+                return 0
+            fi
+            builtin command "$@"
+        }
+        run_bounded_command() {
+            printf '%s\n' \
+                'New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256' \
+                "$negotiated"
+        }
+
+        for negotiated in 'ALPN protocol: http/1.1' 'No ALPN negotiated'; do
+            if check_reality_server example.com; then
+                fail "Reality 目标未协商 H2 时不得通过：$negotiated"
+            else
+                status=$?
+            fi
+            assert_eq 2 "$status" \
+                "Reality 目标未协商 H2 时必须返回可识别状态"
+        done
+    )
+    (
+        local status=0
+
+        resolve_host_ips() { printf '%s\n' 192.0.2.1; }
+        command() {
+            if [ "${1:-}" = "-v" ] && [ "${2:-}" = "openssl" ]; then
+                return 0
+            fi
+            builtin command "$@"
+        }
+        run_bounded_command() { return 1; }
+
+        if check_reality_server example.com; then
+            fail "Reality TLS 1.3 握手失败时不得通过"
+        else
+            status=$?
+        fi
+        assert_eq 1 "$status" \
+            "Reality TLS 1.3 握手失败时必须返回通用失败状态"
     )
 }
 
 test_reality_candidate_is_checked_only_once() {
     (
         local check_log="$TEST_TMP/reality-candidate-checks.log"
+        local output="$TEST_TMP/reality-candidate-output.log"
 
         ensure_node_dependencies() { return 0; }
         require_valid_node_state_if_present() { return 0; }
@@ -890,16 +940,19 @@ test_reality_candidate_is_checked_only_once() {
         rollback_node_files_transaction() { return 0; }
         check_reality_server() {
             printf '%s\n' "$1" >> "$check_log"
-            [ "$1" = good.example ]
+            [ "$1" = good.example ] && return 0
+            return 2
         }
         sing-box() { return 1; }
 
         : > "$check_log"
-        if create_vless_reality_node <<< $'\nbad.example\ngood.example\n' >/dev/null 2>&1; then
+        if create_vless_reality_node <<< $'\nbad.example\ngood.example\n' > "$output" 2>&1; then
             fail "UUID 夹具失败时创建流程不应报告成功"
         fi
         assert_eq $'bad.example\ngood.example' "$(cat "$check_log")" \
-            "每个 Reality 候选只能执行一次 DNS/TLS 探测"
+            "每个 Reality 候选只能执行一次 DNS/TLS 1.3/H2 探测"
+        assert_file_contains "$output" '目标域名支持 TLS 1\.3，但未协商 H2，请更换。' \
+            "Reality 目标未协商 H2 时必须给出明确提示"
     )
     (
         local event_log="$TEST_TMP/reality-dependency-order.log"

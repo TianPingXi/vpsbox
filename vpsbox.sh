@@ -5153,18 +5153,21 @@ generate_reality_keypair() {
 }
 
 check_reality_server() {
-    local server_name="$1"
+    local server_name="$1" output
 
     is_domain_name "$server_name" || return 1
     resolve_host_ips "$server_name" | grep -q . || return 1
     command -v openssl >/dev/null 2>&1 || {
-        err "未找到 openssl，无法验证 Reality 目标的 TLS 443。"
+        err "未找到 openssl，无法验证 Reality 目标的 TLS 1.3 与 H2。"
         return 1
     }
-    run_bounded_command 12 openssl s_client \
+    if ! output="$(run_bounded_command 12 openssl s_client \
         -connect "${server_name}:443" -servername "$server_name" \
-        -alpn h2,http/1.1 \
-        </dev/null >/dev/null 2>&1
+        -tls1_3 -alpn h2,http/1.1 \
+        </dev/null 2>&1)"; then
+        return 1
+    fi
+    grep -Eq '^ALPN protocol: h2\r?$' <<< "$output" || return 2
 }
 
 render_singbox_systemd_service() {
@@ -5453,7 +5456,7 @@ EOF
 create_vless_reality_node() {
     local confirm domain default_name input_name name port input_sni server_name
     local uuid short_id private_key public_key config_id staged_config staged_state
-    local existing_port="" existing_protocols="" reality_check_deferred=0
+    local existing_port="" existing_protocols="" reality_check_deferred=0 reality_check_status=0
     local sibling_ports=""
     local -a keypair
 
@@ -5504,9 +5507,18 @@ create_vless_reality_node() {
             continue
         fi
         if command -v openssl >/dev/null 2>&1; then
-            info "正在检查 Reality 目标的 DNS 与 TLS 443 可达性..."
-            if ! check_reality_server "$server_name"; then
-                err "目标域名无法解析或 TLS 443 不可达，请更换。"
+            info "正在检查 Reality 目标的 DNS、TLS 1.3 与 H2 支持..."
+            if check_reality_server "$server_name"; then
+                reality_check_status=0
+            else
+                reality_check_status=$?
+            fi
+            if [ "$reality_check_status" -ne 0 ]; then
+                if [ "$reality_check_status" -eq 2 ]; then
+                    err "目标域名支持 TLS 1.3，但未协商 H2，请更换。"
+                else
+                    err "目标域名无法解析或 TLS 1.3 不可达，请更换。"
+                fi
                 continue
             fi
         else
@@ -5546,10 +5558,19 @@ EOF
         return 1
     fi
     if [ "$reality_check_deferred" -eq 1 ]; then
-        info "正在检查 Reality 目标的 DNS 与 TLS 443 可达性..."
-        if ! check_reality_server "$server_name"; then
+        info "正在检查 Reality 目标的 DNS、TLS 1.3 与 H2 支持..."
+        if check_reality_server "$server_name"; then
+            reality_check_status=0
+        else
+            reality_check_status=$?
+        fi
+        if [ "$reality_check_status" -ne 0 ]; then
             rollback_node_files_transaction || true
-            err "目标域名无法解析或 TLS 443 不可达，未创建 VLESS Reality 节点。"
+            if [ "$reality_check_status" -eq 2 ]; then
+                err "目标域名支持 TLS 1.3，但未协商 H2，未创建 VLESS Reality 节点。"
+            else
+                err "目标域名无法解析或 TLS 1.3 不可达，未创建 VLESS Reality 节点。"
+            fi
             return 1
         fi
     fi
