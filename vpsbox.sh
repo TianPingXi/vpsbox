@@ -29,7 +29,26 @@ VPSBOX_VERSION="v1.0.48"
 # 只从当前仓库下载并识别可执行脚本。
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
-DEFAULT_REALITY_SERVER_NAME="addons.mozilla.org"
+REALITY_POOL_PROBE_TIMEOUT=3
+REALITY_SERVER_POOL=(
+    "www.berkeley.edu"
+    "dl.google.com"
+    "csgo.com"
+    "www.ucla.edu"
+    "aws.amazon.com"
+    "www.dell.com"
+    "www.nintendo.com"
+    "www.sony.com"
+    "www.tesla.com"
+    "www.amd.com"
+    "www.intel.com"
+    "www.oracle.com"
+    "www.nvidia.com"
+    "www.samsung.com"
+    "addons.mozilla.org"
+    "www.usc.edu"
+    "discoverlosangeles.com"
+)
 CMD_PATH="/usr/local/bin/vpsbox"
 CMD_ALIAS_PATH="/usr/bin/vpsbox"
 CONFIG_DIR="/etc/sing-box"
@@ -5152,8 +5171,54 @@ generate_reality_keypair() {
     printf '%s\n%s\n' "$private_key" "$public_key"
 }
 
+reality_now_ns() {
+    local result_name="$1" stamp seconds fraction
+
+    stamp="${EPOCHREALTIME:-}"
+    if [[ "$stamp" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+        seconds="${BASH_REMATCH[1]}"
+        fraction="${BASH_REMATCH[2]}000000"
+        fraction="${fraction:0:6}"
+        printf -v "$result_name" '%s%s000' "$seconds" "$fraction"
+        return 0
+    fi
+
+    stamp="$(date +%s%N 2>/dev/null)" || return 1
+    [[ "$stamp" =~ ^[0-9]+$ ]] || return 1
+    [ "${#stamp}" -le 19 ] || return 1
+    printf -v "$result_name" '%s' "$stamp"
+}
+
+reality_remaining_seconds() {
+    local deadline_ns="$1" result_name="$2" now_ns remaining_ns remaining_seconds
+
+    [[ "$deadline_ns" =~ ^[0-9]+$ ]] || return 1
+    reality_now_ns now_ns || return 1
+    remaining_ns=$((deadline_ns - now_ns))
+    ((remaining_ns > 0)) || return 1
+    remaining_seconds=$(((remaining_ns + 999999999) / 1000000000))
+    ((remaining_seconds <= REALITY_POOL_PROBE_TIMEOUT)) ||
+        remaining_seconds="$REALITY_POOL_PROBE_TIMEOUT"
+    printf -v "$result_name" '%s' "$remaining_seconds"
+}
+
+run_reality_tls_probe() {
+    local server_name="$1" connect_host="$2" time_limit="$3"
+    local endpoint output
+
+    [[ "$time_limit" =~ ^[1-9][0-9]*$ ]] || return 1
+    endpoint="$(uri_host "$connect_host")" || return 1
+    if ! output="$(run_bounded_command "$time_limit" openssl s_client \
+        -connect "${endpoint}:443" -servername "$server_name" \
+        -tls1_3 -alpn h2,http/1.1 \
+        </dev/null 2>&1)"; then
+        return 1
+    fi
+    grep -Eq '^ALPN protocol: h2\r?$' <<< "$output" || return 2
+}
+
 check_reality_server() {
-    local server_name="$1" output
+    local server_name="$1"
 
     is_domain_name "$server_name" || return 1
     resolve_host_ips "$server_name" | grep -q . || return 1
@@ -5161,13 +5226,61 @@ check_reality_server() {
         err "未找到 openssl，无法验证 Reality 目标的 TLS 1.3 与 H2。"
         return 1
     }
-    if ! output="$(run_bounded_command 12 openssl s_client \
-        -connect "${server_name}:443" -servername "$server_name" \
-        -tls1_3 -alpn h2,http/1.1 \
-        </dev/null 2>&1)"; then
-        return 1
-    fi
-    grep -Eq '^ALPN protocol: h2\r?$' <<< "$output" || return 2
+    run_reality_tls_probe "$server_name" "$server_name" 12
+}
+
+probe_reality_candidate_latency() {
+    local server_name="$1" total_start_ns deadline_ns dns_limit resolved
+    local probe_start_ns end_ns elapsed_ns latency_ms attempt_limit ip
+    local -a resolved_ips=() candidate_ips=()
+
+    is_domain_name "$server_name" || return 1
+    command -v openssl >/dev/null 2>&1 || return 1
+    reality_now_ns total_start_ns || return 1
+    deadline_ns=$((total_start_ns + REALITY_POOL_PROBE_TIMEOUT * 1000000000))
+    reality_remaining_seconds "$deadline_ns" dns_limit || return 1
+    resolved="$(resolve_host_ips "$server_name" "$dns_limit" 2>/dev/null)" || return 1
+    [ -n "$resolved" ] || return 1
+    mapfile -t resolved_ips <<< "$resolved"
+    for ip in "${resolved_ips[@]}"; do
+        is_ip_address "$ip" && candidate_ips+=("$ip")
+    done
+    [ "${#candidate_ips[@]}" -gt 0 ] || return 1
+    reality_now_ns probe_start_ns || return 1
+
+    for ip in "${candidate_ips[@]}"; do
+        reality_remaining_seconds "$deadline_ns" attempt_limit || return 1
+        if run_reality_tls_probe "$server_name" "$ip" "$attempt_limit" 2>/dev/null; then
+            reality_now_ns end_ns || return 1
+            ((end_ns <= deadline_ns)) || return 1
+            elapsed_ns=$((end_ns - probe_start_ns))
+            ((elapsed_ns >= 0)) || return 1
+            latency_ms=$((elapsed_ns / 1000000))
+            ((latency_ms > 0)) || latency_ms=1
+            printf '%s\n' "$latency_ms"
+            return 0
+        fi
+    done
+    return 1
+}
+
+select_fastest_reality_server() {
+    local server_result_name="$1" latency_result_name="$2"
+    local candidate_server candidate_latency best_server="" best_latency=""
+
+    for candidate_server in "${REALITY_SERVER_POOL[@]}"; do
+        if candidate_latency="$(probe_reality_candidate_latency "$candidate_server" 2>/dev/null)" &&
+            [[ "$candidate_latency" =~ ^[0-9]+$ ]]; then
+            if [ -z "$best_server" ] || ((candidate_latency < best_latency)); then
+                best_server="$candidate_server"
+                best_latency="$candidate_latency"
+            fi
+        fi
+    done
+
+    [ -n "$best_server" ] || return 1
+    printf -v "$server_result_name" '%s' "$best_server"
+    printf -v "$latency_result_name" '%s' "$best_latency"
 }
 
 render_singbox_systemd_service() {
@@ -5457,7 +5570,7 @@ create_vless_reality_node() {
     local confirm domain default_name input_name name port input_sni server_name
     local uuid short_id private_key public_key config_id staged_config staged_state
     local existing_port="" existing_protocols="" reality_check_deferred=0 reality_check_status=0
-    local sibling_ports=""
+    local sibling_ports="" reality_latency_ms=""
     local -a keypair
 
     ensure_node_dependencies || return 1
@@ -5499,9 +5612,20 @@ create_vless_reality_node() {
         break
     done
     while true; do
-        read -r -p "请输入 Reality 目标域名/SNI（留空默认 ${DEFAULT_REALITY_SERVER_NAME}）：" input_sni ||
+        read -r -p "请输入 Reality 目标域名/SNI（留空自动选择）：" input_sni ||
             { info "输入已结束，已取消。"; return 1; }
-        server_name="$(normalize_host "${input_sni:-$DEFAULT_REALITY_SERVER_NAME}")"
+        input_sni="$(sanitize_paste_input "$input_sni")"
+        if [ -z "$input_sni" ]; then
+            info "正在自动选择 Reality 目标，请稍候..."
+            if select_fastest_reality_server server_name reality_latency_ms; then
+                info "已选择 Reality 目标：${server_name}（连接耗时 ${reality_latency_ms} ms）"
+                reality_check_deferred=0
+                break
+            fi
+            err "默认域名池中没有可用的 Reality 目标，请手动输入。"
+            continue
+        fi
+        server_name="$(normalize_host "$input_sni")"
         if ! is_domain_name "$server_name"; then
             err "Reality 目标必须是有效域名，不能使用 IP 地址。"
             continue
@@ -16172,12 +16296,14 @@ public_ipv4() {
 }
 
 resolve_host_ips() {
-    local host="$1"
+    local host="$1" time_limit="${2:-12}"
     local output
 
+    [[ "$time_limit" =~ ^[1-9][0-9]*$ ]] || return 1
     command -v getent >/dev/null 2>&1 || return 1
-    output="$(run_bounded_command 12 getent ahosts "$host" 2>/dev/null)" || return 1
-    printf '%s\n' "$output" | awk '{print $1}' | sort -u | head -n 5
+    output="$(run_bounded_command "$time_limit" getent ahosts "$host" 2>/dev/null)" || return 1
+    printf '%s\n' "$output" |
+        awk '!seen[$1]++ { print $1; count++; if (count == 5) exit }'
 }
 
 run_self_check() {

@@ -923,6 +923,156 @@ test_reality_checks_require_bounded_dns_and_openssl() {
     )
 }
 
+test_reality_pool_selection_is_sequential_and_stable() {
+    (
+        local expected_pool selected="" latency=""
+        local log="$TEST_TMP/reality-pool-order.log"
+
+        expected_pool=$'www.berkeley.edu\ndl.google.com\ncsgo.com\nwww.ucla.edu\naws.amazon.com\nwww.dell.com\nwww.nintendo.com\nwww.sony.com\nwww.tesla.com\nwww.amd.com\nwww.intel.com\nwww.oracle.com\nwww.nvidia.com\nwww.samsung.com\naddons.mozilla.org\nwww.usc.edu\ndiscoverlosangeles.com'
+        assert_eq "$expected_pool" "$(printf '%s\n' "${REALITY_SERVER_POOL[@]}")" \
+            "Reality default target pool must keep the approved 17 domains and order"
+
+        REALITY_SERVER_POOL=(slow.example unavailable.example fast.example tied.example)
+        probe_reality_candidate_latency() {
+            printf '%s\n' "$1" >> "$log"
+            case "$1" in
+                slow.example) printf '%s\n' 40 ;;
+                unavailable.example) return 1 ;;
+                fast.example | tied.example) printf '%s\n' 7 ;;
+                *) return 1 ;;
+            esac
+        }
+
+        : > "$log"
+        select_fastest_reality_server selected latency ||
+            fail "Reality pool selection should succeed when a candidate is usable"
+        assert_eq fast.example "$selected" \
+            "Reality pool selection must choose the lowest measured latency"
+        assert_eq 7 "$latency" \
+            "Reality pool selection must return the selected latency"
+        assert_eq $'slow.example\nunavailable.example\nfast.example\ntied.example' "$(cat "$log")" \
+            "Reality pool candidates must be probed sequentially in configured order"
+    )
+}
+
+test_reality_pool_probe_excludes_dns_latency_and_reuses_resolved_ips() {
+    (
+        local clock_index=0 latency
+        local log="$TEST_TMP/reality-pool-probe.log"
+
+        reality_now_ns() {
+            local result_name="$1" value
+            case "$clock_index" in
+                0) value=1000000000 ;;
+                1) value=1000000000 ;;
+                2) value=1900000000 ;;
+                3) value=1900000000 ;;
+                4) value=2100000000 ;;
+                5) value=2300000000 ;;
+                *) return 1 ;;
+            esac
+            clock_index=$((clock_index + 1))
+            printf -v "$result_name" '%s' "$value"
+        }
+        command() {
+            if [ "${1:-}" = -v ] && [ "${2:-}" = openssl ]; then
+                return 0
+            fi
+            builtin command "$@"
+        }
+        resolve_host_ips() {
+            printf 'dns:%s:%s\n' "$1" "$2" >> "$log"
+            printf '%s\n' 192.0.2.1 2001:db8::1
+        }
+        run_bounded_command() {
+            printf '%s\n' "$*" >> "$log"
+            case " $* " in
+                *" -connect 192.0.2.1:443 "*) return 1 ;;
+            esac
+            printf '%s\n' \
+                'New, TLSv1.3, Cipher is TLS_AES_128_GCM_SHA256' \
+                'ALPN protocol: h2'
+        }
+
+        : > "$log"
+        latency="$(probe_reality_candidate_latency example.com)" ||
+            fail "Reality pool probe should try later resolved IPs within one deadline"
+        assert_eq 400 "$latency" \
+            "Reality pool latency must exclude DNS time and include failed connection attempts"
+        assert_eq $'dns:example.com:3\n3 openssl s_client -connect 192.0.2.1:443 -servername example.com -tls1_3 -alpn h2,http/1.1\n2 openssl s_client -connect [2001:db8::1]:443 -servername example.com -tls1_3 -alpn h2,http/1.1' \
+            "$(cat "$log")" \
+            "Reality pool probe must reuse resolved IPs, preserve order, and share the remaining deadline"
+    )
+}
+
+test_blank_reality_target_uses_pool_and_falls_back_to_manual_input() {
+    (
+        local select_log="$TEST_TMP/reality-pool-create-select.log"
+        local check_log="$TEST_TMP/reality-pool-create-check.log"
+        local output="$TEST_TMP/reality-pool-create.out"
+
+        ensure_node_dependencies() { return 0; }
+        require_valid_node_state_if_present() { return 0; }
+        protocol_visible_exists() { return 1; }
+        configured_node_ports_csv() { printf '\n'; }
+        prompt_node_host() { printf -v "$1" '%s' vless.example.com; }
+        select_fastest_reality_server() {
+            printf 'select\n' >> "$select_log"
+            printf -v "$1" '%s' chosen.example
+            printf -v "$2" '%s' 9
+        }
+        check_reality_server() { printf '%s\n' "$1" >> "$check_log"; }
+        choose_node_port() { return 1; }
+
+        : > "$select_log"
+        : > "$check_log"
+        if create_vless_reality_node <<< $'\n\n' > "$output" 2>&1; then
+            fail "VLESS creation should stop when the later port selection fails"
+        fi
+        assert_eq select "$(cat "$select_log")" \
+            "Blank Reality target must invoke the automatic pool selector once"
+        [ ! -s "$check_log" ] ||
+            fail "The automatically selected Reality target must not be checked a second time"
+        assert_file_contains "$output" 'chosen\.example.*9 ms' \
+            "Automatic Reality target selection must report only the chosen target and latency"
+    )
+    (
+        local select_log="$TEST_TMP/reality-pool-fallback-select.log"
+        local check_log="$TEST_TMP/reality-pool-fallback-check.log"
+        local output="$TEST_TMP/reality-pool-fallback.out"
+
+        ensure_node_dependencies() { return 0; }
+        require_valid_node_state_if_present() { return 0; }
+        protocol_visible_exists() { return 1; }
+        configured_node_ports_csv() { printf '\n'; }
+        prompt_node_host() { printf -v "$1" '%s' vless.example.com; }
+        select_fastest_reality_server() {
+            printf 'select\n' >> "$select_log"
+            return 1
+        }
+        check_reality_server() { printf '%s\n' "$1" >> "$check_log"; }
+        choose_node_port() { return 1; }
+        command() {
+            if [ "${1:-}" = -v ] && [ "${2:-}" = openssl ]; then
+                return 0
+            fi
+            builtin command "$@"
+        }
+
+        : > "$select_log"
+        : > "$check_log"
+        if create_vless_reality_node <<< $'\n\nmanual.example\n' > "$output" 2>&1; then
+            fail "VLESS creation should stop when the later port selection fails"
+        fi
+        assert_eq select "$(cat "$select_log")" \
+            "An unavailable Reality pool must be attempted only once before reprompting"
+        assert_eq manual.example "$(cat "$check_log")" \
+            "After the Reality pool fails, a manual target must keep the existing single-target check"
+        assert_file_contains "$output" '默认域名池中没有可用的 Reality 目标，请手动输入。' \
+            "An unavailable Reality pool must clearly request manual input"
+    )
+}
+
 test_reality_candidate_is_checked_only_once() {
     (
         local check_log="$TEST_TMP/reality-candidate-checks.log"
@@ -3201,6 +3351,9 @@ main() {
         test_lockdir_first_acquisition_uses_reclaim_guard
         test_lock_acquisition_installs_runtime_cleanup_traps
         test_reality_checks_require_bounded_dns_and_openssl
+        test_reality_pool_selection_is_sequential_and_stable
+        test_reality_pool_probe_excludes_dns_latency_and_reuses_resolved_ips
+        test_blank_reality_target_uses_pool_and_falls_back_to_manual_input
         test_reality_candidate_is_checked_only_once
         test_view_node_link_is_read_only
         test_uri_cache_repair_failure_is_warning_only

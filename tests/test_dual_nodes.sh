@@ -356,6 +356,10 @@ test_create_vless_preserves_shadowsocks_and_tolerates_uri_cache_failure() {
         install_singbox_if_missing() { return 0; }
         prompt_node_host() { printf -v "$1" '%s' vless.example.com; }
         check_reality_server() { return 0; }
+        select_fastest_reality_server() {
+            printf -v "$1" '%s' addons.mozilla.org
+            printf -v "$2" '%s' 7
+        }
         choose_node_port() { printf '%s\n' 20002; }
         confirm_default_yes() { return 0; }
         listen_mode() { printf '%s\n' ipv4; }
@@ -402,6 +406,8 @@ test_create_vless_preserves_shadowsocks_and_tolerates_uri_cache_failure() {
 
         protocol_node_exists vless ||
             fail "创建后的 VLESS Reality 节点应可独立读取"
+        assert_file_contains "$VLESS_STATE_FILE" '^REALITY_SERVER_NAME=addons\.mozilla\.org$' \
+            "VLESS Reality state must keep the automatically selected target"
         assert_eq "$ss_config_before" "$(cat "$SS_CONFIG_PATH")" \
             "创建 VLESS Reality 时不得改写 Shadowsocks 配置"
         assert_eq "$ss_state_before" "$(cat "$SS_STATE_FILE")" \
