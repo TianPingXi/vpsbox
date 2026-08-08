@@ -851,6 +851,27 @@ test_reality_checks_require_bounded_dns_and_openssl() {
             fail "缺少 openssl 时不得把 Reality TLS 检查视为成功"
         fi
     )
+    (
+        local log="$TEST_TMP/reality-openssl-args.log"
+
+        resolve_host_ips() { printf '%s\n' 192.0.2.1; }
+        command() {
+            if [ "${1:-}" = "-v" ] && [ "${2:-}" = "openssl" ]; then
+                return 0
+            fi
+            builtin command "$@"
+        }
+        run_bounded_command() {
+            printf '%s\n' "$*" > "$log"
+        }
+
+        check_reality_server example.com ||
+            fail "带 SNI 与 ALPN 的 Reality TLS 检查应成功"
+        assert_eq \
+            '12 openssl s_client -connect example.com:443 -servername example.com -alpn h2,http/1.1' \
+            "$(cat "$log")" \
+            "Reality TLS 检查必须发送常用 HTTPS ALPN"
+    )
 }
 
 test_reality_candidate_is_checked_only_once() {

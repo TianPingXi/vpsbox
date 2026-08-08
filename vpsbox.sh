@@ -5163,6 +5163,7 @@ check_reality_server() {
     }
     run_bounded_command 12 openssl s_client \
         -connect "${server_name}:443" -servername "$server_name" \
+        -alpn h2,http/1.1 \
         </dev/null >/dev/null 2>&1
 }
 
