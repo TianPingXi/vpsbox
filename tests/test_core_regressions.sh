@@ -824,6 +824,29 @@ test_lock_acquisition_installs_runtime_cleanup_traps() {
 
 test_reality_checks_require_bounded_dns_and_openssl() {
     (
+        local help_text
+
+        command() {
+            if [ "${1:-}" = -v ] && [ "${2:-}" = openssl ]; then
+                return 0
+            fi
+            builtin command "$@"
+        }
+        openssl() {
+            [ "$*" = "s_client -help" ] || return 1
+            printf '%s\n' "$help_text"
+        }
+
+        help_text='-tls1_3 -alpn protocols'
+        reality_tls_probe_supported ||
+            fail "Reality 探测能力检查应接受同时支持 TLS 1.3 与 ALPN 的 OpenSSL"
+        for help_text in '-tls1_3' '-alpn protocols' ''; do
+            if reality_tls_probe_supported; then
+                fail "Reality 探测能力检查必须同时要求 TLS 1.3 与 ALPN 参数"
+            fi
+        done
+    )
+    (
         local log="$TEST_TMP/dns-bounded.log" timeout
         getent() { return 0; }
         run_bounded_command() {
@@ -1012,6 +1035,7 @@ test_blank_reality_target_uses_pool_and_falls_back_to_manual_input() {
         local output="$TEST_TMP/reality-pool-create.out"
 
         ensure_node_dependencies() { return 0; }
+        reality_tls_probe_supported() { return 0; }
         require_valid_node_state_if_present() { return 0; }
         protocol_visible_exists() { return 1; }
         configured_node_ports_csv() { printf '\n'; }
@@ -1042,6 +1066,7 @@ test_blank_reality_target_uses_pool_and_falls_back_to_manual_input() {
         local output="$TEST_TMP/reality-pool-fallback.out"
 
         ensure_node_dependencies() { return 0; }
+        reality_tls_probe_supported() { return 0; }
         require_valid_node_state_if_present() { return 0; }
         protocol_visible_exists() { return 1; }
         configured_node_ports_csv() { printf '\n'; }
@@ -1073,12 +1098,44 @@ test_blank_reality_target_uses_pool_and_falls_back_to_manual_input() {
     )
 }
 
+test_unsupported_reality_probe_uses_fixed_fallback() {
+    (
+        local probe_log="$TEST_TMP/reality-unsupported-probe.log"
+        local output="$TEST_TMP/reality-unsupported-output.log"
+
+        ensure_node_dependencies() { return 0; }
+        reality_tls_probe_supported() { return 1; }
+        require_valid_node_state_if_present() { return 0; }
+        protocol_visible_exists() { return 1; }
+        configured_node_ports_csv() { printf '\n'; }
+        prompt_node_host() { printf -v "$1" '%s' vless.example.com; }
+        select_fastest_reality_server() { printf 'pool\n' >> "$probe_log"; return 1; }
+        check_reality_server() { printf 'single:%s\n' "$1" >> "$probe_log"; return 1; }
+        resolve_host_ips() { printf 'dns:%s\n' "$1" >> "$probe_log"; return 1; }
+        choose_node_port() { return 1; }
+
+        : > "$probe_log"
+        if create_vless_reality_node <<< $'\ncustom.example\n' > "$output" 2>&1; then
+            fail "VLESS creation should stop when the later port selection fails"
+        fi
+        [ ! -s "$probe_log" ] ||
+            fail "OpenSSL 探测能力不足时不得执行域名池、单域名或 DNS 探测"
+        assert_file_contains "$output" \
+            '当前 OpenSSL 版本过旧或不支持 TLS 1\.3 / ALPN 探测，无法检测 Reality 目标。' \
+            "OpenSSL 探测能力不足时必须给出明确警告"
+        assert_file_contains "$output" \
+            '已使用默认 Reality 目标：addons\.mozilla\.org' \
+            "OpenSSL 探测能力不足时必须明确显示固定默认目标"
+    )
+}
+
 test_reality_candidate_is_checked_only_once() {
     (
         local check_log="$TEST_TMP/reality-candidate-checks.log"
         local output="$TEST_TMP/reality-candidate-output.log"
 
         ensure_node_dependencies() { return 0; }
+        reality_tls_probe_supported() { return 0; }
         require_valid_node_state_if_present() { return 0; }
         protocol_visible_exists() { return 1; }
         configured_node_ports_csv() { printf '\n'; }
@@ -1114,6 +1171,7 @@ test_reality_candidate_is_checked_only_once() {
             dependencies_ready=1
         }
         require_valid_node_state_if_present() { return 0; }
+        reality_tls_probe_supported() { return 0; }
         protocol_visible_exists() { return 1; }
         configured_node_ports_csv() { printf '\n'; }
         prompt_node_host() { printf -v "$1" '%s' vless.example.com; }
@@ -3354,6 +3412,7 @@ main() {
         test_reality_pool_selection_is_sequential_and_stable
         test_reality_pool_probe_excludes_dns_latency_and_reuses_resolved_ips
         test_blank_reality_target_uses_pool_and_falls_back_to_manual_input
+        test_unsupported_reality_probe_uses_fixed_fallback
         test_reality_candidate_is_checked_only_once
         test_view_node_link_is_read_only
         test_uri_cache_repair_failure_is_warning_only

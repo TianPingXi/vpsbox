@@ -30,6 +30,7 @@ VPSBOX_VERSION="v1.0.48"
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 REALITY_POOL_PROBE_TIMEOUT=3
+REALITY_PROBE_FALLBACK_SERVER_NAME="addons.mozilla.org"
 REALITY_SERVER_POOL=(
     "www.berkeley.edu"
     "dl.google.com"
@@ -5202,6 +5203,15 @@ reality_remaining_seconds() {
     printf -v "$result_name" '%s' "$remaining_seconds"
 }
 
+reality_tls_probe_supported() {
+    local help_output
+
+    command -v openssl >/dev/null 2>&1 || return 1
+    help_output="$(openssl s_client -help 2>&1 || true)"
+    grep -Eq '(^|[[:space:]])-tls1_3([[:space:]]|$)' <<< "$help_output" || return 1
+    grep -Eq '(^|[[:space:]])-alpn([[:space:]]|$)' <<< "$help_output"
+}
+
 run_reality_tls_probe() {
     local server_name="$1" connect_host="$2" time_limit="$3"
     local endpoint output
@@ -5570,7 +5580,7 @@ create_vless_reality_node() {
     local confirm domain default_name input_name name port input_sni server_name
     local uuid short_id private_key public_key config_id staged_config staged_state
     local existing_port="" existing_protocols="" reality_check_deferred=0 reality_check_status=0
-    local sibling_ports="" reality_latency_ms=""
+    local sibling_ports="" reality_latency_ms="" reality_probe_capability_checked=0
     local -a keypair
 
     ensure_node_dependencies || return 1
@@ -5615,6 +5625,16 @@ create_vless_reality_node() {
         read -r -p "请输入 Reality 目标域名/SNI（留空自动选择）：" input_sni ||
             { info "输入已结束，已取消。"; return 1; }
         input_sni="$(sanitize_paste_input "$input_sni")"
+        if [ "$reality_probe_capability_checked" -eq 0 ]; then
+            reality_probe_capability_checked=1
+            if ! reality_tls_probe_supported; then
+                warn "当前 OpenSSL 版本过旧或不支持 TLS 1.3 / ALPN 探测，无法检测 Reality 目标。"
+                server_name="$REALITY_PROBE_FALLBACK_SERVER_NAME"
+                info "已使用默认 Reality 目标：$server_name"
+                reality_check_deferred=0
+                break
+            fi
+        fi
         if [ -z "$input_sni" ]; then
             info "正在自动选择 Reality 目标，请稍候..."
             if select_fastest_reality_server server_name reality_latency_ms; then
