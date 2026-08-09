@@ -948,33 +948,46 @@ test_reality_checks_require_bounded_dns_and_openssl() {
 
 test_manual_reality_target_cloudflare_warning_is_non_blocking() {
     (
-        local curl_response curl_status=0
-        local log="$TEST_TMP/reality-cloudflare-curl.log"
+        local trace_response trace_status=0 reader limited
+        local response_file="$TEST_TMP/reality-cloudflare-response"
 
-        curl() {
-            printf '%s\n' "$*" > "$log"
-            printf '%s' "$curl_response"
-            return "$curl_status"
+        reader="$(declare -f read_reality_cloudflare_trace)"
+        grep -Fq 'curl -q -sS' <<< "$reader" ||
+            fail "Cloudflare 检查必须禁用 curl 配置"
+        grep -Fq -- '--max-time "$REALITY_CLOUDFLARE_CHECK_TIMEOUT"' <<< "$reader" ||
+            fail "Cloudflare 检查必须设置总超时"
+        grep -Fq 'head -c "$REALITY_CLOUDFLARE_RESPONSE_LIMIT"' <<< "$reader" ||
+            fail "Cloudflare 检查必须硬限制响应大小"
+        grep -Fq "tr -d '\\000'" <<< "$reader" ||
+            fail "Cloudflare 检查必须删除 NUL 字节"
+        if grep -Fq -- '--max-filesize' <<< "$reader" || grep -Fq -- '-D -' <<< "$reader"; then
+            fail "Cloudflare 检查不得依赖旧 curl 的响应上限或混入响应头"
+        fi
+        read_reality_cloudflare_trace() {
+            printf '%s' "$trace_response"
+            return "$trace_status"
         }
 
-        curl_response=$'HTTP/2 200\r\ncf-ray: 1234567890abcdef-LAX\r\n\r\n'
-        reality_target_uses_cloudflare example.com ||
-            fail "cf-ray 响应头必须识别为 Cloudflare"
-        assert_file_contains "$log" \
-            '^-q -sS --connect-timeout 3 --max-time 3 --max-redirs 0 --max-filesize 65536 -D - https://example\.com/cdn-cgi/trace$' \
-            "Cloudflare 检查必须有界、禁用 curl 配置并且不跟随跳转"
-
-        curl_response=$'HTTP/2 200\r\n\r\nfl=116f4f51\nh=example.com\ncolo=LAX\n'
+        trace_response=$'fl=116f4f51\nh=example.com\ncolo=LAX\n'
         reality_target_uses_cloudflare example.com ||
             fail "完整的 /cdn-cgi/trace 特征必须识别为 Cloudflare"
 
-        curl_response=$'HTTP/2 404\r\nserver: nginx\r\n\r\nnot found\n'
+        trace_response=$'not found\n'
         if reality_target_uses_cloudflare example.com; then
             fail "普通响应不得误判为 Cloudflare"
         fi
 
-        curl_response=""
-        curl_status=28
+        head -c "$REALITY_CLOUDFLARE_RESPONSE_LIMIT" /dev/zero |
+            tr '\000' '\n' > "$response_file"
+        printf '\n%s\n' fl=116f4f51 h=example.com colo=LAX >> "$response_file"
+        limited="$(head -c "$REALITY_CLOUDFLARE_RESPONSE_LIMIT" "$response_file" | tr -d '\000')"
+        trace_response="$limited"
+        if reality_target_uses_cloudflare example.com; then
+            fail "超过 64 KiB 后出现的 Cloudflare 特征不得被读取"
+        fi
+
+        trace_response=""
+        trace_status=28
         if reality_target_uses_cloudflare example.com; then
             fail "Cloudflare 检查超时不得误判为已确认"
         fi

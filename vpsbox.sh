@@ -5239,25 +5239,28 @@ check_reality_server() {
     run_reality_tls_probe "$server_name" "$server_name" 12
 }
 
+read_reality_cloudflare_trace() {
+    local server_name="$1"
+
+    command -v curl >/dev/null 2>&1 || return 1
+    # head 达到上限后会关闭管道，curl 可能因此返回 23；保留已读取正文并继续判断。
+    curl -q -sS \
+        --connect-timeout "$REALITY_CLOUDFLARE_CHECK_TIMEOUT" \
+        --max-time "$REALITY_CLOUDFLARE_CHECK_TIMEOUT" \
+        "https://${server_name}/cdn-cgi/trace" 2>/dev/null |
+        head -c "$REALITY_CLOUDFLARE_RESPONSE_LIMIT" |
+        tr -d '\000'
+}
+
 reality_target_uses_cloudflare() {
     local server_name="$1" response
 
     is_domain_name "$server_name" || return 1
-    command -v curl >/dev/null 2>&1 || return 1
-    if ! response="$(curl -q -sS \
-        --connect-timeout "$REALITY_CLOUDFLARE_CHECK_TIMEOUT" \
-        --max-time "$REALITY_CLOUDFLARE_CHECK_TIMEOUT" \
-        --max-redirs 0 \
-        --max-filesize "$REALITY_CLOUDFLARE_RESPONSE_LIMIT" \
-        -D - "https://${server_name}/cdn-cgi/trace" 2>/dev/null)"; then
-        [ -n "$response" ] || return 1
+    if ! response="$(read_reality_cloudflare_trace "$server_name")"; then
+        :
     fi
 
     response="${response//$'\r'/}"
-    if grep -Eqi '^cf-ray:[[:space:]]*[^[:space:]]+' <<< "$response" ||
-        grep -Eqi '^server:[[:space:]]*cloudflare[[:space:]]*$' <<< "$response"; then
-        return 0
-    fi
     grep -Eq '^fl=[^[:space:]]+$' <<< "$response" &&
         grep -Fqix "h=$server_name" <<< "$response" &&
         grep -Eq '^colo=[A-Z]{3}$' <<< "$response"
