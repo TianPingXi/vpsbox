@@ -30,6 +30,8 @@ VPSBOX_VERSION="v1.0.49"
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
 REALITY_POOL_PROBE_TIMEOUT=3
+REALITY_CLOUDFLARE_CHECK_TIMEOUT=3
+REALITY_CLOUDFLARE_RESPONSE_LIMIT=65536
 REALITY_PROBE_FALLBACK_SERVER_NAME="addons.mozilla.org"
 REALITY_SERVER_POOL=(
     "dl.google.com"
@@ -5237,6 +5239,30 @@ check_reality_server() {
     run_reality_tls_probe "$server_name" "$server_name" 12
 }
 
+reality_target_uses_cloudflare() {
+    local server_name="$1" response
+
+    is_domain_name "$server_name" || return 1
+    command -v curl >/dev/null 2>&1 || return 1
+    if ! response="$(curl -q -sS \
+        --connect-timeout "$REALITY_CLOUDFLARE_CHECK_TIMEOUT" \
+        --max-time "$REALITY_CLOUDFLARE_CHECK_TIMEOUT" \
+        --max-redirs 0 \
+        --max-filesize "$REALITY_CLOUDFLARE_RESPONSE_LIMIT" \
+        -D - "https://${server_name}/cdn-cgi/trace" 2>/dev/null)"; then
+        [ -n "$response" ] || return 1
+    fi
+
+    response="${response//$'\r'/}"
+    if grep -Eqi '^cf-ray:[[:space:]]*[^[:space:]]+' <<< "$response" ||
+        grep -Eqi '^server:[[:space:]]*cloudflare[[:space:]]*$' <<< "$response"; then
+        return 0
+    fi
+    grep -Eq '^fl=[^[:space:]]+$' <<< "$response" &&
+        grep -Fqix "h=$server_name" <<< "$response" &&
+        grep -Eq '^colo=[A-Z]{3}$' <<< "$response"
+}
+
 probe_reality_candidate_latency() {
     local server_name="$1" total_start_ns deadline_ns dns_limit resolved
     local probe_start_ns end_ns elapsed_ns latency_ms attempt_limit ip
@@ -5579,6 +5605,7 @@ create_vless_reality_node() {
     local uuid short_id private_key public_key config_id staged_config staged_state
     local existing_port="" existing_protocols="" reality_check_deferred=0 reality_check_status=0
     local sibling_ports="" reality_latency_ms="" reality_probe_capability_checked=0
+    local reality_target_is_manual=0
     local -a keypair
 
     ensure_node_dependencies || return 1
@@ -5667,8 +5694,13 @@ create_vless_reality_node() {
             reality_check_deferred=1
             info "将在最终确认并补齐依赖后检查 Reality 目标。"
         fi
+        reality_target_is_manual=1
         break
     done
+    if [ "$reality_target_is_manual" -eq 1 ] &&
+        reality_target_uses_cloudflare "$server_name"; then
+        warn "检测到该 Reality 目标使用 Cloudflare，可能产生 fallback 转发流量。"
+    fi
     if ! port="$(choose_node_port "$existing_port" tcp "$existing_protocols" "$sibling_ports")"; then
         err "节点端口选择失败，未创建 VLESS Reality 节点。"
         return 1

@@ -946,6 +946,82 @@ test_reality_checks_require_bounded_dns_and_openssl() {
     )
 }
 
+test_manual_reality_target_cloudflare_warning_is_non_blocking() {
+    (
+        local curl_response curl_status=0
+        local log="$TEST_TMP/reality-cloudflare-curl.log"
+
+        curl() {
+            printf '%s\n' "$*" > "$log"
+            printf '%s' "$curl_response"
+            return "$curl_status"
+        }
+
+        curl_response=$'HTTP/2 200\r\ncf-ray: 1234567890abcdef-LAX\r\n\r\n'
+        reality_target_uses_cloudflare example.com ||
+            fail "cf-ray 响应头必须识别为 Cloudflare"
+        assert_file_contains "$log" \
+            '^-q -sS --connect-timeout 3 --max-time 3 --max-redirs 0 --max-filesize 65536 -D - https://example\.com/cdn-cgi/trace$' \
+            "Cloudflare 检查必须有界、禁用 curl 配置并且不跟随跳转"
+
+        curl_response=$'HTTP/2 200\r\n\r\nfl=116f4f51\nh=example.com\ncolo=LAX\n'
+        reality_target_uses_cloudflare example.com ||
+            fail "完整的 /cdn-cgi/trace 特征必须识别为 Cloudflare"
+
+        curl_response=$'HTTP/2 404\r\nserver: nginx\r\n\r\nnot found\n'
+        if reality_target_uses_cloudflare example.com; then
+            fail "普通响应不得误判为 Cloudflare"
+        fi
+
+        curl_response=""
+        curl_status=28
+        if reality_target_uses_cloudflare example.com; then
+            fail "Cloudflare 检查超时不得误判为已确认"
+        fi
+    )
+    (
+        local cloudflare_result=0
+        local event_log="$TEST_TMP/reality-cloudflare-manual-events.log"
+        local output="$TEST_TMP/reality-cloudflare-manual.out"
+
+        ensure_node_dependencies() { return 0; }
+        reality_tls_probe_supported() { return 0; }
+        require_valid_node_state_if_present() { return 0; }
+        protocol_visible_exists() { return 1; }
+        configured_node_ports_csv() { printf '\n'; }
+        prompt_node_host() { printf -v "$1" '%s' vless.example.com; }
+        check_reality_server() { return 0; }
+        reality_target_uses_cloudflare() {
+            printf 'cloudflare:%s\n' "$1" >> "$event_log"
+            return "$cloudflare_result"
+        }
+        choose_node_port() {
+            printf 'port\n' >> "$event_log"
+            return 1
+        }
+
+        : > "$event_log"
+        if create_vless_reality_node <<< $'\nmanual.example\n' > "$output" 2>&1; then
+            fail "端口夹具失败时创建流程不应报告成功"
+        fi
+        assert_eq $'cloudflare:manual.example\nport' "$(cat "$event_log")" \
+            "手动 Reality 目标必须在端口选择前执行一次 Cloudflare 检查"
+        assert_file_contains "$output" \
+            '检测到该 Reality 目标使用 Cloudflare，可能产生 fallback 转发流量。' \
+            "确认使用 Cloudflare 时必须警告"
+
+        : > "$event_log"
+        cloudflare_result=1
+        if create_vless_reality_node <<< $'\nmanual.example\n' > "$output" 2>&1; then
+            fail "端口夹具失败时创建流程不应报告成功"
+        fi
+        assert_eq $'cloudflare:manual.example\nport' "$(cat "$event_log")" \
+            "Cloudflare 检查无法确认时仍须继续创建流程"
+        assert_file_not_contains "$output" 'Cloudflare' \
+            "Cloudflare 检查无法确认时不得提示"
+    )
+}
+
 test_reality_pool_selection_is_sequential_and_stable() {
     (
         local expected_pool selected="" latency=""
@@ -1032,6 +1108,7 @@ test_blank_reality_target_uses_pool_and_falls_back_to_manual_input() {
     (
         local select_log="$TEST_TMP/reality-pool-create-select.log"
         local check_log="$TEST_TMP/reality-pool-create-check.log"
+        local cloudflare_log="$TEST_TMP/reality-pool-create-cloudflare.log"
         local output="$TEST_TMP/reality-pool-create.out"
 
         ensure_node_dependencies() { return 0; }
@@ -1046,10 +1123,12 @@ test_blank_reality_target_uses_pool_and_falls_back_to_manual_input() {
             printf -v "$2" '%s' 9
         }
         check_reality_server() { printf '%s\n' "$1" >> "$check_log"; }
+        reality_target_uses_cloudflare() { printf '%s\n' "$1" >> "$cloudflare_log"; }
         choose_node_port() { return 1; }
 
         : > "$select_log"
         : > "$check_log"
+        : > "$cloudflare_log"
         if create_vless_reality_node <<< $'\n\n' > "$output" 2>&1; then
             fail "VLESS creation should stop when the later port selection fails"
         fi
@@ -1057,6 +1136,8 @@ test_blank_reality_target_uses_pool_and_falls_back_to_manual_input() {
             "Blank Reality target must invoke the automatic pool selector once"
         [ ! -s "$check_log" ] ||
             fail "The automatically selected Reality target must not be checked a second time"
+        [ ! -s "$cloudflare_log" ] ||
+            fail "The automatically selected Reality target must not run the Cloudflare check"
         assert_file_contains "$output" 'chosen\.example.*9 ms' \
             "Automatic Reality target selection must report only the chosen target and latency"
     )
@@ -1076,6 +1157,7 @@ test_blank_reality_target_uses_pool_and_falls_back_to_manual_input() {
             return 1
         }
         check_reality_server() { printf '%s\n' "$1" >> "$check_log"; }
+        reality_target_uses_cloudflare() { return 1; }
         choose_node_port() { return 1; }
         command() {
             if [ "${1:-}" = -v ] && [ "${2:-}" = openssl ]; then
@@ -1150,6 +1232,7 @@ test_reality_candidate_is_checked_only_once() {
             [ "$1" = good.example ] && return 0
             return 2
         }
+        reality_target_uses_cloudflare() { return 1; }
         sing-box() { return 1; }
 
         : > "$check_log"
@@ -1181,6 +1264,7 @@ test_reality_candidate_is_checked_only_once() {
                 fail "Reality 探测不得早于依赖补齐"
             printf 'check:%s\n' "$1" >> "$event_log"
         }
+        reality_target_uses_cloudflare() { return 1; }
         confirm_default_yes() {
             printf 'confirm\n' >> "$event_log"
             return 1
@@ -3409,6 +3493,7 @@ main() {
         test_lockdir_first_acquisition_uses_reclaim_guard
         test_lock_acquisition_installs_runtime_cleanup_traps
         test_reality_checks_require_bounded_dns_and_openssl
+        test_manual_reality_target_cloudflare_warning_is_non_blocking
         test_reality_pool_selection_is_sequential_and_stable
         test_reality_pool_probe_excludes_dns_latency_and_reuses_resolved_ips
         test_blank_reality_target_uses_pool_and_falls_back_to_manual_input
