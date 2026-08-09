@@ -1040,9 +1040,9 @@ test_reality_pool_selection_is_sequential_and_stable() {
         local expected_pool selected="" latency=""
         local log="$TEST_TMP/reality-pool-order.log"
 
-        expected_pool=$'dl.google.com\nwww.ucla.edu\naws.amazon.com\nwww.dell.com\nwww.nintendo.com\nwww.sony.com\nwww.tesla.com\nwww.amd.com\nwww.intel.com\nwww.oracle.com\nwww.nvidia.com\nwww.samsung.com\naddons.mozilla.org\nwww.usc.edu\ndiscoverlosangeles.com'
+        expected_pool=$'www.dell.com\nwww.sony.com\nwww.amd.com\nwww.intel.com\nwww.oracle.com\nwww.nvidia.com\nwww.samsung.com\nwww.tesla.com'
         assert_eq "$expected_pool" "$(printf '%s\n' "${REALITY_SERVER_POOL[@]}")" \
-            "Reality default target pool must keep the approved 15 domains and order"
+            "Reality default target pool must keep the approved 8 domains and order"
 
         REALITY_SERVER_POOL=(slow.example unavailable.example fast.example tied.example)
         probe_reality_candidate_latency() {
@@ -1219,7 +1219,7 @@ test_unsupported_reality_probe_uses_fixed_fallback() {
             '当前 OpenSSL 版本过旧或不支持 TLS 1\.3 / ALPN 探测，无法检测 Reality 目标。' \
             "OpenSSL 探测能力不足时必须给出明确警告"
         assert_file_contains "$output" \
-            '已使用默认 Reality 目标：addons\.mozilla\.org' \
+            '已使用默认 Reality 目标：www\.dell\.com' \
             "OpenSSL 探测能力不足时必须明确显示固定默认目标"
     )
 }

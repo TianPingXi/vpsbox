@@ -32,23 +32,16 @@ SINGBOX_RELEASE_VERSION="1.13.14"
 REALITY_POOL_PROBE_TIMEOUT=3
 REALITY_CLOUDFLARE_CHECK_TIMEOUT=3
 REALITY_CLOUDFLARE_RESPONSE_LIMIT=65536
-REALITY_PROBE_FALLBACK_SERVER_NAME="addons.mozilla.org"
+REALITY_PROBE_FALLBACK_SERVER_NAME="www.dell.com"
 REALITY_SERVER_POOL=(
-    "dl.google.com"
-    "www.ucla.edu"
-    "aws.amazon.com"
     "www.dell.com"
-    "www.nintendo.com"
     "www.sony.com"
-    "www.tesla.com"
     "www.amd.com"
     "www.intel.com"
     "www.oracle.com"
     "www.nvidia.com"
     "www.samsung.com"
-    "addons.mozilla.org"
-    "www.usc.edu"
-    "discoverlosangeles.com"
+    "www.tesla.com"
 )
 CMD_PATH="/usr/local/bin/vpsbox"
 CMD_ALIAS_PATH="/usr/bin/vpsbox"
