@@ -951,9 +951,9 @@ test_reality_pool_selection_is_sequential_and_stable() {
         local expected_pool selected="" latency=""
         local log="$TEST_TMP/reality-pool-order.log"
 
-        expected_pool=$'www.berkeley.edu\ndl.google.com\ncsgo.com\nwww.ucla.edu\naws.amazon.com\nwww.dell.com\nwww.nintendo.com\nwww.sony.com\nwww.tesla.com\nwww.amd.com\nwww.intel.com\nwww.oracle.com\nwww.nvidia.com\nwww.samsung.com\naddons.mozilla.org\nwww.usc.edu\ndiscoverlosangeles.com'
+        expected_pool=$'dl.google.com\nwww.ucla.edu\naws.amazon.com\nwww.dell.com\nwww.nintendo.com\nwww.sony.com\nwww.tesla.com\nwww.amd.com\nwww.intel.com\nwww.oracle.com\nwww.nvidia.com\nwww.samsung.com\naddons.mozilla.org\nwww.usc.edu\ndiscoverlosangeles.com'
         assert_eq "$expected_pool" "$(printf '%s\n' "${REALITY_SERVER_POOL[@]}")" \
-            "Reality default target pool must keep the approved 17 domains and order"
+            "Reality default target pool must keep the approved 15 domains and order"
 
         REALITY_SERVER_POOL=(slow.example unavailable.example fast.example tied.example)
         probe_reality_candidate_latency() {

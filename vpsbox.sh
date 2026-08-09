@@ -32,9 +32,7 @@ SINGBOX_RELEASE_VERSION="1.13.14"
 REALITY_POOL_PROBE_TIMEOUT=3
 REALITY_PROBE_FALLBACK_SERVER_NAME="addons.mozilla.org"
 REALITY_SERVER_POOL=(
-    "www.berkeley.edu"
     "dl.google.com"
-    "csgo.com"
     "www.ucla.edu"
     "aws.amazon.com"
     "www.dell.com"
