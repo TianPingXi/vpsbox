@@ -406,9 +406,9 @@ test_create_vless_preserves_shadowsocks_and_tolerates_uri_cache_failure() {
 
         protocol_node_exists vless ||
             fail "创建后的 VLESS Reality 节点应可独立读取"
-        assert_file_contains "$VLESS_STATE_FILE" '^REALITY_SERVER_NAME=addons\.mozilla\.org$' \
+        assert_file_contains "$VLESS_STATE_FILE" '^REALITY_SERVER_NAME=www\.dell\.com$' \
             "VLESS Reality state must keep the fixed fallback target"
-        assert_file_contains "$output" '已使用默认 Reality 目标：addons\.mozilla\.org' \
+        assert_file_contains "$output" '已使用默认 Reality 目标：www\.dell\.com' \
             "OpenSSL 探测能力不足时必须显示固定默认目标"
         assert_eq "$ss_config_before" "$(cat "$SS_CONFIG_PATH")" \
             "创建 VLESS Reality 时不得改写 Shadowsocks 配置"
