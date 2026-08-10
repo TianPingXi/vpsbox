@@ -11307,6 +11307,43 @@ ipv6_disabled_runtime_is_current() {
     [ -z "$addresses" ]
 }
 
+ipv6_summary_state() {
+    local runtime addresses count
+
+    runtime="$(ipv6_disable_runtime_values)" || {
+        printf '%s\n' "无法检测"
+        return 0
+    }
+    addresses="$(global_ipv6_addresses)" || {
+        printf '%s\n' "无法检测"
+        return 0
+    }
+
+    if [ -e "$IPV6_DISABLE_CONF" ] || [ -L "$IPV6_DISABLE_CONF" ]; then
+        if ! ipv6_disable_config_is_current; then
+            printf '%s\n' "配置异常"
+        elif [ "$runtime" = "1 1 1" ] && [ -z "$addresses" ]; then
+            printf '%s\n' "已禁用"
+        else
+            printf '%s\n' "禁用配置存在但未生效"
+        fi
+        return 0
+    fi
+
+    if [ "$runtime" = "1 1 1" ]; then
+        if [ -z "$addresses" ]; then
+            printf '%s\n' "已禁用（非 VPSBox 配置）"
+        else
+            printf '%s\n' "无法检测"
+        fi
+    elif [ -n "$addresses" ]; then
+        count="$(awk 'NF { count++ } END { print count + 0 }' <<< "$addresses")"
+        printf '已启用（%s 个全局地址）\n' "$count"
+    else
+        printf '%s\n' "未检测到全局 IPv6"
+    fi
+}
+
 restore_ipv6_runtime_values() {
     local old_all="$1" old_default="$2" old_lo="$3" failed=0
 
@@ -16414,6 +16451,16 @@ EOF
         check_info "首次安装" "历史未记录"
     fi
 
+    check_ok "运行时间" "$(uptime -p 2>/dev/null || echo "无法检测")"
+    check_ok "系统时间" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+    state="$(ntp_sync_state)"
+    case "$state" in
+        已同步) check_ok "NTP 同步" "$state" ;;
+        未安装|不支持) check_info "NTP 同步" "$state" ;;
+        未运行) check_fail "NTP 同步" "$state" ;;
+        *) check_warn "NTP 同步" "$state" ;;
+    esac
+
     if node_core_artifacts_present; then
         has_node_artifacts="1"
         if ! require_valid_node_state_if_present >/dev/null 2>&1; then
@@ -16498,53 +16545,8 @@ EOF
         check_warn "公网 IPv4" "获取失败"
     fi
 
-    check_ok "系统时间" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
-    state="$(ntp_sync_state)"
-    case "$state" in
-        已同步) check_ok "NTP 同步" "$state" ;;
-        未安装|不支持) check_info "NTP 同步" "$state" ;;
-        未运行) check_fail "NTP 同步" "$state" ;;
-        *) check_warn "NTP 同步" "$state" ;;
-    esac
-    check_ok "运行时间" "$(uptime -p 2>/dev/null || echo "无法检测")"
-    if [ -e "$BBR_CONF" ] || [ -L "$BBR_CONF" ] || change_applied_recorded_readonly BBR_CONF; then
-        bbr_config_expected=1
-    fi
-    if change_applied_recorded_readonly GAI_CONF; then
-        ipv4_priority_expected=1
-    fi
     if [ -e "$SSHD_VPSBOX_HARDENING_CONF" ] || [ -L "$SSHD_VPSBOX_HARDENING_CONF" ]; then
         ssh_hardening_expected=1
-    fi
-    state="$(bbr_state)"
-    if [ "$state" = "已启用" ]; then
-        check_ok "BBR" "$state"
-    elif [ "$bbr_config_expected" -eq 1 ]; then
-        check_fail "BBR" "配置存在但未生效"
-    else
-        check_info "BBR" "$state"
-    fi
-    state="$(fq_state)"
-    if [ "$state" = "已启用" ]; then
-        check_ok "fq" "$state"
-    elif [ "$bbr_config_expected" -eq 1 ]; then
-        check_fail "fq" "配置存在但未生效"
-    else
-        check_info "fq" "$state"
-    fi
-    state="$(tcp_buffer_summary_state)"
-    case "$state" in
-        *未生效*|*未开启*|配置异常) check_fail "TCP 缓冲区" "$state" ;;
-        第一档*|第二档*|第三档*) check_ok "TCP 缓冲区" "$state" ;;
-        *) check_info "TCP 缓冲区" "$state" ;;
-    esac
-    state="$(ipv4_priority_state)"
-    if [ "$state" = "已启用" ]; then
-        check_ok "IPv4 优先" "$state"
-    elif [ "$ipv4_priority_expected" -eq 1 ]; then
-        check_fail "IPv4 优先" "配置记录存在但未生效"
-    else
-        check_info "IPv4 优先" "$state"
     fi
     state="$(ssh_port_state || true)"
     [ -n "$state" ] || state="无法读取"
@@ -16615,13 +16617,52 @@ EOF
         fi
     fi
 
-    if [ "$(reboot_required_state)" = "需要" ]; then
-        check_warn "系统重启" "需要重启"
-    else
-        check_ok "系统重启" "不需要重启"
+    if change_applied_recorded_readonly GAI_CONF; then
+        ipv4_priority_expected=1
     fi
-    state="$(journal_disk_usage)"
-    if [ "$state" = "无法检测" ]; then check_warn "日志占用" "$state"; else check_ok "日志占用" "$state"; fi
+    state="$(ipv4_priority_state)"
+    if [ "$state" = "已启用" ]; then
+        check_ok "IPv4 优先" "$state"
+    elif [ "$ipv4_priority_expected" -eq 1 ]; then
+        check_fail "IPv4 优先" "配置记录存在但未生效"
+    else
+        check_info "IPv4 优先" "$state"
+    fi
+
+    state="$(ipv6_summary_state)"
+    case "$state" in
+        已禁用|已启用（*个全局地址）) check_ok "IPv6" "$state" ;;
+        "已禁用（非 VPSBox 配置）"|"未检测到全局 IPv6") check_info "IPv6" "$state" ;;
+        "禁用配置存在但未生效"|配置异常) check_fail "IPv6" "$state" ;;
+        *) check_warn "IPv6" "$state" ;;
+    esac
+
+    if [ -e "$BBR_CONF" ] || [ -L "$BBR_CONF" ] || change_applied_recorded_readonly BBR_CONF; then
+        bbr_config_expected=1
+    fi
+    state="$(bbr_state)"
+    if [ "$state" = "已启用" ]; then
+        check_ok "BBR" "$state"
+    elif [ "$bbr_config_expected" -eq 1 ]; then
+        check_fail "BBR" "配置存在但未生效"
+    else
+        check_info "BBR" "$state"
+    fi
+    state="$(fq_state)"
+    if [ "$state" = "已启用" ]; then
+        check_ok "fq" "$state"
+    elif [ "$bbr_config_expected" -eq 1 ]; then
+        check_fail "fq" "配置存在但未生效"
+    else
+        check_info "fq" "$state"
+    fi
+    state="$(tcp_buffer_summary_state)"
+    case "$state" in
+        *未生效*|*未开启*|配置异常) check_fail "TCP 缓冲区" "$state" ;;
+        第一档*|第二档*|第三档*) check_ok "TCP 缓冲区" "$state" ;;
+        *) check_info "TCP 缓冲区" "$state" ;;
+    esac
+
     state="$(journald_limit_state)"
     if [ -e "$JOURNALD_VPSBOX_CONF" ] || [ -L "$JOURNALD_VPSBOX_CONF" ]; then
         if [ "$state" = "已配置" ] &&
@@ -16643,6 +16684,14 @@ EOF
         check_ok "单个日志最大" "$max_file"
     else
         check_info "日志限制" "未配置"
+    fi
+    state="$(journal_disk_usage)"
+    if [ "$state" = "无法检测" ]; then check_warn "日志占用" "$state"; else check_ok "日志占用" "$state"; fi
+
+    if [ "$(reboot_required_state)" = "需要" ]; then
+        check_warn "系统重启" "需要重启"
+    else
+        check_ok "系统重启" "不需要重启"
     fi
 
     if ports_report="$(show_ports_security_group 2>&1)"; then
@@ -17981,12 +18030,14 @@ system_menu() {
 ========================================
  系统优化
 ========================================
- BBR + fq：$(bbr_fq_summary_state)
- TCP 缓冲区：$(tcp_buffer_summary_state)
- IPv4 优先：$(ipv4_priority_state)
+ NTP：$(ntp_sync_state)
  SSH：端口 $(ssh_port_state) / 加固$(ssh_hardening_state)
  Fail2ban：$(fail2ban_service_state) / SSH 防护$(fail2ban_sshd_state)
- NTP：$(ntp_sync_state)
+ IPv4 优先：$(ipv4_priority_state)
+ IPv6：$(ipv6_summary_state)
+ BBR + fq：$(bbr_fq_summary_state)
+ TCP 缓冲区：$(tcp_buffer_summary_state)
+ journald 日志限制：$(journald_limit_state)
  系统重启：$(reboot_required_state)
 ----------------------------------------
  基础
@@ -17995,18 +18046,18 @@ system_menu() {
  [3] 修改主机名
  [4] $ntp_label
 
- 网络
- [5] 修改 IPv4 DNS
- [6] 开启 IPv4 优先
- [7] 开启 BBR + fq
- [8] 禁用 IPv6
- [9] TCP 缓冲区调优
-
  SSH 安全
- [10] 修改 SSH 端口
- [11] SSH 基础加固
- [12] 查看 SSH 生效配置
- [13] 安装 Fail2ban
+ [5] 修改 SSH 端口
+ [6] SSH 基础加固
+ [7] 查看 SSH 生效配置
+ [8] 安装 Fail2ban
+
+ 网络
+ [9] 修改 IPv4 DNS
+ [10] 开启 IPv4 优先
+ [11] 禁用 IPv6
+ [12] 开启 BBR + fq
+ [13] TCP 缓冲区调优
 
  维护
  [14] $journal_label
@@ -18023,15 +18074,15 @@ EOF
             2) run_menu_action cleanup_system_garbage; pause ;;
             3) run_menu_action change_system_hostname; pause ;;
             4) run_menu_action enable_ntp_sync; pause ;;
-            5) run_menu_action change_ipv4_dns; pause ;;
-            6) run_menu_action enable_ipv4_priority; pause ;;
-            7) run_menu_action enable_bbr_fq; pause ;;
-            8) run_menu_action disable_ipv6; pause ;;
-            9) tcp_buffer_menu ;;
-            10) ssh_port_change_menu ;;
-            11) ssh_basic_hardening_menu ;;
-            12) run_menu_action show_current_ssh_config; pause ;;
-            13) run_menu_action install_fail2ban; pause ;;
+            5) ssh_port_change_menu ;;
+            6) ssh_basic_hardening_menu ;;
+            7) run_menu_action show_current_ssh_config; pause ;;
+            8) run_menu_action install_fail2ban; pause ;;
+            9) run_menu_action change_ipv4_dns; pause ;;
+            10) run_menu_action enable_ipv4_priority; pause ;;
+            11) run_menu_action disable_ipv6; pause ;;
+            12) run_menu_action enable_bbr_fq; pause ;;
+            13) tcp_buffer_menu ;;
             14) run_menu_action limit_systemd_journal; pause ;;
             15) system_changes_menu ;;
             0) return 0 ;;

@@ -89,18 +89,18 @@ sing-box 管理
 [3] 修改主机名
 [4] 开启 NTP 时间同步
 
-网络
-[5] 修改 IPv4 DNS
-[6] 开启 IPv4 优先
-[7] 开启 BBR + fq
-[8] 禁用 IPv6
-[9] TCP 缓冲区调优
-
 SSH 安全
-[10] 修改 SSH 端口
-[11] SSH 基础加固
-[12] 查看 SSH 生效配置
-[13] 安装 Fail2ban
+[5] 修改 SSH 端口
+[6] SSH 基础加固
+[7] 查看 SSH 生效配置
+[8] 安装 Fail2ban
+
+网络
+[9] 修改 IPv4 DNS
+[10] 开启 IPv4 优先
+[11] 禁用 IPv6
+[12] 开启 BBR + fq
+[13] TCP 缓冲区调优
 
 维护
 [14] 限制 journald 日志大小
