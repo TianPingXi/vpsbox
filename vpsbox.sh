@@ -272,7 +272,7 @@ retry() {
 }
 
 run_bounded_in_new_session() {
-    local limit="$1" marker pid start="" timer status marker_state i
+    local limit="$1" marker pid start="" timer timer_sleep="" status marker_state i
 
     shift
     marker="$(mktemp /tmp/vpsbox-command-timeout.XXXXXX)" || return 1
@@ -312,12 +312,25 @@ run_bounded_in_new_session() {
 
     ACTIVE_BOUNDED_START="$start"
     (
-        sleep "$limit"
+        trap '
+            if is_pid "$timer_sleep"; then
+                kill -TERM "$timer_sleep" 2>/dev/null || true
+                wait "$timer_sleep" 2>/dev/null || true
+            fi
+            exit 0
+        ' HUP INT TERM
+        sleep "$limit" &
+        timer_sleep=$!
+        if ! wait "$timer_sleep"; then
+            exit 0
+        fi
+        timer_sleep=""
+        trap - HUP INT TERM
         if bounded_process_group_matches "$pid" "$start"; then
             printf '%s\n' timeout > "$marker"
             terminate_bounded_session "$pid" "$PACKAGE_KILL_GRACE"
         fi
-    ) 200>&- &
+    ) </dev/null >/dev/null 2>&1 200>&- &
     timer=$!
     ACTIVE_BOUNDED_TIMER_PID="$timer"
 

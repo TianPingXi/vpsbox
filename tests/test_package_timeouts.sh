@@ -143,6 +143,47 @@ test_nonzero_exit_cleans_descendants() {
     ACTIVE_TEST_CHILD_FILE=""
 }
 
+test_captured_fast_command_does_not_wait_for_timer() {
+    local output elapsed
+
+    SECONDS=0
+    output="$(run_bounded_command 5 /bin/sh -c 'printf "%s\n" ready')" ||
+        fail "快速有界命令应成功返回"
+    elapsed=$SECONDS
+
+    assert_eq ready "$output" "快速有界命令的捕获输出必须保持完整"
+    [ "$elapsed" -lt 3 ] ||
+        fail "快速有界命令不应等待后台计时器结束（${elapsed} 秒）"
+}
+
+test_finished_command_cleans_timer_sleep() {
+    local bin="$TEST_TMP/timer-sleep-bin" timer_file="$TEST_TMP/timer-sleep.pid"
+    local timer_pid=""
+
+    require_linux_proc || return "$?"
+    mkdir -p "$bin"
+    printf '%s\n' \
+        '#!/bin/sh' \
+        'if [ "${1:-}" = 30 ]; then' \
+        '    printf "%s\n" "$$" > "$VPSBOX_TEST_TIMER_PID_FILE"' \
+        'fi' \
+        'exec /bin/sleep "$@"' > "$bin/sleep"
+    chmod 755 "$bin/sleep"
+
+    ACTIVE_TEST_CHILD_FILE="$timer_file"
+    trap cleanup_active_test_sleep EXIT
+    export VPSBOX_TEST_TIMER_PID_FILE="$timer_file"
+    PATH="$bin:$PATH" run_bounded_command 30 /bin/sleep 1 >/dev/null 2>&1 ||
+        fail "计时器清理夹具中的有界命令应成功返回"
+    unset VPSBOX_TEST_TIMER_PID_FILE
+
+    [ -s "$timer_file" ] || fail "后台计时器 sleep PID 未写入"
+    timer_pid="$(cat "$timer_file")"
+    assert_pid_gone "$timer_pid" "命令完成后仍残留后台计时器 sleep"
+    trap - EXIT
+    ACTIVE_TEST_CHILD_FILE=""
+}
+
 test_apt_options_are_bounded() {
     local log="$TEST_TMP/apt-options.log" value option
 
@@ -258,6 +299,8 @@ main() {
         test_timeout_is_not_retried
         test_timeout_kills_separate_process_group
         test_nonzero_exit_cleans_descendants
+        test_captured_fast_command_does_not_wait_for_timer
+        test_finished_command_cleans_timer_sleep
         test_apt_options_are_bounded
         test_debian_dependency_install_uses_bounds
         test_alpine_dependency_install_uses_bounds
