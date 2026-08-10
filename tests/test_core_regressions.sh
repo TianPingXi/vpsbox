@@ -1610,6 +1610,7 @@ test_self_check_classifies_and_summarizes_results() {
         local metadata_output="$TEST_TMP/self-check-install-metadata.out"
         local metadata_invalid_output="$TEST_TMP/self-check-install-metadata-invalid.out"
         local external_output="$TEST_TMP/self-check-external-journald.out"
+        local unsupported_journald_file_output="$TEST_TMP/self-check-unsupported-journald-file.out"
         local scan_fail_output="$TEST_TMP/self-check-scan-fail.out"
         local ipv6_ok_output="$TEST_TMP/self-check-ipv6-ok.out"
         local ipv6_external_output="$TEST_TMP/self-check-ipv6-external.out"
@@ -1703,6 +1704,17 @@ test_self_check_classifies_and_summarizes_results() {
             "不支持 journald 限制只能显示一条准确的 INFO"
         assert_file_not_contains "$first_output" '日志最大占用|单个日志最大' \
             "不支持 journald 限制时不得输出派生值"
+
+        printf '%s\n' 'stale config' > "$JOURNALD_VPSBOX_CONF"
+        run_self_check > "$unsupported_journald_file_output" 2>&1 ||
+            fail "非 systemd 环境存在 journald 残留配置时一键检测应正常完成"
+        assert_file_contains "$unsupported_journald_file_output" \
+            'INFO[[:space:]]+[|] 日志限制[[:space:]]+[|] 不支持'
+        assert_file_not_contains "$unsupported_journald_file_output" \
+            'FAIL[[:space:]]+[|] 日志限制' \
+            "非 systemd 环境不得把 journald 残留配置误报为失败"
+        rm -f -- "$JOURNALD_VPSBOX_CONF"
+
         assert_file_contains "$first_output" 'INFO[[:space:]]+[|] BBR[[:space:]]+[|] 未启用'
         assert_file_contains "$first_output" 'INFO[[:space:]]+[|] fq[[:space:]]+[|] 未启用'
         assert_file_contains "$first_output" 'INFO[[:space:]]+[|] IPv4 优先[[:space:]]+[|] 未启用'

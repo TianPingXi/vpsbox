@@ -16664,7 +16664,9 @@ EOF
     esac
 
     state="$(journald_limit_state)"
-    if [ -e "$JOURNALD_VPSBOX_CONF" ] || [ -L "$JOURNALD_VPSBOX_CONF" ]; then
+    if [ "$state" = "不支持" ]; then
+        check_info "日志限制" "$state"
+    elif [ -e "$JOURNALD_VPSBOX_CONF" ] || [ -L "$JOURNALD_VPSBOX_CONF" ]; then
         if [ "$state" = "已配置" ] &&
             [ -f "$JOURNALD_VPSBOX_CONF" ] && [ ! -L "$JOURNALD_VPSBOX_CONF" ] &&
             [ "$(stat -c '%u:%g %a' "$JOURNALD_VPSBOX_CONF" 2>/dev/null || true)" = "0:0 644" ]; then
