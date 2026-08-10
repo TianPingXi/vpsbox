@@ -1535,6 +1535,18 @@ test_bbr_fq_summary_preserves_partial_state() {
     )
 }
 
+test_journald_limit_state_reports_unsupported_without_systemd() {
+    (
+        is_systemd() { return 1; }
+        journald_conf_value() {
+            fail "非 systemd 环境不得读取 journald 配置"
+        }
+
+        assert_eq "不支持" "$(journald_limit_state)" \
+            "非 systemd 环境必须明确显示 journald 不支持"
+    )
+}
+
 test_ipv6_summary_states() {
     (
         local mock_runtime="0 0 0"
@@ -1604,7 +1616,7 @@ test_self_check_classifies_and_summarizes_results() {
         local ipv6_fail_output="$TEST_TMP/self-check-ipv6-fail.out"
         local ipv6_warn_output="$TEST_TMP/self-check-ipv6-warn.out"
         local status count
-        local mock_ntp_state=未安装 mock_journald_state=未配置
+        local mock_ntp_state=未安装 mock_journald_state=不支持
         local mock_ipv6_state="未检测到全局 IPv6" ports_ok=1
 
         detect_os() { OS=debian; }
@@ -1687,10 +1699,10 @@ test_self_check_classifies_and_summarizes_results() {
             "未安装 Fail2ban 只能显示一条 INFO"
         assert_file_not_contains "$first_output" '（可选）|[|] Fail2ban 状态|[|] SSH 防护' \
             "Fail2ban 未安装时不得输出重复状态行"
-        assert_eq 1 "$(grep -Ec ' INFO[[:space:]]+[|] 日志限制[[:space:]]+[|] 未配置' "$first_output")" \
-            "未配置 journald 限制只能显示一条 INFO"
+        assert_eq 1 "$(grep -Ec ' INFO[[:space:]]+[|] 日志限制[[:space:]]+[|] 不支持' "$first_output")" \
+            "不支持 journald 限制只能显示一条准确的 INFO"
         assert_file_not_contains "$first_output" '日志最大占用|单个日志最大' \
-            "未配置 journald 限制时不得输出派生值"
+            "不支持 journald 限制时不得输出派生值"
         assert_file_contains "$first_output" 'INFO[[:space:]]+[|] BBR[[:space:]]+[|] 未启用'
         assert_file_contains "$first_output" 'INFO[[:space:]]+[|] fq[[:space:]]+[|] 未启用'
         assert_file_contains "$first_output" 'INFO[[:space:]]+[|] IPv4 优先[[:space:]]+[|] 未启用'
@@ -3655,6 +3667,7 @@ main() {
         test_ssh_port_summary_line_states
         test_node_summary_orders_only_existing_protocols
         test_bbr_fq_summary_preserves_partial_state
+        test_journald_limit_state_reports_unsupported_without_systemd
         test_ipv6_summary_states
         test_self_check_classifies_and_summarizes_results
         test_main_menu_update_notice_spacing_and_entries

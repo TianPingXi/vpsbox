@@ -16683,7 +16683,7 @@ EOF
         check_ok "日志最大占用" "$max_use"
         check_ok "单个日志最大" "$max_file"
     else
-        check_info "日志限制" "未配置"
+        check_info "日志限制" "$state"
     fi
     state="$(journal_disk_usage)"
     if [ "$state" = "无法检测" ]; then check_warn "日志占用" "$state"; else check_ok "日志占用" "$state"; fi
@@ -17812,6 +17812,11 @@ journald_conf_value() {
 journald_limit_state() {
     local max_use
     local max_file
+
+    if ! is_systemd; then
+        echo "不支持"
+        return 0
+    fi
 
     max_use="$(journald_conf_value SystemMaxUse || true)"
     max_file="$(journald_conf_value SystemMaxFileSize || true)"
