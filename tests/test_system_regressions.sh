@@ -1884,6 +1884,27 @@ test_journald_fallback_prefers_managed_dropin() {
 
 test_journald_apply_and_failed_restart_restore_previous_config() {
     (
+        journalctl() {
+            printf '%s\n' 'Archived and active journals take up 48.0M in the file system.'
+        }
+
+        assert_eq 48.0M "$(journal_disk_usage)" \
+            "journald 占用应去掉固定英文说明"
+    )
+    (
+        local output="$TEST_TMP/journald-openrc-unsupported.out"
+
+        forbid_init
+        is_systemd() { return 1; }
+        journalctl() { forbid "OpenRC 环境不得调用 journalctl"; }
+
+        if limit_systemd_journal > "$output" 2>&1; then
+            fail "非 systemd 环境不得进入 journald 配置流程"
+        fi
+        assert_file_contains "$output" '未检测到 systemd，无法配置 systemd-journald'
+        assert_no_forbidden "OpenRC 环境应在 journalctl 调用前退出"
+    )
+    (
         local case_dir="$TEST_TMP/journald-apply" log="$TEST_TMP/journald-apply.log"
 
         mkdir -p "$case_dir"
@@ -1908,6 +1929,26 @@ test_journald_apply_and_failed_restart_restore_previous_config() {
         assert_file_contains "$log" '^systemctl:restart systemd-journald$'
         assert_file_contains "$log" '^systemctl:is-active --quiet systemd-journald$'
         assert_file_contains "$log" '^applied:JOURNALD_CONF$'
+    )
+    (
+        local case_dir="$TEST_TMP/journald-rotate-vacuum" log="$TEST_TMP/journald-rotate-vacuum.log"
+
+        mkdir -p "$case_dir"
+        : > "$log"
+        JOURNALD_VPSBOX_CONF="$case_dir/99-vpsbox.conf"
+        is_systemd() { return 0; }
+        journalctl() { printf 'journalctl:%s\n' "$*" >> "$log"; }
+        systemd-analyze() { cat "$JOURNALD_VPSBOX_CONF" 2>/dev/null; }
+        backup_change_file_once() { :; }
+        begin_change_transaction() { :; }
+        systemctl() { return 0; }
+        mark_change_applied() { :; }
+        journal_disk_usage() { printf '%s\n' 500M; }
+
+        limit_systemd_journal <<< "YES" >/dev/null ||
+            fail "journald 立即清理流程应成功"
+        assert_eq 1 "$(grep -Fxc 'journalctl:--rotate --vacuum-size=500M' "$log")" \
+            "立即清理必须先轮转活动日志，再按 500M 清理归档日志"
     )
     (
         local case_dir="$TEST_TMP/journald-restart-failure"

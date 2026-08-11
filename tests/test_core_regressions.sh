@@ -1678,7 +1678,7 @@ test_self_check_classifies_and_summarizes_results() {
         assert_eq 1 "$(grep -Ec ' INFO[[:space:]]+[|] 节点[[:space:]]+[|] 未创建' "$first_output")" \
             "未创建节点只能显示一条 INFO"
         assert_file_contains "$first_output" 'INFO[[:space:]]+[|] sing-box[[:space:]]+[|] 未安装'
-        assert_file_not_contains "$first_output" '配置文件.*不存在|服务状态.*未运行' \
+        assert_file_not_contains "$first_output" '配置文件.*不存在|sing-box 状态' \
             "未创建节点不得重复报告派生状态"
         assert_eq 1 "$(grep -Ec ' INFO[[:space:]]+[|] Fail2ban[[:space:]]+[|] 未安装' "$first_output")" \
             "未安装 Fail2ban 只能显示一条 INFO"
@@ -1774,9 +1774,10 @@ test_self_check_classifies_and_summarizes_results() {
         run_self_check > "$external_output" 2>&1 ||
             fail "外部 journald 限制已生效时一键检测应正常完成"
         assert_file_contains "$external_output" 'WARN[[:space:]]+[|] NTP 同步[[:space:]]+[|] 运行中'
-        assert_file_contains "$external_output" 'OK[[:space:]]+[|] 日志限制[[:space:]]+[|] 已配置（系统配置已生效）'
-        assert_file_contains "$external_output" 'OK[[:space:]]+[|] 日志最大占用[[:space:]]+[|] 500M'
-        assert_file_contains "$external_output" 'OK[[:space:]]+[|] 单个日志最大[[:space:]]+[|] 50M'
+        assert_file_contains "$external_output" \
+            'OK[[:space:]]+[|] 日志限制[[:space:]]+[|] 总上限 500M / 单文件 50M'
+        assert_file_not_contains "$external_output" '日志最大占用|单个日志最大' \
+            "journald 静态限制应合并为一行"
 
         ports_ok=0
         run_self_check > "$scan_fail_output" 2>&1 ||
@@ -1942,8 +1943,17 @@ test_self_check_classifies_and_summarizes_results() {
 
         run_self_check > "$output" 2>&1 ||
             fail "节点监听和链接缺失时仍应完成状态报告"
-        assert_file_contains "$output" 'FAIL[[:space:]]+[|] VLESS Reality 监听[[:space:]]+[|] 20001 未监听'
-        assert_file_contains "$output" 'FAIL[[:space:]]+[|] Shadowsocks 监听[[:space:]]+[|] 20002 未监听'
+        assert_file_contains "$output" \
+            'FAIL[[:space:]]+[|] VLESS Reality 节点[[:space:]]+[|] vless[.]example[.]com:20001 / TCP 未监听'
+        assert_file_contains "$output" \
+            'FAIL[[:space:]]+[|] Shadowsocks 节点[[:space:]]+[|] ss[.]example[.]com:20002 / TCP、UDP 未完整监听'
+        assert_file_not_contains "$output" \
+            'VLESS Reality 监听|Shadowsocks 监听|VLESS Reality 地址|Shadowsocks 地址' \
+            "节点监听与地址不得继续拆成重复状态行"
+        assert_file_contains "$output" \
+            'OK[[:space:]]+[|] sing-box 状态[[:space:]]+[|] 配置正常 / 运行中'
+        assert_file_not_contains "$output" '配置语法|服务状态' \
+            "sing-box 配置与服务状态应合并显示"
         assert_file_not_contains "$output" 'VLESS Reality 解析|Shadowsocks 解析|未解析到 IP' \
             "一键检测不应显示节点域名解析结果"
         assert_empty_file "$resolver_log" "一键检测不应查询 VLESS 或 Shadowsocks 节点域名"

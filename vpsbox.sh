@@ -16108,6 +16108,7 @@ run_self_check() {
     local max_use
     local max_file
     local state node_protocols protocol protocol_status label detail ports_report uri_cache_state
+    local config_state service_state listener_ok listener_fail
     local install_metadata installed_version installed_at
     local bbr_config_expected=0 ipv4_priority_expected=0
     local singbox_available=0
@@ -16184,45 +16185,51 @@ EOF
         load_protocol_state "$protocol" >/dev/null 2>&1 || continue
         has_node="1"
         [ "$protocol" = "vless" ] && label="VLESS Reality" || label="Shadowsocks"
-        check_ok "$label 节点" "${DOMAIN:-未知}:${PORT:-未知}"
+        if [ "$protocol" = "vless" ]; then
+            node_protocols=tcp
+            listener_ok="TCP 监听正常"
+            listener_fail="TCP 未监听"
+        else
+            node_protocols=both
+            listener_ok="TCP、UDP 监听正常"
+            listener_fail="TCP、UDP 未完整监听"
+        fi
+        if port_listener_ready "$PORT" "$node_protocols"; then
+            check_ok "$label 节点" "${DOMAIN:-未知}:${PORT:-未知} / $listener_ok"
+        else
+            check_fail "$label 节点" "${DOMAIN:-未知}:${PORT:-未知} / $listener_fail"
+        fi
         if [ "$protocol_status" = "deviated" ]; then
             check_warn "$label 模板" "已偏离 VPSBox 管理模板"
         fi
         if [ "$protocol" = "vless" ]; then
             check_ok "Reality SNI" "${REALITY_SERVER_NAME:-未知}"
-            node_protocols=tcp
-        else
-            node_protocols=both
-        fi
-        if port_listener_ready "$PORT" "$node_protocols"; then
-            check_ok "$label 监听" "$PORT 正在监听"
-        else
-            check_fail "$label 监听" "$PORT 未监听"
-        fi
-        if is_ip_address "$DOMAIN"; then
-            check_ok "$label 地址" "$DOMAIN"
-        elif ! is_valid_node_host "$DOMAIN"; then
-            check_fail "$label 地址" "格式不正确：$DOMAIN"
         fi
     done
     if [ "$has_node" != "1" ] && [ "$node_integrity_failed" != "1" ]; then
         check_info "节点" "未创建"
     fi
 
-    if [ "$node_integrity_failed" != "1" ] && [ "$has_node" = "1" ] && [ "$singbox_available" -eq 1 ]; then
-        if check_active_node_config >/dev/null 2>&1; then
-            check_ok "配置语法" "通过"
-        else
-            check_fail "配置语法" "未通过"
-        fi
-    fi
-
     if [ "$has_node" = "1" ] && [ "$singbox_available" -eq 1 ]; then
-        state="$(service_status_short)"
-        if [ "$state" = "运行中" ]; then
-            check_ok "服务状态" "$state"
+        service_state="$(service_status_short)"
+        if [ "$node_integrity_failed" = "1" ]; then
+            if [ "$service_state" = "运行中" ]; then
+                check_ok "sing-box 状态" "$service_state"
+            else
+                check_fail "sing-box 状态" "$service_state"
+            fi
         else
-            check_fail "服务状态" "$state"
+            if check_active_node_config >/dev/null 2>&1; then
+                config_state="配置正常"
+            else
+                config_state="配置未通过"
+            fi
+            detail="$config_state / $service_state"
+            if [ "$config_state" = "配置正常" ] && [ "$service_state" = "运行中" ]; then
+                check_ok "sing-box 状态" "$detail"
+            else
+                check_fail "sing-box 状态" "$detail"
+            fi
         fi
     fi
 
@@ -16356,18 +16363,14 @@ EOF
             [ "$(stat -c '%u:%g %a' "$JOURNALD_VPSBOX_CONF" 2>/dev/null || true)" = "0:0 644" ]; then
             max_use="$(journald_conf_value SystemMaxUse || echo "未配置")"
             max_file="$(journald_conf_value SystemMaxFileSize || echo "未配置")"
-            check_ok "日志限制" "$state"
-            check_ok "日志最大占用" "$max_use"
-            check_ok "单个日志最大" "$max_file"
+            check_ok "日志限制" "总上限 $max_use / 单文件 $max_file"
         else
             check_fail "日志限制" "配置存在但未按预期生效或不安全"
         fi
     elif [ "$state" = "已配置" ]; then
         max_use="$(journald_conf_value SystemMaxUse || echo "未配置")"
         max_file="$(journald_conf_value SystemMaxFileSize || echo "未配置")"
-        check_ok "日志限制" "已配置（系统配置已生效）"
-        check_ok "日志最大占用" "$max_use"
-        check_ok "单个日志最大" "$max_file"
+        check_ok "日志限制" "总上限 $max_use / 单文件 $max_file"
     else
         check_info "日志限制" "$state"
     fi
@@ -17475,7 +17478,8 @@ reboot_required_state() {
 
 journal_disk_usage() {
     if command -v journalctl >/dev/null 2>&1; then
-        journalctl --disk-usage 2>/dev/null | sed -E 's/^Archived and active journals take up //; s/\.$//'
+        journalctl --disk-usage 2>/dev/null |
+            sed -E 's/^Archived and active journals take up //; s/ in the file system\.?$//; s/\.$//'
     else
         echo "无法检测"
     fi
@@ -17587,7 +17591,7 @@ EOF
         confirm=""
     fi
     if [ "$confirm" = "YES" ]; then
-        if retry 3 2 journalctl --vacuum-size=500M; then
+        if retry 3 2 journalctl --rotate --vacuum-size=500M; then
             info "清理完成，当前日志占用：$(journal_disk_usage)"
         else
             err "历史日志清理失败，日志大小限制仍已生效。"

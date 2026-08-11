@@ -2287,6 +2287,15 @@ test_self_check_warns_for_template_drift_without_integrity_failure() {
         assert_file_contains "$output" \
             'WARN[[:space:]]+[|] Shadowsocks 模板[[:space:]]+[|] 已偏离 VPSBox 管理模板' \
             "偏离管理模板应明确显示 WARN"
+        assert_file_contains "$output" \
+            'OK[[:space:]]+[|] Shadowsocks 节点[[:space:]]+[|] ss[.]example[.]com:20001 / TCP、UDP 监听正常' \
+            "节点地址与双协议监听状态应合并显示"
+        assert_file_contains "$output" \
+            'OK[[:space:]]+[|] sing-box 状态[[:space:]]+[|] 配置正常 / 运行中' \
+            "sing-box 配置与服务状态应合并显示"
+        assert_file_not_contains "$output" \
+            'Shadowsocks 监听|Shadowsocks 地址|配置语法|服务状态' \
+            "一键检测不得保留已合并的重复状态行"
         assert_file_not_contains "$output" \
             'FAIL[[:space:]]+[|] Shadowsocks 模板' \
             "偏离管理模板不得被标记为 FAIL"
@@ -2535,7 +2544,12 @@ test_self_check_keeps_valid_sibling_visible() {
 
         assert_eq 1 "$(grep -Ec 'FAIL[[:space:]]+[|] 配置完整性[[:space:]]+[|] 未通过' "$TEST_TMP/self-check-sibling.out")" \
             "残缺节点只能产生一条配置完整性失败"
-        assert_file_contains "$TEST_TMP/self-check-sibling.out" 'Shadowsocks 节点'
+        assert_file_contains "$TEST_TMP/self-check-sibling.out" \
+            'FAIL[[:space:]]+[|] Shadowsocks 节点[[:space:]]+[|] ss[.]example[.]com:20001 / TCP、UDP 未完整监听' \
+            "健康兄弟节点应保留独立的监听结果"
+        assert_file_not_contains "$TEST_TMP/self-check-sibling.out" \
+            'Shadowsocks 监听|Shadowsocks 地址' \
+            "健康兄弟节点不得恢复已合并的重复行"
         assert_file_not_contains "$TEST_TMP/self-check-sibling.out" 'VLESS Reality 模板.*已偏离' \
             "损坏节点不得再被误报为仅偏离管理模板"
         assert_file_not_contains "$TEST_TMP/self-check-sibling.out" '配置文件.*不存在'
