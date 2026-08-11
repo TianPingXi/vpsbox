@@ -2,6 +2,8 @@
 
 本文面向 VPSBox 维护者，只记录稳定的模块边界、状态所有权和高风险流程。具体行为以 `vpsbox.sh` 为准，回归契约以 `tests/` 为准，发布规则以 `tools/release.ps1` 为准。
 
+VPSBox 是面向 Linux VPS 的 Bash 管理脚本，Debian 13 是当前主要的运行与完整验证环境。
+
 ## 1. 交付形态
 
 - `vpsbox.sh` 是唯一运行时源码，也是安装和自更新使用的发布产物。
