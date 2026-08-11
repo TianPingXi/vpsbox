@@ -1561,8 +1561,8 @@ test_ipv6_summary_states() {
 
         mock_runtime="1 1 1"
         mock_addresses=""
-        assert_eq "已禁用（非 VPSBox 配置）" "$(ipv6_summary_state)" \
-            "无受管配置的运行时禁用必须与 VPSBox 禁用区分"
+        assert_eq "已禁用（非 vpsbox 配置）" "$(ipv6_summary_state)" \
+            "无受管配置的运行时禁用必须与 vpsbox 禁用区分"
 
         : > "$IPV6_DISABLE_CONF"
         mock_config_current=1
@@ -1738,9 +1738,9 @@ test_self_check_classifies_and_summarizes_results() {
         run_self_check > "$ipv6_ok_output" 2>&1 || fail "已启用 IPv6 的一键检测应正常完成"
         assert_file_contains "$ipv6_ok_output" 'OK[[:space:]]+[|] IPv6[[:space:]]+[|] 已启用（3 个全局地址）'
 
-        mock_ipv6_state="已禁用（非 VPSBox 配置）"
+        mock_ipv6_state="已禁用（非 vpsbox 配置）"
         run_self_check > "$ipv6_external_output" 2>&1 || fail "外部禁用 IPv6 的一键检测应正常完成"
-        assert_file_contains "$ipv6_external_output" 'INFO[[:space:]]+[|] IPv6[[:space:]]+[|] 已禁用（非 VPSBox 配置）'
+        assert_file_contains "$ipv6_external_output" 'INFO[[:space:]]+[|] IPv6[[:space:]]+[|] 已禁用（非 vpsbox 配置）'
 
         mock_ipv6_state="禁用配置存在但未生效"
         run_self_check > "$ipv6_fail_output" 2>&1 || fail "IPv6 配置未生效时一键检测仍应完成状态报告"

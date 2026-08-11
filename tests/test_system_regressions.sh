@@ -1355,7 +1355,7 @@ test_tcp_buffer_abnormal_managed_config_is_rejected_read_only() {
             fi
             after="$(cksum < "$TCP_BUFFER_CONF")"
             assert_eq "$before" "$after" "异常 TCP 配置必须逐字节保持不变"
-            assert_file_contains "$output" '内容不符合 VPSBox TCP 四项档位模板，已拒绝覆盖'
+            assert_file_contains "$output" '内容不符合 vpsbox TCP 四项档位模板，已拒绝覆盖'
             [ ! -e "$CHANGE_MANIFEST" ] || fail "拒绝异常 TCP 配置后不得创建恢复记录"
             assert_no_forbidden "异常 TCP 配置拒绝路径仍产生了副作用"
         )
@@ -1764,13 +1764,13 @@ test_ipv6_untracked_config_uses_explicit_reenable_path() {
         IPV6_TEST_LO=1
 
         assert_eq legacy "$(system_change_state ipv6)" \
-            "无原始记录的 VPSBox IPv6 配置应显示单独重新启用状态"
+            "无原始记录的 vpsbox IPv6 配置应显示单独重新启用状态"
         if recorded_system_changes_present; then
             fail "无原始记录的 IPv6 配置不得进入恢复全部"
         fi
         restore_vpsbox_system_change_interactive ipv6 <<< "YES" > "$output"
 
-        [ ! -e "$IPV6_DISABLE_CONF" ] || fail "重新启用后应移除无记录的 VPSBox 禁用配置"
+        [ ! -e "$IPV6_DISABLE_CONF" ] || fail "重新启用后应移除无记录的 vpsbox 禁用配置"
         assert_eq "0 0 0" "$IPV6_TEST_ALL $IPV6_TEST_DEFAULT $IPV6_TEST_LO"
         assert_file_contains "$output" '不属于精确还原'
         assert_file_contains "$output" 'all/default/lo 已设置为 0'
@@ -1878,7 +1878,7 @@ test_journald_fallback_prefers_managed_dropin() {
 
         value="$(journald_conf_value SystemMaxUse)" ||
             fail "旧 systemd fallback 应能读取 journald 配置"
-        assert_eq 500M "$value" "VPSBox drop-in 必须覆盖 journald 主配置中的旧值"
+        assert_eq 500M "$value" "vpsbox drop-in 必须覆盖 journald 主配置中的旧值"
     )
 }
 
@@ -2122,7 +2122,7 @@ test_ssh_port_conflicting_main_and_dropin_converge_to_main() {
             assert_file_contains "$SSHD_MAIN_CONF" '^Port 49222$'
             assert_eq 1 "$(grep -Eic '^[[:space:]]*port[[:space:]]+' "$SSHD_MAIN_CONF")"
             [ ! -e "$SSHD_VPSBOX_PORT_CONF" ] ||
-                fail "主配置成为权威来源后必须停用已加载的 VPSBox 端口 drop-in"
+                fail "主配置成为权威来源后必须停用已加载的 vpsbox 端口 drop-in"
         }
         restart_ssh_service() { return 0; }
         wait_for_ssh_listener() { [ "$1" = "$SSH_TARGET_PORT" ]; }
@@ -2136,7 +2136,7 @@ test_ssh_port_conflicting_main_and_dropin_converge_to_main() {
         forbid_init
         apply_ssh_port_target_transaction 22,23333 > "$output"
 
-        assert_file_contains "$output" 'SSH 配置写入位置：主配置（已停用 VPSBox 端口 drop-in）'
+        assert_file_contains "$output" 'SSH 配置写入位置：主配置（已停用 vpsbox 端口 drop-in）'
         assert_no_forbidden "SSH 双来源收敛走错写入或回滚分支"
     )
 }

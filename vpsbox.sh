@@ -3872,7 +3872,7 @@ backup_node_files() {
         "$backup_dir/openrc-sing-box" openrc-sing-box "$manifest" || return 1
 
     # 事务恢复的是服务管理器原本的 active 状态。精确匹配 `run -C vpsbox.d`
-    # 只用于 VPSBox 节点运行验证，不能把 active 的自定义或旧布局服务记成未运行。
+    # 只用于 vpsbox 节点运行验证，不能把 active 的自定义或旧布局服务记成未运行。
     if service_manager_is_active; then
         printf '1\n' > "$backup_dir/service-running" || return 1
     else
@@ -4434,7 +4434,7 @@ restore_node_files() {
     fi
 
     # 原服务可能使用自定义或旧布局；这里验证服务管理器的 enabled/active 状态，
-    # 不要求恢复出的进程必须匹配 VPSBox 的 `run -C vpsbox.d`。
+    # 不要求恢复出的进程必须匹配 vpsbox 的 `run -C vpsbox.d`。
     restore_singbox_service_state "$was_enabled" "$was_active" 0 2>/dev/null || failed=1
 
     if [ "$failed" -ne 0 ]; then
@@ -7777,7 +7777,7 @@ write_chrony_sources() {
     fi
 
     chrony_vpsbox_markers_valid "$conf" || {
-        err "chrony 配置中的 VPSBox NTP 标记不完整、重复或顺序错误，已拒绝修改：$conf"
+        err "chrony 配置中的 vpsbox NTP 标记不完整、重复或顺序错误，已拒绝修改：$conf"
         return 1
     }
     if chrony_main_uses_source_dir "$conf"; then
@@ -8391,7 +8391,7 @@ enable_ntp_sync() {
         return 1
     fi
     if [ -f "$conf" ] && ! chrony_vpsbox_markers_valid "$conf"; then
-        err "chrony 配置中的 VPSBox NTP 标记不完整、重复或顺序错误，已拒绝修改：$conf"
+        err "chrony 配置中的 vpsbox NTP 标记不完整、重复或顺序错误，已拒绝修改：$conf"
         return 1
     fi
 
@@ -10256,7 +10256,7 @@ apply_ssh_port_target_transaction() {
                 fail_ssh_runtime_transaction "停用冲突的 SSH 端口 drop-in 失败" || true
                 return 1
             fi
-            write_action="主配置（已停用 VPSBox 端口 drop-in）"
+            write_action="主配置（已停用 vpsbox 端口 drop-in）"
         fi
         if ! set_main_ssh_port_directives; then
             fail_ssh_runtime_transaction "写入 SSH 主配置失败" || true
@@ -11031,7 +11031,7 @@ ipv6_summary_state() {
 
     if [ "$runtime" = "1 1 1" ]; then
         if [ -z "$addresses" ]; then
-            printf '%s\n' "已禁用（非 VPSBox 配置）"
+            printf '%s\n' "已禁用（非 vpsbox 配置）"
         else
             printf '%s\n' "无法检测"
         fi
@@ -11120,7 +11120,7 @@ disable_ipv6() {
         return 1
     fi
     if [ "$tracking_state" = "none" ] && ipv6_disable_config_is_current; then
-        err "检测到没有原始恢复记录的 VPSBox IPv6 禁用配置。"
+        err "检测到没有原始恢复记录的 vpsbox IPv6 禁用配置。"
         err "请先在系统改动菜单中重新启用 IPv6，再重新执行禁用以建立恢复基线。"
         return 1
     fi
@@ -11274,7 +11274,7 @@ reenable_untracked_ipv6() {
     local runtime_values old_all old_default old_lo parent snapshot failed=0
 
     ipv6_disable_config_is_current || {
-        err "未找到可安全识别的 VPSBox IPv6 禁用配置，已拒绝自动处理。"
+        err "未找到可安全识别的 vpsbox IPv6 禁用配置，已拒绝自动处理。"
         return 1
     }
     [ "$(change_restore_state IPV6_CONF)" = "none" ] || {
@@ -11330,7 +11330,7 @@ reenable_untracked_ipv6() {
     # 文件移除且运行参数已验收即提交；此后中断不应回滚成功状态。
     clear_active_untracked_ipv6_reenable
     rm -f -- "$snapshot" || warn "IPv6 已重新启用，但临时快照清理失败：$snapshot"
-    info "VPSBox IPv6 禁用配置已移除，all/default/lo 已设置为 0。"
+    info "vpsbox IPv6 禁用配置已移除，all/default/lo 已设置为 0。"
     report_ipv6_reenable_address_state
 }
 
@@ -11632,7 +11632,7 @@ apply_tcp_buffer_tier() {
         }
         if ! config_values="$(tcp_buffer_config_values)" ||
             ! tcp_buffer_tier_from_values "$config_values" >/dev/null 2>&1; then
-            err "$TCP_BUFFER_CONF 内容不符合 VPSBox TCP 四项档位模板，已拒绝覆盖。"
+            err "$TCP_BUFFER_CONF 内容不符合 vpsbox TCP 四项档位模板，已拒绝覆盖。"
             return 1
         fi
         config_present=1
@@ -16200,7 +16200,7 @@ EOF
             check_fail "$label 节点" "${DOMAIN:-未知}:${PORT:-未知} / $listener_fail"
         fi
         if [ "$protocol_status" = "deviated" ]; then
-            check_warn "$label 模板" "已偏离 VPSBox 管理模板"
+            check_warn "$label 模板" "已偏离 vpsbox 管理模板"
         fi
         if [ "$protocol" = "vless" ]; then
             check_ok "Reality SNI" "${REALITY_SERVER_NAME:-未知}"
@@ -16323,7 +16323,7 @@ EOF
     state="$(ipv6_summary_state)"
     case "$state" in
         已禁用|已启用（*个全局地址）) check_ok "IPv6" "$state" ;;
-        "已禁用（非 VPSBox 配置）"|"未检测到全局 IPv6") check_info "IPv6" "$state" ;;
+        "已禁用（非 vpsbox 配置）"|"未检测到全局 IPv6") check_info "IPv6" "$state" ;;
         "禁用配置存在但未生效"|配置异常) check_fail "IPv6" "$state" ;;
         *) check_warn "IPv6" "$state" ;;
     esac
@@ -17185,7 +17185,7 @@ restore_vpsbox_system_change_interactive() {
         return 0
     fi
     if [ "$item" = "ipv6" ] && [ "$state" = "legacy" ]; then
-        warn "未找到禁用前的原始记录，只能移除 VPSBox 配置并将 all/default/lo 设置为 0。"
+        warn "未找到禁用前的原始记录，只能移除 vpsbox 配置并将 all/default/lo 设置为 0。"
         warn "这会重新启用 IPv6，但不属于精确还原。"
         if ! read -r -p "重新启用 IPv6？请输入 YES：" confirm; then
             info "输入已结束，已取消重新启用 IPv6。"
@@ -17459,7 +17459,7 @@ node_summary() {
             normal|deviated)
                 load_protocol_state "$protocol" >/dev/null 2>&1 || continue
                 [ "$status" = "normal" ] && status="已创建" ||
-                    status="已创建（配置已偏离 VPSBox 管理模板）"
+                    status="已创建（配置已偏离 vpsbox 管理模板）"
                 printf '%s\n' '----------------------------------------'
                 printf ' %s 节点\n 状态：%s\n 名称：%s\n 地址：%s\n 端口：%s\n' \
                     "$label" "$status" "$NAME" "$DOMAIN" "$PORT"
