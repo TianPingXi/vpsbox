@@ -2922,6 +2922,8 @@ test_ssh_snapshot_restores_exact_fail2ban_state() {
         command chown root:root "$RUNTIME_DIR"
         chmod 700 "$RUNTIME_DIR"
         printf '%s\n' 'Port 22' > "$SSHD_MAIN_CONF"
+        [ ! -e "$SSHD_VPSBOX_HARDENING_CONF" ] ||
+            fail "SSH 快照测试不应继承旧加固文件"
         printf '%s\n' 'custom-before-ssh' > "$FAIL2BAN_VPSBOX_SSHD_CONF"
         chmod 640 "$FAIL2BAN_VPSBOX_SSHD_CONF"
         : > "$log"
