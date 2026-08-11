@@ -305,20 +305,6 @@ test_sensitive_interaction_eof_cancels_before_mutation() {
     )
 
     (
-        local event_log="$TEST_TMP/ssh-hardening-eof-events"
-        : > "$event_log"
-        SSHD_MAIN_CONF="$TEST_TMP/ssh-hardening-eof-sshd_config"
-        : > "$SSHD_MAIN_CONF"
-        sshd_binary() { printf '%s\n' /usr/sbin/sshd; }
-        ssh_basic_hardening_effective() { return 1; }
-        begin_ssh_runtime_transaction() { printf '%s\n' begin >> "$event_log"; }
-
-        apply_ssh_basic_hardening </dev/null >"$TEST_TMP/ssh-hardening-eof.out" 2>&1
-        assert_empty_file "$event_log" "SSH 加固确认输入结束后不得备份或修改配置"
-        assert_file_contains "$TEST_TMP/ssh-hardening-eof.out" '输入已结束，已取消'
-    )
-
-    (
         local event_log="$TEST_TMP/uninstall-eof-events"
         : > "$event_log"
         offer_restore_recorded_changes_before_uninstall() {
@@ -1634,7 +1620,6 @@ test_self_check_classifies_and_summarizes_results() {
         ipv6_summary_state() { printf '%s\n' "$mock_ipv6_state"; }
         ssh_effective_ports_listening() { return 0; }
         ssh_port_state() { printf '%s\n' 22; }
-        ssh_hardening_state() { printf '%s\n' 未配置; }
         fail2ban_installed() { return 1; }
         firewall_control_plane_present() { return 1; }
         reboot_required_state() { printf '%s\n' 不需要; }
@@ -1665,7 +1650,6 @@ test_self_check_classifies_and_summarizes_results() {
         JOURNALD_VPSBOX_CONF="$TEST_TMP/missing-journald.conf"
         FIREWALL_STATE_FILE="$TEST_TMP/missing-firewall.env"
         BBR_CONF="$TEST_TMP/missing-bbr.conf"
-        SSHD_VPSBOX_HARDENING_CONF="$TEST_TMP/missing-ssh-hardening.conf"
         VPSBOX_STATE_DIR="$TEST_TMP/self-check-state"
         INSTALL_METADATA_FILE="$VPSBOX_STATE_DIR/install.env"
         change_applied_recorded_readonly() { return 1; }
@@ -1719,7 +1703,8 @@ test_self_check_classifies_and_summarizes_results() {
         assert_file_contains "$first_output" 'INFO[[:space:]]+[|] fq[[:space:]]+[|] 未启用'
         assert_file_contains "$first_output" 'INFO[[:space:]]+[|] IPv4 优先[[:space:]]+[|] 未启用'
         assert_file_contains "$first_output" 'INFO[[:space:]]+[|] IPv6[[:space:]]+[|] 未检测到全局 IPv6'
-        assert_file_contains "$first_output" 'INFO[[:space:]]+[|] SSH 基础加固[[:space:]]+[|] 未配置'
+        assert_file_not_contains "$first_output" 'SSH 基础加固' \
+            "一键检测不得继续显示已删除的 SSH 基础加固项目"
         assert_file_contains "$first_output" 'INFO[[:space:]]+[|] NTP 同步[[:space:]]+[|] 未安装'
         assert_file_contains "$first_output" 'INFO[[:space:]]+[|] 主机防火墙[[:space:]]+[|] 未启用'
         assert_file_contains "$first_output" \
@@ -1822,7 +1807,6 @@ test_self_check_classifies_and_summarizes_results() {
         ipv4_priority_state() { printf '%s\n' 未启用; }
         ssh_effective_ports_listening() { return 1; }
         ssh_port_state() { printf '%s\n' 22; }
-        ssh_hardening_state() { printf '%s\n' 未配置; }
         fail2ban_installed() { return 0; }
         fail2ban_sshd_configuration_healthy() { return 1; }
         fail2ban_service_state() { printf '%s\n' 运行中; }
@@ -1838,13 +1822,11 @@ test_self_check_classifies_and_summarizes_results() {
         show_ports_security_group() { printf '%s\n' PORTS_MARKER; }
         JOURNALD_VPSBOX_CONF="$TEST_TMP/damaged-journald.conf"
         BBR_CONF="$TEST_TMP/damaged-bbr.conf"
-        SSHD_VPSBOX_HARDENING_CONF="$TEST_TMP/damaged-ssh-hardening.conf"
         VPSBOX_STATE_DIR="$TEST_TMP/self-check-damaged-state"
         INSTALL_METADATA_FILE="$VPSBOX_STATE_DIR/install.env"
         change_applied_recorded_readonly() { [ "$1" = GAI_CONF ]; }
         printf '%s\n' broken > "$JOURNALD_VPSBOX_CONF"
         printf '%s\n' broken > "$BBR_CONF"
-        printf '%s\n' broken > "$SSHD_VPSBOX_HARDENING_CONF"
         chmod 644 "$JOURNALD_VPSBOX_CONF"
 
         run_self_check > "$output" 2>&1 ||
@@ -1864,7 +1846,6 @@ test_self_check_classifies_and_summarizes_results() {
         assert_file_contains "$output" 'FAIL[[:space:]]+[|] BBR[[:space:]]+[|] 配置存在但未生效'
         assert_file_contains "$output" 'FAIL[[:space:]]+[|] fq[[:space:]]+[|] 配置存在但未生效'
         assert_file_contains "$output" 'FAIL[[:space:]]+[|] IPv4 优先[[:space:]]+[|] 配置记录存在但未生效'
-        assert_file_contains "$output" 'FAIL[[:space:]]+[|] SSH 基础加固[[:space:]]+[|] 配置存在但未生效'
         assert_file_not_contains "$output" '日志最大占用|单个日志最大' \
             "journald 配置损坏时不得继续显示派生值"
         assert_eq 1 "$(grep -c '^检测结果：' "$output")" \
@@ -1944,7 +1925,6 @@ test_self_check_classifies_and_summarizes_results() {
         ipv4_priority_state() { printf '%s\n' 已启用; }
         ssh_effective_ports_listening() { return 0; }
         ssh_port_state() { printf '%s\n' 22; }
-        ssh_hardening_state() { printf '%s\n' 已配置; }
         fail2ban_installed() { return 1; }
         firewall_control_plane_present() { return 1; }
         reboot_required_state() { printf '%s\n' 不需要; }
@@ -1953,7 +1933,6 @@ test_self_check_classifies_and_summarizes_results() {
         show_ports_security_group() { printf '%s\n' PORTS_MARKER; }
         change_applied_recorded_readonly() { return 1; }
         BBR_CONF="$TEST_TMP/missing-node-case-bbr.conf"
-        SSHD_VPSBOX_HARDENING_CONF="$TEST_TMP/missing-node-case-ssh-hardening.conf"
         JOURNALD_VPSBOX_CONF="$TEST_TMP/missing-node-case-journald.conf"
         FIREWALL_STATE_FILE="$TEST_TMP/missing-node-case-firewall.env"
         URI_FILE="$TEST_TMP/missing-node-uri.txt"
@@ -2219,7 +2198,6 @@ test_menu_dispatch_and_system_status_wiring() {
         ipv4_priority_state() { :; }
         ipv6_summary_state() { :; }
         ssh_port_state() { :; }
-        ssh_hardening_state() { :; }
         fail2ban_service_state() { :; }
         fail2ban_sshd_state() { :; }
         ntp_sync_state() { :; }
@@ -2228,13 +2206,12 @@ test_menu_dispatch_and_system_status_wiring() {
         pause() { :; }
         run_menu_action() { printf '%s\n' "$1" >> "$submenu_log"; }
         ssh_port_change_menu() { printf '%s\n' ssh_port_change_menu >> "$submenu_log"; }
-        ssh_basic_hardening_menu() { printf '%s\n' ssh_basic_hardening_menu >> "$submenu_log"; }
         tcp_buffer_menu() { printf '%s\n' tcp_buffer_menu >> "$submenu_log"; }
         system_changes_menu() { printf '%s\n' system_changes_menu >> "$submenu_log"; }
 
-        system_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n0' >/dev/null
+        system_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n0' >/dev/null
     )
-    assert_eq $'update_system_packages\ncleanup_system_garbage\nchange_system_hostname\nenable_ntp_sync\nssh_port_change_menu\nssh_basic_hardening_menu\nshow_current_ssh_config\ninstall_fail2ban\nchange_ipv4_dns\nenable_ipv4_priority\ndisable_ipv6\nenable_bbr_fq\ntcp_buffer_menu\nlimit_systemd_journal\nsystem_changes_menu' \
+    assert_eq $'update_system_packages\ncleanup_system_garbage\nchange_system_hostname\nenable_ntp_sync\nssh_port_change_menu\ninstall_fail2ban\nchange_ipv4_dns\nenable_ipv4_priority\ndisable_ipv6\nenable_bbr_fq\ntcp_buffer_menu\nlimit_systemd_journal\nsystem_changes_menu' \
         "$(cat "$submenu_log")" "系统菜单全部编号必须分发到对应操作"
 
     : > "$submenu_log"
@@ -2279,7 +2256,6 @@ test_menu_dispatch_and_system_status_wiring() {
         ipv4_priority_state() { printf '已启用\n'; }
         ipv6_summary_state() { printf '已启用（3 个全局地址）\n'; }
         ssh_port_state() { printf '23333\n'; }
-        ssh_hardening_state() { printf '已配置\n'; }
         fail2ban_service_state() { printf '运行中\n'; }
         fail2ban_sshd_state() { printf '已启用\n'; }
         ntp_sync_state() { printf '已同步\n'; }
@@ -2291,17 +2267,21 @@ test_menu_dispatch_and_system_status_wiring() {
         assert_file_contains "$system_output" 'TCP 缓冲区.*第一档.*8 MiB'
         assert_file_contains "$system_output" 'IPv4.*已启用'
         assert_file_contains "$system_output" 'IPv6.*已启用.*3 个全局地址'
-        assert_file_contains "$system_output" 'SSH.*23333.*已配置'
+        assert_file_contains "$system_output" '^ SSH：端口 23333$'
         assert_file_contains "$system_output" 'Fail2ban.*运行中.*已启用'
         assert_file_contains "$system_output" 'NTP.*已同步'
         assert_file_contains "$system_output" 'journald 日志限制.*已配置'
         assert_file_contains "$system_output" '系统重启.*不需要'
         assert_file_contains "$system_output" '^ [[]5[]] 修改 SSH 端口$'
-        assert_file_contains "$system_output" '^ [[]8[]] 安装 Fail2ban$'
-        assert_file_contains "$system_output" '^ [[]9[]] 修改 IPv4 DNS$'
-        assert_file_contains "$system_output" '^ [[]11[]] 禁用 IPv6$'
-        assert_file_contains "$system_output" '^ [[]12[]] 开启 BBR [+] fq$'
-        assert_file_contains "$system_output" '^ [[]13[]] TCP 缓冲区调优$'
+        assert_file_contains "$system_output" '^ [[]6[]] 安装 Fail2ban$'
+        assert_file_contains "$system_output" '^ [[]7[]] 修改 IPv4 DNS$'
+        assert_file_contains "$system_output" '^ [[]9[]] 禁用 IPv6$'
+        assert_file_contains "$system_output" '^ [[]10[]] 开启 BBR [+] fq$'
+        assert_file_contains "$system_output" '^ [[]11[]] TCP 缓冲区调优$'
+        assert_file_contains "$system_output" '^ [[]12[]] 限制 journald 日志大小$'
+        assert_file_contains "$system_output" '^ [[]13[]] 查看/恢复 vpsbox 系统改动$'
+        assert_file_not_contains "$system_output" 'SSH 基础加固|查看 SSH 生效配置' \
+            "系统优化菜单不得继续显示已删除的 SSH 功能"
         awk '
             /^ NTP：/ { ntp = NR }
             /^ SSH：/ { ssh = NR }

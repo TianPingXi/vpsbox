@@ -2068,7 +2068,6 @@ test_ssh_port_conflicting_main_and_dropin_converge_to_main() {
         SSHD_MAIN_CONF="$ssh_dir/sshd_config"
         SSHD_CONFIG_DIR="$ssh_dir/sshd_config.d"
         SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
-        SSHD_VPSBOX_HARDENING_CONF="$SSHD_CONFIG_DIR/01-vpsbox-ssh-hardening.conf"
         SSH_TARGET_PORT=49222
         output="$ssh_dir/output"
         printf '%s\n' "Include $SSHD_VPSBOX_PORT_CONF" 'Port 22' > "$SSHD_MAIN_CONF"
@@ -2219,34 +2218,6 @@ test_successful_ssh_transaction_uses_only_runtime_snapshot() {
         assert_eq 0 "$ACTIVE_SSH_TRANSACTION_HAS_PORT_CHANGE" \
             "成功后必须清除端口变更标记"
         assert_no_forbidden "SSH 成功路径仍调用了旧持久备份接口"
-    )
-}
-
-test_effective_hardening_force_rewrite_consumes_one_confirmation() {
-    (
-        local reads=0
-        SSHD_MAIN_CONF="$TEST_TMP/ssh-hardening-confirm/sshd_config"
-        mkdir -p "$(dirname "$SSHD_MAIN_CONF")"
-        : > "$SSHD_MAIN_CONF"
-        sshd_binary() { printf '%s\n' /bin/true; }
-        ssh_basic_hardening_effective() { return 0; }
-        read() {
-            reads=$((reads + 1))
-            printf -v "${@: -1}" '%s' y
-        }
-        ssh_effective_ports_csv() { printf '%s\n' 22; }
-        begin_ssh_runtime_transaction() { [ "${2:-0}" = 0 ]; }
-        write_vpsbox_ssh_hardening_config() { return 0; }
-        ensure_sshd_dropin_include() { return 0; }
-        validate_ssh_hardening_effective_config() { return 0; }
-        ssh_effective_ports_match_csv() { [ "$1" = 22 ]; }
-        restart_ssh_service() { return 0; }
-        wait_for_all_ssh_listeners_csv() { [ "$1" = 22 ]; }
-        commit_ssh_runtime_transaction() { return 0; }
-        retire_legacy_ssh_change_tracking() { return 0; }
-
-        apply_ssh_basic_hardening >/dev/null
-        assert_eq 1 "$reads" "已生效加固的强制重写只能消费一次确认"
     )
 }
 
@@ -2607,30 +2578,6 @@ test_systemd_resolved_rollback_failure_is_reported() {
     )
 }
 
-test_sshd_include_only_activates_vpsbox_files() {
-    (
-        local ssh_dir="$TEST_TMP/ssh-explicit-include"
-        mkdir -p "$ssh_dir/sshd_config.d"
-        SSHD_MAIN_CONF="$ssh_dir/sshd_config"
-        SSHD_CONFIG_DIR="$ssh_dir/sshd_config.d"
-        SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
-        SSHD_VPSBOX_HARDENING_CONF="$SSHD_CONFIG_DIR/01-vpsbox-ssh-hardening.conf"
-        printf '%s\n' 'Port 22' > "$SSHD_MAIN_CONF"
-        printf '%s\n' 'Port 23333' > "$SSHD_VPSBOX_PORT_CONF"
-        printf '%s\n' 'PasswordAuthentication yes' > "$SSHD_CONFIG_DIR/90-dormant.conf"
-
-        ensure_sshd_dropin_include
-
-        assert_file_contains "$SSHD_MAIN_CONF" \
-            "^Include $SSHD_VPSBOX_HARDENING_CONF$"
-        assert_file_not_contains "$SSHD_MAIN_CONF" "$SSHD_VPSBOX_PORT_CONF" \
-            "仅加固时不得激活 dormant SSH 端口 drop-in"
-        assert_file_not_contains "$SSHD_MAIN_CONF" 'sshd_config\.d/\*\.conf'
-        assert_file_contains "$SSHD_VPSBOX_PORT_CONF" '^Port 23333$'
-        assert_file_contains "$SSHD_CONFIG_DIR/90-dormant.conf" '^PasswordAuthentication yes$'
-    )
-}
-
 test_main_ssh_port_rewrite_handles_case_and_match_blocks() {
     (
         local ssh_dir="$TEST_TMP/ssh-main-port-rewrite"
@@ -2855,7 +2802,7 @@ test_multiple_ssh_socket_streams_are_parsed() {
     )
 }
 
-test_ssh_restore_entry_targets_22_without_hardening_change() {
+test_ssh_restore_entry_targets_22_without_other_ssh_changes() {
     (
         local ssh_dir="$TEST_TMP/ssh-restore-22" log="$TEST_TMP/ssh-restore-22.log"
         forbid_init
@@ -2863,7 +2810,6 @@ test_ssh_restore_entry_targets_22_without_hardening_change() {
         SSHD_MAIN_CONF="$ssh_dir/sshd_config"
         SSHD_CONFIG_DIR="$ssh_dir/sshd_config.d"
         SSHD_VPSBOX_PORT_CONF="$SSHD_CONFIG_DIR/00-vpsbox-ssh-port.conf"
-        SSHD_VPSBOX_HARDENING_CONF="$SSHD_CONFIG_DIR/01-vpsbox-ssh-hardening.conf"
         printf '%s\n' 'Port 23333' > "$SSHD_MAIN_CONF"
         : > "$log"
         sshd_binary() { printf '%s\n' /bin/true; }
@@ -2876,12 +2822,11 @@ test_ssh_restore_entry_targets_22_without_hardening_change() {
         apply_ssh_port_target_transaction() {
             printf 'target=%s original=%s\n' "$SSH_TARGET_PORT" "$1" >> "$log"
         }
-        write_vpsbox_ssh_hardening_config() { forbid "恢复端口不得改写 hardening"; }
 
         restore_ssh_port_to_22 <<< "YES" >/dev/null
         assert_eq 'target=22 original=23333' "$(cat "$log")" \
             "恢复入口必须仅通过公共事务把目标设为 22"
-        assert_no_forbidden "恢复 SSH 端口时修改了 hardening"
+        assert_no_forbidden "恢复 SSH 端口时执行了范围外操作"
     )
 }
 
@@ -3555,7 +3500,6 @@ main() {
         enable_bbr_fq
         ensure_public_config_dir
         set_main_ssh_port_directives
-        ensure_sshd_dropin_include
         apply_ssh_port_change
         enable_ipv4_priority
         enable_ntp_sync
@@ -3644,7 +3588,6 @@ main() {
         test_runtime_cleanup_rolls_back_active_ssh_transaction
         test_finished_ssh_firewall_is_resynced_during_rollback
         test_successful_ssh_transaction_uses_only_runtime_snapshot
-        test_effective_hardening_force_rewrite_consumes_one_confirmation
         test_absent_resolv_conf_is_created_successfully
         test_resolv_conf_ipv4_replacement_preserves_ipv6_and_other_lines
         test_identical_resolv_conf_is_side_effect_free
@@ -3656,7 +3599,6 @@ main() {
         test_runtime_cleanup_dispatches_active_dns_rollback
         test_systemd_resolved_restart_and_verification_failures_rollback
         test_systemd_resolved_rollback_failure_is_reported
-        test_sshd_include_only_activates_vpsbox_files
         test_main_ssh_port_rewrite_handles_case_and_match_blocks
         test_main_ssh_port_is_inserted_before_match_without_global_port
         test_active_ufw_and_firewalld_unrecognized_rules_warn
@@ -3664,7 +3606,7 @@ main() {
         test_selinux_ssh_port_range_is_validated
         test_enabled_inactive_ssh_socket_is_detected
         test_multiple_ssh_socket_streams_are_parsed
-        test_ssh_restore_entry_targets_22_without_hardening_change
+        test_ssh_restore_entry_targets_22_without_other_ssh_changes
         test_ssh_restore_menu_copy_is_exact
         test_legacy_ssh_state_retires_only_after_success_and_preserves_history
         test_ssh_config_publish_failure_preserves_target
