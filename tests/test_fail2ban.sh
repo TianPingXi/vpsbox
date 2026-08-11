@@ -185,6 +185,8 @@ test_sshd_config_forces_nftables_banaction() {
     render_fail2ban_sshd_config 6384 systemd > "$output"
     assert_file_contains "$output" '^banaction = nftables-multiport$' \
         "vpsbox 管理的 sshd jail 应固定使用 nftables"
+    assert_file_contains "$output" '^bantime = 1d$' \
+        "vpsbox 管理的 sshd jail 应封禁一天"
 }
 
 test_missing_nftables_dependency_is_installed_automatically() {

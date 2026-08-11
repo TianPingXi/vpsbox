@@ -7235,6 +7235,7 @@ enabled = true
 port = $ports
 backend = $backend
 banaction = nftables-multiport
+bantime = 1d
 EOF
     # --- END GENERATED TEMPLATE: Fail2ban sshd jail ---
 }
