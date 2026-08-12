@@ -808,6 +808,60 @@ test_lock_acquisition_installs_runtime_cleanup_traps() {
         "无 flock 锁成功后必须安装运行时清理 trap"
 }
 
+test_unidentified_lock_owner_is_rejected_without_process_scan() {
+    local mode
+
+    for mode in flock lockdir; do
+        (
+            local case_dir="$TEST_TMP/lock-owner-unknown-$mode"
+            local output="$case_dir/output" log="$case_dir/events.log"
+
+            mkdir -p "$case_dir"
+            : > "$log"
+            RUNTIME_DIR="$case_dir/run"
+            LOCK_FILE="$RUNTIME_DIR/menu.lock"
+            LOCK_DIR="$RUNTIME_DIR/menu.lock.d"
+            LOCK_RECLAIM_DIR="$RUNTIME_DIR/menu.lock.reclaim"
+            mkdir -p "$RUNTIME_DIR"
+            prepare_runtime_dir() { :; }
+            ps() { forbid "锁元数据无效时不得扫描进程命令行"; }
+            kill() { forbid "锁元数据无效时不得探测或终止猜测出的进程"; }
+            old_menu_lost_terminal() { forbid "无有效 PID 时不得检查旧菜单身份"; }
+            terminate_old_vpsbox_menu() { forbid "无有效 PID 时不得进入人工终止流程"; }
+            terminate_orphaned_vpsbox_menu() { forbid "无有效 PID 时不得自动终止进程"; }
+            forbid_init
+
+            if [ "$mode" = flock ]; then
+                printf '%s\n' 'pid=invalid' > "$LOCK_FILE"
+                flock() { return 1; }
+            else
+                mkdir "$LOCK_DIR"
+                printf '%s\n' 'pid=invalid' > "$LOCK_DIR/pid"
+                command() {
+                    if [ "${1:-}" = -v ] && [ "${2:-}" = flock ]; then
+                        return 1
+                    fi
+                    builtin command "$@"
+                }
+                acquire_lockdir_reclaim_guard() { return 0; }
+                release_lockdir_reclaim_guard() { printf '%s\n' release >> "$log"; }
+            fi
+
+            if (acquire_lock) > "$output" 2>&1; then
+                fail "$mode 模式下锁元数据缺少有效 PID 时必须拒绝接管"
+            fi
+            assert_file_contains "$output" '锁元数据缺少有效 PID'
+            assert_no_forbidden "$mode 模式下不得用进程子串匹配兜底"
+            if [ "$mode" = lockdir ]; then
+                [ -d "$LOCK_DIR" ] ||
+                    fail "无法确认锁持有者时必须保留原锁目录"
+                assert_eq release "$(cat "$log")" \
+                    "拒绝接管锁目录前必须释放回收保护"
+            fi
+        )
+    done
+}
+
 test_reality_checks_require_bounded_dns_and_openssl() {
     (
         local help_text
@@ -3654,6 +3708,7 @@ main() {
         test_runtime_dir_permission_failure_is_fatal
         test_lockdir_first_acquisition_uses_reclaim_guard
         test_lock_acquisition_installs_runtime_cleanup_traps
+        test_unidentified_lock_owner_is_rejected_without_process_scan
         test_reality_checks_require_bounded_dns_and_openssl
         test_manual_reality_target_cloudflare_warning_is_non_blocking
         test_reality_pool_selection_is_sequential_and_stable

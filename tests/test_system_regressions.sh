@@ -769,7 +769,7 @@ test_ntp_light_repair_is_covered_by_runtime_cleanup() {
 test_enable_ntp_failure_stages_enter_runtime_rollback() {
     local stage
 
-    for stage in package sources enable active timesyncd; do
+    for stage in package stop sources enable active timesyncd; do
         (
             local case_dir="$TEST_TMP/ntp-entry-$stage"
             local log="$case_dir/events.log" chrony_active=0
@@ -815,7 +815,7 @@ test_enable_ntp_failure_stages_enter_runtime_rollback() {
                 printf 'systemctl:%s\n' "$*" >> "$log"
                 case "$*" in
                     'is-active --quiet systemd-timesyncd'|'is-enabled --quiet systemd-timesyncd') return 0 ;;
-                    'stop chrony') return 0 ;;
+                    'stop chrony') [ "$stage" != stop ] ;;
                     'enable --now chrony')
                         [ "$stage" != enable ] || return 23
                         chrony_active=1
@@ -841,6 +841,11 @@ test_enable_ntp_failure_stages_enter_runtime_rollback() {
                 "NTP 的 $stage 阶段失败后必须进入统一运行态回滚"
             assert_file_contains "$log" "^rollback:${stage}$"
             case "$stage" in
+                stop)
+                    assert_file_contains "$log" '^systemctl:stop chrony$'
+                    assert_file_not_contains "$log" '^sources$' \
+                        "chrony 停止失败后不得写入新配置"
+                    ;;
                 enable)
                     assert_file_contains "$log" '^systemctl:enable --now chrony$'
                     ;;
@@ -1870,9 +1875,11 @@ test_journald_fallback_prefers_managed_dropin() {
         printf '%s\n' 'SystemMaxUse=500M' > "$JOURNALD_VPSBOX_CONF"
         systemd-analyze() { return 42; }
         grep() {
-            [ "${1:-}" = -E ] &&
-                [ "${3:-}" = /etc/systemd/journald.conf ] &&
-                [ "${4:-}" = "$JOURNALD_VPSBOX_CONF" ] || return 42
+            [ "$#" -eq 5 ] &&
+                [ "${1:-}" = -h ] &&
+                [ "${2:-}" = -E ] &&
+                [ "${4:-}" = /etc/systemd/journald.conf ] &&
+                [ "${5:-}" = "$JOURNALD_VPSBOX_CONF" ] || return 42
             printf '%s\n' 'SystemMaxUse=100M' 'SystemMaxUse=500M'
         }
 

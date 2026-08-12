@@ -825,13 +825,6 @@ lock_pid_from_file() {
     return 1
 }
 
-find_running_vpsbox_pid() {
-    ps -eo pid=,args= 2>/dev/null |
-        awk -v self="$$" -v cmd="$CMD_PATH" '
-            $1 != self && index($0, cmd) { print $1; exit }
-        '
-}
-
 show_process_summary() {
     local pid="$1"
 
@@ -844,10 +837,6 @@ terminate_old_vpsbox_menu() {
     local pid="${1:-}"
     local confirm
     local i
-
-    if ! is_pid "$pid"; then
-        pid="$(find_running_vpsbox_pid || true)"
-    fi
 
     if ! process_alive "$pid"; then
         return 1
@@ -1020,6 +1009,10 @@ acquire_lock() {
         fi
 
         old_pid="$(lock_pid_from_file "$LOCK_FILE" || true)"
+        if ! is_pid "$old_pid"; then
+            err "vpsbox 锁元数据缺少有效 PID，已拒绝猜测或终止进程。请先退出旧菜单；必要时重启 VPS。"
+            exit 1
+        fi
         if old_menu_lost_terminal "$LOCK_FILE" "$old_pid" && terminate_orphaned_vpsbox_menu "$old_pid"; then
             if flock -n 200; then
                 LOCK_USING_FLOCK=1
@@ -1072,7 +1065,11 @@ acquire_lock() {
 
     wait_for_lockdir_metadata || true
     old_pid="$(lock_pid_from_file "$LOCK_DIR/pid" || true)"
-    [ -z "$old_pid" ] && old_pid="$(find_running_vpsbox_pid || true)"
+    if ! is_pid "$old_pid"; then
+        release_lockdir_reclaim_guard
+        err "vpsbox 锁元数据缺少有效 PID，已拒绝猜测、终止进程或清理锁目录。请先退出旧菜单；必要时重启 VPS。"
+        exit 1
+    fi
     if ! process_alive "$old_pid"; then
         warn "检测到残留 vpsbox 锁，正在清理。"
         rm -rf -- "$LOCK_DIR"
@@ -8569,7 +8566,15 @@ enable_ntp_sync() {
     fi
     info "chrony 服务名：$svc"
 
-    systemctl stop "$svc" 2>/dev/null || true
+    if ! systemctl stop "$svc" 2>/dev/null; then
+        err "chrony 停止失败，正在恢复原 NTP 状态。"
+        settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
+            "$chrony_package" "$timesyncd_package" \
+            "$chrony_unit" "$chrony_enabled" "$chrony_active" \
+            "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
+            "$applied_before" || true
+        return 1
+    fi
     if ! write_chrony_sources; then
         settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
             "$chrony_package" "$timesyncd_package" \
@@ -17493,7 +17498,7 @@ journald_conf_value() {
         rendered="$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null)"; then
         value="$(awk -F= -v key="$key" '$0 ~ "^[[:space:]]*" key "=" { value=$2 } END { print value }' <<< "$rendered")"
     else
-        value="$(grep -E "^[[:space:]]*$key=" /etc/systemd/journald.conf "$JOURNALD_VPSBOX_CONF" 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
+        value="$(grep -h -E "^[[:space:]]*$key=" /etc/systemd/journald.conf "$JOURNALD_VPSBOX_CONF" 2>/dev/null | tail -n 1 | cut -d= -f2- || true)"
     fi
     [ -n "$value" ] || return 1
     printf '%s\n' "$value"
