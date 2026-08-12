@@ -10368,7 +10368,7 @@ apply_ssh_port_change() {
 
     if ssh_effective_ports_match_target; then
         info "SSH 端口已经是 $SSH_TARGET_PORT，无需重复修改。"
-        if ! confirm_default_yes "仍要重新写入并重启 SSH？"; then
+        if ! confirm_default_no "仍要重新写入并重启 SSH？"; then
             info "已取消重复修改。"
             return 0
         fi

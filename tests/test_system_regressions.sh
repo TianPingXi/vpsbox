@@ -357,12 +357,12 @@ test_alpine_update_uses_bounded_steps() {
     assert_eq 2 "$(wc -l < "$log" | tr -d ' ')" "Alpine 应只执行 update 和 upgrade"
 }
 
-test_existing_ssh_port_rewrite_uses_default_yes_confirmation() {
+test_existing_ssh_port_rewrite_uses_default_no_confirmation() {
     local answer input label
 
-    for answer in "" y Y; do
+    for answer in y Y; do
         (
-            label="${answer:-blank}"
+            label="$answer"
             local case_dir="$TEST_TMP/ssh-repeat-confirm-$label"
             local event_log="$case_dir/events.log"
             mkdir -p "$case_dir"
@@ -389,13 +389,14 @@ test_existing_ssh_port_rewrite_uses_default_yes_confirmation() {
                 fail "$label 确认后事务失败不应报告成功"
             fi
             assert_eq $'validate\ntransaction:49222' "$(cat "$event_log")" \
-                "$label 应通过重复写入确认，并继续要求精确 YES 后才进入事务"
+                "$label 应通过默认取消的重复写入确认，并继续要求精确 YES 后才进入事务"
         )
     done
 
-    for answer in n N; do
+    for answer in "" n N; do
         (
-            local case_dir="$TEST_TMP/ssh-repeat-cancel-$answer"
+            label="${answer:-blank}"
+            local case_dir="$TEST_TMP/ssh-repeat-cancel-$label"
             local event_log="$case_dir/events.log"
             mkdir -p "$case_dir"
             : > "$event_log"
@@ -409,9 +410,9 @@ test_existing_ssh_port_rewrite_uses_default_yes_confirmation() {
             validate_ssh_access_controls() { printf 'unexpected\n' >> "$event_log"; }
 
             apply_ssh_port_change <<< "$answer" >/dev/null 2>&1 ||
-                fail "输入 $answer 取消重复写入时应安全返回"
+                fail "输入 $label 取消重复写入时应安全返回"
             assert_empty_file "$event_log" \
-                "输入 $answer 取消后不得进入访问控制检查或 SSH 事务"
+                "输入 $label 取消后不得进入访问控制检查或 SSH 事务"
         )
     done
 }
@@ -3728,7 +3729,7 @@ main() {
         test_systemd_resolved_rollback_failure_is_reported
         test_main_ssh_port_rewrite_handles_case_and_match_blocks
         test_main_ssh_port_is_inserted_before_match_without_global_port
-        test_existing_ssh_port_rewrite_uses_default_yes_confirmation
+        test_existing_ssh_port_rewrite_uses_default_no_confirmation
         test_active_ufw_and_firewalld_unrecognized_rules_warn
         test_unrecognized_local_firewall_rule_still_requires_exact_yes
         test_selinux_ssh_port_range_is_validated
