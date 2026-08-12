@@ -174,6 +174,8 @@ Fail2ban 的硬验收包括配置、服务、jail、SSH 端口和 nftables actio
   -> 确认新版进程已成功启动
 ```
 
+自更新只有在同目录临时文件完成当前脚本复制和权限设置后，才原子发布新的 `.previous`；准备或发布失败时保留既有 `.previous`，且不替换当前脚本。
+
 sing-box 更新或节点事务无法恢复时应停止启动，避免新操作覆盖现有恢复依据。菜单动作通过统一分发隔离单次失败，失败后保留菜单，同时让领域函数的真实退出状态可被测试和日志观察。
 
 ## 8. 维护与验证
@@ -203,6 +205,8 @@ VPSBOX_TEST_STRICT=1 bash tests/run.sh
 # 差异检查
 git diff --check
 ```
+
+ShellCheck 优先使用 Windows 本机维护的最新版；Debian 13 WSL 主要承担 Linux 专属语义和回归验证。两端 ShellCheck 版本不一致时，WSL 发行版自带版本的输出只作辅助，以本机最新版结果为准。
 
 只修改文档时复核最终差异并运行 `git diff --check` 即可。涉及 Linux 权限、`/proc`、服务管理器、真实防火墙或 SSH 连通性的行为，在本机测试无法覆盖时再使用隔离 Linux 环境或已明确授权的 VPS。
 

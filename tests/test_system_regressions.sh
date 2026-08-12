@@ -294,20 +294,37 @@ test_debian_update_stops_after_first_failure() {
     assert_file_contains "$log" ' update$'
 }
 
-test_debian_update_uses_upgrade_timeout() {
+test_debian_update_defaults_to_yes_and_uses_upgrade_timeout() {
     local log="$TEST_TMP/debian-update-success.log"
 
     detect_os() { OS=debian; }
     apt_get_bounded() { printf '%s\n' "$*" >> "$log"; }
     reboot_required_state() { printf '不需要\n'; }
 
-    update_system_packages <<< "y" >/dev/null
+    update_system_packages <<< "" >/dev/null
     assert_file_contains "$log" "^${PACKAGE_UPDATE_TIMEOUT} update$"
     assert_file_contains "$log" "^${SYSTEM_UPGRADE_TIMEOUT} upgrade -y$"
     assert_file_contains "$log" "^${SYSTEM_UPGRADE_TIMEOUT} autoremove -y$"
     assert_eq 3 "$(wc -l < "$log" | tr -d ' ')" "Debian 更新应依次执行三个有界步骤"
     [ "$SYSTEM_UPGRADE_TIMEOUT" -ge 3600 ] ||
         fail "完整系统升级的上限不应沿用短安装超时"
+}
+
+test_system_update_can_still_be_cancelled() {
+    local answer
+
+    for answer in n N; do
+        (
+            local log="$TEST_TMP/system-update-cancelled-$answer.log"
+
+            detect_os() { OS=debian; }
+            apt_get_bounded() { printf '%s\n' "$*" >> "$log"; }
+
+            update_system_packages <<< "$answer" >/dev/null
+            [ ! -e "$log" ] ||
+                fail "输入 $answer 取消系统更新后不得调用包管理器"
+        )
+    done
 }
 
 test_debian_upgrade_failure_skips_autoremove() {
@@ -334,10 +351,69 @@ test_alpine_update_uses_bounded_steps() {
     apk_bounded() { printf '%s\n' "$*" >> "$log"; }
     reboot_required_state() { printf '不需要\n'; }
 
-    update_system_packages <<< "y" >/dev/null
+    update_system_packages <<< "Y" >/dev/null
     assert_file_contains "$log" "^${PACKAGE_UPDATE_TIMEOUT} update$"
     assert_file_contains "$log" "^${SYSTEM_UPGRADE_TIMEOUT} upgrade$"
     assert_eq 2 "$(wc -l < "$log" | tr -d ' ')" "Alpine 应只执行 update 和 upgrade"
+}
+
+test_existing_ssh_port_rewrite_uses_default_yes_confirmation() {
+    local answer input label
+
+    for answer in "" y Y; do
+        (
+            label="${answer:-blank}"
+            local case_dir="$TEST_TMP/ssh-repeat-confirm-$label"
+            local event_log="$case_dir/events.log"
+            mkdir -p "$case_dir"
+            : > "$event_log"
+            SSHD_MAIN_CONF="$case_dir/sshd_config"
+            printf 'Port 49222\n' > "$SSHD_MAIN_CONF"
+
+            sshd_binary() { printf '%s\n' /bin/true; }
+            ssh_socket_activation_enabled_or_active() { return 1; }
+            choose_ssh_target_port() { printf '49222\n'; }
+            ssh_effective_ports_match_target() { return 0; }
+            validate_ssh_access_controls() {
+                printf 'validate\n' >> "$event_log"
+            }
+            firewall_runtime_enabled() { return 1; }
+            ssh_effective_ports_csv() { printf '%s\n' 49222; }
+            apply_ssh_port_target_transaction() {
+                printf 'transaction:%s\n' "$1" >> "$event_log"
+                return 23
+            }
+
+            input="${answer}"$'\nYES'
+            if apply_ssh_port_change <<< "$input" >/dev/null 2>&1; then
+                fail "$label 确认后事务失败不应报告成功"
+            fi
+            assert_eq $'validate\ntransaction:49222' "$(cat "$event_log")" \
+                "$label 应通过重复写入确认，并继续要求精确 YES 后才进入事务"
+        )
+    done
+
+    for answer in n N; do
+        (
+            local case_dir="$TEST_TMP/ssh-repeat-cancel-$answer"
+            local event_log="$case_dir/events.log"
+            mkdir -p "$case_dir"
+            : > "$event_log"
+            SSHD_MAIN_CONF="$case_dir/sshd_config"
+            printf 'Port 49222\n' > "$SSHD_MAIN_CONF"
+
+            sshd_binary() { printf '%s\n' /bin/true; }
+            ssh_socket_activation_enabled_or_active() { return 1; }
+            choose_ssh_target_port() { printf '49222\n'; }
+            ssh_effective_ports_match_target() { return 0; }
+            validate_ssh_access_controls() { printf 'unexpected\n' >> "$event_log"; }
+
+            apply_ssh_port_change <<< "$answer" >/dev/null 2>&1 ||
+                fail "输入 $answer 取消重复写入时应安全返回"
+            assert_empty_file "$event_log" \
+                "输入 $answer 取消后不得进入访问控制检查或 SSH 事务"
+        )
+    done
 }
 
 test_ntp_package_rollback_restores_timesyncd() {
@@ -3588,7 +3664,8 @@ main() {
         test_ntp_rejects_dangling_config_before_tracking_or_install
         test_atomic_snapshot_restore_move_failure_preserves_target
         test_debian_update_stops_after_first_failure
-        test_debian_update_uses_upgrade_timeout
+        test_debian_update_defaults_to_yes_and_uses_upgrade_timeout
+        test_system_update_can_still_be_cancelled
         test_debian_upgrade_failure_skips_autoremove
         test_alpine_update_uses_bounded_steps
         test_ntp_package_rollback_restores_timesyncd
@@ -3651,6 +3728,7 @@ main() {
         test_systemd_resolved_rollback_failure_is_reported
         test_main_ssh_port_rewrite_handles_case_and_match_blocks
         test_main_ssh_port_is_inserted_before_match_without_global_port
+        test_existing_ssh_port_rewrite_uses_default_yes_confirmation
         test_active_ufw_and_firewalld_unrecognized_rules_warn
         test_unrecognized_local_firewall_rule_still_requires_exact_yes
         test_selinux_ssh_port_range_is_validated

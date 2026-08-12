@@ -318,6 +318,7 @@ test_vpsbox_older_is_noop() {
 test_vpsbox_newer_updates_once() {
     reset_update_case newer
     write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
+    printf 'keep-backup\n' > "${CMD_PATH}.previous"
     write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_NEWER" remote
 
     update_vpsbox > "$TEST_TMP/newer.out" 2>&1 || fail "远端新版本应更新成功"
@@ -332,6 +333,71 @@ reexec:${CMD_PATH}.previous" "$(cat "$MOCK_EVENT_LOG")" \
         "更新必须在替换主脚本前启动 watchdog，再安装入口并重新执行"
     assert_eq "$SCRIPT_URL" "$(cat "$MOCK_CURL_LOG")" \
         "新地址可用时只应访问当前官方地址"
+}
+
+test_vpsbox_backup_copy_failure_preserves_existing_previous() {
+    local output="$TEST_TMP/backup-copy-failure.out"
+
+    reset_update_case backup-copy-failure
+    write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
+    printf 'keep-backup\n' > "${CMD_PATH}.previous"
+    write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_NEWER" remote
+    cp() {
+        if [ "$#" -ge 4 ] && [ "$1" = -a ] &&
+            [ "$3" = "$CMD_PATH" ]; then
+            return 23
+        fi
+        command cp "$@"
+    }
+
+    if update_vpsbox > "$output" 2>&1; then
+        fail "当前脚本复制失败时更新不得继续"
+    fi
+    assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_CURRENT"
+    assert_file_contains "$CMD_PATH" 'installed'
+    assert_file_contains "${CMD_PATH}.previous" '^keep-backup$' \
+        "当前脚本复制失败时必须保留旧 .previous"
+    assert_empty_file "$MOCK_EVENT_LOG" \
+        "备份复制失败后不得启动 watchdog 或替换命令入口"
+    [ -z "$(find "$CASE_DIR" -maxdepth 1 \
+        \( -name '.vpsbox-update.*' -o -name '.vpsbox-previous.*' \) \
+        -print -quit)" ] || fail "备份复制失败后必须清理更新临时文件"
+    assert_file_contains "$output" '备份当前 vpsbox 脚本失败'
+}
+
+test_vpsbox_backup_publish_failure_preserves_existing_previous() {
+    local output="$TEST_TMP/backup-publish-failure.out"
+
+    reset_update_case backup-publish-failure
+    write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
+    printf 'keep-backup\n' > "${CMD_PATH}.previous"
+    write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_NEWER" remote
+    mv() {
+        local destination=""
+        local arg
+
+        for arg in "$@"; do
+            destination="$arg"
+        done
+        if [ "$destination" = "${CMD_PATH}.previous" ]; then
+            return 23
+        fi
+        command mv "$@"
+    }
+
+    if update_vpsbox > "$output" 2>&1; then
+        fail ".previous 原子发布失败时更新不得继续"
+    fi
+    assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_CURRENT"
+    assert_file_contains "$CMD_PATH" 'installed'
+    assert_file_contains "${CMD_PATH}.previous" '^keep-backup$' \
+        ".previous 原子发布失败时必须保留旧备份"
+    assert_empty_file "$MOCK_EVENT_LOG" \
+        "备份发布失败后不得启动 watchdog 或替换命令入口"
+    [ -z "$(find "$CASE_DIR" -maxdepth 1 \
+        \( -name '.vpsbox-update.*' -o -name '.vpsbox-previous.*' \) \
+        -print -quit)" ] || fail "备份发布失败后必须清理更新临时文件"
+    assert_file_contains "$output" '备份当前 vpsbox 脚本失败'
 }
 
 test_vpsbox_watchdog_start_failure_preserves_current() {
@@ -1194,6 +1260,8 @@ main() {
         test_vpsbox_same_is_noop
         test_vpsbox_older_is_noop
         test_vpsbox_newer_updates_once
+        test_vpsbox_backup_copy_failure_preserves_existing_previous
+        test_vpsbox_backup_publish_failure_preserves_existing_previous
         test_vpsbox_watchdog_start_failure_preserves_current
         test_vpsbox_update_rejects_unsafe_previous_target
         test_vpsbox_never_fetches_old_owner_url

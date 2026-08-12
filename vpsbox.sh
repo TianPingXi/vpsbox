@@ -7007,7 +7007,7 @@ settle_vpsbox_update_watchdog_after_safe_restore() {
 
 update_vpsbox() {
     local backup="${CMD_PATH}.previous"
-    local candidate
+    local backup_tmp candidate
     local status
 
     info "正在下载最新 vpsbox 脚本..."
@@ -7041,14 +7041,19 @@ update_vpsbox() {
             err "旧版本备份路径不是安全的普通文件，已取消更新：$backup"
             return 1
         fi
-        rm -f -- "$backup" || { rm -f "$candidate"; return 1; }
     fi
-    cp -a "$CMD_PATH" "$backup" || {
-        rm -f "$candidate"
-        err "备份当前 vpsbox 脚本失败，已取消更新。"
+    backup_tmp="$(mktemp "$(dirname "$backup")/.vpsbox-previous.XXXXXX")" || {
+        rm -f -- "$candidate"
+        err "无法创建 vpsbox 备份临时文件，已取消更新。"
         return 1
     }
-    chmod 700 "$backup" || { rm -f "$candidate"; return 1; }
+    if ! cp -a -- "$CMD_PATH" "$backup_tmp" ||
+        ! chmod 700 "$backup_tmp" ||
+        ! mv -f -- "$backup_tmp" "$backup"; then
+        rm -f -- "$candidate" "$backup_tmp"
+        err "备份当前 vpsbox 脚本失败，已取消更新。"
+        return 1
+    fi
     start_vpsbox_update_watchdog "$backup" || {
         rm -f "$candidate"
         err "无法启动新版 vpsbox 启动监护，已取消更新。"
@@ -10363,14 +10368,10 @@ apply_ssh_port_change() {
 
     if ssh_effective_ports_match_target; then
         info "SSH 端口已经是 $SSH_TARGET_PORT，无需重复修改。"
-        if ! read -r -p "仍要重新写入并重启 SSH？[y/N]: " confirm; then
-            info "输入已结束，已取消重复修改。"
+        if ! confirm_default_yes "仍要重新写入并重启 SSH？"; then
+            info "已取消重复修改。"
             return 0
         fi
-        case "$confirm" in
-            y|Y|yes|YES) ;;
-            *) info "已取消重复修改。"; return 0 ;;
-        esac
     fi
 
     validate_ssh_access_controls || {
@@ -10905,8 +10906,6 @@ EOF
 }
 
 update_system_packages() {
-    local confirm
-
     detect_os
     case "$OS" in
         debian)
@@ -10932,11 +10931,10 @@ EOF
             ;;
     esac
 
-    read -r -p "确认继续？[y/N]: " confirm || return 1
-    case "$confirm" in
-        y|Y|yes|YES) ;;
-        *) info "已取消系统更新。"; return 0 ;;
-    esac
+    if ! confirm_default_yes "确认继续？"; then
+        info "已取消系统更新。"
+        return 0
+    fi
 
     case "$OS" in
         debian)
