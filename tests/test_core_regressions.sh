@@ -850,7 +850,7 @@ test_unidentified_lock_owner_is_rejected_without_process_scan() {
             if (acquire_lock) > "$output" 2>&1; then
                 fail "$mode 模式下锁元数据缺少有效 PID 时必须拒绝接管"
             fi
-            assert_file_contains "$output" '锁元数据缺少有效 PID'
+            assert_file_contains "$output" '锁元数据'
             assert_no_forbidden "$mode 模式下不得用进程子串匹配兜底"
             if [ "$mode" = lockdir ]; then
                 [ -d "$LOCK_DIR" ] ||
@@ -858,6 +858,173 @@ test_unidentified_lock_owner_is_rejected_without_process_scan() {
                 assert_eq release "$(cat "$log")" \
                     "拒绝接管锁目录前必须释放回收保护"
             fi
+        )
+    done
+}
+
+test_mismatched_lock_owner_identity_is_rejected() {
+    local mode
+
+    for mode in flock lockdir; do
+        (
+            local case_dir="$TEST_TMP/lock-owner-mismatch-$mode"
+            local output="$case_dir/output" log="$case_dir/events.log"
+
+            mkdir -p "$case_dir"
+            : > "$log"
+            RUNTIME_DIR="$case_dir/run"
+            LOCK_FILE="$RUNTIME_DIR/menu.lock"
+            LOCK_DIR="$RUNTIME_DIR/menu.lock.d"
+            LOCK_RECLAIM_DIR="$RUNTIME_DIR/menu.lock.reclaim"
+            mkdir -p "$RUNTIME_DIR"
+            prepare_runtime_dir() { :; }
+            process_alive() { return 0; }
+            process_start_ticks() { printf '%s\n' 54321; }
+            ps() { forbid "锁身份不匹配时不得显示猜测出的进程"; }
+            kill() { forbid "锁身份不匹配时不得终止进程"; }
+            old_menu_lost_terminal() { forbid "锁身份不匹配时不得检查终端"; }
+            terminate_old_vpsbox_menu() { forbid "锁身份不匹配时不得进入人工终止流程"; }
+            terminate_orphaned_vpsbox_menu() { forbid "锁身份不匹配时不得自动终止进程"; }
+            forbid_init
+
+            if [ "$mode" = flock ]; then
+                printf '%s\n' 'pid=4242' 'start_ticks=12345' 'boot_id=test-boot' > "$LOCK_FILE"
+                flock() { return 1; }
+            else
+                mkdir "$LOCK_DIR"
+                printf '%s\n' 'pid=4242' 'start_ticks=12345' 'boot_id=test-boot' > "$LOCK_DIR/pid"
+                command() {
+                    if [ "${1:-}" = -v ] && [ "${2:-}" = flock ]; then
+                        return 1
+                    fi
+                    builtin command "$@"
+                }
+                acquire_lockdir_reclaim_guard() { return 0; }
+                release_lockdir_reclaim_guard() { printf '%s\n' release >> "$log"; }
+            fi
+
+            if (acquire_lock) > "$output" 2>&1; then
+                fail "$mode 模式下锁持有者身份不匹配时必须拒绝接管"
+            fi
+            assert_file_contains "$output" '进程身份不匹配'
+            assert_no_forbidden "$mode 模式下锁身份不匹配时不得处理进程"
+            if [ "$mode" = lockdir ]; then
+                [ -d "$LOCK_DIR" ] ||
+                    fail "锁持有者身份不匹配时必须保留原锁目录"
+                assert_eq release "$(cat "$log")" \
+                    "拒绝身份不匹配的锁目录前必须释放回收保护"
+            fi
+        )
+    done
+}
+
+test_process_identity_requires_start_and_boot_match() {
+    (
+        process_alive() { return 0; }
+        process_start_ticks() { printf '%s\n' 12345; }
+        cat() {
+            [ "${1:-}" = /proc/sys/kernel/random/boot_id ] || return 1
+            printf '%s\n' test-boot
+        }
+
+        process_identity_matches 4242 12345 test-boot ||
+            fail "启动时间和 boot ID 同时匹配时应确认进程身份"
+        if process_identity_matches 4242 54321 test-boot; then
+            fail "启动时间不匹配时不得确认进程身份"
+        fi
+        if process_identity_matches 4242 12345 other-boot; then
+            fail "boot ID 不匹配时不得确认进程身份"
+        fi
+    )
+}
+
+test_menu_termination_rechecks_identity_before_first_signal() {
+    (
+        local checks=0 output="$TEST_TMP/menu-confirm-identity-change.out"
+
+        process_identity_matches() {
+            checks=$((checks + 1))
+            [ "$checks" -eq 1 ]
+        }
+        show_process_summary() { :; }
+        kill() { forbid "用户确认期间身份变化后不得发送信号"; }
+        forbid_init
+
+        if terminate_old_vpsbox_menu 4242 12345 test-boot \
+            > "$output" 2>&1 <<< YES; then
+            fail "用户确认期间进程身份变化时人工终止必须失败"
+        fi
+        assert_file_contains "$output" '进程身份已变化'
+        assert_no_forbidden "人工终止必须在 TERM 前复核身份"
+    )
+    (
+        local checks=0
+
+        process_identity_matches() {
+            checks=$((checks + 1))
+            [ "$checks" -eq 1 ]
+        }
+        kill() { forbid "自动回收在身份变化后不得发送信号"; }
+        forbid_init
+
+        if terminate_orphaned_vpsbox_menu 4242 12345 test-boot >/dev/null 2>&1; then
+            fail "自动回收在 TERM 前身份不匹配时必须失败"
+        fi
+        assert_no_forbidden "自动回收必须在 TERM 前复核身份"
+    )
+}
+
+test_menu_termination_does_not_kill_reused_pid() {
+    local mode
+
+    for mode in manual orphan; do
+        (
+            local checks=0 log="$TEST_TMP/menu-reused-pid-$mode.log"
+            local identity_checks_before_term=2
+
+            : > "$log"
+            process_identity_matches() {
+                checks=$((checks + 1))
+                [ "$checks" -le "$identity_checks_before_term" ]
+            }
+            show_process_summary() { :; }
+            kill() { printf '%s\n' "$*" >> "$log"; }
+            sleep() { :; }
+
+            if [ "$mode" = manual ]; then
+                terminate_old_vpsbox_menu 4242 12345 test-boot >/dev/null <<< YES
+            else
+                terminate_orphaned_vpsbox_menu 4242 12345 test-boot >/dev/null
+            fi
+            assert_eq '-TERM 4242' "$(cat "$log")" \
+                "$mode 模式下 TERM 后原身份消失时不得向复用 PID 发送 KILL"
+        )
+    done
+}
+
+test_menu_termination_preserves_term_to_kill_flow() {
+    local mode
+
+    for mode in manual orphan; do
+        (
+            local identity_alive=1 log="$TEST_TMP/menu-term-kill-$mode.log"
+
+            : > "$log"
+            process_identity_matches() { [ "$identity_alive" -eq 1 ]; }
+            show_process_summary() { :; }
+            kill() {
+                printf '%s\n' "$*" >> "$log"
+                [ "${1:-}" != -KILL ] || identity_alive=0
+            }
+            sleep() { :; }
+
+            if [ "$mode" = manual ]; then
+                terminate_old_vpsbox_menu 4242 12345 test-boot >/dev/null <<< YES
+            else
+                terminate_orphaned_vpsbox_menu 4242 12345 test-boot >/dev/null
+            fi
+            assert_eq $'-TERM 4242\n-KILL 4242' "$(cat "$log")" \
+                "$mode 模式下同一旧菜单未退出时应保留 TERM 到 KILL 流程"
         )
     done
 }
@@ -3034,11 +3201,18 @@ test_interrupted_singbox_update_rolls_back() {
 
 test_lockdir_metadata_window_is_waited() {
     (
+        local pid="" start="" boot=""
+
         LOCK_DIR="$TEST_TMP/lock-window/lockdir"
         mkdir -p "$LOCK_DIR"
-        (sleep 0.2; printf '%s\n' 'pid=4242' > "$LOCK_DIR/pid") &
+        (sleep 0.2; printf '%s\n' 'pid=4242' 'start_ticks=12345' \
+            'boot_id=test-boot' > "$LOCK_DIR/pid") &
         wait_for_lockdir_metadata || fail "锁目录创建后应等待并发持有者写入元数据"
-        assert_eq 4242 "$(lock_pid_from_file "$LOCK_DIR/pid")"
+        read_lock_owner_snapshot "$LOCK_DIR/pid" pid start boot ||
+            fail "等待完成后应能读取完整锁身份快照"
+        assert_eq 4242 "$pid"
+        assert_eq 12345 "$start"
+        assert_eq test-boot "$boot"
         wait
     )
 }
@@ -3709,6 +3883,11 @@ main() {
         test_lockdir_first_acquisition_uses_reclaim_guard
         test_lock_acquisition_installs_runtime_cleanup_traps
         test_unidentified_lock_owner_is_rejected_without_process_scan
+        test_mismatched_lock_owner_identity_is_rejected
+        test_process_identity_requires_start_and_boot_match
+        test_menu_termination_rechecks_identity_before_first_signal
+        test_menu_termination_does_not_kill_reused_pid
+        test_menu_termination_preserves_term_to_kill_flow
         test_reality_checks_require_bounded_dns_and_openssl
         test_manual_reality_target_cloudflare_warning_is_non_blocking
         test_reality_pool_selection_is_sequential_and_stable

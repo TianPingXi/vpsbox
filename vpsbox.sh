@@ -657,34 +657,39 @@ process_stdin_tty() {
     esac
 }
 
-lock_owner_matches() {
-    local path="$1" pid="$2" recorded_start recorded_boot current_start current_boot
+process_identity_matches() {
+    local pid="$1" recorded_start="$2" recorded_boot="$3"
+    local current_start current_boot
+
     process_alive "$pid" || return 1
-    recorded_start="$(lock_metadata_value "$path" start_ticks || true)"
-    recorded_boot="$(lock_metadata_value "$path" boot_id || true)"
     current_start="$(process_start_ticks "$pid" || true)"
     current_boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
-    [ -n "$recorded_start" ] && [ "$recorded_start" = "$current_start" ] &&
+    [[ "$recorded_start" =~ ^[0-9]+$ ]] && [ "$recorded_start" = "$current_start" ] &&
         [ -n "$recorded_boot" ] && [ "$recorded_boot" = "$current_boot" ]
 }
 
 old_menu_lost_terminal() {
-    local path="$1" pid="$2"
-    lock_owner_matches "$path" "$pid" || return 1
+    local pid="$1" recorded_start="$2" recorded_boot="$3"
+
+    process_identity_matches "$pid" "$recorded_start" "$recorded_boot" || return 1
     [ -z "$(process_stdin_tty "$pid")" ]
 }
 
 terminate_orphaned_vpsbox_menu() {
-    local pid="$1" i
+    local pid="$1" recorded_start="$2" recorded_boot="$3" i
+
+    process_identity_matches "$pid" "$recorded_start" "$recorded_boot" || return 1
     warn "检测到失去终端的旧 vpsbox 菜单（PID $pid），正在自动回收锁。"
+    process_identity_matches "$pid" "$recorded_start" "$recorded_boot" || return 1
     kill -TERM "$pid" 2>/dev/null || return 1
     for i in 1 2 3 4 5; do
-        process_alive "$pid" || return 0
+        process_identity_matches "$pid" "$recorded_start" "$recorded_boot" || return 0
         sleep 1
     done
+    process_identity_matches "$pid" "$recorded_start" "$recorded_boot" || return 0
     kill -KILL "$pid" 2>/dev/null || return 1
     sleep 1
-    ! process_alive "$pid"
+    ! process_identity_matches "$pid" "$recorded_start" "$recorded_boot"
 }
 
 cleanup_vpsbox_lock() {
@@ -811,18 +816,20 @@ install_lock_cleanup_traps() {
     trap 'exit 131' QUIT
 }
 
-lock_pid_from_file() {
-    local path="$1"
-    local pid=""
+read_lock_owner_snapshot() {
+    local path="$1" pid_var="$2" start_var="$3" boot_var="$4"
+    local snapshot_pid="" snapshot_start="" snapshot_boot=""
 
-    [ -f "$path" ] || return 1
-    # PID 只用于定位候选进程；后续自动回收仍必须核对 start_ticks 与 boot_id。
-    pid="$(awk -F= '$1 == "pid" { print $2; exit }' "$path" 2>/dev/null || true)"
-    if is_pid "$pid"; then
-        printf '%s\n' "$pid"
-        return 0
+    if [ -f "$path" ]; then
+        snapshot_pid="$(lock_metadata_value "$path" pid || true)"
+        snapshot_start="$(lock_metadata_value "$path" start_ticks || true)"
+        snapshot_boot="$(lock_metadata_value "$path" boot_id || true)"
     fi
-    return 1
+    printf -v "$pid_var" '%s' "$snapshot_pid"
+    printf -v "$start_var" '%s' "$snapshot_start"
+    printf -v "$boot_var" '%s' "$snapshot_boot"
+    is_pid "$snapshot_pid" && [[ "$snapshot_start" =~ ^[0-9]+$ ]] &&
+        [ -n "$snapshot_boot" ]
 }
 
 show_process_summary() {
@@ -834,11 +841,11 @@ show_process_summary() {
 }
 
 terminate_old_vpsbox_menu() {
-    local pid="${1:-}"
+    local pid="$1" recorded_start="$2" recorded_boot="$3"
     local confirm
     local i
 
-    if ! process_alive "$pid"; then
+    if ! process_identity_matches "$pid" "$recorded_start" "$recorded_boot"; then
         return 1
     fi
 
@@ -854,16 +861,21 @@ terminate_old_vpsbox_menu() {
         exit 1
     fi
 
-    kill "$pid" 2>/dev/null || true
+    if ! process_identity_matches "$pid" "$recorded_start" "$recorded_boot"; then
+        err "旧菜单进程身份已变化，已拒绝终止该 PID。"
+        return 1
+    fi
+    kill -TERM "$pid" 2>/dev/null || true
     for i in 1 2 3 4 5; do
-        process_alive "$pid" || return 0
+        process_identity_matches "$pid" "$recorded_start" "$recorded_boot" || return 0
         sleep 1
     done
 
+    process_identity_matches "$pid" "$recorded_start" "$recorded_boot" || return 0
     warn "旧菜单未正常退出，正在强制结束。"
     kill -KILL "$pid" 2>/dev/null || true
     sleep 1
-    process_alive "$pid" && return 1 || return 0
+    process_identity_matches "$pid" "$recorded_start" "$recorded_boot" && return 1 || return 0
 }
 
 write_flock_metadata() {
@@ -993,7 +1005,7 @@ activate_lockdir_lock() {
 }
 
 acquire_lock() {
-    local old_pid=""
+    local old_pid="" old_start="" old_boot="" snapshot_valid=0
     local reclaim_guard=0
 
     prepare_runtime_dir
@@ -1008,12 +1020,15 @@ acquire_lock() {
             return 0
         fi
 
-        old_pid="$(lock_pid_from_file "$LOCK_FILE" || true)"
-        if ! is_pid "$old_pid"; then
-            err "vpsbox 锁元数据缺少有效 PID，已拒绝猜测或终止进程。请先退出旧菜单；必要时重启 VPS。"
+        snapshot_valid=0
+        read_lock_owner_snapshot "$LOCK_FILE" old_pid old_start old_boot && snapshot_valid=1
+        if [ "$snapshot_valid" -ne 1 ] ||
+            ! process_identity_matches "$old_pid" "$old_start" "$old_boot"; then
+            err "vpsbox 锁元数据不完整或进程身份不匹配，已拒绝猜测或终止进程。请先退出旧菜单；必要时重启 VPS。"
             exit 1
         fi
-        if old_menu_lost_terminal "$LOCK_FILE" "$old_pid" && terminate_orphaned_vpsbox_menu "$old_pid"; then
+        if old_menu_lost_terminal "$old_pid" "$old_start" "$old_boot" &&
+            terminate_orphaned_vpsbox_menu "$old_pid" "$old_start" "$old_boot"; then
             if flock -n 200; then
                 LOCK_USING_FLOCK=1
                 write_flock_metadata
@@ -1021,7 +1036,7 @@ acquire_lock() {
                 return 0
             fi
         fi
-        if terminate_old_vpsbox_menu "$old_pid"; then
+        if terminate_old_vpsbox_menu "$old_pid" "$old_start" "$old_boot"; then
             if flock -n 200; then
                 LOCK_USING_FLOCK=1
                 write_flock_metadata
@@ -1064,7 +1079,8 @@ acquire_lock() {
     fi
 
     wait_for_lockdir_metadata || true
-    old_pid="$(lock_pid_from_file "$LOCK_DIR/pid" || true)"
+    snapshot_valid=0
+    read_lock_owner_snapshot "$LOCK_DIR/pid" old_pid old_start old_boot && snapshot_valid=1
     if ! is_pid "$old_pid"; then
         release_lockdir_reclaim_guard
         err "vpsbox 锁元数据缺少有效 PID，已拒绝猜测、终止进程或清理锁目录。请先退出旧菜单；必要时重启 VPS。"
@@ -1073,9 +1089,15 @@ acquire_lock() {
     if ! process_alive "$old_pid"; then
         warn "检测到残留 vpsbox 锁，正在清理。"
         rm -rf -- "$LOCK_DIR"
-    elif old_menu_lost_terminal "$LOCK_DIR/pid" "$old_pid" && terminate_orphaned_vpsbox_menu "$old_pid"; then
+    elif [ "$snapshot_valid" -ne 1 ] ||
+        ! process_identity_matches "$old_pid" "$old_start" "$old_boot"; then
+        release_lockdir_reclaim_guard
+        err "vpsbox 锁元数据不完整或进程身份不匹配，已拒绝终止进程或清理锁目录。请先退出旧菜单；必要时重启 VPS。"
+        exit 1
+    elif old_menu_lost_terminal "$old_pid" "$old_start" "$old_boot" &&
+        terminate_orphaned_vpsbox_menu "$old_pid" "$old_start" "$old_boot"; then
         rm -rf -- "$LOCK_DIR"
-    elif terminate_old_vpsbox_menu "$old_pid"; then
+    elif terminate_old_vpsbox_menu "$old_pid" "$old_start" "$old_boot"; then
         rm -rf -- "$LOCK_DIR"
     else
         release_lockdir_reclaim_guard
