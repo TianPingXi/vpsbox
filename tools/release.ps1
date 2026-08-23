@@ -1,6 +1,7 @@
 ﻿[CmdletBinding()]
 param(
-    [switch]$Bump
+    [switch]$Bump,
+    [switch]$Review
 )
 
 $ErrorActionPreference = 'Stop'
@@ -130,13 +131,16 @@ function Get-HeadVersion {
 }
 
 function Assert-RepositoryState {
+    param([switch]$AllowMixedChanges)
+
     [array]$stagedPaths = @(Invoke-GitLines `
             -Description '已暂存文件列表' `
             -Arguments @('diff', '--cached', '--name-only', '--diff-filter=ACDMRTUXB'))
     [array]$unstagedPaths = @(Invoke-GitLines `
             -Description '未暂存文件列表' `
             -Arguments @('diff', '--name-only', '--diff-filter=ACDMRTUXB'))
-    if ($stagedPaths.Count -gt 0 -and $unstagedPaths.Count -gt 0) {
+    if (-not $AllowMixedChanges -and
+        $stagedPaths.Count -gt 0 -and $unstagedPaths.Count -gt 0) {
         throw (
             '检测到已暂存和未暂存改动同时存在。' +
             '请先统一暂存全部改动，或取消暂存后重试。'
@@ -159,7 +163,7 @@ function Assert-RepositoryState {
             -Description '未跟踪文件列表' `
             -Arguments @('ls-files', '--others', '--exclude-standard'))
     if ($untracked.Count -gt 0) {
-        throw "存在未跟踪文件，请确认后再发布：$($untracked -join ', ')"
+        throw "存在未跟踪文件，请纳入 Git 跟踪或清理后重试：$($untracked -join ', ')"
     }
 
     [array]$indexFlags = @(Invoke-GitLines `
@@ -238,6 +242,10 @@ $selfRelativePath = 'tools/release.ps1'
 $sensitivePattern =
     'BEGIN ((OPENSSH|RSA|EC|DSA|ENCRYPTED) )?PRIVATE KEY|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}'
 
+if ($Bump -and $Review) {
+    throw '-Bump 与 -Review 不能同时使用。'
+}
+
 if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf) -or
     -not (Test-Path -LiteralPath $readmePath -PathType Leaf) -or
     -not (Test-Path -LiteralPath $testsPath -PathType Container)) {
@@ -259,7 +267,7 @@ try {
         throw "$selfRelativePath 必须是当前仓库正常跟踪的文件。"
     }
 
-    Assert-RepositoryState
+    Assert-RepositoryState -AllowMixedChanges:$Review
     [array]$workingTreeChanges = @(Invoke-GitLines `
             -Description '工作区状态' `
             -Arguments @('status', '--porcelain=v1', '--untracked-files=all'))
@@ -278,7 +286,7 @@ try {
 
     $headVersion = Get-HeadVersion
     $expectedVersion = Get-NextPatchVersion -Version $headVersion
-    if ($Bump) {
+    if ($Bump -or $Review) {
         if ($currentVersion -notin $headVersion, $expectedVersion) {
             throw "当前版本 $currentVersion 既不等于 HEAD 的 $headVersion，也不是下一版本 $expectedVersion。"
         }
@@ -307,7 +315,7 @@ try {
             -Description '检查后的工作区状态' `
             -Arguments @('status', '--porcelain=v1', '--untracked-files=all'))
     if (($statusAfterChecks -join "`n") -cne $statusBeforeChecks) {
-        throw '发布检查期间 Git 状态发生变化，请确认没有其他进程正在修改仓库后重试。'
+        throw '静态检查期间 Git 状态发生变化，请确认没有其他进程正在修改仓库后重试。'
     }
 
     [byte[]]$scriptBytesAfterChecks = [IO.File]::ReadAllBytes($scriptPath)
@@ -316,7 +324,7 @@ try {
             [Convert]::ToBase64String($scriptBytesBeforeChecks) -or
         [Convert]::ToBase64String($readmeBytesAfterChecks) -cne
             [Convert]::ToBase64String($readmeBytesBeforeChecks)) {
-        throw '发布检查期间版本文件发生变化，请重试。'
+        throw '静态检查期间版本文件发生变化，请重试。'
     }
 
     $versionChanged = $false
@@ -409,6 +417,10 @@ try {
         }
         Write-Info "预检和改号后复验全部通过，当前版本：$currentVersion"
         Write-Info '请统一暂存所有改动后，再运行 .\tools\release.ps1 做最终检查。'
+    }
+    elseif ($Review) {
+        Write-Info "开发审查静态检查全部通过，当前版本：$currentVersion"
+        Write-Info '审查模式没有要求待发布改动提前递增版本。'
     }
     else {
         Write-Info "发布前静态检查全部通过，当前版本：$currentVersion"

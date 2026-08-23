@@ -911,6 +911,7 @@ test_stopped_docker_fixed_binding_is_public() {
 test_stopped_docker_fixed_binding_without_host_ip_is_rejected() {
     (
         local output="$TEST_TMP/docker-stopped-empty-host-ip.out"
+        local snapshot_var
 
         docker() { :; }
         firewall_docker_available() { return 0; }
@@ -937,11 +938,38 @@ test_stopped_docker_fixed_binding_without_host_ip_is_rejected() {
             esac
         }
 
+        for snapshot_var in \
+            FW_DOCKER_TCP FW_DOCKER_UDP FW_DOCKER_PUBLIC_TCP FW_DOCKER_PUBLIC_UDP \
+            FW_DOCKER_PUBLIC4_TCP FW_DOCKER_PUBLIC4_UDP \
+            FW_DOCKER_PUBLIC6_TCP FW_DOCKER_PUBLIC6_UDP \
+            FW_DOCKER_PROXY4_TCP FW_DOCKER_PROXY4_UDP \
+            FW_DOCKER_PROXY6_TCP FW_DOCKER_PROXY6_UDP \
+            FW_DOCKER_BRIDGES FW_DOCKER_DAEMON_PID FW_DOCKER_DAEMON_START_TICKS; do
+            printf -v "$snapshot_var" '%s' stale
+        done
+        FW_DOCKER_HOST_NETWORK=1
+        FW_DOCKER_DYNAMIC_PORT=1
+        FW_DOCKER_DIRECT_NETWORK=1
+        FW_DOCKER_CUSTOM_BRIDGE=1
+
         if firewall_detect_docker_ports >"$output" 2>&1; then
             fail "停止容器的固定 HostPort 缺少 HostIp 时不得猜测公网绑定范围"
         fi
         assert_file_contains "$output" '固定宿主机端口但未指定绑定地址'
         assert_file_contains "$output" '请启动该容器后重试'
+        for snapshot_var in \
+            FW_DOCKER_TCP FW_DOCKER_UDP FW_DOCKER_PUBLIC_TCP FW_DOCKER_PUBLIC_UDP \
+            FW_DOCKER_PUBLIC4_TCP FW_DOCKER_PUBLIC4_UDP \
+            FW_DOCKER_PUBLIC6_TCP FW_DOCKER_PUBLIC6_UDP \
+            FW_DOCKER_PROXY4_TCP FW_DOCKER_PROXY4_UDP \
+            FW_DOCKER_PROXY6_TCP FW_DOCKER_PROXY6_UDP \
+            FW_DOCKER_BRIDGES FW_DOCKER_DAEMON_PID FW_DOCKER_DAEMON_START_TICKS; do
+            assert_eq "" "${!snapshot_var}" "失败的 Docker 探测不得提交 $snapshot_var"
+        done
+        assert_eq 0 "$FW_DOCKER_HOST_NETWORK"
+        assert_eq 0 "$FW_DOCKER_DYNAMIC_PORT"
+        assert_eq 0 "$FW_DOCKER_DIRECT_NETWORK"
+        assert_eq 0 "$FW_DOCKER_CUSTOM_BRIDGE"
     )
 }
 

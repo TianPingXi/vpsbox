@@ -210,6 +210,14 @@ ShellCheck 优先使用 Windows 本机维护的最新版；Debian 13 WSL 主要�
 
 只修改文档时复核最终差异并运行 `git diff --check` 即可。涉及 Linux 权限、`/proc`、服务管理器、真实防火墙或 SSH 连通性的行为，在本机测试无法覆盖时再使用隔离 Linux 环境或已明确授权的 VPS。
 
+开发期间可以在版本号尚未变化、tracked 文件仍有未提交改动时运行只读静态审查：
+
+```powershell
+.\tools\release.ps1 -Review
+```
+
+审查模式复用正式发布的 ShellCheck、Bash 语法、差异格式和敏感信息检查，不修改版本或仓库文件。它允许 tracked 文件同时存在已暂存和未暂存改动，但仍拒绝冲突、未跟踪文件及异常索引状态。完整 Linux/WSL 回归仍需单独运行。
+
 正式发布或推送前，先在 Windows PowerShell 同步提升版本号：
 
 ```powershell

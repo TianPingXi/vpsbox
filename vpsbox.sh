@@ -25,7 +25,7 @@ umask 077
 # ==============================================================================
 # 产品、版本、受管路径和超时均在加载时确定，业务函数只读取这些配置。
 APP_NAME="vpsbox"
-VPSBOX_VERSION="v1.0.57"
+VPSBOX_VERSION="v1.0.58"
 # 只从当前仓库下载并识别可执行脚本。
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
 SINGBOX_RELEASE_VERSION="1.13.14"
@@ -707,10 +707,9 @@ cleanup_vpsbox_lock() {
     fi
 }
 
-cleanup_vpsbox_runtime() {
-    local backup="${ACTIVE_NODE_BACKUP:-}"
-    local firewall_rollback="${ACTIVE_FIREWALL_ROLLBACK_DIR:-}"
-    local firewall_additive="${ACTIVE_FIREWALL_ADDITIVE_DIR:-}"
+cleanup_vpsbox_runtime_host_transactions() {
+    local backup="$1"
+
     if declare -F cleanup_active_bounded_command >/dev/null 2>&1; then
         cleanup_active_bounded_command
     fi
@@ -755,6 +754,11 @@ cleanup_vpsbox_runtime() {
         firewall_abort_port_transition ||
             warn "端口切换被中断，防火墙临时规则恢复失败，请重新进入防火墙菜单更新。"
     fi
+}
+
+cleanup_vpsbox_runtime_firewall_transactions() {
+    local firewall_additive="$1" firewall_rollback="$2"
+
     if [ -n "$firewall_additive" ] &&
         declare -F firewall_additive_transaction_dir_valid >/dev/null 2>&1 &&
         firewall_additive_transaction_dir_valid "$firewall_additive" &&
@@ -788,6 +792,9 @@ cleanup_vpsbox_runtime() {
                 warn "防火墙操作被中断，自动恢复失败；快照已保留：$firewall_rollback"
         fi
     fi
+}
+
+cleanup_vpsbox_runtime_service_transactions() {
     if declare -F cleanup_active_fail2ban_test >/dev/null 2>&1; then
         cleanup_active_fail2ban_test ||
             warn "Fail2ban 测试地址自动解封失败，请按错误提示手动清理。"
@@ -801,6 +808,17 @@ cleanup_vpsbox_runtime() {
         rollback_active_dns_operation ||
             warn "DNS 修改被中断，配置或服务状态未能完整恢复；临时快照已保留。"
     fi
+}
+
+cleanup_vpsbox_runtime() {
+    local backup="${ACTIVE_NODE_BACKUP:-}"
+    local firewall_rollback="${ACTIVE_FIREWALL_ROLLBACK_DIR:-}"
+    local firewall_additive="${ACTIVE_FIREWALL_ADDITIVE_DIR:-}"
+
+    # 先冻结活动事务路径，再按原有顺序收敛各事务域；后续回滚可能清空对应全局状态。
+    cleanup_vpsbox_runtime_host_transactions "$backup"
+    cleanup_vpsbox_runtime_firewall_transactions "$firewall_additive" "$firewall_rollback"
+    cleanup_vpsbox_runtime_service_transactions
     cleanup_vpsbox_lock
     if declare -F rollback_pending_vpsbox_update >/dev/null 2>&1; then
         rollback_pending_vpsbox_update ||
@@ -1004,52 +1022,50 @@ activate_lockdir_lock() {
     install_lock_cleanup_traps
 }
 
-acquire_lock() {
+try_acquire_flock_lock() {
+    flock -n 200 || return 1
+    LOCK_USING_FLOCK=1
+    write_flock_metadata
+    install_lock_cleanup_traps
+}
+
+acquire_flock_lock() {
     local old_pid="" old_start="" old_boot="" snapshot_valid=0
-    local reclaim_guard=0
 
-    prepare_runtime_dir
+    [ ! -L "$LOCK_FILE" ] || { err "$LOCK_FILE 是符号链接，已拒绝使用。"; exit 1; }
+    exec 200<>"$LOCK_FILE"
+    if try_acquire_flock_lock; then
+        return 0
+    fi
 
-    if command -v flock >/dev/null 2>&1; then
-        [ ! -L "$LOCK_FILE" ] || { err "$LOCK_FILE 是符号链接，已拒绝使用。"; exit 1; }
-        exec 200<>"$LOCK_FILE"
-        if flock -n 200; then
-            LOCK_USING_FLOCK=1
-            write_flock_metadata
-            install_lock_cleanup_traps
-            return 0
-        fi
-
-        snapshot_valid=0
-        read_lock_owner_snapshot "$LOCK_FILE" old_pid old_start old_boot && snapshot_valid=1
-        if [ "$snapshot_valid" -ne 1 ] ||
-            ! process_identity_matches "$old_pid" "$old_start" "$old_boot"; then
-            err "vpsbox 锁元数据不完整或进程身份不匹配，已拒绝猜测或终止进程。请先退出旧菜单；必要时重启 VPS。"
-            exit 1
-        fi
-        if old_menu_lost_terminal "$old_pid" "$old_start" "$old_boot" &&
-            terminate_orphaned_vpsbox_menu "$old_pid" "$old_start" "$old_boot"; then
-            if flock -n 200; then
-                LOCK_USING_FLOCK=1
-                write_flock_metadata
-                install_lock_cleanup_traps
-                return 0
-            fi
-        fi
-        if terminate_old_vpsbox_menu "$old_pid" "$old_start" "$old_boot"; then
-            if flock -n 200; then
-                LOCK_USING_FLOCK=1
-                write_flock_metadata
-                install_lock_cleanup_traps
-                return 0
-            fi
-            err "旧菜单已处理，但锁仍被占用，请稍后重试。"
-            exit 1
-        fi
-
-        err "检测到另一个 vpsbox 正在运行，请先退出旧菜单。"
+    snapshot_valid=0
+    read_lock_owner_snapshot "$LOCK_FILE" old_pid old_start old_boot && snapshot_valid=1
+    if [ "$snapshot_valid" -ne 1 ] ||
+        ! process_identity_matches "$old_pid" "$old_start" "$old_boot"; then
+        err "vpsbox 锁元数据不完整或进程身份不匹配，已拒绝猜测或终止进程。请先退出旧菜单；必要时重启 VPS。"
         exit 1
     fi
+    if old_menu_lost_terminal "$old_pid" "$old_start" "$old_boot" &&
+        terminate_orphaned_vpsbox_menu "$old_pid" "$old_start" "$old_boot"; then
+        if try_acquire_flock_lock; then
+            return 0
+        fi
+    fi
+    if terminate_old_vpsbox_menu "$old_pid" "$old_start" "$old_boot"; then
+        if try_acquire_flock_lock; then
+            return 0
+        fi
+        err "旧菜单已处理，但锁仍被占用，请稍后重试。"
+        exit 1
+    fi
+
+    err "检测到另一个 vpsbox 正在运行，请先退出旧菜单。"
+    exit 1
+}
+
+acquire_lockdir_lock() {
+    local old_pid="" old_start="" old_boot="" snapshot_valid=0
+    local reclaim_guard=0
 
     if [ -L "$LOCK_DIR" ] || { [ -e "$LOCK_DIR" ] && [ ! -d "$LOCK_DIR" ]; }; then
         err "$LOCK_DIR 不是安全的锁目录，已拒绝使用。"
@@ -1116,6 +1132,16 @@ acquire_lock() {
         exit 1
     }
     [ "$reclaim_guard" = "1" ] && release_lockdir_reclaim_guard
+}
+
+acquire_lock() {
+    prepare_runtime_dir
+
+    if command -v flock >/dev/null 2>&1; then
+        acquire_flock_lock
+    else
+        acquire_lockdir_lock
+    fi
 }
 
 # ==============================================================================
@@ -5499,85 +5525,118 @@ verify_all_node_runtime() {
     done
 }
 
-create_or_rebuild_node() {
-    local confirm domain default_name input_name name port password config_id
-    local staged_config staged_state
-    local existing_port="" existing_protocols="" sibling_ports=""
+prompt_node_name() {
+    local domain="$1" default_name="$2" output_var="$3"
+    local pasted_name selected_name
 
-    ensure_node_dependencies || return 1
-    require_valid_node_state_if_present || return 1
-    if protocol_visible_exists ss; then
-        load_protocol_state ss || return 1
-        existing_port="$PORT"
-        existing_protocols=both
-        warn "检测到已有 Shadowsocks 节点。"
-        if ! read -r -p "是否覆盖重建 Shadowsocks 节点？[y/N]: " confirm; then
+    while true; do
+        read -r -p "请输入节点名称，留空默认 ${default_name}：" pasted_name || {
             info "输入已结束，已取消。"
             return 1
-        fi
-        [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消。"; return 0; }
-    fi
-
-    sibling_ports="$(configured_node_ports_csv ss)" || {
-        err "无法读取 VLESS Reality 节点端口，未创建 Shadowsocks 节点。"
-        return 1
-    }
-
-    if ! prompt_node_host domain "请输入节点域名或 IP（留空自动检测公网 IPv4）："; then
-        info "输入已结束，已取消。"
-        return 1
-    fi
-    default_name="$(default_name_for_host "$domain")"
-    while true; do
-        read -r -p "请输入节点名称，留空默认 ${default_name}：" input_name ||
-            { info "输入已结束，已取消。"; return 1; }
-        input_name="$(sanitize_paste_input "$input_name")"
-        if [ -n "$input_name" ] && [[ "${input_name,,}" == "${domain,,}"* ]]; then
-            err "检测到节点名称包含连接地址前缀，可能是粘贴残留：$input_name"
+        }
+        pasted_name="$(sanitize_paste_input "$pasted_name")"
+        if [ -n "$pasted_name" ] && [[ "${pasted_name,,}" == "${domain,,}"* ]]; then
+            err "检测到节点名称包含连接地址前缀，可能是粘贴残留：$pasted_name"
             err "请重新输入节点名称。"
             continue
         fi
-        name="$(sanitize_name "${input_name:-$default_name}")"
-        info "已识别节点名称：$name"
+        selected_name="$(sanitize_name "${pasted_name:-$default_name}")"
+        printf -v "$output_var" '%s' "$selected_name"
+        info "已识别节点名称：$selected_name"
+        return 0
+    done
+}
+
+prompt_reality_server() {
+    local server_var="$1" deferred_var="$2"
+    local input_sni selected_server latency_ms=""
+    local check_deferred=0 check_status=0 capability_checked=0 target_is_manual=0
+
+    while true; do
+        read -r -p "请输入 Reality 目标域名/SNI（留空自动选择）：" input_sni || {
+            info "输入已结束，已取消。"
+            return 1
+        }
+        input_sni="$(sanitize_paste_input "$input_sni")"
+        if [ "$capability_checked" -eq 0 ]; then
+            capability_checked=1
+            if ! reality_tls_probe_supported; then
+                warn "当前 OpenSSL 版本过旧或不支持 TLS 1.3 / ALPN 探测，无法检测 Reality 目标。"
+                selected_server="$REALITY_PROBE_FALLBACK_SERVER_NAME"
+                info "已使用默认 Reality 目标：$selected_server"
+                check_deferred=0
+                break
+            fi
+        fi
+        if [ -z "$input_sni" ]; then
+            info "正在自动选择 Reality 目标，请稍候..."
+            if select_fastest_reality_server selected_server latency_ms; then
+                info "已选择 Reality 目标：${selected_server}（连接耗时 ${latency_ms} ms）"
+                check_deferred=0
+                break
+            fi
+            err "默认域名池中没有可用的 Reality 目标，请手动输入。"
+            continue
+        fi
+        selected_server="$(normalize_host "$input_sni")"
+        if ! is_domain_name "$selected_server"; then
+            err "Reality 目标必须是有效域名，不能使用 IP 地址。"
+            continue
+        fi
+        if command -v openssl >/dev/null 2>&1; then
+            info "正在检查 Reality 目标的 DNS、TLS 1.3 与 H2 支持..."
+            if check_reality_server "$selected_server"; then
+                check_status=0
+            else
+                check_status=$?
+            fi
+            if [ "$check_status" -ne 0 ]; then
+                if [ "$check_status" -eq 2 ]; then
+                    err "目标域名支持 TLS 1.3，但未协商 H2，请更换。"
+                else
+                    err "目标域名无法解析或 TLS 1.3 不可达，请更换。"
+                fi
+                continue
+            fi
+        else
+            check_deferred=1
+            info "将在最终确认并补齐依赖后检查 Reality 目标。"
+        fi
+        target_is_manual=1
         break
     done
-    if ! port="$(choose_node_port "$existing_port" both "$existing_protocols" "$sibling_ports")"; then
-        err "节点端口选择失败，未创建 Shadowsocks 节点。"
-        return 1
+    if [ "$target_is_manual" -eq 1 ] &&
+        reality_target_uses_cloudflare "$selected_server"; then
+        warn "检测到该 Reality 目标使用 Cloudflare，可能产生 fallback 转发流量。"
     fi
-    info "节点端口：$port"
+    printf -v "$server_var" '%s' "$selected_server"
+    printf -v "$deferred_var" '%s' "$check_deferred"
+}
 
-    cat <<EOF
-----------------------------------------
- 请确认节点信息
- 协议：Shadowsocks
- 连接地址：$domain
- 连接端口：$port
- 节点名称：$name
-----------------------------------------
-EOF
-    if ! confirm_default_yes "确认无误并创建？"; then
-        info "已取消，未修改现有节点。"
-        return 0
-    fi
+begin_node_creation_transaction() {
+    local label="$1"
 
-    # 最终确认前不创建事务、不停止服务，也不刷新防火墙；pending 写入后才允许首次修改。
     if ! begin_node_transaction; then
-        err "无法创建受保护的节点事务，未修改 Shadowsocks 节点。"
+        err "无法创建受保护的节点事务，未修改 $label 节点。"
         return 1
     fi
     if ! install_singbox_for_node_transaction; then
         rollback_node_files_transaction || true
-        err "sing-box 或节点依赖安装失败，未创建 Shadowsocks 节点。"
+        err "sing-box 或节点依赖安装失败，未创建 $label 节点。"
         return 1
     fi
+}
+
+prepare_shadowsocks_node_stage() {
+    local domain="$1" name="$2" port="$3"
+    local password config_id staged_config staged_state
+
     info "正在自动生成随机强密码..."
     if ! password="$(random_password)" || [ -z "$password" ]; then
         rollback_node_files_transaction || true
         err "随机强密码生成失败，未创建 Shadowsocks 节点。"
         return 1
     fi
-
     config_id="$(generate_node_config_id)" || {
         rollback_node_files_transaction || true
         err "节点配置标识生成失败，未创建 Shadowsocks 节点。"
@@ -5594,182 +5653,24 @@ EOF
         err "Shadowsocks 配置或状态预生成校验失败，未修改现有节点。"
         return 1
     fi
-    if ! mark_node_transaction_mutated ||
-        ! firewall_prepare_port_transition "$port" "$port" "$existing_port" "$existing_port"; then
-        fail_after_node_rollback "主机防火墙无法临时放行新节点端口，未创建 Shadowsocks 节点" "创建前" || true
-        return 1
-    fi
-    info "加密方式：$SS_METHOD"
-    info "正在写入 Shadowsocks 配置..."
-    if ! publish_staged_node ss ||
-        ! check_node_config_set ||
-        ! setup_service; then
-        fail_after_node_rollback "Shadowsocks 配置、状态或服务写入失败" "创建前" || true
-        return 1
-    fi
-    info "正在启动 sing-box 服务..."
-    if ! restart_singbox_cleanly || ! verify_all_node_runtime; then
-        fail_after_node_rollback "sing-box 未保持运行或节点端口未完整监听" "创建前" || true
-        return 1
-    fi
-    if ! firewall_complete_port_transition; then
-        fail_after_node_rollback "主机防火墙未能同步节点端口" "创建前" || true
-        return 1
-    fi
-
-    if ! commit_node_transaction; then
-        fail_after_node_rollback "节点事务提交失败" "创建前" || true
-        return 1
-    fi
-    repair_node_uri_cache_best_effort "创建 Shadowsocks 节点后"
-    info "Shadowsocks 节点创建完成，当前节点链接如下："
-    view_node_link || {
-        err "节点已创建并运行，但链接显示失败，请稍后使用查看节点链接功能重试。"
-        return 1
-    }
 }
 
-create_vless_reality_node() {
-    local confirm domain default_name input_name name port input_sni server_name
+prepare_vless_reality_node_stage() {
+    local domain="$1" name="$2" port="$3" server_name="$4" check_deferred="$5"
     local uuid short_id private_key public_key config_id staged_config staged_state
-    local existing_port="" existing_protocols="" reality_check_deferred=0 reality_check_status=0
-    local sibling_ports="" reality_latency_ms="" reality_probe_capability_checked=0
-    local reality_target_is_manual=0
+    local check_status=0
     local -a keypair
 
-    ensure_node_dependencies || return 1
-    require_valid_node_state_if_present || return 1
-    if protocol_visible_exists vless; then
-        load_protocol_state vless || return 1
-        existing_port="$PORT"
-        existing_protocols=tcp
-        warn "检测到已有 VLESS Reality 节点。"
-        if ! read -r -p "是否覆盖重建 VLESS Reality 节点？[y/N]: " confirm; then
-            info "输入已结束，已取消。"
-            return 1
-        fi
-        [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消。"; return 0; }
-    fi
-
-    sibling_ports="$(configured_node_ports_csv vless)" || {
-        err "无法读取 Shadowsocks 节点端口，未创建 VLESS Reality 节点。"
-        return 1
-    }
-
-    if ! prompt_node_host domain "请输入节点连接地址（域名或 IP，留空自动检测公网 IPv4）："; then
-        info "输入已结束，已取消。"
-        return 1
-    fi
-    default_name="$(default_name_for_host "$domain")"
-    default_name="vless-${default_name#ss-}"
-    while true; do
-        read -r -p "请输入节点名称，留空默认 ${default_name}：" input_name ||
-            { info "输入已结束，已取消。"; return 1; }
-        input_name="$(sanitize_paste_input "$input_name")"
-        if [ -n "$input_name" ] && [[ "${input_name,,}" == "${domain,,}"* ]]; then
-            err "检测到节点名称包含连接地址前缀，可能是粘贴残留：$input_name"
-            err "请重新输入节点名称。"
-            continue
-        fi
-        name="$(sanitize_name "${input_name:-$default_name}")"
-        info "已识别节点名称：$name"
-        break
-    done
-    while true; do
-        read -r -p "请输入 Reality 目标域名/SNI（留空自动选择）：" input_sni ||
-            { info "输入已结束，已取消。"; return 1; }
-        input_sni="$(sanitize_paste_input "$input_sni")"
-        if [ "$reality_probe_capability_checked" -eq 0 ]; then
-            reality_probe_capability_checked=1
-            if ! reality_tls_probe_supported; then
-                warn "当前 OpenSSL 版本过旧或不支持 TLS 1.3 / ALPN 探测，无法检测 Reality 目标。"
-                server_name="$REALITY_PROBE_FALLBACK_SERVER_NAME"
-                info "已使用默认 Reality 目标：$server_name"
-                reality_check_deferred=0
-                break
-            fi
-        fi
-        if [ -z "$input_sni" ]; then
-            info "正在自动选择 Reality 目标，请稍候..."
-            if select_fastest_reality_server server_name reality_latency_ms; then
-                info "已选择 Reality 目标：${server_name}（连接耗时 ${reality_latency_ms} ms）"
-                reality_check_deferred=0
-                break
-            fi
-            err "默认域名池中没有可用的 Reality 目标，请手动输入。"
-            continue
-        fi
-        server_name="$(normalize_host "$input_sni")"
-        if ! is_domain_name "$server_name"; then
-            err "Reality 目标必须是有效域名，不能使用 IP 地址。"
-            continue
-        fi
-        if command -v openssl >/dev/null 2>&1; then
-            info "正在检查 Reality 目标的 DNS、TLS 1.3 与 H2 支持..."
-            if check_reality_server "$server_name"; then
-                reality_check_status=0
-            else
-                reality_check_status=$?
-            fi
-            if [ "$reality_check_status" -ne 0 ]; then
-                if [ "$reality_check_status" -eq 2 ]; then
-                    err "目标域名支持 TLS 1.3，但未协商 H2，请更换。"
-                else
-                    err "目标域名无法解析或 TLS 1.3 不可达，请更换。"
-                fi
-                continue
-            fi
-        else
-            reality_check_deferred=1
-            info "将在最终确认并补齐依赖后检查 Reality 目标。"
-        fi
-        reality_target_is_manual=1
-        break
-    done
-    if [ "$reality_target_is_manual" -eq 1 ] &&
-        reality_target_uses_cloudflare "$server_name"; then
-        warn "检测到该 Reality 目标使用 Cloudflare，可能产生 fallback 转发流量。"
-    fi
-    if ! port="$(choose_node_port "$existing_port" tcp "$existing_protocols" "$sibling_ports")"; then
-        err "节点端口选择失败，未创建 VLESS Reality 节点。"
-        return 1
-    fi
-    info "节点端口：$port"
-
-    cat <<EOF
-----------------------------------------
- 请确认节点信息
- 协议：VLESS Reality
- 连接地址：$domain
- 连接端口：$port
- Reality 目标：${server_name}:443
- 节点名称：$name
-----------------------------------------
-EOF
-    if ! confirm_default_yes "确认无误并创建？"; then
-        info "已取消，未修改现有节点。"
-        return 0
-    fi
-
-    if ! begin_node_transaction; then
-        err "无法创建受保护的节点事务，未修改 VLESS Reality 节点。"
-        return 1
-    fi
-    if ! install_singbox_for_node_transaction; then
-        rollback_node_files_transaction || true
-        err "sing-box 或节点依赖安装失败，未创建 VLESS Reality 节点。"
-        return 1
-    fi
-    if [ "$reality_check_deferred" -eq 1 ]; then
+    if [ "$check_deferred" -eq 1 ]; then
         info "正在检查 Reality 目标的 DNS、TLS 1.3 与 H2 支持..."
         if check_reality_server "$server_name"; then
-            reality_check_status=0
+            check_status=0
         else
-            reality_check_status=$?
+            check_status=$?
         fi
-        if [ "$reality_check_status" -ne 0 ]; then
+        if [ "$check_status" -ne 0 ]; then
             rollback_node_files_transaction || true
-            if [ "$reality_check_status" -eq 2 ]; then
+            if [ "$check_status" -eq 2 ]; then
                 err "目标域名支持 TLS 1.3，但未协商 H2，未创建 VLESS Reality 节点。"
             else
                 err "目标域名无法解析或 TLS 1.3 不可达，未创建 VLESS Reality 节点。"
@@ -5797,7 +5698,6 @@ EOF
         err "Reality Short ID 生成失败，未创建 VLESS Reality 节点。"
         return 1
     fi
-
     config_id="$(generate_node_config_id)" || {
         rollback_node_files_transaction || true
         err "节点配置标识生成失败，未创建 VLESS Reality 节点。"
@@ -5818,16 +5718,26 @@ EOF
         err "VLESS Reality 配置或状态预生成校验失败，未修改现有节点。"
         return 1
     fi
+}
+
+publish_and_accept_node_creation() {
+    local protocol="$1" label="$2" port="$3" add_udp="$4"
+    local existing_port="$5" drop_udp="$6"
+
     if ! mark_node_transaction_mutated ||
-        ! firewall_prepare_port_transition "$port" "" "$existing_port" ""; then
-        fail_after_node_rollback "主机防火墙无法临时放行新节点端口，未创建 VLESS Reality 节点" "创建前" || true
+        ! firewall_prepare_port_transition "$port" "$add_udp" "$existing_port" "$drop_udp"; then
+        fail_after_node_rollback \
+            "主机防火墙无法临时放行新节点端口，未创建 $label 节点" "创建前" || true
         return 1
     fi
-    info "正在写入 VLESS Reality 配置..."
-    if ! publish_staged_node vless ||
+    if [ "$protocol" = ss ]; then
+        info "加密方式：$SS_METHOD"
+    fi
+    info "正在写入 $label 配置..."
+    if ! publish_staged_node "$protocol" ||
         ! check_node_config_set ||
         ! setup_service; then
-        fail_after_node_rollback "VLESS Reality 配置、状态或服务写入失败" "创建前" || true
+        fail_after_node_rollback "$label 配置、状态或服务写入失败" "创建前" || true
         return 1
     fi
     info "正在启动 sing-box 服务..."
@@ -5839,17 +5749,132 @@ EOF
         fail_after_node_rollback "主机防火墙未能同步节点端口" "创建前" || true
         return 1
     fi
-
     if ! commit_node_transaction; then
         fail_after_node_rollback "节点事务提交失败" "创建前" || true
         return 1
     fi
-    repair_node_uri_cache_best_effort "创建 VLESS Reality 节点后"
-    info "VLESS Reality 节点创建完成，当前节点链接如下："
+    repair_node_uri_cache_best_effort "创建 $label 节点后"
+    info "$label 节点创建完成，当前节点链接如下："
     view_node_link || {
         err "节点已创建并运行，但链接显示失败，请稍后使用查看节点链接功能重试。"
         return 1
     }
+}
+
+create_or_rebuild_node() {
+    local confirm domain default_name name port
+    local existing_port="" existing_protocols="" sibling_ports=""
+
+    ensure_node_dependencies || return 1
+    require_valid_node_state_if_present || return 1
+    if protocol_visible_exists ss; then
+        load_protocol_state ss || return 1
+        existing_port="$PORT"
+        existing_protocols=both
+        warn "检测到已有 Shadowsocks 节点。"
+        if ! read -r -p "是否覆盖重建 Shadowsocks 节点？[y/N]: " confirm; then
+            info "输入已结束，已取消。"
+            return 1
+        fi
+        [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消。"; return 0; }
+    fi
+
+    sibling_ports="$(configured_node_ports_csv ss)" || {
+        err "无法读取 VLESS Reality 节点端口，未创建 Shadowsocks 节点。"
+        return 1
+    }
+
+    if ! prompt_node_host domain "请输入节点域名或 IP（留空自动检测公网 IPv4）："; then
+        info "输入已结束，已取消。"
+        return 1
+    fi
+    default_name="$(default_name_for_host "$domain")"
+    prompt_node_name "$domain" "$default_name" name || return 1
+    if ! port="$(choose_node_port "$existing_port" both "$existing_protocols" "$sibling_ports")"; then
+        err "节点端口选择失败，未创建 Shadowsocks 节点。"
+        return 1
+    fi
+    info "节点端口：$port"
+
+    cat <<EOF
+----------------------------------------
+ 请确认节点信息
+ 协议：Shadowsocks
+ 连接地址：$domain
+ 连接端口：$port
+ 节点名称：$name
+----------------------------------------
+EOF
+    if ! confirm_default_yes "确认无误并创建？"; then
+        info "已取消，未修改现有节点。"
+        return 0
+    fi
+
+    # 最终确认前不创建事务、不停止服务，也不刷新防火墙；pending 写入后才允许首次修改。
+    begin_node_creation_transaction Shadowsocks || return 1
+    prepare_shadowsocks_node_stage "$domain" "$name" "$port" || return 1
+    publish_and_accept_node_creation \
+        ss Shadowsocks "$port" "$port" "$existing_port" "$existing_port"
+}
+
+create_vless_reality_node() {
+    local confirm domain default_name name port server_name
+    local existing_port="" existing_protocols="" reality_check_deferred=0
+    local sibling_ports=""
+
+    ensure_node_dependencies || return 1
+    require_valid_node_state_if_present || return 1
+    if protocol_visible_exists vless; then
+        load_protocol_state vless || return 1
+        existing_port="$PORT"
+        existing_protocols=tcp
+        warn "检测到已有 VLESS Reality 节点。"
+        if ! read -r -p "是否覆盖重建 VLESS Reality 节点？[y/N]: " confirm; then
+            info "输入已结束，已取消。"
+            return 1
+        fi
+        [[ "$confirm" =~ ^[Yy]$ ]] || { info "已取消。"; return 0; }
+    fi
+
+    sibling_ports="$(configured_node_ports_csv vless)" || {
+        err "无法读取 Shadowsocks 节点端口，未创建 VLESS Reality 节点。"
+        return 1
+    }
+
+    if ! prompt_node_host domain "请输入节点连接地址（域名或 IP，留空自动检测公网 IPv4）："; then
+        info "输入已结束，已取消。"
+        return 1
+    fi
+    default_name="$(default_name_for_host "$domain")"
+    default_name="vless-${default_name#ss-}"
+    prompt_node_name "$domain" "$default_name" name || return 1
+    prompt_reality_server server_name reality_check_deferred || return 1
+    if ! port="$(choose_node_port "$existing_port" tcp "$existing_protocols" "$sibling_ports")"; then
+        err "节点端口选择失败，未创建 VLESS Reality 节点。"
+        return 1
+    fi
+    info "节点端口：$port"
+
+    cat <<EOF
+----------------------------------------
+ 请确认节点信息
+ 协议：VLESS Reality
+ 连接地址：$domain
+ 连接端口：$port
+ Reality 目标：${server_name}:443
+ 节点名称：$name
+----------------------------------------
+EOF
+    if ! confirm_default_yes "确认无误并创建？"; then
+        info "已取消，未修改现有节点。"
+        return 0
+    fi
+
+    begin_node_creation_transaction "VLESS Reality" || return 1
+    prepare_vless_reality_node_stage \
+        "$domain" "$name" "$port" "$server_name" "$reality_check_deferred" || return 1
+    publish_and_accept_node_creation \
+        vless "VLESS Reality" "$port" "" "$existing_port" ""
 }
 
 view_node_link() {
@@ -5947,9 +5972,136 @@ node_cleanup_target_artifacts_safe() {
     [ "$found" -eq 1 ]
 }
 
+prepare_node_deletion_transaction() {
+    local validation_spec="$1" cleanup_mode="$2" node_port="$3" firewall_drop_udp="$4"
+
+    if ! begin_node_transaction "$validation_spec"; then
+        err "备份当前节点失败，已取消删除。"
+        return 1
+    fi
+    if ! mark_node_transaction_mutated; then
+        fail_after_node_rollback "节点删除事务无法记录首次修改，已取消删除" "删除前" || true
+        return 1
+    fi
+    if [ "$cleanup_mode" -eq 0 ] &&
+        ! firewall_prepare_port_transition \
+            "" "" "$node_port" "$firewall_drop_udp"; then
+        fail_after_node_rollback "主机防火墙无法开始节点删除事务，已取消删除" "删除前" || true
+        return 1
+    fi
+}
+
+stop_node_runtime_for_deletion() {
+    local singbox_available="$1" node_port="$2" node_protocols="$3"
+    local port_status
+
+    if [ "$singbox_available" -eq 1 ]; then
+        service_stop 2>/dev/null ||
+            warn "服务管理器未能正常停止 sing-box，将继续检查 vpsbox 配置对应的进程。"
+        if ! stop_singbox_config_processes; then
+            fail_after_node_rollback "残留 sing-box 进程无法停止" "删除前" || true
+            return 1
+        fi
+        sleep 1
+    fi
+    if service_manager_is_active || [ -n "$(singbox_config_pids)" ]; then
+        fail_after_node_rollback "sing-box 服务仍在运行" "删除前" || true
+        return 1
+    fi
+    if [ "$singbox_available" -eq 1 ] && [ -n "$node_port" ]; then
+        if port_in_use_for_protocols "$node_port" "$node_protocols"; then
+            fail_after_node_rollback "节点端口 $node_port 仍被其他进程监听" "删除前" || true
+            return 1
+        else
+            port_status=$?
+            if [ "$port_status" -ne 1 ]; then
+                fail_after_node_rollback "无法确认节点端口 $node_port 是否已释放" "删除前" || true
+                return 1
+            fi
+        fi
+    fi
+}
+
+publish_node_deletion() {
+    local protocol="$1" label="$2" config state
+
+    config="$(node_config_path "$protocol")" || return 1
+    state="$(node_state_path "$protocol")" || return 1
+    rm -f -- "$config" "$state" || {
+        fail_after_node_rollback "$label 节点文件删除失败" "删除前" || true
+        return 1
+    }
+    repair_node_uri_cache_best_effort "删除节点后"
+}
+
+accept_node_deletion_result() {
+    local singbox_available="$1" cleanup_mode="$2"
+
+    if node_exists; then
+        if [ "$singbox_available" -eq 1 ]; then
+            if ! check_node_config_set ||
+                ! setup_service ||
+                ! restart_singbox_cleanly ||
+                ! verify_all_node_runtime; then
+                fail_after_node_rollback "剩余节点恢复运行失败" "删除前" || true
+                return 1
+            fi
+        elif ! require_valid_node_state_if_present; then
+            fail_after_node_rollback "剩余节点静态完整性校验失败" "删除前" || true
+            return 1
+        fi
+    else
+        if [ "$singbox_available" -eq 1 ] || service_is_enabled; then
+            if ! service_disable || service_is_enabled; then
+                fail_after_node_rollback "无法禁用 sing-box 开机启动" "删除前" || true
+                return 1
+            fi
+        fi
+        [ "$NODE_CONFIG_DIR" = "$CONFIG_DIR/vpsbox.d" ] &&
+            rmdir "$NODE_CONFIG_DIR" 2>/dev/null || true
+    fi
+}
+
+finish_node_deletion() {
+    local label="$1" singbox_available="$2" cleanup_mode="$3" port_unknown="$4"
+
+    if [ "$cleanup_mode" -eq 0 ] && ! firewall_complete_port_transition; then
+        fail_after_node_rollback "主机防火墙端口同步失败" "删除前" || true
+        return 1
+    fi
+    if ! commit_node_transaction; then
+        fail_after_node_rollback "节点删除事务提交失败" "删除前" || true
+        return 1
+    fi
+    if [ "$port_unknown" -eq 1 ] && firewall_control_plane_present; then
+        warn "无法从损坏状态中取得可信旧端口，未自动猜测或删除防火墙端口；请进入 [4] 主机防火墙执行一键开启/更新。"
+    fi
+    if node_exists; then
+        if [ "$singbox_available" -eq 1 ]; then
+            if [ "$cleanup_mode" -eq 1 ]; then
+                info "损坏的 $label 节点残留已清理，其他节点继续运行。"
+            else
+                info "$label 节点已删除，其他节点继续运行。"
+            fi
+        else
+            info "$label 节点已删除；其他节点配置已保留，但 sing-box 未安装，当前不会运行。"
+        fi
+    else
+        if [ "$singbox_available" -eq 1 ]; then
+            if [ "$cleanup_mode" -eq 1 ]; then
+                info "损坏的 $label 节点残留已清理，sing-box 服务已停止并禁用开机启动。"
+            else
+                info "$label 节点已删除，sing-box 服务已停止并禁用开机启动。"
+            fi
+        else
+            info "$label 节点残留配置已删除；sing-box 未安装，无需停止服务。"
+        fi
+    fi
+}
+
 delete_node_protocol() {
-    local protocol="$1" label config state node_port="" node_protocols
-    local confirm port_status transaction_validation="full" singbox_available=1
+    local protocol="$1" label node_port="" node_protocols
+    local confirm transaction_validation="full" singbox_available=1
     local firewall_drop_udp="" status sibling_protocol sibling_status
     local cleanup_mode=0 port_unknown=0
 
@@ -6045,111 +6197,14 @@ delete_node_protocol() {
         fi
     fi
 
-    if ! begin_node_transaction "$transaction_validation"; then
-        err "备份当前节点失败，已取消删除。"
-        return 1
-    fi
-    if ! mark_node_transaction_mutated; then
-        fail_after_node_rollback "节点删除事务无法记录首次修改，已取消删除" "删除前" || true
-        return 1
-    fi
-    if [ "$cleanup_mode" -eq 0 ] &&
-        ! firewall_prepare_port_transition \
-            "" "" "$node_port" "$firewall_drop_udp"; then
-        fail_after_node_rollback "主机防火墙无法开始节点删除事务，已取消删除" "删除前" || true
-        return 1
-    fi
-
-    if [ "$singbox_available" -eq 1 ]; then
-        service_stop 2>/dev/null ||
-            warn "服务管理器未能正常停止 sing-box，将继续检查 vpsbox 配置对应的进程。"
-        if ! stop_singbox_config_processes; then
-            fail_after_node_rollback "残留 sing-box 进程无法停止" "删除前" || true
-            return 1
-        fi
-        sleep 1
-    fi
-    if service_manager_is_active || [ -n "$(singbox_config_pids)" ]; then
-        fail_after_node_rollback "sing-box 服务仍在运行" "删除前" || true
-        return 1
-    fi
-    if [ "$singbox_available" -eq 1 ] && [ -n "$node_port" ]; then
-        if port_in_use_for_protocols "$node_port" "$node_protocols"; then
-            fail_after_node_rollback "节点端口 $node_port 仍被其他进程监听" "删除前" || true
-            return 1
-        else
-            port_status=$?
-            if [ "$port_status" -ne 1 ]; then
-                fail_after_node_rollback "无法确认节点端口 $node_port 是否已释放" "删除前" || true
-                return 1
-            fi
-        fi
-    fi
-
-    config="$(node_config_path "$protocol")" || return 1
-    state="$(node_state_path "$protocol")" || return 1
-    rm -f -- "$config" "$state" || {
-        fail_after_node_rollback "$label 节点文件删除失败" "删除前" || true
-        return 1
-    }
-    repair_node_uri_cache_best_effort "删除节点后"
-
-    if node_exists; then
-        if [ "$singbox_available" -eq 1 ]; then
-            if ! check_node_config_set ||
-                ! setup_service ||
-                ! restart_singbox_cleanly ||
-                ! verify_all_node_runtime; then
-                fail_after_node_rollback "剩余节点恢复运行失败" "删除前" || true
-                return 1
-            fi
-        elif ! require_valid_node_state_if_present; then
-            fail_after_node_rollback "剩余节点静态完整性校验失败" "删除前" || true
-            return 1
-        fi
-    else
-        if [ "$singbox_available" -eq 1 ] || service_is_enabled; then
-            if ! service_disable || service_is_enabled; then
-                fail_after_node_rollback "无法禁用 sing-box 开机启动" "删除前" || true
-                return 1
-            fi
-        fi
-        [ "$NODE_CONFIG_DIR" = "$CONFIG_DIR/vpsbox.d" ] &&
-            rmdir "$NODE_CONFIG_DIR" 2>/dev/null || true
-    fi
-    if [ "$cleanup_mode" -eq 0 ] && ! firewall_complete_port_transition; then
-        fail_after_node_rollback "主机防火墙端口同步失败" "删除前" || true
-        return 1
-    fi
-
-    if ! commit_node_transaction; then
-        fail_after_node_rollback "节点删除事务提交失败" "删除前" || true
-        return 1
-    fi
-    if [ "$port_unknown" -eq 1 ] && firewall_control_plane_present; then
-        warn "无法从损坏状态中取得可信旧端口，未自动猜测或删除防火墙端口；请进入 [4] 主机防火墙执行一键开启/更新。"
-    fi
-    if node_exists; then
-        if [ "$singbox_available" -eq 1 ]; then
-            if [ "$cleanup_mode" -eq 1 ]; then
-                info "损坏的 $label 节点残留已清理，其他节点继续运行。"
-            else
-                info "$label 节点已删除，其他节点继续运行。"
-            fi
-        else
-            info "$label 节点已删除；其他节点配置已保留，但 sing-box 未安装，当前不会运行。"
-        fi
-    else
-        if [ "$singbox_available" -eq 1 ]; then
-            if [ "$cleanup_mode" -eq 1 ]; then
-                info "损坏的 $label 节点残留已清理，sing-box 服务已停止并禁用开机启动。"
-            else
-                info "$label 节点已删除，sing-box 服务已停止并禁用开机启动。"
-            fi
-        else
-            info "$label 节点残留配置已删除；sing-box 未安装，无需停止服务。"
-        fi
-    fi
+    prepare_node_deletion_transaction \
+        "$transaction_validation" "$cleanup_mode" "$node_port" "$firewall_drop_udp" || return 1
+    stop_node_runtime_for_deletion \
+        "$singbox_available" "$node_port" "$node_protocols" || return 1
+    publish_node_deletion "$protocol" "$label" || return 1
+    accept_node_deletion_result "$singbox_available" "$cleanup_mode" || return 1
+    finish_node_deletion \
+        "$label" "$singbox_available" "$cleanup_mode" "$port_unknown"
 }
 
 delete_vless_reality_node() {
@@ -6546,6 +6601,21 @@ begin_singbox_update_transaction() {
     ACTIVE_SINGBOX_UPDATE_MUTATED=0
 }
 
+arm_singbox_update_rollback_material() {
+    ACTIVE_SINGBOX_UPDATE_PACKAGE="$1"
+    ACTIVE_SINGBOX_UPDATE_OLD_VERSION="$2"
+}
+
+promote_singbox_update_transaction() {
+    ACTIVE_SINGBOX_UPDATE_DIR="$1"
+    ACTIVE_SINGBOX_UPDATE_BACKUP="$2"
+    ACTIVE_SINGBOX_UPDATE_PACKAGE="$3"
+}
+
+mark_singbox_update_mutated() {
+    ACTIVE_SINGBOX_UPDATE_MUTATED=1
+}
+
 cancel_unmodified_singbox_update_transaction() {
     local backup_dir="${ACTIVE_SINGBOX_UPDATE_DIR:-}"
 
@@ -6639,20 +6709,24 @@ commit_singbox_update_transaction() {
     fi
 }
 
-update_singbox() {
-    local binary_path backup_dir backup_binary rollback_package old_version package_name
-    local relation new_version
-    local was_active=0 was_enabled=0 had_nodes=0
+prepare_singbox_update_inputs() {
+    local binary_var="$1" version_var="$2" nodes_var="$3" proceed_var="$4"
+    local detected_binary detected_version relation
+    local detected_nodes=0 should_proceed=0
 
+    printf -v "$binary_var" '%s' ""
+    printf -v "$version_var" '%s' ""
+    printf -v "$nodes_var" '%s' "$detected_nodes"
+    printf -v "$proceed_var" '%s' "$should_proceed"
     if ! singbox_installed; then
         warn "当前未安装 sing-box，已取消更新。"
         info "如需安装 sing-box，请先创建节点或启动服务。"
         return 0
     fi
-    binary_path="$(command -v sing-box)"
-    old_version="$(singbox_version)"
-    [[ "$old_version" =~ ^[0-9]+([.][0-9]+){2}$ ]] || { err "无法识别当前 sing-box 版本，已取消更新。"; return 1; }
-    relation="$(version_relation "$SINGBOX_RELEASE_VERSION" "$old_version")" || {
+    detected_binary="$(command -v sing-box)"
+    detected_version="$(singbox_version)"
+    [[ "$detected_version" =~ ^[0-9]+([.][0-9]+){2}$ ]] || { err "无法识别当前 sing-box 版本，已取消更新。"; return 1; }
+    relation="$(version_relation "$SINGBOX_RELEASE_VERSION" "$detected_version")" || {
         err "无法比较 sing-box 版本，已取消更新。"
         return 1
     }
@@ -6662,12 +6736,12 @@ update_singbox() {
             return 0
             ;;
         older)
-            warn "当前 sing-box v$old_version 高于受管版本 v$SINGBOX_RELEASE_VERSION，已拒绝隐式降级。"
+            warn "当前 sing-box v$detected_version 高于受管版本 v$SINGBOX_RELEASE_VERSION，已拒绝隐式降级。"
             return 0
             ;;
         newer) ;;
     esac
-    if ! singbox_binary_is_package_managed "$binary_path"; then
+    if ! singbox_binary_is_package_managed "$detected_binary"; then
         err "当前 sing-box 不是由系统 sing-box 软件包管理，已拒绝自动更新。"
         info "请先用原安装方式更新或卸载，再由 vpsbox 安装受管版本。"
         return 1
@@ -6683,84 +6757,118 @@ update_singbox() {
             err "节点配置未通过当前 sing-box 检查，已拒绝更新。"
             return 1
         }
-        had_nodes=1
+        detected_nodes=1
     fi
-    backup_dir="$(mktemp -d /tmp/vpsbox-sing-box-update.XXXXXX)" || return 1
-    backup_binary="$backup_dir/sing-box"
-    cp -a "$binary_path" "$backup_binary" || { rm -rf "$backup_dir"; err "备份当前 sing-box 二进制失败，已取消更新。"; return 1; }
+
+    should_proceed=1
+    printf -v "$binary_var" '%s' "$detected_binary"
+    printf -v "$version_var" '%s' "$detected_version"
+    printf -v "$nodes_var" '%s' "$detected_nodes"
+    printf -v "$proceed_var" '%s' "$should_proceed"
+}
+
+prepare_singbox_update_transaction() {
+    local binary_path="$1" old_version="$2"
+    local backup_dir_var="$3" was_enabled_var="$4" was_active_var="$5"
+    local temp_dir temp_binary rollback_file package_name_value persistent_dir persistent_binary
+    local active_before=0 enabled_before=0
+
+    temp_dir="$(mktemp -d /tmp/vpsbox-sing-box-update.XXXXXX)" || return 1
+    temp_binary="$temp_dir/sing-box"
+    cp -a "$binary_path" "$temp_binary" || { rm -rf "$temp_dir"; err "备份当前 sing-box 二进制失败，已取消更新。"; return 1; }
 
     # 更新回滚需要恢复服务管理器的原始 active 状态；精确的 vpsbox 进程匹配
     # 只用于节点运行检查，不能把 active 的自定义/旧布局服务误记为未运行。
     if service_manager_is_active; then
-        was_active=1
+        active_before=1
     fi
     if service_is_enabled; then
-        was_enabled=1
+        enabled_before=1
     fi
     begin_singbox_update_transaction \
-        "$binary_path" "$backup_binary" "$backup_dir" "$was_enabled" "$was_active"
+        "$binary_path" "$temp_binary" "$temp_dir" "$enabled_before" "$active_before"
 
     if ! ensure_node_dependencies; then
         cancel_unmodified_singbox_update_transaction
         err "更新依赖准备失败；sing-box 二进制和服务状态均未修改。"
         return 1
     fi
-    if ! rollback_package="$(prepare_singbox_rollback_package "$old_version" "$backup_dir")"; then
-        rollback_package=""
+    if ! rollback_file="$(prepare_singbox_rollback_package "$old_version" "$temp_dir")"; then
+        rollback_file=""
         warn "无法下载并校验旧版 sing-box 回滚包；将使用已校验的旧二进制副本作为回滚保障并继续更新。若后续发生回滚，软件包管理记录可能仍显示新版。"
     fi
-    ACTIVE_SINGBOX_UPDATE_PACKAGE="$rollback_package"
-    ACTIVE_SINGBOX_UPDATE_OLD_VERSION="$old_version"
+    arm_singbox_update_rollback_material "$rollback_file" "$old_version"
     if ! persist_singbox_update_transaction \
-        "$binary_path" "$backup_binary" "$rollback_package" "$old_version" \
-        "$was_enabled" "$was_active"; then
+        "$binary_path" "$temp_binary" "$rollback_file" "$old_version" \
+        "$enabled_before" "$active_before"; then
         cancel_unmodified_singbox_update_transaction
         err "无法持久化 sing-box 更新回滚记录，已取消更新。"
         return 1
     fi
-    rm -rf -- "$backup_dir"
-    backup_dir="$SINGBOX_UPDATE_TRANSACTION_DIR"
-    backup_binary="$backup_dir/old-binary"
-    package_name="$(singbox_update_state_value package_name)"
-    if [ "$package_name" = "none" ]; then
-        rollback_package=""
+    rm -rf -- "$temp_dir"
+    persistent_dir="$SINGBOX_UPDATE_TRANSACTION_DIR"
+    persistent_binary="$persistent_dir/old-binary"
+    package_name_value="$(singbox_update_state_value package_name)"
+    if [ "$package_name_value" = "none" ]; then
+        rollback_file=""
     else
-        rollback_package="$backup_dir/$package_name"
+        rollback_file="$persistent_dir/$package_name_value"
     fi
-    ACTIVE_SINGBOX_UPDATE_DIR="$backup_dir"
-    ACTIVE_SINGBOX_UPDATE_BACKUP="$backup_binary"
-    ACTIVE_SINGBOX_UPDATE_PACKAGE="$rollback_package"
+    promote_singbox_update_transaction "$persistent_dir" "$persistent_binary" "$rollback_file"
+    printf -v "$backup_dir_var" '%s' "$persistent_dir"
+    printf -v "$was_enabled_var" '%s' "$enabled_before"
+    printf -v "$was_active_var" '%s' "$active_before"
+}
+
+fail_singbox_update_with_rollback() {
+    err "$1"
+    rollback_active_singbox_update || true
+    return 1
+}
+
+install_and_accept_singbox_update() {
+    local had_nodes="$1" was_enabled="$2" was_active="$3"
+    local installed_version
+
     info "正在更新 sing-box..."
-    ACTIVE_SINGBOX_UPDATE_MUTATED=1
+    mark_singbox_update_mutated
     if ! run_singbox_installer; then
-        err "sing-box 安装过程失败，正在恢复旧二进制和原服务状态。"
-        rollback_active_singbox_update || true
+        fail_singbox_update_with_rollback "sing-box 安装过程失败，正在恢复旧二进制和原服务状态。"
         return 1
     fi
 
-    new_version="$(singbox_version)"
-    if [ "$new_version" != "$SINGBOX_RELEASE_VERSION" ]; then
-        err "安装后的 sing-box 版本异常（当前：$new_version），正在恢复旧版本。"
-        rollback_active_singbox_update || true
+    installed_version="$(singbox_version)"
+    if [ "$installed_version" != "$SINGBOX_RELEASE_VERSION" ]; then
+        fail_singbox_update_with_rollback "安装后的 sing-box 版本异常（当前：$installed_version），正在恢复旧版本。"
         return 1
     fi
 
     if [ "$had_nodes" -eq 1 ]; then
         if ! check_node_config_set; then
-            err "当前节点配置未通过新版 sing-box 检查，正在恢复旧二进制。"
-            rollback_active_singbox_update || true
+            fail_singbox_update_with_rollback "当前节点配置未通过新版 sing-box 检查，正在恢复旧二进制。"
             return 1
         fi
         if ! setup_service || ! restore_singbox_service_state "$was_enabled" "$was_active" 1; then
-            err "新版 sing-box 未能恢复原服务状态，正在恢复旧二进制。"
-            rollback_active_singbox_update || true
+            fail_singbox_update_with_rollback "新版 sing-box 未能恢复原服务状态，正在恢复旧二进制。"
             return 1
         fi
     elif ! restore_singbox_service_state "$was_enabled" "$was_active" 0; then
-        err "新版 sing-box 未能恢复原服务状态，正在恢复旧二进制。"
-        rollback_active_singbox_update || true
+        fail_singbox_update_with_rollback "新版 sing-box 未能恢复原服务状态，正在恢复旧二进制。"
         return 1
     fi
+}
+
+update_singbox() {
+    local binary_path="" old_version="" backup_dir=""
+    local was_active=0 was_enabled=0 had_nodes=0 should_update=0
+
+    prepare_singbox_update_inputs \
+        binary_path old_version had_nodes should_update || return 1
+    [ "$should_update" -eq 1 ] || return 0
+    prepare_singbox_update_transaction \
+        "$binary_path" "$old_version" backup_dir was_enabled was_active || return 1
+    install_and_accept_singbox_update \
+        "$had_nodes" "$was_enabled" "$was_active" || return 1
 
     commit_singbox_update_transaction || {
         err "sing-box 已更新，但临时备份清理失败：$backup_dir"
@@ -6845,6 +6953,75 @@ mark_vpsbox_update_ready() {
     fi
 }
 
+run_vpsbox_update_watchdog() {
+    local backup="$1" dir="$2" handoff="$3" ready="$4"
+    local owner_pid="$5" owner_start="$6"
+    local elapsed=0 current_start i
+
+    # 准备期覆盖脚本替换和命令入口安装；exec 前由 handoff 重新开始计算
+    # 新版启动验收时间，避免准备工作消耗恢复事务所需的启动预算。
+    while [ "$elapsed" -lt "$VPSBOX_UPDATE_PREPARE_TIMEOUT" ]; do
+        if [ -f "$ready" ] && [ ! -L "$ready" ]; then
+            rm -rf -- "$dir"
+            exit 0
+        fi
+        if [ -f "$handoff" ] && [ ! -L "$handoff" ]; then
+            break
+        fi
+        current_start="$(process_start_ticks "$owner_pid" 2>/dev/null || true)"
+        [ "$current_start" = "$owner_start" ] || break
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    if [ -f "$ready" ] && [ ! -L "$ready" ]; then
+        rm -rf -- "$dir"
+        exit 0
+    fi
+    if [ -f "$handoff" ] && [ ! -L "$handoff" ]; then
+        elapsed=0
+        while [ "$elapsed" -lt "$VPSBOX_UPDATE_STARTUP_TIMEOUT" ]; do
+            if [ -f "$ready" ] && [ ! -L "$ready" ]; then
+                rm -rf -- "$dir"
+                exit 0
+            fi
+            current_start="$(process_start_ticks "$owner_pid" 2>/dev/null || true)"
+            [ "$current_start" = "$owner_start" ] || break
+            sleep 1
+            elapsed=$((elapsed + 1))
+        done
+        if [ -f "$ready" ] && [ ! -L "$ready" ]; then
+            rm -rf -- "$dir"
+            exit 0
+        fi
+    fi
+
+    # 从这里开始只允许回滚。即使 TERM/KILL 期间出现迟到的 ready，
+    # 也不能把已经终止候选进程的结果重新解释为启动成功。
+    current_start="$(process_start_ticks "$owner_pid" 2>/dev/null || true)"
+    if [ "$current_start" = "$owner_start" ]; then
+        kill -TERM "$owner_pid" 2>/dev/null || true
+        for i in 1 2 3 4 5; do
+            sleep 1
+            current_start="$(process_start_ticks "$owner_pid" 2>/dev/null || true)"
+            [ "$current_start" = "$owner_start" ] || break
+        done
+        [ "$current_start" != "$owner_start" ] ||
+            kill -KILL "$owner_pid" 2>/dev/null || true
+    fi
+    if restore_previous_vpsbox "$backup"; then
+        if [ -w /dev/tty ]; then
+            printf '\n[WARN] 新版 vpsbox 未完成启动，已自动恢复旧版。\n' >/dev/tty 2>/dev/null || true
+        fi
+        rm -rf -- "$dir"
+    else
+        printf '%s\n' "restore_failed=1" > "$dir/restore-failed" 2>/dev/null || true
+        if [ -w /dev/tty ]; then
+            printf '\n[ERR] 新版 vpsbox 启动失败，且旧版自动恢复失败：%s\n' "$backup" >/dev/tty 2>/dev/null || true
+        fi
+    fi
+}
+
 start_vpsbox_update_watchdog() {
     local backup="$1" dir handoff ready owner_pid owner_start
 
@@ -6866,71 +7043,9 @@ start_vpsbox_update_watchdog() {
     [[ "$owner_start" =~ ^[0-9]+$ ]] || { rm -rf -- "$dir"; return 1; }
 
     (
-        local elapsed=0 current_start i
-
         trap - EXIT HUP INT TERM QUIT
-        # 准备期覆盖脚本替换和命令入口安装；exec 前由 handoff 重新开始计算
-        # 新版启动验收时间，避免准备工作消耗恢复事务所需的启动预算。
-        while [ "$elapsed" -lt "$VPSBOX_UPDATE_PREPARE_TIMEOUT" ]; do
-            if [ -f "$ready" ] && [ ! -L "$ready" ]; then
-                rm -rf -- "$dir"
-                exit 0
-            fi
-            if [ -f "$handoff" ] && [ ! -L "$handoff" ]; then
-                break
-            fi
-            current_start="$(process_start_ticks "$owner_pid" 2>/dev/null || true)"
-            [ "$current_start" = "$owner_start" ] || break
-            sleep 1
-            elapsed=$((elapsed + 1))
-        done
-
-        if [ -f "$ready" ] && [ ! -L "$ready" ]; then
-            rm -rf -- "$dir"
-            exit 0
-        fi
-        if [ -f "$handoff" ] && [ ! -L "$handoff" ]; then
-            elapsed=0
-            while [ "$elapsed" -lt "$VPSBOX_UPDATE_STARTUP_TIMEOUT" ]; do
-                if [ -f "$ready" ] && [ ! -L "$ready" ]; then
-                    rm -rf -- "$dir"
-                    exit 0
-                fi
-                current_start="$(process_start_ticks "$owner_pid" 2>/dev/null || true)"
-                [ "$current_start" = "$owner_start" ] || break
-                sleep 1
-                elapsed=$((elapsed + 1))
-            done
-            if [ -f "$ready" ] && [ ! -L "$ready" ]; then
-                rm -rf -- "$dir"
-                exit 0
-            fi
-        fi
-
-        # 从这里开始只允许回滚。即使 TERM/KILL 期间出现迟到的 ready，
-        # 也不能把已经终止候选进程的结果重新解释为启动成功。
-        current_start="$(process_start_ticks "$owner_pid" 2>/dev/null || true)"
-        if [ "$current_start" = "$owner_start" ]; then
-            kill -TERM "$owner_pid" 2>/dev/null || true
-            for i in 1 2 3 4 5; do
-                sleep 1
-                current_start="$(process_start_ticks "$owner_pid" 2>/dev/null || true)"
-                [ "$current_start" = "$owner_start" ] || break
-            done
-            [ "$current_start" != "$owner_start" ] ||
-                kill -KILL "$owner_pid" 2>/dev/null || true
-        fi
-        if restore_previous_vpsbox "$backup"; then
-            if [ -w /dev/tty ]; then
-                printf '\n[WARN] 新版 vpsbox 未完成启动，已自动恢复旧版。\n' >/dev/tty 2>/dev/null || true
-            fi
-            rm -rf -- "$dir"
-        else
-            printf '%s\n' "restore_failed=1" > "$dir/restore-failed" 2>/dev/null || true
-            if [ -w /dev/tty ]; then
-                printf '\n[ERR] 新版 vpsbox 启动失败，且旧版自动恢复失败：%s\n' "$backup" >/dev/tty 2>/dev/null || true
-            fi
-        fi
+        run_vpsbox_update_watchdog \
+            "$backup" "$dir" "$handoff" "$ready" "$owner_pid" "$owner_start"
     ) 200>&- </dev/null >>"$dir/watchdog.log" 2>&1 &
     VPSBOX_UPDATE_WATCHDOG_PID=$!
     VPSBOX_UPDATE_WATCHDOG_DIR="$dir"
@@ -7005,30 +7120,34 @@ settle_vpsbox_update_watchdog_after_safe_restore() {
     return "$status"
 }
 
-update_vpsbox() {
-    local backup="${CMD_PATH}.previous"
-    local backup_tmp candidate
+prepare_vpsbox_update_candidate() {
+    local output_var="$1" downloaded_candidate
     local status
 
     info "正在下载最新 vpsbox 脚本..."
     mkdir -p "$(dirname "$CMD_PATH")" || return 1
-    candidate="$(mktemp "$(dirname "$CMD_PATH")/.vpsbox-update.XXXXXX")" || return 1
-    if download_vpsbox_script "$candidate" 1; then
+    downloaded_candidate="$(mktemp "$(dirname "$CMD_PATH")/.vpsbox-update.XXXXXX")" || return 1
+    if download_vpsbox_script "$downloaded_candidate" 1; then
         :
     else
         status=$?
-        rm -f "$candidate"
+        rm -f "$downloaded_candidate"
         REMOTE_VERSION=""
         UPDATE_AVAILABLE=0
         case "$status" in
             2)
                 info "当前已是最新版，无需更新。"
-                return 0
+                return 2
                 ;;
-            3) return 0 ;;
+            3) return 3 ;;
             *) return "$status" ;;
         esac
     fi
+    printf -v "$output_var" '%s' "$downloaded_candidate"
+}
+
+backup_current_vpsbox_for_update() {
+    local candidate="$1" backup="$2" backup_tmp
 
     [ -f "$CMD_PATH" ] && [ ! -L "$CMD_PATH" ] || {
         rm -f "$candidate"
@@ -7054,6 +7173,11 @@ update_vpsbox() {
         err "备份当前 vpsbox 脚本失败，已取消更新。"
         return 1
     fi
+}
+
+publish_vpsbox_update_candidate() {
+    local candidate="$1" backup="$2"
+
     start_vpsbox_update_watchdog "$backup" || {
         rm -f "$candidate"
         err "无法启动新版 vpsbox 启动监护，已取消更新。"
@@ -7088,29 +7212,51 @@ update_vpsbox() {
         fi
         return 1
     fi
+}
+
+recover_vpsbox_after_reexec_failure() {
+    local backup="$1" status="$2"
+
+    err "无法重新打开新版管理面板，正在恢复旧版脚本。"
+    if restore_previous_vpsbox "$backup"; then
+        if settle_vpsbox_update_watchdog_after_safe_restore; then
+            warn "已恢复更新前的 vpsbox 脚本。"
+        else
+            err "旧版脚本已恢复，但更新监护清理失败。"
+        fi
+        acquire_lock || true
+        return "$status"
+    fi
+    err "自动恢复失败；请使用备份手动恢复：$backup"
+    if [ -n "${VPSBOX_UPDATE_WATCHDOG_PID:-}" ]; then
+        err "当前 vpsbox 将退出，并由更新监护再次尝试恢复旧版。"
+        exit "$status"
+    fi
+    acquire_lock || true
+    return "$status"
+}
+
+update_vpsbox() {
+    local backup="${CMD_PATH}.previous" candidate status
+
+    if prepare_vpsbox_update_candidate candidate; then
+        :
+    else
+        status=$?
+        case "$status" in
+            2|3) return 0 ;;
+            *) return "$status" ;;
+        esac
+    fi
+    backup_current_vpsbox_for_update "$candidate" "$backup" || return 1
+    publish_vpsbox_update_candidate "$candidate" "$backup" || return 1
 
     info "vpsbox 已更新；旧版本备份：$backup"
     info "正在重新打开新版管理面板..."
     cleanup_vpsbox_lock
     reexec_updated_vpsbox "$backup" || {
         status=$?
-        err "无法重新打开新版管理面板，正在恢复旧版脚本。"
-        if restore_previous_vpsbox "$backup"; then
-            if settle_vpsbox_update_watchdog_after_safe_restore; then
-                warn "已恢复更新前的 vpsbox 脚本。"
-            else
-                err "旧版脚本已恢复，但更新监护清理失败。"
-            fi
-            acquire_lock || true
-            return "$status"
-        fi
-        err "自动恢复失败；请使用备份手动恢复：$backup"
-        if [ -n "${VPSBOX_UPDATE_WATCHDOG_PID:-}" ]; then
-            err "当前 vpsbox 将退出，并由更新监护再次尝试恢复旧版。"
-            exit "$status"
-        fi
-        acquire_lock || true
-        return "$status"
+        recover_vpsbox_after_reexec_failure "$backup" "$status"
     }
 }
 
@@ -8153,6 +8299,24 @@ cleanup_ntp_snapshot() {
     rm -rf -- "$snapshot_dir"
 }
 
+arm_ntp_tracking_cleanup() {
+    [ -z "${ACTIVE_NTP_SNAPSHOT:-}" ] &&
+        [ "${ACTIVE_NTP_SERVICE_ROLLBACK:-0}" = "0" ] &&
+        [ "${ACTIVE_NTP_TRACKING_CANCEL:-0}" = "0" ] || return 1
+    ACTIVE_NTP_TRACKING_CANCEL=1
+}
+
+cancel_prepared_ntp_change() {
+    local snapshot_dir="${1:-}" applied_before="$2"
+
+    if [ -n "$snapshot_dir" ]; then
+        cleanup_ntp_snapshot "$snapshot_dir" ||
+            warn "NTP 尚未修改，但临时快照清理失败：$snapshot_dir"
+    fi
+    cancel_unmodified_ntp_tracking "$applied_before" ||
+        warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
+}
+
 arm_ntp_runtime_rollback() {
     local snapshot_dir="$1"
     shift
@@ -8440,7 +8604,10 @@ enable_ntp_sync() {
         applied_before=1
     if [ "$applied_before" -eq 0 ]; then
         # 在第一份持久恢复记录前登记只清理记录的活动阶段；此时尚未修改系统。
-        ACTIVE_NTP_TRACKING_CANCEL=1
+        arm_ntp_tracking_cleanup || {
+            err "无法登记 NTP 恢复记录清理状态，已取消修改。"
+            return 1
+        }
         if ! backup_change_file_once NTP_CONF "$conf" ||
             ! backup_change_file_once NTP_SOURCES "$source_file" ||
             ! manifest_set_once NTP_CHRONY_ACTIVE "$chrony_active" ||
@@ -8451,14 +8618,12 @@ enable_ntp_sync() {
             ! manifest_set_once NTP_TIMESYNCD_ENABLED "$timesyncd_enabled" ||
             ! manifest_set_once NTP_TIMESYNCD_PACKAGE "$timesyncd_package" ||
             ! manifest_set_once NTP_TIMESYNCD_UNIT "$timesyncd_unit"; then
-            cancel_unmodified_ntp_tracking "$applied_before" ||
-                warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
+            cancel_prepared_ntp_change "" "$applied_before"
             err "记录 NTP 原状态失败，已取消修改。"
             return 1
         fi
         mark_change_applied NTP_CONF || {
-            cancel_unmodified_ntp_tracking "$applied_before" ||
-                warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
+            cancel_prepared_ntp_change "" "$applied_before"
             err "无法记录 NTP 事务，已取消修改。"
             return 1
         }
@@ -8471,58 +8636,39 @@ enable_ntp_sync() {
     fi
 
     backup_dir="$(mktemp -d /tmp/vpsbox-chrony.XXXXXX)" || {
-        cancel_unmodified_ntp_tracking "$applied_before" ||
-            warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
+        cancel_prepared_ntp_change "" "$applied_before"
         err "创建 NTP 临时快照目录失败，已取消修改。"
         return 1
     }
     if [ -f "$conf" ] && [ ! -L "$conf" ]; then
         cp -a "$conf" "$backup_dir/conf" &&
             : > "$backup_dir/conf.present" || {
-            cleanup_ntp_snapshot "$backup_dir" ||
-                warn "NTP 尚未修改，但临时快照清理失败：$backup_dir"
-            cancel_unmodified_ntp_tracking "$applied_before" ||
-                warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
+            cancel_prepared_ntp_change "$backup_dir" "$applied_before"
             return 1
         }
     elif [ ! -e "$conf" ] && [ ! -L "$conf" ]; then
         if ! : > "$backup_dir/conf.absent"; then
-            cleanup_ntp_snapshot "$backup_dir" ||
-                warn "NTP 尚未修改，但临时快照清理失败：$backup_dir"
-            cancel_unmodified_ntp_tracking "$applied_before" ||
-                warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
+            cancel_prepared_ntp_change "$backup_dir" "$applied_before"
             return 1
         fi
     else
-        cleanup_ntp_snapshot "$backup_dir" ||
-            warn "NTP 尚未修改，但临时快照清理失败：$backup_dir"
-        cancel_unmodified_ntp_tracking "$applied_before" ||
-            warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
+        cancel_prepared_ntp_change "$backup_dir" "$applied_before"
         err "chrony 配置不是普通文件，已拒绝修改：$conf"
         return 1
     fi
     if [ -f "$source_file" ] && [ ! -L "$source_file" ]; then
         cp -a "$source_file" "$backup_dir/sources" &&
             : > "$backup_dir/sources.present" || {
-            cleanup_ntp_snapshot "$backup_dir" ||
-                warn "NTP 尚未修改，但临时快照清理失败：$backup_dir"
-            cancel_unmodified_ntp_tracking "$applied_before" ||
-                warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
+            cancel_prepared_ntp_change "$backup_dir" "$applied_before"
             return 1
         }
     elif [ ! -e "$source_file" ] && [ ! -L "$source_file" ]; then
         if ! : > "$backup_dir/sources.absent"; then
-            cleanup_ntp_snapshot "$backup_dir" ||
-                warn "NTP 尚未修改，但临时快照清理失败：$backup_dir"
-            cancel_unmodified_ntp_tracking "$applied_before" ||
-                warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
+            cancel_prepared_ntp_change "$backup_dir" "$applied_before"
             return 1
         fi
     else
-        cleanup_ntp_snapshot "$backup_dir" ||
-            warn "NTP 尚未修改，但临时快照清理失败：$backup_dir"
-        cancel_unmodified_ntp_tracking "$applied_before" ||
-            warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
+        cancel_prepared_ntp_change "$backup_dir" "$applied_before"
         err "NTP 源配置不是普通文件，已拒绝修改：$source_file"
         return 1
     fi
@@ -8531,10 +8677,7 @@ enable_ntp_sync() {
         "$chrony_unit" "$chrony_enabled" "$chrony_active" \
         "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
         "$applied_before"; then
-        cleanup_ntp_snapshot "$backup_dir" ||
-            warn "NTP 尚未修改，但临时快照清理失败：$backup_dir"
-        cancel_unmodified_ntp_tracking "$applied_before" ||
-            warn "NTP 尚未修改，但首次恢复记录清理失败；恢复菜单可能保留该项目。"
+        cancel_prepared_ntp_change "$backup_dir" "$applied_before"
         err "无法登记 NTP 中断回滚状态，已取消修改。"
         return 1
     fi
@@ -8546,11 +8689,7 @@ enable_ntp_sync() {
                 export DEBIAN_FRONTEND=noninteractive
                 if ! apt_get_bounded "$PACKAGE_UPDATE_TIMEOUT" update ||
                     ! apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y chrony; then
-                    settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
-                        "$chrony_package" "$timesyncd_package" \
-                        "$chrony_unit" "$chrony_enabled" "$chrony_active" \
-                        "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
-                        "$applied_before" || true
+                    rollback_active_ntp_operation || true
                     return 1
                 fi
                 ;;
@@ -8560,20 +8699,12 @@ enable_ntp_sync() {
                 else
                     yum_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y chrony
                 fi || {
-                    settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
-                        "$chrony_package" "$timesyncd_package" \
-                        "$chrony_unit" "$chrony_enabled" "$chrony_active" \
-                        "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
-                        "$applied_before" || true
+                    rollback_active_ntp_operation || true
                     return 1
                 }
                 ;;
             *)
-                settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
-                    "$chrony_package" "$timesyncd_package" \
-                    "$chrony_unit" "$chrony_enabled" "$chrony_active" \
-                    "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
-                    "$applied_before" || true
+                rollback_active_ntp_operation || true
                 err "未识别系统类型，无法自动配置 chrony。"
                 return 1
                 ;;
@@ -8584,41 +8715,25 @@ enable_ntp_sync() {
 
     if [ ! -f "$conf" ] || [ -L "$conf" ]; then
         err "chrony 安装后未生成有效配置，正在恢复原 NTP 状态。"
-        settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
-            "$chrony_package" "$timesyncd_package" \
-            "$chrony_unit" "$chrony_enabled" "$chrony_active" \
-            "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
-            "$applied_before" || true
+        rollback_active_ntp_operation || true
         return 1
     fi
     info "chrony 服务名：$svc"
 
     if ! systemctl stop "$svc" 2>/dev/null; then
         err "chrony 停止失败，正在恢复原 NTP 状态。"
-        settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
-            "$chrony_package" "$timesyncd_package" \
-            "$chrony_unit" "$chrony_enabled" "$chrony_active" \
-            "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
-            "$applied_before" || true
+        rollback_active_ntp_operation || true
         return 1
     fi
     if ! write_chrony_sources; then
-        settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
-            "$chrony_package" "$timesyncd_package" \
-            "$chrony_unit" "$chrony_enabled" "$chrony_active" \
-            "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
-            "$applied_before" || true
+        rollback_active_ntp_operation || true
         return 1
     fi
 
     info "正在启用 chrony 并设置开机自启..."
     if ! systemctl enable --now "$svc"; then
         err "chrony 启动失败，正在恢复原 NTP 配置。"
-        settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
-            "$chrony_package" "$timesyncd_package" \
-            "$chrony_unit" "$chrony_enabled" "$chrony_active" \
-            "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
-            "$applied_before" || true
+        rollback_active_ntp_operation || true
         show_chrony_permission_hint "$svc"
         return 1
     fi
@@ -8626,11 +8741,7 @@ enable_ntp_sync() {
     sleep 2
     if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
         err "chrony 未保持运行，正在恢复原 NTP 配置。"
-        settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
-            "$chrony_package" "$timesyncd_package" \
-            "$chrony_unit" "$chrony_enabled" "$chrony_active" \
-            "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
-            "$applied_before" || true
+        rollback_active_ntp_operation || true
         show_chrony_permission_hint "$svc"
         return 1
     fi
@@ -8639,11 +8750,7 @@ enable_ntp_sync() {
         info "chrony 已确认运行，正在停用 systemd-timesyncd，避免多个 NTP 客户端并存..."
         if ! systemctl disable --now systemd-timesyncd; then
             warn "无法停用 systemd-timesyncd；为避免多个 NTP 客户端并存，正在回滚 chrony 配置。"
-            settle_failed_ntp_change "$backup_dir" "$conf" "$source_file" "$svc" \
-                "$chrony_package" "$timesyncd_package" \
-                "$chrony_unit" "$chrony_enabled" "$chrony_active" \
-                "$timesyncd_unit" "$timesyncd_enabled" "$timesyncd_active" \
-                "$applied_before" || true
+            rollback_active_ntp_operation || true
             return 1
         fi
     fi
@@ -8955,11 +9062,46 @@ rollback_active_dns_operation() {
     clear_active_dns_operation
 }
 
+prepare_dns_operation() {
+    local name="$1" target="$2" snapshot_prefix="$3" label="$4"
+    local applied_before="$5" staged_file="$6" snapshot_var="$7"
+    local snapshot_path="" target_created=0
+
+    if ! backup_change_file_once "$name" "$target"; then
+        rm -f -- "$staged_file"
+        err "记录 DNS 原配置失败，已取消修改。"
+        return 1
+    fi
+    if ! begin_change_transaction "$name"; then
+        rm -f -- "$staged_file"
+        remove_dns_operation_snapshot "$snapshot_path" || true
+        cancel_unmodified_change_transaction "$name" || true
+        err "记录 DNS 修改事务失败，已取消修改。"
+        return 1
+    fi
+    if ! create_dns_operation_snapshot "$target" "$snapshot_prefix" \
+        snapshot_path target_created; then
+        rm -f -- "$staged_file"
+        restore_dns_change_tracking "$name" "$applied_before" || true
+        err "创建 ${label}DNS 临时回滚快照失败，已取消修改。"
+        return 1
+    fi
+    if ! arm_dns_operation_rollback "$name" "$snapshot_path" "$target" \
+        "$target_created" "$applied_before"; then
+        rm -f -- "$staged_file"
+        remove_dns_operation_snapshot "$snapshot_path" || true
+        restore_dns_change_tracking "$name" "$applied_before" || true
+        err "登记 ${label}DNS 中断回滚状态失败，已取消修改。"
+        return 1
+    fi
+
+    printf -v "$snapshot_var" '%s' "$snapshot_path"
+}
+
 write_resolv_conf_dns() {
     local dns1="$1"
     local dns2="${2:-}"
     local snapshot=""
-    local created_resolv="0"
     local applied_before="0"
     local pending_before="0"
     local target_is_current=0
@@ -9016,33 +9158,8 @@ write_resolv_conf_dns() {
         err "生成新的 $RESOLV_CONF 失败。"
         return 1
     fi
-    if ! backup_change_file_once DNS_RESOLV "$RESOLV_CONF"; then
-        rm -f -- "$tmp"
-        err "记录 DNS 原配置失败，已取消修改。"
-        return 1
-    fi
-    if ! begin_change_transaction DNS_RESOLV; then
-        rm -f -- "$tmp"
-        remove_dns_operation_snapshot "$snapshot" || true
-        cancel_unmodified_change_transaction DNS_RESOLV || true
-        err "记录 DNS 修改事务失败，已取消修改。"
-        return 1
-    fi
-    if ! create_dns_operation_snapshot "$RESOLV_CONF" ".resolv.conf.vpsbox-rollback" \
-        snapshot created_resolv; then
-        rm -f -- "$tmp"
-        restore_dns_change_tracking DNS_RESOLV "$applied_before" || true
-        err "创建 DNS 临时回滚快照失败，已取消修改。"
-        return 1
-    fi
-    if ! arm_dns_operation_rollback DNS_RESOLV "$snapshot" "$RESOLV_CONF" \
-        "$created_resolv" "$applied_before"; then
-        rm -f -- "$tmp"
-        remove_dns_operation_snapshot "$snapshot" || true
-        restore_dns_change_tracking DNS_RESOLV "$applied_before" || true
-        err "登记 DNS 中断回滚状态失败，已取消修改。"
-        return 1
-    fi
+    prepare_dns_operation DNS_RESOLV "$RESOLV_CONF" ".resolv.conf.vpsbox-rollback" \
+        "" "$applied_before" "$tmp" snapshot || return 1
     if ! chown root:root "$tmp" || ! chmod 644 "$tmp"; then
         rm -f -- "$tmp"
         cancel_active_dns_operation_before_publish || true
@@ -9101,7 +9218,6 @@ write_systemd_resolved_dns() {
     local conf_dir="/etc/systemd/resolved.conf.d"
     local conf_file="$conf_dir/vpsbox.conf"
     local snapshot=""
-    local created_conf="0"
     local applied_before="0"
     local pending_before="0"
     local target_is_current=0
@@ -9184,33 +9300,8 @@ write_systemd_resolved_dns() {
         err "写入 $conf_file 失败。"
         return 1
     fi
-    if ! backup_change_file_once DNS_RESOLVED "$conf_file"; then
-        rm -f -- "$tmp"
-        err "记录 DNS 原配置失败，已取消修改。"
-        return 1
-    fi
-    if ! begin_change_transaction DNS_RESOLVED; then
-        rm -f -- "$tmp"
-        remove_dns_operation_snapshot "$snapshot" || true
-        cancel_unmodified_change_transaction DNS_RESOLVED || true
-        err "记录 DNS 修改事务失败，已取消修改。"
-        return 1
-    fi
-    if ! create_dns_operation_snapshot "$conf_file" ".vpsbox.conf.rollback" \
-        snapshot created_conf; then
-        rm -f -- "$tmp"
-        restore_dns_change_tracking DNS_RESOLVED "$applied_before" || true
-        err "创建 systemd-resolved DNS 临时回滚快照失败，已取消修改。"
-        return 1
-    fi
-    if ! arm_dns_operation_rollback DNS_RESOLVED "$snapshot" "$conf_file" \
-        "$created_conf" "$applied_before"; then
-        rm -f -- "$tmp"
-        remove_dns_operation_snapshot "$snapshot" || true
-        restore_dns_change_tracking DNS_RESOLVED "$applied_before" || true
-        err "登记 systemd-resolved DNS 中断回滚状态失败，已取消修改。"
-        return 1
-    fi
+    prepare_dns_operation DNS_RESOLVED "$conf_file" ".vpsbox.conf.rollback" \
+        "systemd-resolved " "$applied_before" "$tmp" snapshot || return 1
     if ! chown root:root "$tmp" || ! chmod 644 "$tmp"; then
         rm -f -- "$tmp"
         cancel_active_dns_operation_before_publish || true
@@ -10124,6 +10215,11 @@ prune_fail2ban_sshd_backups() {
     done
 }
 
+mark_active_ssh_fail2ban_mutated() {
+    [ -n "${ACTIVE_SSH_TRANSACTION_DIR:-}" ] || return 0
+    ACTIVE_SSH_FAIL2BAN_MUTATED=1
+}
+
 sync_fail2ban_sshd_port() {
     local backup=""
     local backend="auto"
@@ -10185,9 +10281,7 @@ sync_fail2ban_sshd_port() {
         rm -f -- "$tmp"
         return 1
     fi
-    if [ -n "${ACTIVE_SSH_TRANSACTION_DIR:-}" ]; then
-        ACTIVE_SSH_FAIL2BAN_MUTATED=1
-    fi
+    mark_active_ssh_fail2ban_mutated
     if ! fail2ban-client -t -c /etc/fail2ban >/dev/null 2>&1; then
         fail2ban_sync_failure_with_rollback "Fail2ban 配置预检失败" "$backup" "$was_running" || true
         return 1
@@ -10267,47 +10361,40 @@ sync_fail2ban_sshd_port() {
     fi
 }
 
-apply_ssh_port_target_transaction() {
-    local original_ports="$1" write_action
-
-    if ! begin_ssh_runtime_transaction "$original_ports" 1; then
-        err "无法创建可校验的 SSH 运行期回滚快照，已取消修改。"
-        return 1
-    fi
-    if ! ssh_firewall_transition_begin "$SSH_TARGET_PORT"; then
-        cancel_ssh_runtime_transaction ||
-            warn "SSH 尚未修改，但运行期快照未能清理。"
-        err "主机防火墙无法临时放行 SSH 目标端口，已取消修改。"
-        return 1
-    fi
+publish_ssh_port_target_configuration() {
+    local output_var="$1" action
 
     if sshd_main_has_active_port_directive; then
-        write_action="主配置"
+        action="主配置"
         if [ -e "$SSHD_VPSBOX_PORT_CONF" ] && sshd_vpsbox_port_include_available; then
             if ! rm -f -- "$SSHD_VPSBOX_PORT_CONF"; then
                 fail_ssh_runtime_transaction "停用冲突的 SSH 端口 drop-in 失败" || true
                 return 1
             fi
-            write_action="主配置（已停用 vpsbox 端口 drop-in）"
+            action="主配置（已停用 vpsbox 端口 drop-in）"
         fi
         if ! set_main_ssh_port_directives; then
             fail_ssh_runtime_transaction "写入 SSH 主配置失败" || true
             return 1
         fi
     elif sshd_vpsbox_port_include_available; then
-        write_action="vpsbox drop-in"
+        action="vpsbox drop-in"
         if ! write_vpsbox_ssh_port_config; then
             fail_ssh_runtime_transaction "写入 SSH drop-in 失败" || true
             return 1
         fi
     else
-        write_action="主配置"
+        action="主配置"
         if ! set_main_ssh_port_directives; then
             fail_ssh_runtime_transaction "写入 SSH 主配置失败" || true
             return 1
         fi
     fi
 
+    printf -v "$output_var" '%s' "$action"
+}
+
+verify_ssh_port_target_change() {
     if ! validate_ssh_port_effective_config; then
         fail_ssh_runtime_transaction "SSH 端口配置验证失败" || true
         return 1
@@ -10329,6 +10416,24 @@ apply_ssh_port_target_transaction() {
         fail_ssh_runtime_transaction "主机防火墙无法同步 SSH 目标端口" || true
         return 1
     fi
+}
+
+apply_ssh_port_target_transaction() {
+    local original_ports="$1" write_action
+
+    if ! begin_ssh_runtime_transaction "$original_ports" 1; then
+        err "无法创建可校验的 SSH 运行期回滚快照，已取消修改。"
+        return 1
+    fi
+    if ! ssh_firewall_transition_begin "$SSH_TARGET_PORT"; then
+        cancel_ssh_runtime_transaction ||
+            warn "SSH 尚未修改，但运行期快照未能清理。"
+        err "主机防火墙无法临时放行 SSH 目标端口，已取消修改。"
+        return 1
+    fi
+
+    publish_ssh_port_target_configuration write_action || return 1
+    verify_ssh_port_target_change || return 1
     if ! commit_ssh_runtime_transaction; then
         err "SSH 运行期事务无法提交，正在回滚。"
         rollback_active_ssh_transaction || true
@@ -11085,6 +11190,61 @@ cancel_unmodified_ipv6_change() {
     fi
 }
 
+prepare_ipv6_disable_change() {
+    local old_all="$1" old_default="$2" old_lo="$3" parent="$4" output_var="$5"
+    local staged_file
+
+    if ! backup_change_file_once IPV6_CONF "$IPV6_DISABLE_CONF" ||
+        ! manifest_set_once IPV6_ALL "$old_all" ||
+        ! manifest_set_once IPV6_DEFAULT "$old_default" ||
+        ! manifest_set_once IPV6_LO "$old_lo"; then
+        cancel_unmodified_ipv6_change || true
+        err "记录 IPv6 原配置失败，已取消修改。"
+        return 1
+    fi
+    if ! begin_change_transaction IPV6_CONF; then
+        cancel_unmodified_ipv6_change || true
+        err "记录 IPv6 修改事务失败，已取消修改。"
+        return 1
+    fi
+
+    staged_file="$(mktemp "$parent/.vpsbox-disable-ipv6.XXXXXX")" || {
+        cancel_unmodified_ipv6_change || true
+        return 1
+    }
+    if ! render_ipv6_disable_config > "$staged_file" ||
+        ! chown root:root "$staged_file" ||
+        ! chmod 644 "$staged_file"; then
+        rm -f -- "$staged_file" || warn "清理 IPv6 临时配置失败：$staged_file"
+        cancel_unmodified_ipv6_change || true
+        err "生成 IPv6 配置失败，未修改系统。"
+        return 1
+    fi
+    printf -v "$output_var" '%s' "$staged_file"
+}
+
+rollback_failed_ipv6_disable() {
+    local old_all="$1" old_default="$2" old_lo="$3" failure_stage="$4"
+    local failure_text
+
+    case "$failure_stage" in
+        runtime) failure_text="禁用 IPv6 失败" ;;
+        publish) failure_text="保存 IPv6 配置失败" ;;
+        *) return 2 ;;
+    esac
+
+    if restore_ipv6_runtime_values "$old_all" "$old_default" "$old_lo"; then
+        if cancel_unmodified_ipv6_change; then
+            err "$failure_text；已恢复记录的运行参数，持久配置未改动。"
+        else
+            err "$failure_text；运行参数已恢复，但事务记录清理失败。"
+        fi
+    else
+        err "$failure_text，且记录的运行参数未能确认完整恢复。"
+        err "已保留事务记录，请通过恢复菜单或 IPv4/VPS 控制台处理。"
+    fi
+}
+
 disable_ipv6() {
     local addresses runtime_values old_all old_default old_lo
     local parent tmp interface address tracking_state
@@ -11164,60 +11324,18 @@ disable_ipv6() {
     }
     read -r old_all old_default old_lo <<< "$runtime_values"
 
-    if ! backup_change_file_once IPV6_CONF "$IPV6_DISABLE_CONF" ||
-        ! manifest_set_once IPV6_ALL "$old_all" ||
-        ! manifest_set_once IPV6_DEFAULT "$old_default" ||
-        ! manifest_set_once IPV6_LO "$old_lo"; then
-        cancel_unmodified_ipv6_change || true
-        err "记录 IPv6 原配置失败，已取消修改。"
+    prepare_ipv6_disable_change "$old_all" "$old_default" "$old_lo" "$parent" tmp ||
         return 1
-    fi
-    if ! begin_change_transaction IPV6_CONF; then
-        cancel_unmodified_ipv6_change || true
-        err "记录 IPv6 修改事务失败，已取消修改。"
-        return 1
-    fi
-
-    tmp="$(mktemp "$parent/.vpsbox-disable-ipv6.XXXXXX")" || {
-        cancel_unmodified_ipv6_change || true
-        return 1
-    }
-    if ! render_ipv6_disable_config > "$tmp" ||
-        ! chown root:root "$tmp" ||
-        ! chmod 644 "$tmp"; then
-        rm -f -- "$tmp" || warn "清理 IPv6 临时配置失败：$tmp"
-        cancel_unmodified_ipv6_change || true
-        err "生成 IPv6 配置失败，未修改系统。"
-        return 1
-    fi
 
     if ! sysctl -p "$tmp" >/dev/null 2>&1 || ! ipv6_disabled_runtime_is_current; then
         rm -f -- "$tmp" || warn "清理 IPv6 临时配置失败：$tmp"
-        if restore_ipv6_runtime_values "$old_all" "$old_default" "$old_lo"; then
-            if cancel_unmodified_ipv6_change; then
-                err "禁用 IPv6 失败；已恢复记录的运行参数，持久配置未改动。"
-            else
-                err "禁用 IPv6 失败；运行参数已恢复，但事务记录清理失败。"
-            fi
-        else
-            err "禁用 IPv6 失败，且记录的运行参数未能确认完整恢复。"
-            err "已保留事务记录，请通过恢复菜单或 IPv4/VPS 控制台处理。"
-        fi
+        rollback_failed_ipv6_disable "$old_all" "$old_default" "$old_lo" runtime
         return 1
     fi
 
     if ! mv -f -- "$tmp" "$IPV6_DISABLE_CONF"; then
         rm -f -- "$tmp" || warn "清理 IPv6 临时配置失败：$tmp"
-        if restore_ipv6_runtime_values "$old_all" "$old_default" "$old_lo"; then
-            if cancel_unmodified_ipv6_change; then
-                err "保存 IPv6 配置失败；已恢复记录的运行参数，持久配置未改动。"
-            else
-                err "保存 IPv6 配置失败；运行参数已恢复，但事务记录清理失败。"
-            fi
-        else
-            err "保存 IPv6 配置失败，且记录的运行参数未能确认完整恢复。"
-            err "已保留事务记录，请通过恢复菜单或 IPv4/VPS 控制台处理。"
-        fi
+        rollback_failed_ipv6_disable "$old_all" "$old_default" "$old_lo" publish
         return 1
     fi
 
@@ -11636,11 +11754,75 @@ tcp_buffer_values_have_max_above() {
         [ $((10#$wmem_max)) -gt $((10#$target_max)) ]
 }
 
+prepare_tcp_buffer_change() {
+    local runtime_values="$1" target_values="$2" parent="$3" output_var="$4"
+    local old_core_rmem old_core_wmem old_tcp_rmem old_tcp_wmem staged_file
+
+    read -r old_core_rmem old_core_wmem old_tcp_rmem old_tcp_wmem <<< "$runtime_values"
+    if ! backup_change_file_once TCP_BUFFER_CONF "$TCP_BUFFER_CONF" ||
+        ! manifest_set_once TCP_BUFFER_RMEM_MAX "$old_core_rmem" ||
+        ! manifest_set_once TCP_BUFFER_WMEM_MAX "$old_core_wmem" ||
+        ! manifest_set_once TCP_BUFFER_TCP_RMEM "$old_tcp_rmem" ||
+        ! manifest_set_once TCP_BUFFER_TCP_WMEM "$old_tcp_wmem"; then
+        cancel_unmodified_tcp_buffer_change || true
+        err "记录 TCP 缓冲区原配置失败，已取消修改。"
+        return 1
+    fi
+    if ! begin_change_transaction TCP_BUFFER_CONF; then
+        cancel_unmodified_tcp_buffer_change || true
+        err "记录 TCP 缓冲区修改事务失败，已取消修改。"
+        return 1
+    fi
+
+    staged_file="$(mktemp "$parent/.vpsbox-tcp-buffer.XXXXXX")" || {
+        cancel_unmodified_tcp_buffer_change || true
+        return 1
+    }
+    if ! render_tcp_buffer_config "$target_values" > "$staged_file" ||
+        ! chown root:root "$staged_file" ||
+        ! chmod 644 "$staged_file"; then
+        rm -f -- "$staged_file"
+        cancel_unmodified_tcp_buffer_change || true
+        err "生成 TCP 缓冲区配置失败，未修改系统。"
+        return 1
+    fi
+    printf -v "$output_var" '%s' "$staged_file"
+}
+
+rollback_failed_tcp_buffer_change() {
+    local runtime_values="$1" failure_stage="$2"
+    local restored_message cleanup_message restore_failure_message
+
+    case "$failure_stage" in
+        runtime)
+            restored_message="TCP 缓冲区调优未能完整生效；运行参数已恢复，持久配置未改动。"
+            cleanup_message="TCP 缓冲区调优失败；运行参数已恢复，但事务记录清理失败。"
+            restore_failure_message="TCP 缓冲区调优失败，且运行参数未能确认完整恢复。"
+            ;;
+        publish)
+            restored_message="保存 TCP 缓冲区配置失败；运行参数已恢复，原配置未改动。"
+            cleanup_message="保存 TCP 缓冲区配置失败；运行参数已恢复，但事务记录清理失败。"
+            restore_failure_message="保存 TCP 缓冲区配置失败，且运行参数未能确认完整恢复。"
+            ;;
+        *) return 2 ;;
+    esac
+
+    if restore_tcp_buffer_runtime_values "$runtime_values"; then
+        if cancel_unmodified_tcp_buffer_change; then
+            err "$restored_message"
+        else
+            err "$cleanup_message"
+        fi
+    else
+        err "$restore_failure_message"
+        err "已保留事务记录，请使用恢复菜单处理。"
+    fi
+}
+
 apply_tcp_buffer_tier() {
     local tier="$1" target_max tier_description runtime_values source_values target_values
     local config_values="" current_config_values="" config_present=0
     local auto_values parent tmp tracking_state
-    local old_core_rmem old_core_wmem old_tcp_rmem old_tcp_wmem
     local auto_moderate auto_window
 
     target_max="$(tcp_buffer_tier_max "$tier")" || return 2
@@ -11744,64 +11926,19 @@ apply_tcp_buffer_tier() {
         cancel_unmodified_tcp_buffer_change || return 1
     fi
 
-    read -r old_core_rmem old_core_wmem old_tcp_rmem old_tcp_wmem <<< "$runtime_values"
-    if ! backup_change_file_once TCP_BUFFER_CONF "$TCP_BUFFER_CONF" ||
-        ! manifest_set_once TCP_BUFFER_RMEM_MAX "$old_core_rmem" ||
-        ! manifest_set_once TCP_BUFFER_WMEM_MAX "$old_core_wmem" ||
-        ! manifest_set_once TCP_BUFFER_TCP_RMEM "$old_tcp_rmem" ||
-        ! manifest_set_once TCP_BUFFER_TCP_WMEM "$old_tcp_wmem"; then
-        cancel_unmodified_tcp_buffer_change || true
-        err "记录 TCP 缓冲区原配置失败，已取消修改。"
-        return 1
-    fi
-    if ! begin_change_transaction TCP_BUFFER_CONF; then
-        cancel_unmodified_tcp_buffer_change || true
-        err "记录 TCP 缓冲区修改事务失败，已取消修改。"
-        return 1
-    fi
-
-    tmp="$(mktemp "$parent/.vpsbox-tcp-buffer.XXXXXX")" || {
-        cancel_unmodified_tcp_buffer_change || true
-        return 1
-    }
-    if ! render_tcp_buffer_config "$target_values" > "$tmp" ||
-        ! chown root:root "$tmp" ||
-        ! chmod 644 "$tmp"; then
-        rm -f -- "$tmp"
-        cancel_unmodified_tcp_buffer_change || true
-        err "生成 TCP 缓冲区配置失败，未修改系统。"
-        return 1
-    fi
+    prepare_tcp_buffer_change "$runtime_values" "$target_values" "$parent" tmp || return 1
 
     if ! sysctl -p "$tmp" >/dev/null 2>&1 ||
         ! tcp_buffer_runtime_matches_values "$target_values" ||
         ! tcp_buffer_autotuning_is_ready; then
         rm -f -- "$tmp"
-        if restore_tcp_buffer_runtime_values "$runtime_values"; then
-            if cancel_unmodified_tcp_buffer_change; then
-                err "TCP 缓冲区调优未能完整生效；运行参数已恢复，持久配置未改动。"
-            else
-                err "TCP 缓冲区调优失败；运行参数已恢复，但事务记录清理失败。"
-            fi
-        else
-            err "TCP 缓冲区调优失败，且运行参数未能确认完整恢复。"
-            err "已保留事务记录，请使用恢复菜单处理。"
-        fi
+        rollback_failed_tcp_buffer_change "$runtime_values" runtime
         return 1
     fi
 
     if ! mv -f -- "$tmp" "$TCP_BUFFER_CONF"; then
         rm -f -- "$tmp"
-        if restore_tcp_buffer_runtime_values "$runtime_values"; then
-            if cancel_unmodified_tcp_buffer_change; then
-                err "保存 TCP 缓冲区配置失败；运行参数已恢复，原配置未改动。"
-            else
-                err "保存 TCP 缓冲区配置失败；运行参数已恢复，但事务记录清理失败。"
-            fi
-        else
-            err "保存 TCP 缓冲区配置失败，且运行参数未能确认完整恢复。"
-            err "已保留事务记录，请使用恢复菜单处理。"
-        fi
+        rollback_failed_tcp_buffer_change "$runtime_values" publish
         return 1
     fi
 
@@ -11907,8 +12044,74 @@ cancel_unmodified_bbr_change() {
     fi
 }
 
+prepare_bbr_change() {
+    local old_cc="$1" old_fq="$2" output_var="$3"
+    local parent staged_file
+
+    if [ -e "$BBR_CONF" ] || [ -L "$BBR_CONF" ]; then
+        [ ! -L "$BBR_CONF" ] || { err "$BBR_CONF 是符号链接，已拒绝覆盖。"; return 1; }
+    fi
+    if ! modprobe tcp_bbr >/dev/null 2>&1 || ! modprobe sch_fq >/dev/null 2>&1; then
+        err "内核不支持 tcp_bbr 或 sch_fq，未写入持久化配置。"
+        return 1
+    fi
+    if ! backup_change_file_once BBR_CONF "$BBR_CONF" ||
+        ! manifest_set_once BBR_CC "${old_cc:-unknown}" ||
+        ! manifest_set_once BBR_FQ "${old_fq:-unknown}"; then
+        cancel_unmodified_bbr_change || true
+        err "记录 BBR 原配置失败，已取消修改。"
+        return 1
+    fi
+    if ! begin_change_transaction BBR_CONF; then
+        cancel_unmodified_bbr_change || true
+        err "记录 BBR 修改事务失败，已取消修改。"
+        return 1
+    fi
+
+    parent="$(dirname "$BBR_CONF")"
+    if [ ! -d "$parent" ] || [ -L "$parent" ]; then
+        cancel_unmodified_bbr_change || true
+        err "BBR 配置目录不存在或不安全：$parent"
+        return 1
+    fi
+    staged_file="$(mktemp "$parent/.vpsbox-bbr.XXXXXX")" || {
+        cancel_unmodified_bbr_change || true
+        return 1
+    }
+    render_bbr_fq_config > "$staged_file" || {
+        rm -f -- "$staged_file"
+        cancel_unmodified_bbr_change || true
+        return 1
+    }
+    printf -v "$output_var" '%s' "$staged_file"
+}
+
+rollback_failed_bbr_change() {
+    local old_cc="$1" old_fq="$2" failure_stage="$3"
+    local restored_message restore_failure_message
+
+    case "$failure_stage" in
+        runtime)
+            restored_message="BBR + fq 未能同时生效；运行时内核参数已恢复，未写入持久化配置。"
+            restore_failure_message="BBR + fq 未能同时生效，且运行时内核参数未能确认完整恢复；已保留事务记录，请使用恢复菜单处理。"
+            ;;
+        publish)
+            restored_message="保存 BBR 配置失败；原持久化配置未被替换，运行时参数已恢复。"
+            restore_failure_message="保存 BBR 配置失败，且运行时参数未能确认完整恢复；已保留事务记录，请使用恢复菜单处理。"
+            ;;
+        *) return 2 ;;
+    esac
+
+    if restore_bbr_runtime_values "$old_cc" "$old_fq"; then
+        cancel_unmodified_bbr_change || true
+        err "$restored_message"
+    else
+        err "$restore_failure_message"
+    fi
+}
+
 enable_bbr_fq() {
-    local old_cc old_fq tmp parent tracking_state
+    local old_cc old_fq tmp tracking_state
 
     tracking_state="$(change_restore_state_readonly BBR_CONF)" || return 1
     if [ "$tracking_state" = "pending" ]; then
@@ -11946,60 +12149,17 @@ enable_bbr_fq() {
 
     old_cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
     old_fq="$(sysctl -n net.core.default_qdisc 2>/dev/null || true)"
-    if [ -e "$BBR_CONF" ] || [ -L "$BBR_CONF" ]; then
-        [ ! -L "$BBR_CONF" ] || { err "$BBR_CONF 是符号链接，已拒绝覆盖。"; return 1; }
-    fi
-    if ! modprobe tcp_bbr >/dev/null 2>&1 || ! modprobe sch_fq >/dev/null 2>&1; then
-        err "内核不支持 tcp_bbr 或 sch_fq，未写入持久化配置。"
-        return 1
-    fi
-    if ! backup_change_file_once BBR_CONF "$BBR_CONF" ||
-        ! manifest_set_once BBR_CC "${old_cc:-unknown}" ||
-        ! manifest_set_once BBR_FQ "${old_fq:-unknown}"; then
-        cancel_unmodified_bbr_change || true
-        err "记录 BBR 原配置失败，已取消修改。"
-        return 1
-    fi
-    if ! begin_change_transaction BBR_CONF; then
-        cancel_unmodified_bbr_change || true
-        err "记录 BBR 修改事务失败，已取消修改。"
-        return 1
-    fi
-    parent="$(dirname "$BBR_CONF")"
-    if [ ! -d "$parent" ] || [ -L "$parent" ]; then
-        cancel_unmodified_bbr_change || true
-        err "BBR 配置目录不存在或不安全：$parent"
-        return 1
-    fi
-    tmp="$(mktemp "$parent/.vpsbox-bbr.XXXXXX")" || {
-        cancel_unmodified_bbr_change || true
-        return 1
-    }
-    render_bbr_fq_config > "$tmp" || {
-        rm -f -- "$tmp"
-        cancel_unmodified_bbr_change || true
-        return 1
-    }
+    prepare_bbr_change "$old_cc" "$old_fq" tmp || return 1
 
-    if ! sysctl -p "$tmp" >/dev/null 2>&1 || [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" != "bbr" ] || [ "$(sysctl -n net.core.default_qdisc 2>/dev/null || true)" != "fq" ]; then
+    if ! sysctl -p "$tmp" >/dev/null 2>&1 || ! bbr_fq_runtime_is_current; then
         rm -f -- "$tmp"
-        if restore_bbr_runtime_values "$old_cc" "$old_fq"; then
-            cancel_unmodified_bbr_change || true
-            err "BBR + fq 未能同时生效；运行时内核参数已恢复，未写入持久化配置。"
-        else
-            err "BBR + fq 未能同时生效，且运行时内核参数未能确认完整恢复；已保留事务记录，请使用恢复菜单处理。"
-        fi
+        rollback_failed_bbr_change "$old_cc" "$old_fq" runtime
         return 1
     fi
 
     if ! chown root:root "$tmp" || ! chmod 644 "$tmp" || ! mv -f "$tmp" "$BBR_CONF"; then
         rm -f -- "$tmp"
-        if restore_bbr_runtime_values "$old_cc" "$old_fq"; then
-            cancel_unmodified_bbr_change || true
-            err "保存 BBR 配置失败；原持久化配置未被替换，运行时参数已恢复。"
-        else
-            err "保存 BBR 配置失败，且运行时参数未能确认完整恢复；已保留事务记录，请使用恢复菜单处理。"
-        fi
+        rollback_failed_bbr_change "$old_cc" "$old_fq" publish
         return 1
     fi
     mark_change_applied BBR_CONF || return 1
@@ -12026,15 +12186,8 @@ ensure_fail2ban_service_running() {
     fi
 }
 
-install_fail2ban() {
+prepare_fail2ban_install_change() {
     local original_active original_enabled
-
-    detect_os
-    if fail2ban_sshd_configuration_healthy; then
-        ensure_fail2ban_nftables_dependency || return 1
-        info "Fail2ban SSH 防护已正常运行，无需重复安装或配置。"
-        return 0
-    fi
 
     if [ "$(fail2ban_service_state)" = "运行中" ]; then
         original_active=active
@@ -12054,44 +12207,71 @@ install_fail2ban() {
         err "记录 Fail2ban 安装事务失败，已取消修改。"
         return 1
     }
+}
 
-    if ! fail2ban_installed; then
-        info "正在安装 Fail2ban..."
-        case "$OS" in
-            debian)
-                export DEBIAN_FRONTEND=noninteractive
-                if ! apt_get_bounded "$PACKAGE_UPDATE_TIMEOUT" update ||
-                    ! apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban nftables; then
-                    warn "Fail2ban 安装未完全成功，将检查最终安装状态。"
-                fi
-                ;;
-            alpine)
-                if ! apk_bounded "$PACKAGE_UPDATE_TIMEOUT" update ||
-                    ! apk_bounded "$PACKAGE_INSTALL_TIMEOUT" add --no-cache fail2ban nftables; then
+install_fail2ban_packages() {
+    if fail2ban_installed; then
+        info "Fail2ban 已安装，正在检查服务与 SSH 防护配置..."
+        return 0
+    fi
+
+    info "正在安装 Fail2ban..."
+    case "$OS" in
+        debian)
+            export DEBIAN_FRONTEND=noninteractive
+            if ! apt_get_bounded "$PACKAGE_UPDATE_TIMEOUT" update ||
+                ! apt_get_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban nftables; then
+                warn "Fail2ban 安装未完全成功，将检查最终安装状态。"
+            fi
+            ;;
+        alpine)
+            if ! apk_bounded "$PACKAGE_UPDATE_TIMEOUT" update ||
+                ! apk_bounded "$PACKAGE_INSTALL_TIMEOUT" add --no-cache fail2ban nftables; then
+                err "Fail2ban 安装失败。"
+                return 1
+            fi
+            ;;
+        redhat)
+            if command -v dnf >/dev/null 2>&1; then
+                dnf_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban nftables || {
                     err "Fail2ban 安装失败。"
                     return 1
-                fi
-                ;;
-            redhat)
-                if command -v dnf >/dev/null 2>&1; then
-                    dnf_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban nftables || { err "Fail2ban 安装失败。"; return 1; }
-                else
-                    yum_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban nftables || { err "Fail2ban 安装失败。"; return 1; }
-                fi
-                ;;
-            *)
-                err "未识别系统类型，无法自动安装 Fail2ban。"
-                return 1
-                ;;
-        esac
-    else
-        info "Fail2ban 已安装，正在检查服务与 SSH 防护配置..."
-    fi
+                }
+            else
+                yum_bounded "$PACKAGE_INSTALL_TIMEOUT" install -y fail2ban nftables || {
+                    err "Fail2ban 安装失败。"
+                    return 1
+                }
+            fi
+            ;;
+        *)
+            err "未识别系统类型，无法自动安装 Fail2ban。"
+            return 1
+            ;;
+    esac
 
     if ! fail2ban_installed; then
         err "Fail2ban 未安装成功，请检查软件源或网络。"
         return 1
     fi
+}
+
+fail2ban_install_state_is_accepted() {
+    fail2ban_service_is_enabled &&
+        [ "$(fail2ban_service_state)" = "运行中" ] &&
+        [ "$(fail2ban_sshd_state)" = "已启用" ]
+}
+
+install_fail2ban() {
+    detect_os
+    if fail2ban_sshd_configuration_healthy; then
+        ensure_fail2ban_nftables_dependency || return 1
+        info "Fail2ban SSH 防护已正常运行，无需重复安装或配置。"
+        return 0
+    fi
+
+    prepare_fail2ban_install_change || return 1
+    install_fail2ban_packages || return 1
     ensure_fail2ban_nftables_dependency || return 1
 
     ensure_fail2ban_service_running || {
@@ -12105,9 +12285,7 @@ install_fail2ban() {
         return 1
     }
 
-    if ! fail2ban_service_is_enabled ||
-        [ "$(fail2ban_service_state)" != "运行中" ] ||
-        [ "$(fail2ban_sshd_state)" != "已启用" ]; then
+    if ! fail2ban_install_state_is_accepted; then
         err "Fail2ban 未达到预期状态，请检查服务日志和 SSH 端口配置。"
         return 1
     fi
@@ -12945,14 +13123,7 @@ firewall_detect_docker_proxy_ports() {
     done
 }
 
-firewall_detect_docker_ports() {
-    local container mode mapping container_port protocol binding host_ip host_port remainder
-    local network_id network_name network_driver bridge_name swarm_state
-    local docker_host context endpoint effective_endpoint security_options container_list network_list
-    local bindings running publish_all port_mappings network_data gateway_v4 gateway_v6 trusted_interfaces
-    local container_dynamic container_unresolved_fixed
-    local connected_count
-
+firewall_reset_docker_snapshot() {
     FW_DOCKER_TCP=""
     FW_DOCKER_UDP=""
     FW_DOCKER_PUBLIC_TCP=""
@@ -12972,6 +13143,13 @@ firewall_detect_docker_ports() {
     FW_DOCKER_DYNAMIC_PORT=0
     FW_DOCKER_DIRECT_NETWORK=0
     FW_DOCKER_CUSTOM_BRIDGE=0
+}
+
+firewall_validate_docker_connection() {
+    local active_var="$1"
+    local docker_host context endpoint effective_endpoint security_options swarm_state
+
+    printf -v "$active_var" '%s' 0
 
     if ! command -v docker >/dev/null 2>&1; then
         docker_daemon_process_present || return 0
@@ -13031,6 +13209,13 @@ firewall_detect_docker_ports() {
     fi
 
     firewall_validate_docker_daemon_mode || return 1
+    printf -v "$active_var" '%s' 1
+}
+
+firewall_collect_docker_container_ports() {
+    local container mode mapping container_port protocol binding host_ip host_port remainder
+    local container_list bindings running publish_all port_mappings
+    local container_dynamic container_unresolved_fixed
 
     container_list="$(docker_with_timeout ps -aq 2>/dev/null)" || {
         err "Docker 容器枚举失败，已拒绝生成不完整的防火墙规则。"
@@ -13156,6 +13341,11 @@ firewall_detect_docker_ports() {
         fi
         [ "$container_dynamic" = "0" ] || FW_DOCKER_DYNAMIC_PORT=1
     done <<< "$container_list"
+}
+
+firewall_collect_docker_network_bridges() {
+    local network_id network_name network_driver bridge_name network_list
+    local network_data gateway_v4 gateway_v6 trusted_interfaces connected_count
 
     network_list="$(docker_with_timeout network ls --format '{{.ID}}|{{.Name}}|{{.Driver}}' 2>/dev/null)" || {
         err "Docker 网络枚举失败，已拒绝生成不完整的防火墙规则。"
@@ -13211,15 +13401,110 @@ firewall_detect_docker_ports() {
                     return 1
                 fi
                 ;;
-        esac
+            esac
     done <<< "$network_list"
+}
 
+firewall_reconcile_docker_snapshot() {
     firewall_detect_docker_proxy_ports || {
         err "docker-proxy 监听与 Docker 发布端口不一致，已拒绝更新防火墙。"
         return 1
     }
     firewall_docker_daemon_identity_unchanged || {
         err "Docker daemon 在检查期间发生变化，已拒绝使用可能不一致的端口结果。"
+        return 1
+    }
+}
+
+firewall_encode_docker_snapshot() {
+    local output_var="$1"
+
+    printf -v "$output_var" \
+        'v1|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|end' \
+        "$FW_DOCKER_TCP" "$FW_DOCKER_UDP" \
+        "$FW_DOCKER_PUBLIC_TCP" "$FW_DOCKER_PUBLIC_UDP" \
+        "$FW_DOCKER_PUBLIC4_TCP" "$FW_DOCKER_PUBLIC4_UDP" \
+        "$FW_DOCKER_PUBLIC6_TCP" "$FW_DOCKER_PUBLIC6_UDP" \
+        "$FW_DOCKER_PROXY4_TCP" "$FW_DOCKER_PROXY4_UDP" \
+        "$FW_DOCKER_PROXY6_TCP" "$FW_DOCKER_PROXY6_UDP" \
+        "$FW_DOCKER_BRIDGES" "$FW_DOCKER_DAEMON_PID" \
+        "$FW_DOCKER_DAEMON_START_TICKS" "$FW_DOCKER_HOST_NETWORK" \
+        "$FW_DOCKER_DYNAMIC_PORT" "$FW_DOCKER_DIRECT_NETWORK" \
+        "$FW_DOCKER_CUSTOM_BRIDGE"
+}
+
+firewall_collect_docker_snapshot() {
+    local output_var="$1" docker_active=0
+    # Bash 的动态作用域使既有 Docker helper 写入以下局部同名变量；
+    # 只有全部采集与身份复验成功后，外层才会提交这些暂存值。
+    local FW_DOCKER_TCP="" FW_DOCKER_UDP=""
+    local FW_DOCKER_PUBLIC_TCP="" FW_DOCKER_PUBLIC_UDP=""
+    local FW_DOCKER_PUBLIC4_TCP="" FW_DOCKER_PUBLIC4_UDP=""
+    local FW_DOCKER_PUBLIC6_TCP="" FW_DOCKER_PUBLIC6_UDP=""
+    local FW_DOCKER_PROXY4_TCP="" FW_DOCKER_PROXY4_UDP=""
+    local FW_DOCKER_PROXY6_TCP="" FW_DOCKER_PROXY6_UDP=""
+    local FW_DOCKER_BRIDGES="" FW_DOCKER_DAEMON_PID="" FW_DOCKER_DAEMON_START_TICKS=""
+    local FW_DOCKER_HOST_NETWORK=0 FW_DOCKER_DYNAMIC_PORT=0
+    local FW_DOCKER_DIRECT_NETWORK=0 FW_DOCKER_CUSTOM_BRIDGE=0
+
+    firewall_validate_docker_connection docker_active || return $?
+    if [ "$docker_active" -eq 1 ]; then
+        firewall_collect_docker_container_ports || return 1
+        firewall_collect_docker_network_bridges || return 1
+        firewall_reconcile_docker_snapshot || return 1
+    fi
+    firewall_encode_docker_snapshot "$output_var"
+}
+
+firewall_commit_docker_snapshot() {
+    local snapshot="$1" marker terminator extra
+    local docker_tcp docker_udp public_tcp public_udp
+    local public4_tcp public4_udp public6_tcp public6_udp
+    local proxy4_tcp proxy4_udp proxy6_tcp proxy6_udp bridges daemon_pid daemon_ticks
+    local host_network dynamic_port direct_network custom_bridge flag
+
+    IFS='|' read -r marker docker_tcp docker_udp public_tcp public_udp \
+        public4_tcp public4_udp public6_tcp public6_udp \
+        proxy4_tcp proxy4_udp proxy6_tcp proxy6_udp bridges daemon_pid daemon_ticks \
+        host_network dynamic_port direct_network custom_bridge terminator extra <<< "$snapshot"
+    [ "$marker" = v1 ] && [ "$terminator" = end ] && [ -z "$extra" ] || return 1
+    for flag in "$host_network" "$dynamic_port" "$direct_network" "$custom_bridge"; do
+        [[ "$flag" =~ ^[01]$ ]] || return 1
+    done
+
+    FW_DOCKER_TCP="$docker_tcp"
+    FW_DOCKER_UDP="$docker_udp"
+    FW_DOCKER_PUBLIC_TCP="$public_tcp"
+    FW_DOCKER_PUBLIC_UDP="$public_udp"
+    FW_DOCKER_PUBLIC4_TCP="$public4_tcp"
+    FW_DOCKER_PUBLIC4_UDP="$public4_udp"
+    FW_DOCKER_PUBLIC6_TCP="$public6_tcp"
+    FW_DOCKER_PUBLIC6_UDP="$public6_udp"
+    FW_DOCKER_PROXY4_TCP="$proxy4_tcp"
+    FW_DOCKER_PROXY4_UDP="$proxy4_udp"
+    FW_DOCKER_PROXY6_TCP="$proxy6_tcp"
+    FW_DOCKER_PROXY6_UDP="$proxy6_udp"
+    FW_DOCKER_BRIDGES="$bridges"
+    FW_DOCKER_DAEMON_PID="$daemon_pid"
+    FW_DOCKER_DAEMON_START_TICKS="$daemon_ticks"
+    FW_DOCKER_HOST_NETWORK="$host_network"
+    FW_DOCKER_DYNAMIC_PORT="$dynamic_port"
+    FW_DOCKER_DIRECT_NETWORK="$direct_network"
+    FW_DOCKER_CUSTOM_BRIDGE="$custom_bridge"
+}
+
+firewall_detect_docker_ports() {
+    local snapshot="" status
+
+    firewall_reset_docker_snapshot
+    if firewall_collect_docker_snapshot snapshot; then
+        :
+    else
+        status=$?
+        return "$status"
+    fi
+    firewall_commit_docker_snapshot "$snapshot" || {
+        firewall_reset_docker_snapshot
         return 1
     }
 
@@ -14599,18 +14884,7 @@ EOF
     fi
 }
 
-firewall_apply_desired_state() {
-    local work_dir rollback_dir answer service_file service_target service_mode
-    local detect_status requested_extra_tcp="" requested_extra_udp="" override_extra_ports=0
-
-    if [ "$#" -eq 2 ]; then
-        requested_extra_tcp="$1"
-        requested_extra_udp="$2"
-        override_extra_ports=1
-    elif [ "$#" -ne 0 ]; then
-        return 2
-    fi
-
+prepare_firewall_apply_environment() {
     firewall_settle_pending_port_transition || return 1
     detect_os
     case "$OS" in
@@ -14621,74 +14895,94 @@ firewall_apply_desired_state() {
     firewall_check_conflicts || return 1
     ensure_nftables || return 1
     firewall_check_conflicts || return 1
-    firewall_load_state || return 1
+}
+
+apply_firewall_extra_port_override() {
+    local override_extra_ports="$1" requested_extra_tcp="$2" requested_extra_udp="$3"
+
     if [ "$override_extra_ports" -eq 1 ]; then
         FW_EXTRA_TCP="$requested_extra_tcp"
         FW_EXTRA_UDP="$requested_extra_udp"
     fi
-    FW_DOCKER_STOPPED_IGNORED=0
-    if firewall_detect_allowed_ports initial; then
+}
+
+refresh_firewall_apply_desired_state() {
+    local phase="$1" override_extra_ports="$2"
+    local requested_extra_tcp="$3" requested_extra_udp="$4" detect_status
+
+    if firewall_load_state; then
         :
     else
-        detect_status=$?
-        [ "$detect_status" -eq 3 ] && return 0
-        return "$detect_status"
-    fi
-
-    if firewall_desired_state_is_current; then
-        info "当前防火墙规则与端口状态一致，无需更新。"
-        return 0
-    fi
-    firewall_show_port_summary
-    read -r -p "确认应用以上规则？请输入 YES：" answer || return 1
-    [ "$answer" = "YES" ] || { info "已取消，未修改防火墙。"; return 0; }
-
-    # 用户确认期间 ssh.socket、sshd、Docker 或公网监听可能变化；落盘前重新取一次实时状态。
-    firewall_load_state || {
-        err "确认后防火墙状态文件发生异常，未修改防火墙。"
+        if [ "$phase" = confirmed ]; then
+            err "确认后防火墙状态文件发生异常，未修改防火墙。"
+        fi
         return 1
-    }
-    if [ "$override_extra_ports" -eq 1 ]; then
-        FW_EXTRA_TCP="$requested_extra_tcp"
-        FW_EXTRA_UDP="$requested_extra_udp"
     fi
-    if ! firewall_detect_allowed_ports confirmed; then
+    apply_firewall_extra_port_override \
+        "$override_extra_ports" "$requested_extra_tcp" "$requested_extra_udp"
+    [ "$phase" != initial ] || FW_DOCKER_STOPPED_IGNORED=0
+    if firewall_detect_allowed_ports "$phase"; then
+        return 0
+    else
+        detect_status=$?
+    fi
+    if [ "$phase" = confirmed ]; then
         err "确认后端口状态发生异常，未修改防火墙。"
         return 1
     fi
-    if firewall_desired_state_is_current; then
-        info "当前防火墙规则与端口状态一致，无需更新。"
-        return 0
-    fi
+    return "$detect_status"
+}
+
+prepare_firewall_apply_candidate() {
+    local work_var="$1" service_file_var="$2" service_target_var="$3" service_mode_var="$4"
+    local candidate_dir candidate_service_file candidate_service_target candidate_service_mode
 
     ensure_change_store || return 1
-    work_dir="$(mktemp -d "$RUNTIME_DIR/firewall-work.XXXXXX")" || return 1
-    firewall_write_state_file "$work_dir/firewall.env" || { rm -rf "$work_dir"; return 1; }
-    firewall_write_config "$work_dir/firewall.nft" || { rm -rf "$work_dir"; return 1; }
+    candidate_dir="$(mktemp -d "$RUNTIME_DIR/firewall-work.XXXXXX")" || return 1
+    firewall_write_state_file "$candidate_dir/firewall.env" || { rm -rf "$candidate_dir"; return 1; }
+    firewall_write_config "$candidate_dir/firewall.nft" || { rm -rf "$candidate_dir"; return 1; }
     if is_systemd; then
-        service_file="$work_dir/vpsbox-firewall.service"
-        service_target="$FIREWALL_SYSTEMD_UNIT"
-        service_mode=644
+        candidate_service_file="$candidate_dir/vpsbox-firewall.service"
+        candidate_service_target="$FIREWALL_SYSTEMD_UNIT"
+        candidate_service_mode=644
     else
-        service_file="$work_dir/vpsbox-firewall"
-        service_target="$FIREWALL_OPENRC_SERVICE"
-        service_mode=755
+        candidate_service_file="$candidate_dir/vpsbox-firewall"
+        candidate_service_target="$FIREWALL_OPENRC_SERVICE"
+        candidate_service_mode=755
     fi
-    firewall_write_service_definition "$service_file" || { rm -rf "$work_dir"; return 1; }
+    firewall_write_service_definition "$candidate_service_file" || {
+        rm -rf "$candidate_dir"
+        return 1
+    }
 
-    if ! firewall_create_rollback_snapshot rollback_dir "$FW_SSH_PORTS"; then
+    printf -v "$work_var" '%s' "$candidate_dir"
+    printf -v "$service_file_var" '%s' "$candidate_service_file"
+    printf -v "$service_target_var" '%s' "$candidate_service_target"
+    printf -v "$service_mode_var" '%s' "$candidate_service_mode"
+}
+
+arm_firewall_apply_rollback() {
+    local work_dir="$1" rollback_var="$2" candidate_rollback=""
+
+    if ! firewall_create_rollback_snapshot candidate_rollback "$FW_SSH_PORTS"; then
         rm -rf "$work_dir"
         err "无法创建防火墙回滚快照。"
         return 1
     fi
-    if ! firewall_start_rollback_watchdog "$rollback_dir"; then
+    if ! firewall_start_rollback_watchdog "$candidate_rollback"; then
         err "无法启动自动回滚保护，正在恢复原状态。"
-        if ! firewall_restore_snapshot_now "$rollback_dir"; then
+        if ! firewall_restore_snapshot_now "$candidate_rollback"; then
             err "原状态恢复失败，必须先处理保留的回滚快照。"
         fi
         rm -rf "$work_dir"
         return 1
     fi
+    printf -v "$rollback_var" '%s' "$candidate_rollback"
+}
+
+apply_firewall_candidate_runtime() {
+    local work_dir="$1" rollback_dir="$2" answer
+
     # SSH 二次确认前只修改内核运行态，不覆盖开机配置。若此时异常重启，
     # 系统仍按原有持久配置启动；持久快照会在下次进入防火墙功能时继续恢复/清理。
     if ! firewall_apply_config_file "$work_dir/firewall.nft"; then
@@ -14711,6 +15005,11 @@ firewall_apply_desired_state() {
         rm -rf "$work_dir"
         return 1
     fi
+}
+
+commit_firewall_apply_candidate() {
+    local work_dir="$1" rollback_dir="$2" service_file="$3"
+    local service_target="$4" service_mode="$5"
 
     if ! firewall_begin_commit "$rollback_dir"; then
         err "确认前规则已经开始自动恢复，本次设置未保存。"
@@ -14743,6 +15042,53 @@ firewall_apply_desired_state() {
         return 1
     fi
     rm -rf "$work_dir"
+    return 0
+}
+
+firewall_apply_desired_state() {
+    local work_dir="" rollback_dir="" answer service_file="" service_target="" service_mode=""
+    local detect_status requested_extra_tcp="" requested_extra_udp="" override_extra_ports=0
+
+    if [ "$#" -eq 2 ]; then
+        requested_extra_tcp="$1"
+        requested_extra_udp="$2"
+        override_extra_ports=1
+    elif [ "$#" -ne 0 ]; then
+        return 2
+    fi
+
+    prepare_firewall_apply_environment || return 1
+    if refresh_firewall_apply_desired_state \
+        initial "$override_extra_ports" "$requested_extra_tcp" "$requested_extra_udp"; then
+        :
+    else
+        detect_status=$?
+        [ "$detect_status" -eq 3 ] && return 0
+        return "$detect_status"
+    fi
+
+    if firewall_desired_state_is_current; then
+        info "当前防火墙规则与端口状态一致，无需更新。"
+        return 0
+    fi
+    firewall_show_port_summary
+    read -r -p "确认应用以上规则？请输入 YES：" answer || return 1
+    [ "$answer" = "YES" ] || { info "已取消，未修改防火墙。"; return 0; }
+
+    # 用户确认期间 ssh.socket、sshd、Docker 或公网监听可能变化；落盘前重新取一次实时状态。
+    refresh_firewall_apply_desired_state \
+        confirmed "$override_extra_ports" "$requested_extra_tcp" "$requested_extra_udp" || return 1
+    if firewall_desired_state_is_current; then
+        info "当前防火墙规则与端口状态一致，无需更新。"
+        return 0
+    fi
+
+    prepare_firewall_apply_candidate \
+        work_dir service_file service_target service_mode || return 1
+    arm_firewall_apply_rollback "$work_dir" rollback_dir || return 1
+    apply_firewall_candidate_runtime "$work_dir" "$rollback_dir" || return 1
+    commit_firewall_apply_candidate \
+        "$work_dir" "$rollback_dir" "$service_file" "$service_target" "$service_mode" || return 1
     info "主机防火墙已启用并设置为开机自动加载。"
 }
 
@@ -16126,30 +16472,8 @@ resolve_host_ips() {
         awk '!seen[$1]++ { print $1; count++; if (count == 5) exit }'
 }
 
-run_self_check() {
-    local has_node="0"
-    local has_node_artifacts="0"
-    local node_integrity_failed="0"
-    local max_use
-    local max_file
-    local state node_protocols protocol protocol_status label detail ports_report uri_cache_state
-    local config_state service_state listener_ok listener_fail
-    local install_metadata installed_version installed_at
-    local bbr_config_expected=0 ipv4_priority_expected=0
-    local singbox_available=0
-    local CHECK_OK_COUNT=0
-    local CHECK_INFO_COUNT=0
-    local CHECK_WARN_COUNT=0
-    local CHECK_FAIL_COUNT=0
-
-    detect_os
-
-    cat <<EOF
-========================================
- 一键检测
-========================================
-EOF
-    check_table_header
+self_check_system_basics() {
+    local install_metadata installed_version installed_at state
 
     if [ "$(id -u)" = "0" ]; then
         check_ok "运行用户" "root"
@@ -16185,6 +16509,15 @@ EOF
         未运行) check_fail "NTP 同步" "$state" ;;
         *) check_warn "NTP 同步" "$state" ;;
     esac
+}
+
+self_check_node_stack() {
+    local has_node="0"
+    local has_node_artifacts="0"
+    local node_integrity_failed="0"
+    local singbox_available=0
+    local config_state service_state listener_ok listener_fail
+    local detail label node_protocols protocol protocol_status uri_cache_state
 
     if node_core_artifacts_present; then
         has_node_artifacts="1"
@@ -16267,8 +16600,11 @@ EOF
             *) check_warn "节点链接" "状态无法确认" ;;
         esac
     fi
+}
 
-    local ip
+self_check_access_security() {
+    local detail ip state
+
     ip="$(public_ipv4 || true)"
     if [ -n "$ip" ] && is_ipv4_address "$ip"; then
         check_ok "公网 IPv4" "$ip"
@@ -16332,6 +16668,10 @@ EOF
             check_fail "防火墙端口" "配置已过期，请执行防火墙更新"
         fi
     fi
+}
+
+self_check_network_tuning() {
+    local bbr_config_expected=0 ipv4_priority_expected=0 state
 
     if change_applied_recorded_readonly GAI_CONF; then
         ipv4_priority_expected=1
@@ -16378,6 +16718,10 @@ EOF
         第一档*|第二档*|第三档*) check_ok "TCP 缓冲区" "$state" ;;
         *) check_info "TCP 缓冲区" "$state" ;;
     esac
+}
+
+self_check_maintenance() {
+    local max_file max_use state
 
     state="$(journald_limit_state)"
     if [ "$state" = "不支持" ]; then
@@ -16407,6 +16751,10 @@ EOF
     else
         check_ok "系统重启" "不需要重启"
     fi
+}
+
+self_check_ports_report() {
+    local ports_report
 
     if ports_report="$(show_ports_security_group 2>&1)"; then
         check_table_footer
@@ -16416,6 +16764,30 @@ EOF
         check_table_footer
         [ -z "$ports_report" ] || printf '%s\n' "$ports_report"
     fi
+}
+
+run_self_check() {
+    local CHECK_OK_COUNT=0
+    local CHECK_INFO_COUNT=0
+    local CHECK_WARN_COUNT=0
+    local CHECK_FAIL_COUNT=0
+
+    detect_os
+
+    cat <<EOF
+========================================
+ 一键检测
+========================================
+EOF
+    check_table_header
+
+    self_check_system_basics
+    self_check_node_stack
+    self_check_access_security
+    self_check_network_tuning
+    self_check_maintenance
+    self_check_ports_report
+
     printf '\n检测结果：OK %s / INFO %s / WARN %s / FAIL %s\n' \
         "$CHECK_OK_COUNT" "$CHECK_INFO_COUNT" "$CHECK_WARN_COUNT" "$CHECK_FAIL_COUNT"
 }

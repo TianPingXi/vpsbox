@@ -1823,7 +1823,7 @@ test_self_check_classifies_and_summarizes_results() {
         local ipv6_external_output="$TEST_TMP/self-check-ipv6-external.out"
         local ipv6_fail_output="$TEST_TMP/self-check-ipv6-fail.out"
         local ipv6_warn_output="$TEST_TMP/self-check-ipv6-warn.out"
-        local status count
+        local status count actual_labels
         local mock_ntp_state=未安装 mock_journald_state=不支持
         local mock_ipv6_state="未检测到全局 IPv6" ports_ok=1
 
@@ -1891,11 +1891,21 @@ test_self_check_classifies_and_summarizes_results() {
             "每次一键检测必须重新开始计数"
         assert_eq 1 "$(grep -c '^检测结果：' "$first_output")" \
             "一次检测只能输出一条结果摘要"
+        assert_eq 1 "$(grep -Fxc -- ' 状态   | 项目             | 结果' "$first_output")" \
+            "一键检测只能输出一个表头"
+        assert_eq 2 "$(grep -Fxc -- '--------+------------------+------------' "$first_output")" \
+            "一键检测表格必须包含表头分隔线和表尾"
         awk '
+            $0 == "--------+------------------+------------" {
+                separator_count++
+                if (separator_count == 2) footer = NR
+            }
             /PORTS_MARKER/ { marker = NR }
             /^检测结果：/ { summary = NR }
-            END { exit !(marker && summary > marker) }
-        ' "$first_output" || fail "检测摘要必须位于端口建议之后"
+            END {
+                exit !(separator_count == 2 && footer < marker && marker < summary)
+            }
+        ' "$first_output" || fail "表尾、端口建议与检测摘要必须按固定顺序输出"
         assert_eq 1 "$(grep -Ec ' INFO[[:space:]]+[|] 节点[[:space:]]+[|] 未创建' "$first_output")" \
             "未创建节点只能显示一条 INFO"
         assert_file_contains "$first_output" 'INFO[[:space:]]+[|] sing-box[[:space:]]+[|] 未安装'
@@ -1930,30 +1940,19 @@ test_self_check_classifies_and_summarizes_results() {
         assert_file_contains "$first_output" 'INFO[[:space:]]+[|] 主机防火墙[[:space:]]+[|] 未启用'
         assert_file_contains "$first_output" \
             'INFO[[:space:]]+[|] 首次安装[[:space:]]+[|] 历史未记录'
-        awk '
-            /[|][[:space:]]+首次安装[[:space:]]+[|]/ { install = NR }
-            /[|][[:space:]]+运行时间[[:space:]]+[|]/ { uptime = NR }
-            /[|][[:space:]]+NTP 同步[[:space:]]+[|]/ { ntp = NR }
-            /[|][[:space:]]+sing-box[[:space:]]+[|]/ { singbox = NR }
-            /[|][[:space:]]+节点[[:space:]]+[|]/ { node = NR }
-            /[|][[:space:]]+公网 IPv4[[:space:]]+[|]/ { public_ip = NR }
-            /[|][[:space:]]+SSH 端口[[:space:]]+[|]/ { ssh = NR }
-            /[|][[:space:]]+主机防火墙[[:space:]]+[|]/ { firewall = NR }
-            /[|][[:space:]]+IPv4 优先[[:space:]]+[|]/ { ipv4 = NR }
-            /[|][[:space:]]+IPv6[[:space:]]+[|]/ { ipv6 = NR }
-            /[|][[:space:]]+BBR[[:space:]]+[|]/ { bbr = NR }
-            /[|][[:space:]]+TCP 缓冲区[[:space:]]+[|]/ { tcp = NR }
-            /[|][[:space:]]+日志限制[[:space:]]+[|]/ { journal_limit = NR }
-            /[|][[:space:]]+日志占用[[:space:]]+[|]/ { journal_usage = NR }
-            /[|][[:space:]]+系统重启[[:space:]]+[|]/ { reboot = NR }
-            END {
-                exit !(install < uptime && uptime < ntp && ntp < singbox &&
-                    singbox < node && node < public_ip && public_ip < ssh &&
-                    ssh < firewall && firewall < ipv4 && ipv4 < ipv6 &&
-                    ipv6 < bbr && bbr < tcp && tcp < journal_limit &&
-                    journal_limit < journal_usage && journal_usage < reboot)
-            }
-        ' "$first_output" || fail "一键检测必须按基础、核心、SSH 安全、网络、维护顺序输出"
+        actual_labels="$(
+            awk -F '|' '
+                $1 ~ /^[[:space:]]*(OK|INFO|WARN|FAIL)[[:space:]]*$/ {
+                    label = $2
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "", label)
+                    print label
+                }
+            ' "$first_output"
+        )"
+        assert_eq \
+            $'运行用户\nvpsbox 命令\n首次安装\n运行时间\n系统时间\nNTP 同步\nsing-box\n节点\n公网 IPv4\nSSH 端口\nFail2ban\n主机防火墙\nIPv4 优先\nIPv6\nBBR\nfq\nTCP 缓冲区\n日志限制\n日志占用\n系统重启' \
+            "$actual_labels" \
+            "基准场景的一键检测项目集合与顺序必须保持稳定"
 
         mock_ipv6_state="已启用（3 个全局地址）"
         run_self_check > "$ipv6_ok_output" 2>&1 || fail "已启用 IPv6 的一键检测应正常完成"
