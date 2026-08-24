@@ -130,6 +130,133 @@ function Get-HeadVersion {
     return Get-VersionFromText -Text ($headLines -join "`n")
 }
 
+function Get-LocalUpstream {
+    [array]$refLines = @(
+        & git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>$null
+    )
+    if ($LASTEXITCODE -ne 0 -or $refLines.Count -ne 1 -or
+        [string]::IsNullOrWhiteSpace([string]$refLines[0])) {
+        throw (
+            '当前分支未配置本地 upstream，无法核对已提交内容的发布版本。' +
+            '请先配置 upstream，或仅使用 -Review 进行只读审查。'
+        )
+    }
+
+    [array]$commitLines = @(& git rev-parse --verify '@{u}^{commit}' 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $commitLines.Count -ne 1 -or
+        [string]$commitLines[0] -notmatch '^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$') {
+        throw '无法解析当前分支的本地 upstream 提交。'
+    }
+
+    return [pscustomobject]@{
+        Ref = ([string]$refLines[0]).Trim()
+        Commit = ([string]$commitLines[0]).Trim()
+    }
+}
+
+function Get-GitAheadBehind {
+    param([Parameter(Mandatory)][string]$UpstreamCommit)
+
+    [array]$countLines = @(Invoke-GitLines `
+            -Description 'HEAD 与本地 upstream 的 ahead/behind 状态' `
+            -Arguments @(
+                'rev-list', '--left-right', '--count',
+                "HEAD...$UpstreamCommit"
+            ))
+    if ($countLines.Count -ne 1 -or
+        [string]$countLines[0] -notmatch '^\s*([0-9]+)\s+([0-9]+)\s*$') {
+        throw '无法解析 HEAD 与本地 upstream 的 ahead/behind 状态。'
+    }
+
+    return [pscustomobject]@{
+        Ahead = [long]$Matches[1]
+        Behind = [long]$Matches[2]
+    }
+}
+
+function Get-VersionFromGitCommit {
+    param([Parameter(Mandatory)][string]$Commit)
+
+    if ($Commit -notmatch '^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$') {
+        throw '用于读取版本的 Git 提交格式不正确。'
+    }
+    [array]$versionLines = @(Invoke-GitLines `
+            -Description "$Commit 中的 vpsbox.sh" `
+            -Arguments @('show', "${Commit}:vpsbox.sh"))
+    return Get-VersionFromText -Text ($versionLines -join "`n")
+}
+
+function Assert-CommittedReleaseVersion {
+    param(
+        [Parameter(Mandatory)][long]$Ahead,
+        [Parameter(Mandatory)][long]$Behind,
+        [Parameter(Mandatory)][string]$CurrentVersion,
+        [Parameter(Mandatory)][string]$UpstreamVersion,
+        [Parameter(Mandatory)][string]$UpstreamRef
+    )
+
+    if ($Ahead -lt 0 -or $Behind -lt 0) {
+        throw 'ahead/behind 计数不得为负数。'
+    }
+    if ($Behind -gt 0) {
+        if ($Ahead -gt 0) {
+            throw (
+                "当前 HEAD 与本地 upstream $UpstreamRef 已分叉" +
+                "（ahead $Ahead / behind $Behind），已拒绝正式发布检查。"
+            )
+        }
+        throw (
+            "当前 HEAD 落后于本地 upstream $UpstreamRef $Behind 个提交，" +
+            '已拒绝正式发布检查。'
+        )
+    }
+    if ($Ahead -eq 0) {
+        return
+    }
+
+    $expectedVersion = Get-NextPatchVersion -Version $UpstreamVersion
+    if ($CurrentVersion -cne $expectedVersion) {
+        throw (
+            "检测到相对本地 upstream $UpstreamRef 有 $Ahead 个未推送提交，" +
+            "版本必须由 $UpstreamVersion 增加至 $expectedVersion，" +
+            "当前为 $CurrentVersion。请运行：.\tools\release.ps1 -Bump"
+        )
+    }
+}
+
+function Test-CommittedReleaseVersionGate {
+    Assert-CommittedReleaseVersion `
+        -Ahead 0 -Behind 0 `
+        -CurrentVersion 'v1.2.3' -UpstreamVersion 'v1.2.3' `
+        -UpstreamRef 'origin/main'
+    Assert-CommittedReleaseVersion `
+        -Ahead 1 -Behind 0 `
+        -CurrentVersion 'v1.2.4' -UpstreamVersion 'v1.2.3' `
+        -UpstreamRef 'origin/main'
+
+    $rejectedCases = @(
+        @{ Name = '同版本的新提交'; Ahead = 1; Behind = 0; Version = 'v1.2.3' }
+        @{ Name = '跳过补丁版本'; Ahead = 1; Behind = 0; Version = 'v1.2.5' }
+        @{ Name = '落后 upstream'; Ahead = 0; Behind = 1; Version = 'v1.2.3' }
+    )
+    foreach ($case in $rejectedCases) {
+        $accepted = $false
+        try {
+            Assert-CommittedReleaseVersion `
+                -Ahead $case.Ahead -Behind $case.Behind `
+                -CurrentVersion $case.Version -UpstreamVersion 'v1.2.3' `
+                -UpstreamRef 'origin/main'
+            $accepted = $true
+        }
+        catch {
+            $accepted = $false
+        }
+        if ($accepted) {
+            throw "发布版本门禁自测失败：错误接受了$($case.Name)。"
+        }
+    }
+}
+
 function Assert-RepositoryState {
     param([switch]$AllowMixedChanges)
 
@@ -202,6 +329,9 @@ function Invoke-ReleaseChecks {
         [Parameter(Mandatory)][string[]]$ShellScripts,
         [Parameter(Mandatory)][string]$SensitivePattern
     )
+
+    Write-Info '运行发布版本门禁自测'
+    Test-CommittedReleaseVersionGate
 
     Invoke-Native -Name '运行 ShellCheck warning 级检查' -Command {
         & shellcheck --severity=warning @ShellScripts
@@ -291,12 +421,24 @@ try {
             throw "当前版本 $currentVersion 既不等于 HEAD 的 $headVersion，也不是下一版本 $expectedVersion。"
         }
     }
-    elseif ($workingTreeChanges.Count -gt 0 -and
-        $currentVersion -cne $expectedVersion) {
-        throw (
-            "检测到待发布改动，版本必须由 $headVersion 增加至 $expectedVersion。" +
-            '请运行：.\tools\release.ps1 -Bump'
-        )
+    elseif ($workingTreeChanges.Count -gt 0) {
+        if ($currentVersion -cne $expectedVersion) {
+            throw (
+                "检测到待发布改动，版本必须由 $headVersion 增加至 $expectedVersion。" +
+                '请运行：.\tools\release.ps1 -Bump'
+            )
+        }
+    }
+    else {
+        $upstream = Get-LocalUpstream
+        $aheadBehind = Get-GitAheadBehind -UpstreamCommit $upstream.Commit
+        $upstreamVersion = Get-VersionFromGitCommit -Commit $upstream.Commit
+        Assert-CommittedReleaseVersion `
+            -Ahead $aheadBehind.Ahead `
+            -Behind $aheadBehind.Behind `
+            -CurrentVersion $currentVersion `
+            -UpstreamVersion $upstreamVersion `
+            -UpstreamRef $upstream.Ref
     }
 
     $gitBash = Get-GitBashPath

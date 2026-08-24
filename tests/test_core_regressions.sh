@@ -808,6 +808,33 @@ test_lock_acquisition_installs_runtime_cleanup_traps() {
         "无 flock 锁成功后必须安装运行时清理 trap"
 }
 
+test_flock_metadata_failure_releases_lock() {
+    (
+        local log="$TEST_TMP/flock-metadata-failure.log"
+        local output="$TEST_TMP/flock-metadata-failure.out" status=0
+
+        : > "$log"
+        LOCK_USING_FLOCK=0
+        flock() {
+            case "${1:-} ${2:-}" in
+                '-n 200') printf '%s\n' acquire >> "$log" ;;
+                '-u 200') printf '%s\n' unlock >> "$log" ;;
+                *) fail "flock 收到非预期参数：$*" ;;
+            esac
+        }
+        write_flock_metadata() { return 37; }
+        install_lock_cleanup_traps() { printf '%s\n' trap >> "$log"; }
+
+        try_acquire_flock_lock > "$output" 2>&1 || status=$?
+
+        assert_eq 2 "$status" "锁元数据写入失败必须返回独立的致命状态"
+        assert_eq 0 "$LOCK_USING_FLOCK" "失败后不得保留 flock 已持有标记"
+        assert_eq $'acquire\nunlock' "$(cat "$log")" \
+            "元数据写入失败必须释放锁，且不得安装成功后的清理 trap"
+        assert_file_contains "$output" '写入 vpsbox 锁元数据失败'
+    )
+}
+
 test_unidentified_lock_owner_is_rejected_without_process_scan() {
     local mode
 
@@ -3829,6 +3856,7 @@ main() {
     local name
     local -a required=(
         acquire_lock
+        try_acquire_flock_lock
         install_lock_cleanup_traps
         prompt_node_host
         create_or_rebuild_node
@@ -3881,6 +3909,7 @@ main() {
         test_runtime_dir_permission_failure_is_fatal
         test_lockdir_first_acquisition_uses_reclaim_guard
         test_lock_acquisition_installs_runtime_cleanup_traps
+        test_flock_metadata_failure_releases_lock
         test_unidentified_lock_owner_is_rejected_without_process_scan
         test_mismatched_lock_owner_identity_is_rejected
         test_process_identity_requires_start_and_boot_match

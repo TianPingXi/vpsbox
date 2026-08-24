@@ -2498,6 +2498,37 @@ test_dns_operation_snapshot_restores_existing_and_absent_targets() {
     done
 }
 
+test_prepare_dns_operation_returns_and_arms_existing_snapshot() {
+    (
+        local case_dir="$TEST_TMP/dns-prepare-existing"
+        local target staged snapshot=""
+
+        mkdir -p "$case_dir"
+        target="$case_dir/target.conf"
+        staged="$case_dir/staged.conf"
+        printf '%s\n' original > "$target"
+        printf '%s\n' replacement > "$staged"
+        clear_active_dns_operation
+        backup_change_file_once() { return 0; }
+        begin_change_transaction() { return 0; }
+        restore_dns_change_tracking() { return 0; }
+
+        prepare_dns_operation \
+            DNS_RESOLV "$target" '.rollback' '' 0 "$staged" snapshot
+
+        [ -n "$snapshot" ] || fail "既有 DNS 目标的操作快照路径不得丢失"
+        [ -f "$snapshot" ] || fail "返回的 DNS 操作快照必须存在"
+        assert_file_contains "$snapshot" '^original$'
+        assert_eq DNS_RESOLV "$ACTIVE_DNS_OPERATION_NAME"
+        assert_eq "$snapshot" "$ACTIVE_DNS_OPERATION_SNAPSHOT" \
+            "调用方与中断回滚状态必须持有同一个快照路径"
+
+        cancel_active_dns_operation_before_publish
+        [ ! -e "$snapshot" ] || fail "取消发布前操作后必须清理 DNS 快照"
+        assert_eq '' "$ACTIVE_DNS_OPERATION_NAME"
+    )
+}
+
 test_pending_dns_same_target_commits_without_rewrite() {
     local kind
 
@@ -2930,6 +2961,7 @@ test_multiple_ssh_socket_streams_are_parsed() {
 test_ssh_restore_entry_targets_22_without_other_ssh_changes() {
     (
         local ssh_dir="$TEST_TMP/ssh-restore-22" log="$TEST_TMP/ssh-restore-22.log"
+        local output="$TEST_TMP/ssh-restore-22.out"
         forbid_init
         mkdir -p "$ssh_dir/sshd_config.d"
         SSHD_MAIN_CONF="$ssh_dir/sshd_config"
@@ -2944,13 +2976,17 @@ test_ssh_restore_entry_targets_22_without_other_ssh_changes() {
         docker_reserved_ports_for_port_choice() { printf '\n'; }
         validate_ssh_access_controls() { return 0; }
         ssh_effective_ports_csv() { printf '%s\n' 23333; }
+        firewall_runtime_enabled() { return 0; }
         apply_ssh_port_target_transaction() {
             printf 'target=%s original=%s\n' "$SSH_TARGET_PORT" "$1" >> "$log"
         }
 
-        restore_ssh_port_to_22 <<< "YES" >/dev/null
+        restore_ssh_port_to_22 <<< "YES" > "$output"
         assert_eq 'target=22 original=23333' "$(cat "$log")" \
             "恢复入口必须仅通过公共事务把目标设为 22"
+        assert_file_contains "$output" '再次更新 vpsbox 防火墙' \
+            "恢复到 22 后必须提示收敛 vpsbox 防火墙中的旧端口"
+        assert_file_contains "$output" '旧端口（23333）'
         assert_no_forbidden "恢复 SSH 端口时执行了范围外操作"
     )
 }
@@ -3617,6 +3653,7 @@ main() {
         change_restore_state
         change_restore_state_readonly
         create_dns_operation_snapshot
+        prepare_dns_operation
         chrony_main_uses_source_dir
         chrony_sources_are_current
         chrony_vpsbox_markers_valid
@@ -3721,6 +3758,7 @@ main() {
         test_identical_resolv_conf_is_side_effect_free
         test_identical_systemd_resolved_config_repairs_only_service_state
         test_dns_operation_snapshot_restores_existing_and_absent_targets
+        test_prepare_dns_operation_returns_and_arms_existing_snapshot
         test_pending_dns_same_target_commits_without_rewrite
         test_pending_dns_different_target_is_rejected_without_side_effects
         test_pending_resolved_unsafe_directory_never_starts_service

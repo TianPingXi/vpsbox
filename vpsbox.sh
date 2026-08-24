@@ -1025,18 +1025,26 @@ activate_lockdir_lock() {
 try_acquire_flock_lock() {
     flock -n 200 || return 1
     LOCK_USING_FLOCK=1
-    write_flock_metadata
+    if ! write_flock_metadata; then
+        LOCK_USING_FLOCK=0
+        flock -u 200 >/dev/null 2>&1 || true
+        err "写入 vpsbox 锁元数据失败，已释放本次锁。"
+        return 2
+    fi
     install_lock_cleanup_traps
 }
 
 acquire_flock_lock() {
-    local old_pid="" old_start="" old_boot="" snapshot_valid=0
+    local old_pid="" old_start="" old_boot="" snapshot_valid=0 attempt_status
 
     [ ! -L "$LOCK_FILE" ] || { err "$LOCK_FILE 是符号链接，已拒绝使用。"; exit 1; }
     exec 200<>"$LOCK_FILE"
     if try_acquire_flock_lock; then
         return 0
+    else
+        attempt_status=$?
     fi
+    [ "$attempt_status" -ne 2 ] || exit 1
 
     snapshot_valid=0
     read_lock_owner_snapshot "$LOCK_FILE" old_pid old_start old_boot && snapshot_valid=1
@@ -1049,12 +1057,18 @@ acquire_flock_lock() {
         terminate_orphaned_vpsbox_menu "$old_pid" "$old_start" "$old_boot"; then
         if try_acquire_flock_lock; then
             return 0
+        else
+            attempt_status=$?
         fi
+        [ "$attempt_status" -ne 2 ] || exit 1
     fi
     if terminate_old_vpsbox_menu "$old_pid" "$old_start" "$old_boot"; then
         if try_acquire_flock_lock; then
             return 0
+        else
+            attempt_status=$?
         fi
+        [ "$attempt_status" -ne 2 ] || exit 1
         err "旧菜单已处理，但锁仍被占用，请稍后重试。"
         exit 1
     fi
@@ -9065,7 +9079,7 @@ rollback_active_dns_operation() {
 prepare_dns_operation() {
     local name="$1" target="$2" snapshot_prefix="$3" label="$4"
     local applied_before="$5" staged_file="$6" snapshot_var="$7"
-    local snapshot_path="" target_created=0
+    local operation_snapshot="" target_created=0
 
     if ! backup_change_file_once "$name" "$target"; then
         rm -f -- "$staged_file"
@@ -9074,28 +9088,28 @@ prepare_dns_operation() {
     fi
     if ! begin_change_transaction "$name"; then
         rm -f -- "$staged_file"
-        remove_dns_operation_snapshot "$snapshot_path" || true
+        remove_dns_operation_snapshot "$operation_snapshot" || true
         cancel_unmodified_change_transaction "$name" || true
         err "记录 DNS 修改事务失败，已取消修改。"
         return 1
     fi
     if ! create_dns_operation_snapshot "$target" "$snapshot_prefix" \
-        snapshot_path target_created; then
+        operation_snapshot target_created; then
         rm -f -- "$staged_file"
         restore_dns_change_tracking "$name" "$applied_before" || true
         err "创建 ${label}DNS 临时回滚快照失败，已取消修改。"
         return 1
     fi
-    if ! arm_dns_operation_rollback "$name" "$snapshot_path" "$target" \
+    if ! arm_dns_operation_rollback "$name" "$operation_snapshot" "$target" \
         "$target_created" "$applied_before"; then
         rm -f -- "$staged_file"
-        remove_dns_operation_snapshot "$snapshot_path" || true
+        remove_dns_operation_snapshot "$operation_snapshot" || true
         restore_dns_change_tracking "$name" "$applied_before" || true
         err "登记 ${label}DNS 中断回滚状态失败，已取消修改。"
         return 1
     fi
 
-    printf -v "$snapshot_var" '%s' "$snapshot_path"
+    printf -v "$snapshot_var" '%s' "$operation_snapshot"
 }
 
 write_resolv_conf_dns() {
@@ -10908,7 +10922,8 @@ fail_ssh_runtime_transaction() {
 }
 
 restore_ssh_port_to_22() {
-    local confirm original_ports docker_ports status
+    local confirm original_ports retired_ports docker_ports status
+    local vpsbox_firewall_active=0
 
     if ! sshd_binary >/dev/null 2>&1; then
         err "未找到 sshd，无法恢复 SSH 端口。"
@@ -10963,6 +10978,13 @@ restore_ssh_port_to_22() {
         err "无法读取 SSH 当前生效端口，已取消恢复。"
         return 1
     }
+    retired_ports="$(csv_remove_port "$original_ports" "$SSH_TARGET_PORT")" || {
+        err "无法计算 SSH 旧端口，已取消恢复。"
+        return 1
+    }
+    if firewall_runtime_enabled; then
+        vpsbox_firewall_active=1
+    fi
 
     echo "将仅把 SSH 端口恢复为 22；其他 SSH 配置保持不变。"
     echo "请先确认商家安全组及其他外部防火墙已放行 TCP 22。"
@@ -10975,6 +10997,14 @@ restore_ssh_port_to_22() {
     apply_ssh_port_target_transaction "$original_ports" || return 1
     info "SSH 端口已恢复为 22，其他 SSH 配置未修改。"
     warn "不要关闭当前 SSH 窗口，请另开新窗口测试 TCP 22 登录。"
+    if [ -n "$retired_ports" ]; then
+        if [ "$vpsbox_firewall_active" -eq 1 ]; then
+            warn "确认 TCP 22 可以登录后，请在新 SSH 会话再次更新 vpsbox 防火墙，以移除暂时保留的旧端口（$retired_ports）。"
+            warn "如果厂商安全组仍放行旧端口（$retired_ports），届时也可在厂商面板关闭。"
+        else
+            warn "确认 TCP 22 可以登录后，再在商家安全组或其他外部防火墙关闭旧端口（$retired_ports）。"
+        fi
+    fi
 }
 
 ssh_port_change_menu() {
