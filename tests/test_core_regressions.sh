@@ -626,29 +626,37 @@ test_setup_service_rejects_missing_binary_before_mutation() {
     )
 }
 
-test_singbox_package_removal_failure_preserves_files() {
+check_singbox_uninstall_failure() {
     (
         local delete_log="$TEST_TMP/singbox-uninstall-failure-delete-events"
         local service_log="$TEST_TMP/singbox-uninstall-failure-service-events"
         local output="$TEST_TMP/singbox-uninstall-failure.out"
-        local service_active=1 service_enabled=1
+        local original_active="$1" original_enabled="$2" managed="$3"
+        local stop_failed="${4:-0}" lose_managed_process="${5:-0}"
+        local service_active="$original_active" service_enabled="$original_enabled"
+        local started=0 status=0
         : > "$delete_log"
         : > "$service_log"
         OS=debian
         service_stop() {
             printf '%s\n' stop >> "$service_log"
+            [ "$stop_failed" -eq 0 ] || return 23
             service_active=0
         }
         service_start() {
             printf '%s\n' start >> "$service_log"
             service_active=1
+            started=1
         }
         stop_singbox_config_processes() { return 0; }
         singbox_config_pids() {
-            [ "$service_active" -eq 1 ] && printf '%s\n' 123
+            if [ "$managed" -eq 1 ] && [ "$service_active" -eq 1 ] &&
+                { [ "$started" -eq 0 ] || [ "$lose_managed_process" -eq 0 ]; }; then
+                printf '%s\n' 123
+            fi
         }
         sleep() { return 0; }
-        service_is_running() { [ "$service_active" -eq 1 ]; }
+        singbox_installed() { return 0; }
         service_manager_is_active() { [ "$service_active" -eq 1 ]; }
         service_is_enabled() { [ "$service_enabled" -eq 1 ]; }
         service_disable() {
@@ -660,7 +668,10 @@ test_singbox_package_removal_failure_preserves_files() {
             service_enabled=1
         }
         singbox_package_installed() { return 0; }
-        apt_get_bounded() { return 23; }
+        apt_get_bounded() {
+            printf '%s\n' package-remove >> "$service_log"
+            return 23
+        }
         is_systemd() {
             printf '%s\n' systemd >> "$delete_log"
             return 0
@@ -670,18 +681,51 @@ test_singbox_package_removal_failure_preserves_files() {
             return 0
         }
 
-        if uninstall_singbox_and_nodes >"$output" 2>&1; then
-            fail "sing-box 软件包卸载失败时整体卸载不应成功"
+        uninstall_singbox_and_nodes >"$output" 2>&1 || status=$?
+        assert_eq 1 "$status" "停止或软件包卸载失败时整体卸载必须失败"
+        assert_empty_file "$delete_log" "失败后不得删除服务、二进制或节点文件"
+        if [ "$stop_failed" -eq 1 ]; then
+            assert_file_not_contains "$service_log" '^(package-remove|disable)$' \
+                "服务仍在运行时不得继续禁用或卸载软件包"
+            assert_eq "$original_active" "$service_active"
+            assert_eq "$original_enabled" "$service_enabled"
+            return 0
         fi
-        assert_empty_file "$delete_log" \
-            "软件包卸载失败后不得删除服务、二进制或节点文件"
-        [ "$service_active" -eq 1 ] || fail "软件包卸载失败后应恢复原运行状态"
-        [ "$service_enabled" -eq 1 ] || fail "软件包卸载失败后应恢复原自启状态"
-        assert_file_contains "$service_log" '^enable$'
-        assert_file_contains "$service_log" '^start$'
-        assert_file_contains "$output" \
-            '已恢复 sing-box 原运行与自启状态'
+        assert_file_contains "$service_log" '^package-remove$'
+        assert_eq "$original_enabled" "$service_enabled" "应恢复原自启状态"
+        if [ "$lose_managed_process" -eq 1 ]; then
+            assert_file_contains "$output" '原服务状态恢复失败'
+            assert_file_not_contains "$output" '已恢复 sing-box 原运行与自启状态'
+        else
+            assert_eq "$original_active" "$service_active" "应恢复原运行状态"
+            assert_file_contains "$output" '已恢复 sing-box 原运行与自启状态'
+        fi
+        if [ "$original_active" -eq 1 ]; then
+            assert_file_contains "$service_log" '^start$'
+        else
+            assert_file_not_contains "$service_log" '^start$' "原本停止的服务不得启动"
+        fi
     )
+}
+
+test_singbox_package_removal_failure_preserves_files() {
+    local active enabled managed
+    for active in 1 0; do
+        for enabled in 1 0; do
+            for managed in 1 0; do
+                check_singbox_uninstall_failure "$active" "$enabled" "$managed"
+            done
+        done
+    done
+}
+
+test_singbox_uninstall_rejects_active_service_after_stop_failure() {
+    check_singbox_uninstall_failure 1 1 0 1
+    check_singbox_uninstall_failure 1 1 1 1
+}
+
+test_singbox_uninstall_restore_requires_original_managed_process() {
+    check_singbox_uninstall_failure 1 1 1 0 1
 }
 
 test_firewall_sync_restore_failure_preserves_backup() {
@@ -3905,6 +3949,8 @@ main() {
         test_singbox_service_publish_preserves_existing_target
         test_setup_service_rejects_missing_binary_before_mutation
         test_singbox_package_removal_failure_preserves_files
+        test_singbox_uninstall_rejects_active_service_after_stop_failure
+        test_singbox_uninstall_restore_requires_original_managed_process
         test_firewall_sync_restore_failure_preserves_backup
         test_runtime_dir_permission_failure_is_fatal
         test_lockdir_first_acquisition_uses_reclaim_guard

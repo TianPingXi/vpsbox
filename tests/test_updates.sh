@@ -902,6 +902,255 @@ test_update_watchdog_handoff_resets_startup_timer() {
     )
 }
 
+test_update_watchdog_group_hup_restores_published_candidate() {
+    (
+        local owner="" status=0 restored=0 watchdog_pid="" i
+        require_linux_proc || return "$?"
+        command -v setsid >/dev/null 2>&1 || fail "HUP 进程组测试需要 setsid"
+        reset_update_case watchdog-group-hup
+        write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
+        write_fixture "${CMD_PATH}.previous" "$UPDATE_TEST_CURRENT" installed
+        write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_NEWER" remote
+        cleanup_hup_owner() {
+            [ -n "$owner" ] || return 0
+            builtin kill -KILL -- "-$owner" 2>/dev/null || true
+            wait "$owner" 2>/dev/null || true
+        }
+        trap cleanup_hup_owner EXIT
+        REPO_DIR="$REPO_DIR" CASE_DIR="$CASE_DIR" setsid bash -c '
+            set -euo pipefail
+            source "$REPO_DIR/vpsbox.sh"
+            CMD_PATH="$CASE_DIR/vpsbox"
+            RUNTIME_DIR="$CASE_DIR/run"
+            LOCK_FILE="$CASE_DIR/lock"
+            LOCK_DIR="$CASE_DIR/lockdir"
+            NODE_TRANSACTION_DIR="$CASE_DIR/node-transaction"
+            VPSBOX_UPDATE_PREPARE_TIMEOUT=20
+            install_command_alias() {
+                # 只把更新主进程停在正式脚本替换后；watchdog 的恢复入口不阻塞。
+                if [ "$BASHPID" = "$$" ]; then
+                    printf "%s\n" "$VPSBOX_UPDATE_WATCHDOG_PID" > "$CASE_DIR/watchdog.pid"
+                    : > "$CASE_DIR/published"
+                    while :; do sleep 0.1; done
+                fi
+            }
+            install_lock_cleanup_traps
+            publish_vpsbox_update_candidate "$CASE_DIR/remote.sh" "${CMD_PATH}.previous"
+        ' > "$CASE_DIR/owner.log" 2>&1 &
+        owner=$!
+        for ((i = 0; i < 100; i++)); do
+            [ ! -f "$CASE_DIR/published" ] || break
+            sleep 0.05
+        done
+        [ -f "$CASE_DIR/published" ] || fail "测试主进程未完成脚本替换"
+        watchdog_pid="$(cat "$CASE_DIR/watchdog.pid")"
+        assert_eq "$owner" "$(ps -o pgid= -p "$owner" | tr -d ' ')" "必须使用独立测试进程组"
+        assert_eq "$owner" "$(ps -o pgid= -p "$watchdog_pid" | tr -d ' ')" "监护必须属于测试进程组"
+        assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_NEWER"
+        builtin kill -HUP -- "-$owner"
+        wait "$owner" || status=$?
+        assert_eq 129 "$status" "主进程应执行实际 HUP 退出清理"
+        for ((i = 0; i < 100; i++)); do
+            if grep -Fqx "VPSBOX_VERSION=\"$UPDATE_TEST_CURRENT\"" "$CMD_PATH"; then
+                restored=1
+                break
+            fi
+            sleep 0.05
+        done
+        assert_eq 1 "$restored" "进程组收到 HUP 后仍须自动恢复旧版"
+        assert_fixture_version "${CMD_PATH}.previous" "$UPDATE_TEST_CURRENT"
+        for ((i = 0; i < 100; i++)); do
+            [ -n "$(find "$RUNTIME_DIR" -mindepth 1 -print -quit)" ] || break
+            sleep 0.05
+        done
+        [ -z "$(find "$RUNTIME_DIR" -mindepth 1 -print -quit)" ] || fail "成功回滚后应清理监护目录"
+    )
+}
+
+check_update_watchdog_owner_exit_during_handshake() {
+    (
+        local mode="$1" owner="" status=0 i
+        require_linux_proc || return "$?"
+        command -v setsid >/dev/null 2>&1 || fail "交接竞态测试需要 setsid"
+        reset_update_case "watchdog-owner-exit-$mode"
+        write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
+        # 未发布时必须保留当前版本，不能误用更旧的备份。
+        write_fixture "${CMD_PATH}.previous" "$UPDATE_TEST_OLDER" previous
+        write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_NEWER" remote
+        cleanup_handshake_owner() {
+            [ -n "$owner" ] || return 0
+            builtin kill -KILL -- "-$owner" 2>/dev/null || true
+            wait "$owner" 2>/dev/null || true
+        }
+        trap cleanup_handshake_owner EXIT
+        REPO_DIR="$REPO_DIR" CASE_DIR="$CASE_DIR" HANDSHAKE_MODE="$mode" setsid bash -c '
+            set -euo pipefail
+            source "$REPO_DIR/vpsbox.sh"
+            CMD_PATH="$CASE_DIR/vpsbox"
+            RUNTIME_DIR="$CASE_DIR/run"
+            LOCK_FILE="$CASE_DIR/lock"
+            LOCK_DIR="$CASE_DIR/lockdir"
+            NODE_TRANSACTION_DIR="$CASE_DIR/node-transaction"
+            VPSBOX_UPDATE_PREPARE_TIMEOUT=20
+            eval "saved_process_start_ticks() $(declare -f process_start_ticks | sed "1d")"
+            process_start_ticks() {
+                local path attempt
+                for path in "$RUNTIME_DIR"/update-startup.*/armed; do
+                    if [ -f "$path" ] && [ ! -f "$CASE_DIR/probe" ]; then
+                        : > "$CASE_DIR/probe"
+                        for ((attempt = 0; attempt < 200; attempt++)); do
+                            [ ! -f "$CASE_DIR/release-probe" ] || break
+                            sleep 0.05
+                        done
+                        [ -f "$CASE_DIR/release-probe" ] || return 1
+                    fi
+                done
+                saved_process_start_ticks "$@"
+            }
+            builtin() {
+                # 在父进程读取 armed 前，让子进程确定停在进程状态读取处。
+                if [ "${1:-}" = kill ] && [ "${2:-}" = -0 ] && [ "$BASHPID" = "$$" ]; then
+                    local attempt
+                    for ((attempt = 0; attempt < 200; attempt++)); do
+                        [ ! -f "$CASE_DIR/probe" ] || break
+                        sleep 0.05
+                    done
+                    [ -f "$CASE_DIR/probe" ] || return 1
+                    if [ "$HANDSHAKE_MODE" = unpublished ]; then
+                        : > "$CASE_DIR/owner-waiting"
+                        while :; do sleep 0.05; done
+                    fi
+                fi
+                command builtin "$@"
+            }
+            install_command_alias() {
+                if [ "$BASHPID" = "$$" ]; then
+                    : > "$CASE_DIR/owner-waiting"
+                    while :; do sleep 0.05; done
+                fi
+            }
+            install_lock_cleanup_traps
+            publish_vpsbox_update_candidate "$CASE_DIR/remote.sh" "${CMD_PATH}.previous"
+        ' > "$CASE_DIR/owner.log" 2>&1 &
+        owner=$!
+        for ((i = 0; i < 100; i++)); do
+            [ ! -f "$CASE_DIR/owner-waiting" ] || break
+            sleep 0.05
+        done
+        [ -f "$CASE_DIR/owner-waiting" ] || fail "测试主进程未进入指定交接阶段"
+        [ -f "$CASE_DIR/probe" ] || fail "监护未停在指定进程状态读取处"
+        assert_eq "$owner" "$(ps -o pgid= -p "$owner" | tr -d ' ')" "必须使用独立测试进程组"
+        if [ "$mode" = published ]; then
+            assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_NEWER"
+            [ -n "$(find "$RUNTIME_DIR" -name start -print -quit)" ] || fail "必须已经放行发布"
+        else
+            assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_CURRENT"
+            [ -z "$(find "$RUNTIME_DIR" -name start -print -quit)" ] || fail "本用例不得放行发布"
+        fi
+        builtin kill -HUP "$owner"
+        wait "$owner" || status=$?
+        assert_eq 129 "$status" "主进程必须已完成实际退出清理"
+        : > "$CASE_DIR/release-probe"
+        for ((i = 0; i < 100; i++)); do
+            [ -n "$(find "$RUNTIME_DIR" -mindepth 1 -print -quit)" ] || break
+            sleep 0.05
+        done
+        [ -z "$(find "$RUNTIME_DIR" -mindepth 1 -print -quit)" ] || fail "监护退出后应清理目录"
+        if [ "$mode" = published ]; then
+            assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_OLDER"
+        else
+            assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_CURRENT"
+        fi
+        assert_fixture_version "${CMD_PATH}.previous" "$UPDATE_TEST_OLDER"
+    )
+}
+
+test_update_watchdog_owner_exit_after_publish_during_handshake() {
+    check_update_watchdog_owner_exit_during_handshake published
+}
+
+test_update_watchdog_owner_exit_before_publish_preserves_current() {
+    check_update_watchdog_owner_exit_during_handshake unpublished
+}
+
+test_update_watchdog_hup_then_ready_keeps_candidate() {
+    (
+        local watchdog_pid="" status=0
+        reset_update_case watchdog-hup-ready
+        write_fixture "$CMD_PATH" "$UPDATE_TEST_NEWER" remote
+        write_fixture "${CMD_PATH}.previous" "$UPDATE_TEST_CURRENT" installed
+        trap 'if [ -n "$watchdog_pid" ]; then builtin kill -TERM "$watchdog_pid" 2>/dev/null || true; wait "$watchdog_pid" 2>/dev/null || true; fi' EXIT
+        production_start_vpsbox_update_watchdog "${CMD_PATH}.previous"
+        watchdog_pid="$VPSBOX_UPDATE_WATCHDOG_PID"
+        builtin kill -HUP "$watchdog_pid"
+        mark_vpsbox_update_ready "$VPSBOX_UPDATE_WATCHDOG_DIR/ready"
+        wait "$watchdog_pid" || status=$?
+        watchdog_pid=""
+        assert_eq 0 "$status" "HUP 后监护仍应接受正常启动确认"
+        assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_NEWER"
+        [ ! -e "$VPSBOX_UPDATE_WATCHDOG_DIR" ] || fail "确认后应清理监护目录"
+    )
+}
+
+test_update_watchdog_term_cleanup_remains_available() {
+    (
+        local watchdog_pid="" status=0
+        reset_update_case watchdog-term
+        write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
+        write_fixture "${CMD_PATH}.previous" "$UPDATE_TEST_CURRENT" installed
+        trap 'if [ -n "$watchdog_pid" ]; then builtin kill -KILL "$watchdog_pid" 2>/dev/null || true; wait "$watchdog_pid" 2>/dev/null || true; fi' EXIT
+        production_start_vpsbox_update_watchdog "${CMD_PATH}.previous"
+        watchdog_pid="$VPSBOX_UPDATE_WATCHDOG_PID"
+        mark_vpsbox_update_ready() { return 23; }
+        settle_vpsbox_update_watchdog_after_safe_restore > "$CASE_DIR/cleanup.log" 2>&1 || status=$?
+        assert_eq 1 "$status" "ready 写入失败应走 TERM 清理并保留失败状态"
+        if builtin kill -0 "$watchdog_pid" 2>/dev/null; then fail "TERM 清理后监护不应存活"; fi
+        watchdog_pid=""
+        assert_eq "" "$VPSBOX_UPDATE_WATCHDOG_PID"
+        [ -z "$(find "$RUNTIME_DIR" -mindepth 1 -print -quit)" ] || fail "TERM 后应清理监护目录"
+        assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_CURRENT"
+    )
+}
+
+check_update_watchdog_signal_init_failure() {
+    (
+        local mode="$1" started_at="$SECONDS"
+        reset_update_case watchdog-signal-init-failure
+        write_fixture "$CMD_PATH" "$UPDATE_TEST_CURRENT" installed
+        write_fixture "$MOCK_REMOTE_SCRIPT" "$UPDATE_TEST_NEWER" remote
+        trap 'if [ -n "${VPSBOX_UPDATE_WATCHDOG_PID:-}" ]; then builtin kill -KILL "$VPSBOX_UPDATE_WATCHDOG_PID" 2>/dev/null || true; wait "$VPSBOX_UPDATE_WATCHDOG_PID" 2>/dev/null || true; fi' EXIT
+        start_vpsbox_update_watchdog() { production_start_vpsbox_update_watchdog "$@"; }
+        trap() {
+            if [ "${1:-}" = "" ] && [ "${2:-}" = HUP ]; then
+                if [ "$mode" = stopped ]; then
+                    builtin kill -STOP "$BASHPID"
+                fi
+                return 23
+            fi
+            # shellcheck disable=SC2064 # 透传调用方提供的 trap 参数，不生成新的信号处理命令。
+            builtin trap "$@"
+        }
+        if update_vpsbox > "$CASE_DIR/update.log" 2>&1; then
+            fail "信号初始化失败时不得发布候选脚本"
+        fi
+        assert_fixture_version "$CMD_PATH" "$UPDATE_TEST_CURRENT"
+        assert_fixture_version "${CMD_PATH}.previous" "$UPDATE_TEST_CURRENT"
+        assert_empty_file "$MOCK_EVENT_LOG" "监护未初始化时不得安装入口或 exec"
+        assert_eq "" "$VPSBOX_UPDATE_WATCHDOG_PID"
+        assert_eq "" "$VPSBOX_UPDATE_WATCHDOG_DIR"
+        [ -z "$(find "$RUNTIME_DIR" -mindepth 1 -print -quit)" ] || fail "失败时应清理监护目录"
+        [ "$((SECONDS - started_at))" -lt 15 ] || fail "初始化失败及回收必须有界完成"
+    )
+}
+
+test_update_watchdog_signal_init_failure_preserves_current() {
+    check_update_watchdog_signal_init_failure error
+}
+
+test_update_watchdog_signal_init_timeout_preserves_current() {
+    check_update_watchdog_signal_init_failure stopped
+}
+
 test_stale_previous_without_handshake_is_ignored() {
     reset_update_case startup-no-handshake
     write_fixture "$CMD_PATH" "$UPDATE_TEST_NEWER" remote
@@ -1278,6 +1527,13 @@ main() {
         test_pending_update_confirmation_prevents_rollback
         test_update_watchdog_late_ready_cannot_cancel_rollback
         test_update_watchdog_handoff_resets_startup_timer
+        test_update_watchdog_group_hup_restores_published_candidate
+        test_update_watchdog_owner_exit_after_publish_during_handshake
+        test_update_watchdog_owner_exit_before_publish_preserves_current
+        test_update_watchdog_hup_then_ready_keeps_candidate
+        test_update_watchdog_term_cleanup_remains_available
+        test_update_watchdog_signal_init_failure_preserves_current
+        test_update_watchdog_signal_init_timeout_preserves_current
         test_stale_previous_without_handshake_is_ignored
         test_pending_update_rejects_unexpected_backup_path
         test_singbox_version_noop_guards

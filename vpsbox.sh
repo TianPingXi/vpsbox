@@ -7037,7 +7037,7 @@ run_vpsbox_update_watchdog() {
 }
 
 start_vpsbox_update_watchdog() {
-    local backup="$1" dir handoff ready owner_pid owner_start
+    local backup="$1" dir handoff ready owner_pid owner_start watchdog_pid current_start i
 
     # 当前更新协议由旧进程先启动独立 watchdog，再 exec 新脚本。这样即使候选脚本
     # 在解析完毕后、进入 vpsbox_main 之前顶层退出，也能依据 PID 启动时间恢复 .previous。
@@ -7057,12 +7057,48 @@ start_vpsbox_update_watchdog() {
     [[ "$owner_start" =~ ^[0-9]+$ ]] || { rm -rf -- "$dir"; return 1; }
 
     (
-        trap - EXIT HUP INT TERM QUIT
-        run_vpsbox_update_watchdog \
-            "$backup" "$dir" "$handoff" "$ready" "$owner_pid" "$owner_start"
+        trap - EXIT INT TERM QUIT || exit 1
+        trap '' HUP || exit 1
+        # 先确认信号保护，再允许父进程发布候选。start 是父进程的启动确认，
+        # 与新版菜单的 ready 分开；也避免快速退出的监护提前删除 armed。
+        : > "$dir/armed" || exit 1
+        while :; do
+            # 先读取父进程身份，再检查发布许可。父进程可能在读取期间放行发布
+            # 并退出；只有随后仍无 start，才能确定它未发布候选。
+            current_start="$(process_start_ticks "$owner_pid" 2>/dev/null || true)"
+            if [ -f "$dir/start" ] && [ ! -L "$dir/start" ]; then
+                run_vpsbox_update_watchdog \
+                    "$backup" "$dir" "$handoff" "$ready" "$owner_pid" "$owner_start"
+                exit "$?"
+            fi
+            if [ "$current_start" != "$owner_start" ]; then
+                # 父进程未确认启动就退出时尚未发布候选，只清理初始化资料。
+                rm -rf -- "$dir"
+                exit 1
+            fi
+            command sleep 0.1 || exit 1
+        done
     ) 200>&- </dev/null >>"$dir/watchdog.log" 2>&1 &
-    VPSBOX_UPDATE_WATCHDOG_PID=$!
-    VPSBOX_UPDATE_WATCHDOG_DIR="$dir"
+    watchdog_pid=$!
+    for i in {1..50}; do
+        builtin kill -0 "$watchdog_pid" 2>/dev/null || break
+        if [ -f "$dir/armed" ] && [ ! -L "$dir/armed" ]; then
+            if : > "$dir/start"; then
+                VPSBOX_UPDATE_WATCHDOG_PID="$watchdog_pid"
+                VPSBOX_UPDATE_WATCHDOG_DIR="$dir"
+                return 0
+            fi
+            break
+        fi
+        command sleep 0.1 || break
+    done
+    # 初始化未确认时还没有替换脚本；强制回收本次子进程，避免清理无限等待。
+    builtin kill -KILL "$watchdog_pid" 2>/dev/null || true
+    wait "$watchdog_pid" 2>/dev/null || true
+    rm -rf -- "$dir"
+    VPSBOX_UPDATE_WATCHDOG_PID=""
+    VPSBOX_UPDATE_WATCHDOG_DIR=""
+    return 1
 }
 
 rollback_pending_vpsbox_update() {
@@ -16827,10 +16863,13 @@ EOF
 # ==============================================================================
 uninstall_singbox_and_nodes() {
     local failed=0 package_remove_failed=0
-    local was_active=0 was_enabled=0
+    local was_active=0 was_enabled=0 require_vpsbox_process=0
 
-    if service_is_running; then
+    if service_manager_is_active; then
         was_active=1
+    fi
+    if [ -n "$(singbox_config_pids)" ]; then
+        require_vpsbox_process=1
     fi
     if service_is_enabled; then
         was_enabled=1
@@ -16843,7 +16882,7 @@ uninstall_singbox_and_nodes() {
         return 1
     fi
     sleep 1
-    if service_is_running; then
+    if service_manager_is_active || [ -n "$(singbox_config_pids)" ]; then
         err "sing-box 服务仍在运行，已取消删除。"
         return 1
     fi
@@ -16874,7 +16913,7 @@ uninstall_singbox_and_nodes() {
 
     if [ "$package_remove_failed" -eq 1 ]; then
         err "sing-box 软件包卸载失败，vpsbox 未继续删除服务文件、二进制或节点配置。"
-        if restore_singbox_service_state "$was_enabled" "$was_active"; then
+        if restore_singbox_service_state "$was_enabled" "$was_active" "$require_vpsbox_process"; then
             info "已恢复 sing-box 原运行与自启状态。"
         else
             err "sing-box 原服务状态恢复失败，请立即检查服务、软件包和节点配置。"
@@ -16903,7 +16942,8 @@ uninstall_singbox_and_nodes() {
     rm -f /var/log/sing-box* || failed=1
     hash -r
 
-    if service_is_running || service_is_enabled || singbox_artifacts_present; then
+    if service_manager_is_active || [ -n "$(singbox_config_pids)" ] ||
+        service_is_enabled || singbox_artifacts_present; then
         err "仍检测到 sing-box 的进程、软件包、服务或配置残留。"
         failed=1
     fi
