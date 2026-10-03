@@ -3243,10 +3243,13 @@ EOF
 }
 
 test_interrupted_singbox_update_rolls_back() {
+    require_root_permission_semantics || return "$?"
     (
         local case_dir="$TEST_TMP/singbox-interrupt"
         local binary="$case_dir/sing-box" backup_dir="$case_dir/update" backup="$case_dir/update/sing-box"
         mkdir -p "$backup_dir"
+        mock_singbox_update_service_files "$case_dir/service-files"
+        snapshot_singbox_update_service "$backup_dir" 0
         printf '%s\n' old-binary > "$binary"
         cp "$binary" "$backup"
         service_stop() { return 0; }
@@ -3342,6 +3345,7 @@ test_failed_singbox_update_restores_binary_and_state() {
         local fake_bin="$TEST_TMP/singbox-bin"
         local output="$TEST_TMP/singbox-update.out"
         local update_backup="$TEST_TMP/singbox-update-backup"
+        mock_singbox_update_service_files "$TEST_TMP/singbox-update-service"
         VPSBOX_STATE_DIR="$TEST_TMP/singbox-update-state"
         SINGBOX_UPDATE_TRANSACTION_DIR="$VPSBOX_STATE_DIR/singbox-update"
         # shellcheck disable=SC2034 # 被测的 sing-box 持久事务函数动态读取。
@@ -3370,8 +3374,9 @@ test_failed_singbox_update_restores_binary_and_state() {
             printf '%s\n' broken-new-binary > "$fake_bin/sing-box"
             return 1
         }
-        service_stop() { return 0; }
-        service_manager_is_active() { return 0; }
+        local test_update_active=1
+        service_stop() { test_update_active=0; }
+        service_manager_is_active() { [ "$test_update_active" = 1 ]; }
         service_is_running() { return 1; }
         stop_singbox_config_processes() { return 0; }
         setup_service() { return 0; }
@@ -3398,9 +3403,13 @@ test_failed_singbox_update_restores_binary_and_state() {
 }
 
 test_singbox_package_restore_failure_accepts_verified_binary_fallback() {
+    require_root_permission_semantics || return "$?"
     (
         local event_log="$TEST_TMP/singbox-package-fallback.events"
         local output="$TEST_TMP/singbox-package-fallback.out"
+        mock_singbox_update_service_files "$TEST_TMP/singbox-package-fallback-service"
+        mkdir -p "$TEST_TMP/update-backup"
+        snapshot_singbox_update_service "$TEST_TMP/update-backup" 0
         : > "$event_log"
         service_stop() { printf '%s\n' stop >> "$event_log"; }
         service_manager_is_active() { return 1; }
@@ -3421,7 +3430,7 @@ test_singbox_package_restore_failure_accepts_verified_binary_fallback() {
             /usr/bin/sing-box "$TEST_TMP/old-binary" "$TEST_TMP/update-backup" \
             1 1 "$TEST_TMP/old.deb" 1.13.13 >"$output" 2>&1 ||
             fail "软件包恢复失败但可信二进制和服务状态已恢复时，不应继续阻塞启动"
-        assert_eq $'stop\npackage-failed\nbinary-restored\nservice-restored:1:1' \
+        assert_eq $'stop\npackage-failed\nstop\nbinary-restored\nservice-restored:1:1' \
             "$(cat "$event_log")"
         assert_file_contains "$output" '软件包管理记录可能不一致'
     )
@@ -3525,6 +3534,7 @@ test_singbox_pending_update_recovers_on_next_start() {
     (
         local fake_bin="$TEST_TMP/singbox-recovery/bin" backup="$TEST_TMP/singbox-recovery/old"
         local package="$TEST_TMP/singbox-recovery/old.deb" state_log="$TEST_TMP/singbox-recovery/service"
+        mock_singbox_update_service_files "$TEST_TMP/singbox-recovery/service-files"
         mkdir -p "$fake_bin"
         printf '%s\n' '#!/bin/sh' 'printf "sing-box version 1.13.13\n"' > "$fake_bin/sing-box"
         chmod 755 "$fake_bin/sing-box"
@@ -3582,6 +3592,7 @@ test_singbox_recovery_rejects_corrupted_backup() {
     (
         local fake_bin="$TEST_TMP/singbox-corrupt/bin" backup="$TEST_TMP/singbox-corrupt/old"
         local package="$TEST_TMP/singbox-corrupt/old.deb"
+        mock_singbox_update_service_files "$TEST_TMP/singbox-corrupt/service-files"
         mkdir -p "$fake_bin"
         printf '%s\n' '#!/bin/sh' 'printf "sing-box version 1.13.13\n"' > "$fake_bin/sing-box"
         chmod 755 "$fake_bin/sing-box"

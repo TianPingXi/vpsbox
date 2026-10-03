@@ -87,6 +87,15 @@ require_function() {
     declare -F "$name" >/dev/null 2>&1 || fail "缺少待测函数：$name"
 }
 
+# sing-box 更新事务测试只读写临时服务文件，不接触宿主机的 unit 或 OpenRC 脚本。
+mock_singbox_update_service_files() {
+    SINGBOX_TEST_SERVICE_ROOT="$1"
+    mkdir -p "$SINGBOX_TEST_SERVICE_ROOT"
+    singbox_update_service_manager() { printf '%s\n' systemd; }
+    singbox_update_service_path() { printf '%s/%s\n' "$SINGBOX_TEST_SERVICE_ROOT" "$1"; }
+    systemctl() { [ "$*" = daemon-reload ]; }
+}
+
 forbid_init() {
     FORBIDDEN_LOG="$(mktemp "$TEST_TMP/forbidden.XXXXXX")" ||
         fail "无法创建禁止调用标记文件"

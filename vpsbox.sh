@@ -6300,6 +6300,86 @@ singbox_update_binary_path_allowed() {
     fi
 }
 
+singbox_update_service_manager() {
+    if is_systemd; then
+        printf '%s\n' systemd
+    elif [ "$OS" = alpine ]; then
+        printf '%s\n' openrc
+    else
+        return 1
+    fi
+}
+
+singbox_update_service_entries() {
+    case "$1" in
+        systemd) printf '%s\n' systemd-local systemd-usr systemd-lib ;;
+        openrc) printf '%s\n' openrc ;;
+        *) return 1 ;;
+    esac
+}
+
+singbox_update_service_path() {
+    case "$1" in
+        systemd-local) printf '%s\n' /etc/systemd/system/sing-box.service ;;
+        systemd-usr) printf '%s\n' /usr/lib/systemd/system/sing-box.service ;;
+        systemd-lib) printf '%s\n' /lib/systemd/system/sing-box.service ;;
+        openrc) printf '%s\n' /etc/init.d/sing-box ;;
+        *) return 1 ;;
+    esac
+}
+
+singbox_update_service_snapshot_valid() {
+    local dir="$1/service" manager entries entry
+
+    [ -d "$dir" ] && [ ! -L "$dir" ] &&
+        [ "$(stat -c '%u:%g %a' "$dir")" = '0:0 700' ] || return 1
+    for entry in manager require-managed manifest; do
+        node_backup_file_is_safe "$dir/$entry" || return 1
+        [ "$(stat -c '%a' "$dir/$entry")" = 600 ] || return 1
+    done
+    manager="$(cat "$dir/manager")" || return 1
+    entries="$(singbox_update_service_entries "$manager")" || return 1
+    [[ "$(cat "$dir/require-managed")" =~ ^[01]$ ]] || return 1
+    [ "$(wc -l < "$dir/manifest")" -eq "$(printf '%s\n' "$entries" | wc -l)" ] || return 1
+    while IFS= read -r entry; do
+        validate_node_backup_file_entry "$dir/manifest" "$entry" "$dir/$entry" || return 1
+    done <<< "$entries"
+}
+
+snapshot_singbox_update_service() {
+    local dir="$1/service" require_managed="$2" manager entries entry path
+
+    [[ "$require_managed" =~ ^[01]$ ]] || return 1
+    manager="$(singbox_update_service_manager)" || return 1
+    entries="$(singbox_update_service_entries "$manager")" || return 1
+    mkdir -m 700 -- "$dir" || return 1
+    printf '%s\n' "$manager" > "$dir/manager" &&
+        printf '%s\n' "$require_managed" > "$dir/require-managed" &&
+        : > "$dir/manifest" || return 1
+    chmod 600 "$dir/manager" "$dir/require-managed" "$dir/manifest" || return 1
+    while IFS= read -r entry; do
+        path="$(singbox_update_service_path "$entry")" || return 1
+        backup_node_file_with_manifest "$path" "$dir/$entry" "$entry" "$dir/manifest" || return 1
+    done <<< "$entries"
+    singbox_update_service_snapshot_valid "$1"
+}
+
+restore_singbox_update_service_files() {
+    local dir="$1/service" manager entries entry path
+
+    singbox_update_service_snapshot_valid "$1" || return 1
+    manager="$(cat "$dir/manager")" || return 1
+    [ "$manager" = "$(singbox_update_service_manager)" ] || return 1
+    entries="$(singbox_update_service_entries "$manager")" || return 1
+    while IFS= read -r entry; do
+        path="$(singbox_update_service_path "$entry")" || return 1
+        restore_node_file_from_backup "$dir" "$entry" "$dir/$entry" "$path" || return 1
+    done <<< "$entries"
+    if [ "$manager" = systemd ]; then
+        systemctl daemon-reload || return 1
+    fi
+}
+
 singbox_update_metadata_without_backup_valid() {
     local binary_path old_version was_enabled was_active package_name
     local binary_hash package_hash mode
@@ -6320,7 +6400,10 @@ singbox_update_metadata_without_backup_valid() {
     [ "$(stat -c '%u:%g' "$SINGBOX_UPDATE_TRANSACTION_DIR" 2>/dev/null || true)" = "0:0" ] ||
         return 1
 
-    [ "$(singbox_update_state_value version 2>/dev/null || true)" = "1" ] || return 1
+    case "$(singbox_update_state_value version 2>/dev/null || true)" in
+        1|2) ;;
+        *) return 1 ;;
+    esac
     binary_path="$(singbox_update_state_value binary_path 2>/dev/null || true)"
     old_version="$(singbox_update_state_value old_version 2>/dev/null || true)"
     was_enabled="$(singbox_update_state_value was_enabled 2>/dev/null || true)"
@@ -6380,7 +6463,11 @@ singbox_update_transaction_valid() {
     mode="$(stat -c '%a' "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary" 2>/dev/null || true)"
     [ "$mode" = "755" ] || return 1
 
-    [ "$(singbox_update_state_value version 2>/dev/null || true)" = "1" ] || return 1
+    case "$(singbox_update_state_value version 2>/dev/null || true)" in
+        1) ;;
+        2) singbox_update_service_snapshot_valid "$SINGBOX_UPDATE_TRANSACTION_DIR" || return 1 ;;
+        *) return 1 ;;
+    esac
     binary_path="$(singbox_update_state_value binary_path 2>/dev/null || true)"
     old_version="$(singbox_update_state_value old_version 2>/dev/null || true)"
     was_enabled="$(singbox_update_state_value was_enabled 2>/dev/null || true)"
@@ -6416,7 +6503,7 @@ singbox_update_transaction_valid() {
 persist_singbox_update_transaction() {
     local binary_path="$1" backup_binary="$2" rollback_package="$3" old_version="$4"
     local was_enabled="$5" was_active="$6" package_name package_hash="none"
-    local binary_hash tmp_dir
+    local binary_hash tmp_dir require_managed="${7:-0}"
 
     command -v sha256sum >/dev/null 2>&1 || return 1
     [ ! -L "$VPSBOX_STATE_DIR" ] && [ ! -L "$SINGBOX_UPDATE_TRANSACTION_DIR" ] || return 1
@@ -6451,8 +6538,12 @@ persist_singbox_update_transaction() {
     else
         package_name=none
     fi
+    if ! snapshot_singbox_update_service "$tmp_dir" "$require_managed"; then
+        rm -rf -- "$tmp_dir"
+        return 1
+    fi
     if ! {
-        printf 'version=1\n'
+        printf 'version=2\n'
         printf 'binary_path=%s\n' "$binary_path"
         printf 'old_version=%s\n' "$old_version"
         printf 'was_enabled=%s\n' "$was_enabled"
@@ -6481,6 +6572,12 @@ restore_singbox_update_backup() {
     local failed=0 package_state_may_differ=0 require_vpsbox_process=0
     local package_restored=0 binary_ready=0 service_ready=1
 
+    # 服务定义必须来自操作前快照；节点文件仍存在不表示原服务正在加载它们。
+    if ! singbox_update_service_snapshot_valid "$backup_dir"; then
+        err "sing-box 原服务快照缺失或损坏，已保留更新备份，拒绝猜测原服务定义：$backup_dir"
+        return 1
+    fi
+    require_vpsbox_process="$(cat "$backup_dir/service/require-managed")" || return 1
     if ! service_stop 2>/dev/null && service_manager_is_active; then
         err "更新后的 sing-box 服务无法停止，已拒绝在运行中覆盖二进制。"
         failed=1
@@ -6502,6 +6599,13 @@ restore_singbox_update_backup() {
             err "旧 sing-box 软件包恢复失败，正在尝试恢复二进制副本。"
             package_state_may_differ=1
         fi
+        # 包的维护脚本即使失败也可能已经启动服务。先停止并核验，
+        # 再尝试二进制回退，避免覆盖运行中的实例或在回退失败后留下意外服务。
+        service_stop 2>/dev/null || true
+        if ! stop_singbox_config_processes 2>/dev/null || service_manager_is_active; then
+            err "回滚软件包后的 sing-box 未能停止，备份已保留：$backup_dir"
+            return 1
+        fi
     else
         # 旧版本 Release 包只是优先回滚材料；可信旧二进制仍是持久事务的必要保障。
         # 二进制回滚可恢复运行，但无法保证 dpkg/apk/rpm 的版本记录一并回退。
@@ -6516,9 +6620,9 @@ restore_singbox_update_backup() {
         fi
     fi
     hash -r
-    if [ "$binary_ready" -eq 1 ] && node_exists; then
-        require_vpsbox_process=1
-        if ! setup_service; then
+    if [ "$binary_ready" -eq 1 ]; then
+        # 软件包安装可能重写 unit/init 脚本，因此在二进制/包恢复之后还原文件。
+        if ! restore_singbox_update_service_files "$backup_dir"; then
             err "旧 sing-box 服务配置恢复失败。"
             failed=1
             service_ready=0
@@ -6556,6 +6660,12 @@ recover_pending_singbox_update() {
     fi
     if [ ! -e "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary" ] &&
         [ ! -L "$SINGBOX_UPDATE_TRANSACTION_DIR/old-binary" ]; then
+        # 只有历史 v1 的清理顺序可能留下 pending 而丢失 old-binary。
+        # v2 缺失任何必要恢复材料时不得把它当作已完成更新的清理残留。
+        [ "$(singbox_update_state_value version 2>/dev/null || true)" = 1 ] || {
+            err "sing-box 更新的旧二进制缺失，事务记录已保留。"
+            return 1
+        }
         if ! current_singbox_update_binary_usable; then
             err "sing-box 旧二进制恢复材料缺失，且当前二进制或事务元数据不可用；已保留记录：$SINGBOX_UPDATE_TRANSACTION_DIR"
             return 1
@@ -6580,6 +6690,10 @@ recover_pending_singbox_update() {
         err "sing-box 更新恢复记录未通过完整性检查，已保留：$SINGBOX_UPDATE_TRANSACTION_DIR"
         return 1
     }
+    if [ "$(singbox_update_state_value version)" = 1 ]; then
+        err "旧版 sing-box 更新事务没有原服务定义快照，无法确认完整恢复；请人工处理，备份已保留：$SINGBOX_UPDATE_TRANSACTION_DIR"
+        return 1
+    fi
     binary_path="$(singbox_update_state_value binary_path)"
     old_version="$(singbox_update_state_value old_version)"
     was_enabled="$(singbox_update_state_value was_enabled)"
@@ -6785,7 +6899,7 @@ prepare_singbox_update_transaction() {
     local binary_path="$1" old_version="$2"
     local backup_dir_var="$3" was_enabled_var="$4" was_active_var="$5"
     local temp_dir temp_binary rollback_file package_name_value persistent_dir persistent_binary
-    local active_before=0 enabled_before=0
+    local active_before=0 enabled_before=0 require_managed_before=0
 
     temp_dir="$(mktemp -d /tmp/vpsbox-sing-box-update.XXXXXX)" || return 1
     temp_binary="$temp_dir/sing-box"
@@ -6799,6 +6913,7 @@ prepare_singbox_update_transaction() {
     if service_is_enabled; then
         enabled_before=1
     fi
+    [ -z "$(singbox_config_pids)" ] || require_managed_before=1
     begin_singbox_update_transaction \
         "$binary_path" "$temp_binary" "$temp_dir" "$enabled_before" "$active_before"
 
@@ -6814,7 +6929,7 @@ prepare_singbox_update_transaction() {
     arm_singbox_update_rollback_material "$rollback_file" "$old_version"
     if ! persist_singbox_update_transaction \
         "$binary_path" "$temp_binary" "$rollback_file" "$old_version" \
-        "$enabled_before" "$active_before"; then
+        "$enabled_before" "$active_before" "$require_managed_before"; then
         cancel_unmodified_singbox_update_transaction
         err "无法持久化 sing-box 更新回滚记录，已取消更新。"
         return 1

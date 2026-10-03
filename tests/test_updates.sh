@@ -1218,6 +1218,7 @@ reset_singbox_case() {
     MOCK_SINGBOX_EVENT_LOG="$TEST_TMP/singbox-$name.log"
     : > "$MOCK_SINGBOX_EVENT_LOG"
     VPSBOX_STATE_DIR="$TEST_TMP/singbox-$name-state"
+    mock_singbox_update_service_files "$TEST_TMP/singbox-$name-service"
     SINGBOX_UPDATE_TRANSACTION_DIR="$VPSBOX_STATE_DIR/singbox-update"
     # shellcheck disable=SC2034 # 被测的 sing-box 持久事务函数动态读取。
     SINGBOX_UPDATE_TRANSACTION_STATE="$SINGBOX_UPDATE_TRANSACTION_DIR/state"

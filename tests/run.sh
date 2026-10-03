@@ -12,6 +12,7 @@ declare -a DISCOVERED_SUITES=()
 declare -a SUITES=(
     test_harness.sh
     test_updates.sh
+    test_singbox_update_service.sh
     test_fail2ban.sh
     test_package_timeouts.sh
     test_ipv4_priority.sh
