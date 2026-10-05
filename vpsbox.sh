@@ -5216,10 +5216,19 @@ publish_staged_node() {
 }
 
 check_node_config_set() {
+    local working_dir=/
+
     [ -d "$NODE_CONFIG_DIR" ] && [ ! -L "$NODE_CONFIG_DIR" ] || return 1
     { [ -f "$SS_CONFIG_PATH" ] || [ -f "$VLESS_CONFIG_PATH" ]; } || return 1
     node_config_dir_contents_valid || return 1
-    sing-box check -C "$NODE_CONFIG_DIR" >/dev/null
+    # 与受管服务模板一致：systemd 指定 CONFIG_DIR，OpenRC 系统服务默认从 / 启动。
+    if is_systemd; then
+        working_dir="$CONFIG_DIR"
+    fi
+    (
+        cd -- "$working_dir" || return 1
+        sing-box check -C "$NODE_CONFIG_DIR" >/dev/null
+    )
 }
 
 check_active_node_config() {
@@ -17923,6 +17932,10 @@ start_service_action() {
     fi
 
     install_singbox_if_missing || return 1
+    if ! check_node_config_set; then
+        err "sing-box 配置检查失败，已取消启动；请修正配置后重试。"
+        return 1
+    fi
     if singbox_service_definition_is_current &&
         ! service_manager_is_active &&
         [ -z "$(singbox_config_pids)" ]; then
@@ -17952,6 +17965,10 @@ restart_service_action() {
     fi
     repair_node_uri_cache_best_effort "重启 sing-box 前"
     install_singbox_if_missing || return 1
+    if ! check_node_config_set; then
+        err "sing-box 配置检查失败，已取消重启；请修正配置后重试。"
+        return 1
+    fi
     setup_service || return 1
     restart_singbox_cleanly || return 1
     if ! verify_current_node_runtime; then

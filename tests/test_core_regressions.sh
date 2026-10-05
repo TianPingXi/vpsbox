@@ -2685,6 +2685,7 @@ test_start_service_action_healthy_is_noop() {
         singbox_service_definition_is_current() { return 0; }
         service_is_enabled() { return 0; }
         install_singbox_if_missing() { printf '%s\n' install >> "$log"; }
+        check_node_config_set() { printf '%s\n' check >> "$log"; }
         service_enable() { printf '%s\n' enable >> "$log"; }
         setup_service() { printf '%s\n' setup >> "$log"; }
         restart_singbox_cleanly() { printf '%s\n' restart >> "$log"; }
@@ -2704,6 +2705,7 @@ test_start_service_action_uses_light_start() {
         repair_node_uri_cache_best_effort() { printf '%s\n' repair >> "$log"; }
         service_is_running() { return 1; }
         install_singbox_if_missing() { printf '%s\n' install >> "$log"; }
+        check_node_config_set() { printf '%s\n' check >> "$log"; }
         singbox_service_definition_is_current() { return 0; }
         service_manager_is_active() { return 1; }
         singbox_config_pids() { return 0; }
@@ -2718,6 +2720,8 @@ test_start_service_action_uses_light_start() {
         assert_file_contains "$log" '^repair$'
         assert_file_contains "$log" '^install$'
         assert_file_contains "$log" '^start$'
+        assert_eq $'repair\ninstall\ncheck\nstart' "$(cat "$log")" \
+            "轻量启动必须在安装后、启动前检查配置"
         assert_file_not_contains "$log" '^(enable|setup|restart)$' \
             "当前服务定义只需启动时不得重写或重启"
     )
@@ -2731,6 +2735,7 @@ test_restart_service_action_keeps_full_restart() {
         node_exists() { return 0; }
         repair_node_uri_cache_best_effort() { printf '%s\n' repair >> "$log"; }
         install_singbox_if_missing() { printf '%s\n' install >> "$log"; }
+        check_node_config_set() { printf '%s\n' check >> "$log"; }
         setup_service() { printf '%s\n' setup >> "$log"; }
         restart_singbox_cleanly() { printf '%s\n' restart >> "$log"; }
         verify_current_node_runtime() { return 0; }
@@ -2740,6 +2745,8 @@ test_restart_service_action_keeps_full_restart() {
         assert_file_contains "$log" '^install$'
         assert_file_contains "$log" '^setup$'
         assert_file_contains "$log" '^restart$'
+        assert_eq $'repair\ninstall\ncheck\nsetup\nrestart' "$(cat "$log")" \
+            "重启必须在安装后、修改服务前检查配置"
     )
 }
 

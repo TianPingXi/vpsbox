@@ -239,6 +239,156 @@ EOF
     fi
 }
 
+test_service_actions_validate_config_before_mutation() {
+    local mode protocol validity
+
+    for mode in restart rebuild light; do
+        for protocol in ss vless; do
+            for validity in invalid valid; do
+                (
+                    local action=start_service_action running=1 enabled=0
+                    local target log output expected
+                    set_node_paths "$TEST_TMP/service-check-$mode-$protocol-$validity"
+                    mkdir -p "$NODE_CONFIG_DIR"
+                    chmod 700 "$CONFIG_DIR" "$NODE_CONFIG_DIR"
+                    write_ss_config_fixture "$SS_CONFIG_PATH"
+                    write_ss_state_fixture "$SS_STATE_FILE"
+                    write_vless_config_fixture "$VLESS_CONFIG_PATH"
+                    write_vless_state_fixture "$VLESS_STATE_FILE"
+                    target="$(node_config_path "$protocol")"
+                    if [ "$validity" = invalid ]; then
+                        jq '.outbounds[0].type = "invalid"' "$target" > "$CONFIG_DIR/changed.json"
+                    else
+                        # 合法的自定义监听地址可以偏离模板，不能被新增校验误拒。
+                        jq '.inbounds[0].listen = "127.0.0.1"' "$target" > "$CONFIG_DIR/changed.json"
+                    fi
+                    cat "$CONFIG_DIR/changed.json" > "$target"
+                    require_valid_node_state_if_present || fail "夹具必须通过核心完整性检查"
+                    if [ "$validity" = invalid ]; then
+                        if check_node_config_set >/dev/null 2>&1; then
+                            fail "无效夹具必须被完整配置检查拒绝"
+                        fi
+                    else
+                        check_node_config_set || fail "合法自定义配置必须通过完整检查"
+                    fi
+
+                    log="$CONFIG_DIR/calls"
+                    output="$CONFIG_DIR/output"
+                    : > "$log"
+                    [ "$mode" != restart ] || action=restart_service_action
+                    [ "$mode" != light ] || running=0
+                    repair_node_uri_cache_best_effort() { return 0; }
+                    install_singbox_if_missing() { printf 'install\n' >> "$log"; }
+                    sing-box() {
+                        printf '%s\n' "$*" >> "$log"
+                        command sing-box "$@"
+                    }
+                    service_is_running() { [ "$running" = 1 ]; }
+                    service_manager_is_active() { [ "$running" = 1 ]; }
+                    verify_current_node_runtime() { [ "$running" = 1 ]; }
+                    singbox_service_definition_is_current() { [ "$mode" = light ]; }
+                    singbox_config_pids() { if [ "$running" = 1 ]; then printf '12345\n'; fi; }
+                    service_is_enabled() { [ "$enabled" = 1 ]; }
+                    service_enable() { printf 'enable\n' >> "$log"; enabled=1; }
+                    setup_service() { printf 'setup\n' >> "$log"; enabled=1; }
+                    service_stop() { printf 'stop\n' >> "$log"; running=0; }
+                    stop_singbox_config_processes() { printf 'stop-managed\n' >> "$log"; running=0; }
+                    service_start() { printf 'start\n' >> "$log"; running=1; }
+
+                    expected="$(printf 'install\ncheck -C %s' "$NODE_CONFIG_DIR")"
+                    if [ "$validity" = invalid ]; then
+                        if "$action" > "$output" 2>&1; then
+                            fail "$mode/$protocol 必须拒绝无效配置"
+                        fi
+                        assert_eq "$expected" "$(cat "$log")" \
+                            "校验失败不得修改服务定义、自启或启停服务"
+                        assert_eq 0 "$enabled" "校验失败必须保留自启状态"
+                        if [ "$mode" = light ]; then
+                            assert_eq 0 "$running" "校验失败不得启动已停止的服务"
+                        else
+                            assert_eq 1 "$running" "校验失败必须保留旧服务运行"
+                        fi
+                        assert_file_contains "$output" '配置检查失败'
+                    else
+                        "$action" > "$output" 2>&1 || fail "$mode/$protocol 合法配置应成功"
+                        if [ "$mode" = light ]; then
+                            expected+=$'\nenable\nstart'
+                        else
+                            expected+=$'\nsetup\nstop\nstop-managed\nstart'
+                        fi
+                        assert_eq "$expected" "$(cat "$log")" "完整检查必须先于服务修改"
+                        assert_eq 1 "$running" "合法配置应启动服务"
+                        assert_eq 1 "$enabled" "合法配置保留现有自启行为"
+                    fi
+                )
+            done
+        done
+    done
+}
+
+test_service_config_check_uses_service_working_directory() {
+    local manager action
+
+    for manager in systemd openrc; do
+        for action in start_service_action restart_service_action; do
+            (
+                local caller="$TEST_TMP/caller-$manager-$action" certificate expected_dir log
+                set_node_paths "$TEST_TMP/relative config-$manager-$action"
+                mkdir -p "$NODE_CONFIG_DIR" "$caller"
+                chmod 700 "$CONFIG_DIR" "$NODE_CONFIG_DIR"
+                write_ss_config_fixture "$SS_CONFIG_PATH"
+                write_ss_state_fixture "$SS_STATE_FILE"
+                is_systemd() { [ "$manager" = systemd ]; }
+                expected_dir="$CONFIG_DIR"
+                certificate=ca.pem
+                if [ "$manager" = openrc ]; then
+                    expected_dir=/
+                    certificate="${CONFIG_DIR#/}/ca.pem"
+                fi
+                jq --arg path "$certificate" '.outbounds = [{type:"http", tag:"custom-http",
+                    server:"example.com", server_port:443,
+                    tls:{enabled:true, certificate_path:$path}}]' \
+                    "$SS_CONFIG_PATH" > "$CONFIG_DIR/changed.json"
+                cat "$CONFIG_DIR/changed.json" > "$SS_CONFIG_PATH"
+                # 此替身只验证相对文件解析，不替代 sing-box 的证书格式校验。
+                printf 'service-certificate\n' > "$CONFIG_DIR/ca.pem"
+                mkdir -p "$caller/$(dirname "$certificate")"
+                printf 'caller-decoy\n' > "$caller/$certificate"
+                log="$CONFIG_DIR/calls"
+                : > "$log"
+                sing-box() {
+                    local path
+                    [ "$1" = check ] && [ "$2" = -C ] || return 2
+                    printf '%s\n' "$PWD" >> "$log"
+                    path="$(jq -r '.outbounds[0].tls.certificate_path' "$3/10-ss.json")"
+                    [ -f "$path" ] && [ "$(cat "$path")" = service-certificate ]
+                }
+                repair_node_uri_cache_best_effort() { return 0; }
+                install_singbox_if_missing() { return 0; }
+                service_is_running() { return 0; }
+                verify_current_node_runtime() { return 0; }
+                singbox_service_definition_is_current() { return 1; }
+                setup_service() { printf 'setup\n' >> "$log"; }
+                restart_singbox_cleanly() { printf 'restart\n' >> "$log"; }
+
+                cd -- "$caller"
+                "$action" >/dev/null
+                assert_eq "$expected_dir" "$(head -n 1 "$log")" "校验必须使用目标服务目录"
+                assert_file_contains "$log" '^restart$' "合法相对路径不得阻止服务启动"
+                assert_eq "$caller" "$PWD" "成功校验不得改变调用者工作目录"
+
+                rm -- "$CONFIG_DIR/ca.pem"
+                : > "$log"
+                if "$action" > "$CONFIG_DIR/failure.out" 2>&1; then
+                    fail "服务目录缺少引用文件时必须拒绝，不能采用调用目录同名文件"
+                fi
+                assert_eq "$expected_dir" "$(cat "$log")" "失败时不得修改服务"
+                assert_eq "$caller" "$PWD" "失败校验不得改变调用者工作目录"
+            )
+        done
+    done
+}
+
 test_complete_configs_merge_with_unique_tags() {
     (
         local vless_before
@@ -452,8 +602,12 @@ test_service_definition_uses_independent_config_directory() {
         write_ss_state_fixture "$SS_STATE_FILE"
         write_uri_files
         render_singbox_systemd_service /usr/bin/sing-box > "$TEST_TMP/sing-box.service"
+        assert_file_contains "$TEST_TMP/sing-box.service" "^WorkingDirectory=$CONFIG_DIR$"
         assert_file_contains "$TEST_TMP/sing-box.service" "ExecStart=/usr/bin/sing-box run -C $NODE_CONFIG_DIR"
         assert_file_not_contains "$TEST_TMP/sing-box.service" ' run -c '
+        render_singbox_openrc_service /usr/bin/sing-box > "$TEST_TMP/sing-box.init"
+        assert_file_not_contains "$TEST_TMP/sing-box.init" '^directory=' \
+            "OpenRC 模板应保留系统服务默认的根工作目录"
     )
 }
 
@@ -2615,6 +2769,8 @@ main() {
     )
     local -a tests=(
         test_fake_singbox_rejects_invalid_config_schema
+        test_service_actions_validate_config_before_mutation
+        test_service_config_check_uses_service_working_directory
         test_complete_configs_merge_with_unique_tags
         test_create_shadowsocks_preserves_vless_and_tolerates_uri_cache_failure
         test_create_vless_preserves_shadowsocks_and_tolerates_uri_cache_failure
