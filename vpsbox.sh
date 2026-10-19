@@ -74,6 +74,7 @@ SINGBOX_UPDATE_TRANSACTION_DIR="$VPSBOX_STATE_DIR/singbox-update"
 SINGBOX_UPDATE_TRANSACTION_STATE="$SINGBOX_UPDATE_TRANSACTION_DIR/state"
 GAI_CONF="/etc/gai.conf"
 RESOLV_CONF="/etc/resolv.conf"
+RESOLVED_VPSBOX_CONF="/etc/systemd/resolved.conf.d/vpsbox.conf"
 NTP_SOURCES_BEGIN="# BEGIN VPSBOX NTP SOURCES"
 NTP_SOURCES_END="# END VPSBOX NTP SOURCES"
 CHRONY_SOURCE_FILE="/etc/chrony/sources.d/vpsbox.sources"
@@ -9169,6 +9170,11 @@ rollback_dns_change() {
     local name="$1" snapshot="$2" target="$3" created="$4" applied_before="$5"
 
     restore_dns_operation_snapshot "$snapshot" "$target" "$created" || return 1
+    # resolved 重新加载旧配置并恢复运行后，才能撤销 pending 或清理恢复基线。
+    if [ "$name" = "DNS_RESOLVED" ]; then
+        retry 2 2 systemctl restart systemd-resolved >/dev/null 2>&1 || return 1
+        systemctl is-active --quiet systemd-resolved 2>/dev/null || return 1
+    fi
     restore_dns_change_tracking "$name" "$applied_before"
 }
 
@@ -9229,9 +9235,6 @@ rollback_active_dns_operation() {
     [ -n "$name" ] || return 0
     rollback_dns_change "$name" "$snapshot" "$target" "$created" "$applied_before" ||
         return 1
-    if [ "$name" = "DNS_RESOLVED" ]; then
-        retry 2 2 systemctl restart systemd-resolved >/dev/null 2>&1 || return 1
-    fi
     remove_dns_operation_snapshot "$snapshot" || return 1
     clear_active_dns_operation
 }
@@ -9389,8 +9392,7 @@ rollback_systemd_resolved_dns() {
 write_systemd_resolved_dns() {
     local dns1="$1"
     local dns2="${2:-}"
-    local conf_dir="/etc/systemd/resolved.conf.d"
-    local conf_file="$conf_dir/vpsbox.conf"
+    local conf_file="$RESOLVED_VPSBOX_CONF" conf_dir
     local snapshot=""
     local applied_before="0"
     local pending_before="0"
@@ -9398,6 +9400,7 @@ write_systemd_resolved_dns() {
     local tmp
     local verify_status
 
+    conf_dir="$(dirname -- "$conf_file")" || return 1
     [ -z "${ACTIVE_DNS_OPERATION_NAME:-}" ] || {
         err "当前进程仍有未完成的 DNS 回滚，已拒绝开始新的修改。"
         return 1
@@ -9427,14 +9430,13 @@ write_systemd_resolved_dns() {
             err "请先在系统优化恢复菜单中恢复 IPv4 DNS，再重新修改。"
             return 1
         fi
-        if ! systemctl is-active --quiet systemd-resolved 2>/dev/null; then
-            info "systemd-resolved DNS 配置正确，正在恢复未完成事务的服务状态..."
-            retry 3 2 systemctl start systemd-resolved || {
-                err "systemd-resolved 服务启动失败，已保留未完成的 DNS 恢复记录。"
-                return 1
-            }
+        # pending 可能停在文件发布后、服务重启前，active 不能证明已加载目标配置。
+        info "正在重新加载未完成事务的 systemd-resolved DNS 配置..."
+        if ! retry 3 2 systemctl restart systemd-resolved ||
+            ! systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+            err "systemd-resolved 配置加载或服务验收失败，已保留未完成的 DNS 恢复记录。"
+            return 1
         fi
-        systemctl is-active --quiet systemd-resolved 2>/dev/null || return 1
         if verify_dns_resolution; then
             info "未完成的 systemd-resolved DNS 配置已通过解析验证。"
         else
@@ -17559,6 +17561,7 @@ recorded_system_changes_present() {
 
 restore_dns_system_change() {
     local restore_resolv=0 restore_resolved=0 failed=0
+    local snapshot=""
 
     change_needs_restore DNS_RESOLV && restore_resolv=1
     change_needs_restore DNS_RESOLVED && restore_resolved=1
@@ -17570,13 +17573,21 @@ restore_dns_system_change() {
     [ "$restore_resolv" -eq 0 ] ||
         restore_change_file DNS_RESOLV "$RESOLV_CONF" || failed=1
     [ "$restore_resolved" -eq 0 ] ||
-        restore_change_file DNS_RESOLVED /etc/systemd/resolved.conf.d/vpsbox.conf || failed=1
+        restore_change_file DNS_RESOLVED "$RESOLVED_VPSBOX_CONF" || failed=1
     [ "$failed" -eq 0 ] || return 1
-    if resolv_conf_managed_by_systemd_resolved &&
-        ! systemctl restart systemd-resolved; then
-        return 1
+    if resolv_conf_managed_by_systemd_resolved; then
+        systemctl restart systemd-resolved || return 1
+        systemctl is-active --quiet systemd-resolved 2>/dev/null || return 1
     fi
 
+    # 首次基线已恢复，先解除本次操作回滚，避免退出清理再次覆盖恢复结果。
+    # 必须早于持久记录清理；即使后续清理失败，也不能重放已失效的快照。
+    if { [ "$restore_resolv" -eq 1 ] && [ "${ACTIVE_DNS_OPERATION_NAME:-}" = DNS_RESOLV ]; } ||
+        { [ "$restore_resolved" -eq 1 ] && [ "${ACTIVE_DNS_OPERATION_NAME:-}" = DNS_RESOLVED ]; }; then
+        snapshot="${ACTIVE_DNS_OPERATION_SNAPSHOT:-}"
+        finish_active_dns_operation ||
+            warn "IPv4 DNS 已恢复，但临时回滚快照清理失败：$snapshot"
+    fi
     [ "$restore_resolv" -eq 0 ] || clear_change_tracking DNS_RESOLV || failed=1
     [ "$restore_resolved" -eq 0 ] || clear_change_tracking DNS_RESOLVED || failed=1
     return "$failed"

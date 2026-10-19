@@ -2558,9 +2558,13 @@ test_pending_dns_same_target_commits_without_rewrite() {
             cmp() { cat >/dev/null; }
             verify_dns_resolution() { printf '%s\n' verify >> "$log"; }
             mark_change_applied() { printf 'applied:%s\n' "$1" >> "$log"; }
+            retry() { shift 2; "$@"; }
             systemctl() {
                 printf 'systemctl:%s\n' "$*" >> "$log"
-                [ "$*" = 'is-active --quiet systemd-resolved' ]
+                case "$*" in
+                    'restart systemd-resolved'|'is-active --quiet systemd-resolved') return 0 ;;
+                    *) return 1 ;;
+                esac
             }
             mktemp() { forbid "pending 同目标提交不得创建临时文件"; }
             backup_change_file_once() { forbid "pending 同目标提交不得覆盖恢复基线"; }
@@ -2573,10 +2577,93 @@ test_pending_dns_same_target_commits_without_rewrite() {
                 assert_eq $'backup:DNS_RESOLV\nverify\napplied:DNS_RESOLV' "$(cat "$log")"
             else
                 write_systemd_resolved_dns 1.1.1.1 8.8.8.8 >/dev/null
-                assert_eq $'backup:DNS_RESOLVED\nsystemctl:is-active --quiet systemd-resolved\nsystemctl:is-active --quiet systemd-resolved\nverify\napplied:DNS_RESOLVED' \
+                assert_eq $'backup:DNS_RESOLVED\nsystemctl:restart systemd-resolved\nsystemctl:is-active --quiet systemd-resolved\nverify\napplied:DNS_RESOLVED' \
                     "$(cat "$log")"
             fi
             assert_no_forbidden "pending 同目标提交产生了重复写入副作用"
+        )
+    done
+}
+
+test_pending_resolved_loads_config_before_commit_and_preserves_failures() {
+    local scenario
+
+    require_root_permission_semantics || return $?
+    for scenario in active stopped restart-fails stays-inactive verify-fails no-verifier; do
+        (
+            local case_name="dns-pending-runtime-$scenario"
+            local case_dir="$TEST_TMP/$case_name" target log runtime state=active
+            local manifest_before backup_before target_before status=0
+
+            reset_change_store "$case_name"
+            target="$case_dir/vpsbox.conf"
+            log="$case_dir/events"
+            runtime="$case_dir/loaded.conf"
+            RESOLVED_VPSBOX_CONF="$target"
+            : > "$log"
+            render_systemd_resolved_dns 9.9.9.9 > "$target"
+            cp -- "$target" "$runtime"
+            backup_change_file_once DNS_RESOLVED "$target"
+            begin_change_transaction DNS_RESOLVED
+            render_systemd_resolved_dns 1.1.1.1 8.8.8.8 > "$target"
+            manifest_before="$(cksum < "$CHANGE_MANIFEST")"
+            backup_before="$(cksum < "$CHANGE_BACKUP_DIR/DNS_RESOLVED")"
+            target_before="$(cksum < "$target")"
+            [ "$scenario" != stopped ] || state=inactive
+            forbid_init
+            sleep() { :; }
+            backup_change_file_once() { forbid "pending 恢复不得重建备份"; }
+            begin_change_transaction() { forbid "pending 恢复不得重开事务"; }
+            ensure_public_config_dir() { forbid "pending 恢复不得重写配置"; }
+            systemctl() {
+                printf '%s\n' "$*" >> "$log"
+                [ "$(change_restore_state DNS_RESOLVED)" = pending ] ||
+                    { forbid "服务验收前不得提交 pending"; return 1; }
+                case "$*" in
+                    'restart systemd-resolved')
+                        [ "$scenario" != restart-fails ] || return 23
+                        cp -- "$target" "$runtime" || return 1
+                        state=active
+                        [ "$scenario" != stays-inactive ] || state=inactive
+                        ;;
+                    'is-active --quiet systemd-resolved') [ "$state" = active ] ;;
+                    *) forbid "非预期的 resolved 操作：$*" ;;
+                esac
+            }
+            verify_dns_resolution() {
+                printf '%s\n' verify >> "$log"
+                [ "$state" = active ] && cmp -s "$target" "$runtime" ||
+                    { forbid "必须加载目标配置后再验证解析"; return 1; }
+                [ "$(change_restore_state DNS_RESOLVED)" = pending ] ||
+                    { forbid "解析验收前不得提交 pending"; return 1; }
+                [ "$scenario" != no-verifier ] || return 2
+                [ "$scenario" != verify-fails ]
+            }
+
+            write_systemd_resolved_dns 1.1.1.1 8.8.8.8 > "$case_dir/output" 2>&1 ||
+                status=$?
+
+            case "$scenario" in
+                active|stopped|no-verifier)
+                    assert_eq 0 "$status"
+                    assert_eq applied "$(change_restore_state DNS_RESOLVED)"
+                    assert_eq $'restart systemd-resolved\nis-active --quiet systemd-resolved\nverify' \
+                        "$(cat "$log")" "必须按加载、运行状态、解析顺序验收"
+                    ;;
+                *)
+                    [ "$status" -ne 0 ] || fail "$scenario 必须返回失败"
+                    assert_eq pending "$(change_restore_state DNS_RESOLVED)"
+                    assert_eq "$manifest_before" "$(cksum < "$CHANGE_MANIFEST")" \
+                        "验收失败必须原样保留恢复记录"
+                    if [ "$scenario" != verify-fails ]; then
+                        assert_file_not_contains "$log" '^verify$'
+                    fi
+                    ;;
+            esac
+            assert_eq "$backup_before" "$(cksum < "$CHANGE_BACKUP_DIR/DNS_RESOLVED")"
+            assert_eq "$target_before" "$(cksum < "$target")"
+            assert_eq '' "$ACTIVE_DNS_OPERATION_NAME"
+            assert_no_forbidden
         )
     done
 }
@@ -2731,6 +2818,424 @@ test_systemd_resolved_rollback_failure_is_reported() {
             /etc/systemd/resolved.conf.d/vpsbox.conf "" 1 0 > "$output" 2>&1; then
             fail "systemd-resolved 回滚失败时不得报告成功"
         fi
+    )
+}
+
+prepare_resolved_rollback_case() {
+    local case_name="$1" baseline="$2" applied_before="$3"
+    # shellcheck disable=SC2034 # prepare_dns_operation 按变量名回填；活动事务持有同一路径。
+    local case_dir="$TEST_TMP/$1" staged snapshot_path=""
+
+    reset_change_store "$case_name"
+    RESOLVED_VPSBOX_CONF="$case_dir/vpsbox.conf"
+    render_systemd_resolved_dns 9.9.9.9 > "$case_dir/original.conf"
+    if [ "$baseline" = existing ]; then
+        cp -- "$case_dir/original.conf" "$RESOLVED_VPSBOX_CONF"
+    fi
+    if [ "$applied_before" = 1 ]; then
+        backup_change_file_once DNS_RESOLVED "$RESOLVED_VPSBOX_CONF"
+        mark_change_applied DNS_RESOLVED
+        render_systemd_resolved_dns 4.4.4.4 > "$RESOLVED_VPSBOX_CONF"
+    fi
+    if [ -f "$RESOLVED_VPSBOX_CONF" ]; then
+        cp -- "$RESOLVED_VPSBOX_CONF" "$case_dir/before.conf"
+    fi
+    staged="$case_dir/staged.conf"
+    render_systemd_resolved_dns 1.1.1.1 8.8.8.8 > "$staged"
+    prepare_dns_operation DNS_RESOLVED "$RESOLVED_VPSBOX_CONF" .rollback \
+        '' "$applied_before" "$staged" snapshot_path
+    mv -- "$staged" "$RESOLVED_VPSBOX_CONF"
+}
+
+test_resolved_rollback_keeps_tracking_until_service_is_restored() {
+    local baseline applied_before failure_stage
+
+    require_root_permission_semantics || return $?
+    for baseline in existing absent; do
+        for applied_before in 0 1; do
+            for failure_stage in file restart inactive; do
+                (
+                    local case_name="dns-rollback-$baseline-$applied_before-$failure_stage"
+                    local case_dir="$TEST_TMP/$case_name" log snapshot manifest_before
+                    local stage="$failure_stage" status=0
+
+                    prepare_resolved_rollback_case "$case_name" "$baseline" "$applied_before"
+                    log="$case_dir/events"
+                    : > "$log"
+                    snapshot="$ACTIVE_DNS_OPERATION_SNAPSHOT"
+                    manifest_before="$(cksum < "$CHANGE_MANIFEST")"
+                    forbid_init
+                    sleep() { :; }
+                    mv() {
+                        [ "$stage" != file ] || [ "${!#}" != "$RESOLVED_VPSBOX_CONF" ] ||
+                            return 23
+                        command mv "$@"
+                    }
+                    rm() {
+                        [ "$stage" != file ] || [ "${!#}" != "$RESOLVED_VPSBOX_CONF" ] ||
+                            return 23
+                        command rm "$@"
+                    }
+                    systemctl() {
+                        printf '%s\n' "$*" >> "$log"
+                        [ "$(change_restore_state DNS_RESOLVED)" = pending ] &&
+                            change_backup_record_is_valid DNS_RESOLVED ||
+                            { forbid "服务恢复前必须保留 pending 和原始基线"; return 1; }
+                        if [ -f "$case_dir/before.conf" ]; then
+                            cmp -s "$case_dir/before.conf" "$RESOLVED_VPSBOX_CONF" ||
+                                { forbid "服务恢复前必须先恢复旧文件"; return 1; }
+                        else
+                            [ ! -e "$RESOLVED_VPSBOX_CONF" ] ||
+                                { forbid "服务恢复前必须移除本次新建文件"; return 1; }
+                        fi
+                        case "$*" in
+                            'restart systemd-resolved') [ "$stage" != restart ] ;;
+                            'is-active --quiet systemd-resolved') [ "$stage" != inactive ] ;;
+                            *) forbid "非预期的回滚服务操作：$*" ;;
+                        esac
+                    }
+
+                    rollback_active_dns_operation > "$case_dir/output" 2>&1 || status=$?
+                    [ "$status" -ne 0 ] || fail "$failure_stage 失败必须阻止回滚提交"
+                    assert_eq "$manifest_before" "$(cksum < "$CHANGE_MANIFEST")"
+                    assert_eq DNS_RESOLVED "$ACTIVE_DNS_OPERATION_NAME"
+                    change_backup_record_is_valid DNS_RESOLVED
+                    [ -z "$snapshot" ] || [ -f "$snapshot" ] ||
+                        fail "失败后必须保留本次操作快照"
+                    if [ "$failure_stage" = file ]; then
+                        assert_empty_file "$log" "文件恢复失败后不得操作服务"
+                    fi
+                    assert_no_forbidden
+
+                    # 退出清理使用真实活动回滚入口，再次尝试并完成本次恢复。
+                    stage=success
+                    cleanup_vpsbox_runtime_service_transactions
+                    assert_eq '' "$ACTIVE_DNS_OPERATION_NAME"
+                    [ -z "$snapshot" ] || [ ! -e "$snapshot" ] ||
+                        fail "恢复成功后应清理临时快照"
+                    if [ -f "$case_dir/before.conf" ]; then
+                        cmp -s "$case_dir/before.conf" "$RESOLVED_VPSBOX_CONF"
+                    else
+                        [ ! -e "$RESOLVED_VPSBOX_CONF" ] || fail "原目标不存在时应恢复为不存在"
+                    fi
+                    if [ "$applied_before" = 1 ]; then
+                        assert_eq applied "$(change_restore_state DNS_RESOLVED)"
+                        change_backup_record_is_valid DNS_RESOLVED
+                        if [ "$baseline" = existing ]; then
+                            cmp -s "$case_dir/original.conf" "$CHANGE_BACKUP_DIR/DNS_RESOLVED"
+                        else
+                            assert_eq absent "$(manifest_value BACKUP_DNS_RESOLVED)"
+                        fi
+                    else
+                        assert_eq none "$(change_restore_state DNS_RESOLVED)"
+                        assert_file_not_contains "$CHANGE_MANIFEST" 'DNS_RESOLVED'
+                        [ ! -e "$CHANGE_BACKUP_DIR/DNS_RESOLVED" ] ||
+                            fail "首次修改回滚成功后应清理持久备份"
+                    fi
+                    assert_no_forbidden
+                )
+            done
+        done
+    done
+}
+
+test_resolved_failed_rollback_is_recoverable_in_fresh_process() {
+    local baseline
+
+    require_root_permission_semantics || return $?
+    for baseline in existing absent; do
+        (
+            local case_name="dns-fresh-process-$baseline"
+            local case_dir="$TEST_TMP/$case_name"
+
+            prepare_resolved_rollback_case "$case_name" "$baseline" 1
+            # 两个独立 Bash 进程只共享临时文件，不继承 ACTIVE_* 运行期状态。
+            bash -s -- "$REPO_DIR/vpsbox.sh" "$case_dir" \
+                "$ACTIVE_DNS_OPERATION_SNAPSHOT" <<'BASH'
+set -euo pipefail
+source "$1"
+VPSBOX_STATE_DIR="$2/state"
+CHANGE_MANIFEST="$VPSBOX_STATE_DIR/changes.env"
+CHANGE_BACKUP_DIR="$VPSBOX_STATE_DIR/backups"
+RESOLVED_VPSBOX_CONF="$2/vpsbox.conf"
+arm_dns_operation_rollback DNS_RESOLVED "$3" "$RESOLVED_VPSBOX_CONF" 0 1
+sleep() { :; }
+systemctl() { return 23; }
+trap cleanup_vpsbox_runtime_service_transactions EXIT
+if rollback_active_dns_operation; then
+    exit 1
+fi
+[ "$(change_restore_state DNS_RESOLVED)" = pending ]
+change_backup_record_is_valid DNS_RESOLVED
+BASH
+            assert_eq pending "$(change_restore_state DNS_RESOLVED)"
+            # 保留管理器检测的真实逻辑，仅把 resolv.conf 和服务命令隔离。
+            mkdir -p "$case_dir/systemd/resolve"
+            : > "$case_dir/systemd/resolve/stub-resolv.conf"
+            ln -s "$case_dir/systemd/resolve/stub-resolv.conf" "$case_dir/resolv.conf"
+            bash -s -- "$REPO_DIR/vpsbox.sh" "$case_dir" <<'BASH'
+set -euo pipefail
+source "$1"
+VPSBOX_STATE_DIR="$2/state"
+CHANGE_MANIFEST="$VPSBOX_STATE_DIR/changes.env"
+CHANGE_BACKUP_DIR="$VPSBOX_STATE_DIR/backups"
+RESOLVED_VPSBOX_CONF="$2/vpsbox.conf"
+RESOLV_CONF="$2/resolv.conf"
+[ -z "$ACTIVE_DNS_OPERATION_NAME" ]
+[ "$(system_change_state dns)" = pending ]
+service_ready=0
+systemctl() {
+    case "$*" in
+        'list-unit-files systemd-resolved.service')
+            printf '%s\n' 'systemd-resolved.service enabled'
+            ;;
+        'restart systemd-resolved')
+            [ "$(change_restore_state DNS_RESOLVED)" = pending ] &&
+                change_backup_record_is_valid DNS_RESOLVED
+            ;;
+        'is-active --quiet systemd-resolved') [ "$service_ready" = 1 ] ;;
+        *) return 1 ;;
+    esac
+}
+if restore_vpsbox_system_change dns; then
+    exit 1
+fi
+[ "$(system_change_state dns)" = pending ]
+change_backup_record_is_valid DNS_RESOLVED
+service_ready=1
+restore_vpsbox_system_change dns
+[ "$(system_change_state dns)" = none ]
+BASH
+            assert_eq none "$(change_restore_state DNS_RESOLVED)"
+            if [ "$baseline" = existing ]; then
+                cmp -s "$case_dir/original.conf" "$RESOLVED_VPSBOX_CONF"
+            else
+                [ ! -e "$RESOLVED_VPSBOX_CONF" ] || fail "新进程应恢复首次不存在的状态"
+            fi
+        )
+    done
+}
+
+test_resolved_same_process_restore_disarms_failed_operation() {
+    local baseline applied_before
+
+    require_root_permission_semantics || return $?
+    for baseline in existing absent; do
+        for applied_before in 0 1; do
+            (
+                local case_name="dns-same-process-$baseline-$applied_before"
+                local case_dir="$TEST_TMP/$case_name" snapshot manifest_after
+                local stage=apply status=0
+
+                reset_change_store "$case_name"
+                chmod 755 "$case_dir"
+                RESOLVED_VPSBOX_CONF="$case_dir/vpsbox.conf"
+                render_systemd_resolved_dns 9.9.9.9 > "$case_dir/original.conf"
+                if [ "$baseline" = existing ]; then
+                    cp -- "$case_dir/original.conf" "$RESOLVED_VPSBOX_CONF"
+                fi
+                if [ "$applied_before" = 1 ]; then
+                    backup_change_file_once DNS_RESOLVED "$RESOLVED_VPSBOX_CONF"
+                    mark_change_applied DNS_RESOLVED
+                    render_systemd_resolved_dns 4.4.4.4 > "$RESOLVED_VPSBOX_CONF"
+                fi
+                mkdir -p "$case_dir/systemd/resolve"
+                : > "$case_dir/systemd/resolve/stub-resolv.conf"
+                RESOLV_CONF="$case_dir/resolv.conf"
+                ln -s "$case_dir/systemd/resolve/stub-resolv.conf" "$RESOLV_CONF"
+                sleep() { :; }
+                resolvectl() { return 0; }
+                systemctl() {
+                    case "$*" in
+                        'list-unit-files systemd-resolved.service')
+                            printf '%s\n' 'systemd-resolved.service enabled'
+                            ;;
+                        'restart systemd-resolved')
+                            [ "$stage" != rollback ] || return 23
+                            if [ -f "$RESOLVED_VPSBOX_CONF" ]; then
+                                cp -- "$RESOLVED_VPSBOX_CONF" "$case_dir/runtime.conf"
+                            else
+                                rm -f -- "$case_dir/runtime.conf"
+                            fi
+                            ;;
+                        'is-active --quiet systemd-resolved') [ "$stage" != rollback ] ;;
+                        *) return 1 ;;
+                    esac
+                }
+                verify_dns_resolution() { stage=rollback; return 1; }
+
+                apply_ipv4_dns 1.1.1.1 8.8.8.8 > "$case_dir/apply.log" 2>&1 || status=$?
+                [ "$status" -ne 0 ] || fail "解析及即时回滚失败时必须报告失败"
+                assert_eq pending "$(change_restore_state DNS_RESOLVED)"
+                assert_eq DNS_RESOLVED "$ACTIVE_DNS_OPERATION_NAME"
+                snapshot="$ACTIVE_DNS_OPERATION_SNAPSHOT"
+
+                stage=restore
+                run_menu_action restore_vpsbox_system_change_interactive dns <<< YES
+                assert_eq none "$(change_restore_state DNS_RESOLVED)"
+                assert_eq '' "$ACTIVE_DNS_OPERATION_NAME" "恢复菜单成功后必须解除活动回滚"
+                [ -z "$snapshot" ] || [ ! -e "$snapshot" ] || fail "应清理本次操作快照"
+                manifest_after="$(cksum < "$CHANGE_MANIFEST")"
+                forbid_init
+                systemctl() { forbid "恢复完成后的退出清理不得再操作 DNS 服务"; }
+                cleanup_vpsbox_runtime_service_transactions
+
+                assert_eq "$manifest_after" "$(cksum < "$CHANGE_MANIFEST")"
+                if [ "$baseline" = existing ]; then
+                    cmp -s "$case_dir/original.conf" "$RESOLVED_VPSBOX_CONF"
+                    cmp -s "$case_dir/original.conf" "$case_dir/runtime.conf"
+                else
+                    [ ! -e "$RESOLVED_VPSBOX_CONF" ] && [ ! -e "$case_dir/runtime.conf" ] ||
+                        fail "首次不存在的 DNS 配置不得在退出时重新出现"
+                fi
+                assert_file_not_contains "$CHANGE_MANIFEST" 'DNS_RESOLVED'
+                [ ! -e "$CHANGE_BACKUP_DIR/DNS_RESOLVED" ] || fail "恢复成功后应清理首次备份"
+                assert_no_forbidden
+            )
+        done
+    done
+}
+
+test_resolved_restore_failure_preserves_active_operation() {
+    local failure_stage
+
+    require_root_permission_semantics || return $?
+    for failure_stage in file restart inactive; do
+        (
+            local case_name="dns-menu-failure-$failure_stage"
+            local case_dir="$TEST_TMP/$case_name" snapshot manifest_before status=0
+            local stage="$failure_stage"
+
+            prepare_resolved_rollback_case "$case_name" existing 1
+            snapshot="$ACTIVE_DNS_OPERATION_SNAPSHOT"
+            manifest_before="$(cksum < "$CHANGE_MANIFEST")"
+            forbid_init
+            resolv_conf_managed_by_systemd_resolved() { return 0; }
+            mv() {
+                [ "$stage" != file ] || [ "${!#}" != "$RESOLVED_VPSBOX_CONF" ] || return 23
+                command mv "$@"
+            }
+            systemctl() {
+                [ "$stage" != file ] || { forbid "文件恢复失败后不得操作服务"; return 1; }
+                case "$*" in
+                    'restart systemd-resolved') [ "$stage" != restart ] ;;
+                    'is-active --quiet systemd-resolved') [ "$stage" != inactive ] ;;
+                    *) forbid "非预期的服务操作：$*" ;;
+                esac
+            }
+
+            restore_vpsbox_system_change dns > "$case_dir/output" 2>&1 || status=$?
+            [ "$status" -ne 0 ] || fail "恢复菜单的 $stage 失败不得提交"
+            assert_eq "$manifest_before" "$(cksum < "$CHANGE_MANIFEST")"
+            assert_eq DNS_RESOLVED "$ACTIVE_DNS_OPERATION_NAME"
+            [ -f "$snapshot" ] || fail "恢复失败后应保留活动快照"
+            change_backup_record_is_valid DNS_RESOLVED
+
+            stage=success
+            cleanup_vpsbox_runtime_service_transactions
+            assert_eq '' "$ACTIVE_DNS_OPERATION_NAME"
+            assert_eq applied "$(change_restore_state DNS_RESOLVED)"
+            cmp -s "$case_dir/before.conf" "$RESOLVED_VPSBOX_CONF"
+            cmp -s "$case_dir/original.conf" "$CHANGE_BACKUP_DIR/DNS_RESOLVED"
+            assert_no_forbidden
+        )
+    done
+}
+
+test_dns_restore_cleanup_failures_do_not_replay_active_snapshot() {
+    local kind failure_stage
+
+    for kind in direct resolved; do
+        for failure_stage in none snapshot tracking; do
+            (
+                local case_name="dns-menu-cleanup-$kind-$failure_stage"
+                local case_dir="$TEST_TMP/$case_name" name target staged snapshot="" status=0
+
+                reset_change_store "$case_name"
+                target="$case_dir/dns.conf"
+                RESOLV_CONF="$target"
+                RESOLVED_VPSBOX_CONF="$target"
+                if [ "$kind" = resolved ]; then
+                    name=DNS_RESOLVED
+                else
+                    name=DNS_RESOLV
+                fi
+                printf '%s\n' original > "$target"
+                backup_change_file_once "$name" "$target"
+                mark_change_applied "$name"
+                printf '%s\n' previous > "$target"
+                staged="$case_dir/staged"
+                printf '%s\n' replacement > "$staged"
+                prepare_dns_operation "$name" "$target" .rollback '' 1 "$staged" snapshot
+                command mv -- "$staged" "$target"
+                forbid_init
+                resolv_conf_managed_by_systemd_resolved() { [ "$kind" = resolved ]; }
+                systemctl() {
+                    [ "$kind" = resolved ] || { forbid "直接 DNS 恢复不得操作服务"; return 1; }
+                    case "$*" in
+                        'restart systemd-resolved'|'is-active --quiet systemd-resolved') return 0 ;;
+                        *) forbid "非预期的服务操作：$*" ;;
+                    esac
+                }
+                rm() {
+                    if [ "$failure_stage" = snapshot ] && [ "${!#}" = "$snapshot" ]; then
+                        return 23
+                    fi
+                    command rm "$@"
+                }
+                mv() {
+                    if [ "$failure_stage" = tracking ] && [ "${!#}" = "$CHANGE_MANIFEST" ]; then
+                        return 23
+                    fi
+                    command mv "$@"
+                }
+
+                restore_vpsbox_system_change dns > "$case_dir/output" 2>&1 || status=$?
+                if [ "$failure_stage" = tracking ]; then
+                    [ "$status" -ne 0 ] || fail "持久记录清理失败必须报告失败"
+                else
+                    assert_eq 0 "$status"
+                    assert_eq none "$(change_restore_state "$name")"
+                fi
+                assert_eq '' "$ACTIVE_DNS_OPERATION_NAME" \
+                    "恢复已验收后，清理失败不得保留可重放的活动事务"
+                if [ "$failure_stage" = snapshot ]; then
+                    [ -f "$snapshot" ] || fail "注入删除失败后应保留快照"
+                    assert_file_contains "$case_dir/output" '临时回滚快照清理失败'
+                    assert_file_contains "$case_dir/output" "$snapshot"
+                else
+                    [ ! -e "$snapshot" ] || fail "已恢复操作应清理快照"
+                fi
+                systemctl() { forbid "后续退出不得重放已经恢复的 DNS 操作"; }
+                cleanup_vpsbox_runtime_service_transactions
+                assert_file_contains "$target" '^original$'
+                assert_no_forbidden
+            )
+        done
+    done
+}
+
+test_direct_dns_rollback_restores_without_service_operations() {
+    (
+        local case_dir="$TEST_TMP/dns-direct-rollback" staged snapshot=""
+
+        reset_change_store dns-direct-rollback
+        RESOLV_CONF="$case_dir/resolv.conf"
+        printf '%s\n' 'nameserver 9.9.9.9' > "$RESOLV_CONF"
+        staged="$case_dir/staged.conf"
+        render_resolv_conf_dns 1.1.1.1 > "$staged"
+        prepare_dns_operation DNS_RESOLV "$RESOLV_CONF" .rollback '' 0 "$staged" snapshot
+        mv -- "$staged" "$RESOLV_CONF"
+        forbid_init
+        systemctl() { forbid "普通 resolv.conf 回滚不得操作服务"; }
+
+        rollback_active_dns_operation
+
+        assert_file_contains "$RESOLV_CONF" '^nameserver 9\.9\.9\.9$'
+        assert_eq none "$(change_restore_state DNS_RESOLV)"
+        assert_eq '' "$ACTIVE_DNS_OPERATION_NAME"
+        [ ! -e "$snapshot" ] || fail "普通 DNS 回滚成功后应清理快照"
+        assert_no_forbidden
     )
 }
 
@@ -3760,11 +4265,18 @@ main() {
         test_dns_operation_snapshot_restores_existing_and_absent_targets
         test_prepare_dns_operation_returns_and_arms_existing_snapshot
         test_pending_dns_same_target_commits_without_rewrite
+        test_pending_resolved_loads_config_before_commit_and_preserves_failures
         test_pending_dns_different_target_is_rejected_without_side_effects
         test_pending_resolved_unsafe_directory_never_starts_service
         test_runtime_cleanup_dispatches_active_dns_rollback
         test_systemd_resolved_restart_and_verification_failures_rollback
         test_systemd_resolved_rollback_failure_is_reported
+        test_resolved_rollback_keeps_tracking_until_service_is_restored
+        test_resolved_failed_rollback_is_recoverable_in_fresh_process
+        test_resolved_same_process_restore_disarms_failed_operation
+        test_resolved_restore_failure_preserves_active_operation
+        test_dns_restore_cleanup_failures_do_not_replay_active_snapshot
+        test_direct_dns_rollback_restores_without_service_operations
         test_main_ssh_port_rewrite_handles_case_and_match_blocks
         test_main_ssh_port_is_inserted_before_match_without_global_port
         test_existing_ssh_port_rewrite_uses_default_no_confirmation
