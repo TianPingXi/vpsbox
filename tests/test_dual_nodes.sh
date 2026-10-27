@@ -389,6 +389,231 @@ test_service_config_check_uses_service_working_directory() {
     done
 }
 
+test_ipv6_detection_reads_zero_size_stream_and_rejects_unavailable() {
+    (
+        local disabled="$TEST_TMP/disable-ipv6" addresses="$TEST_TMP/if-inet6" fd
+        printf '0\n' > "$disabled"
+        # 与 procfs 一样：stat 大小为 0，但读取可得到地址记录。
+        exec {fd}< <(printf '00000000000000000000000000000001 01 80 10 80 lo\n')
+        [ ! -s "/dev/fd/$fd" ] || fail '测试输入必须报告零大小'
+        ipv6_listen_available "/dev/fd/$fd" "$disabled"
+        exec {fd}<&-
+        printf '00000000000000000000000000000001 01 80 10 80 lo\n' > "$addresses"
+        ipv6_listen_available "$addresses" "$disabled"
+        printf '1\n' > "$disabled"
+        if ipv6_listen_available "$addresses" "$disabled"; then fail 'IPv6 禁用时必须拒绝'; fi
+        printf 'invalid\n' > "$disabled"
+        if ipv6_listen_available "$addresses" "$disabled"; then fail '禁用状态不可解析时必须拒绝'; fi
+        printf '0\n' > "$disabled"
+        : > "$addresses"
+        if ipv6_listen_available "$addresses" "$disabled"; then fail '空地址表必须拒绝'; fi
+        if ipv6_listen_available "$addresses.missing" "$disabled"; then fail '缺少地址表必须拒绝'; fi
+    )
+}
+
+test_ipv6_host_state_and_uri_round_trip() {
+    (
+        local input domain expected='2001:db8::10'
+        set_node_paths "$TEST_TMP/ipv6-host"
+        mkdir -p "$CONFIG_DIR"
+        # 同时覆盖没有 Python 的运行环境。
+        command() {
+            if [ "${1:-}" = -v ] && [ "${2:-}" = python3 ]; then return 1; fi
+            builtin command "$@"
+        }
+        public_ipv4() { fail '手动 IPv6 不应触发公网 IPv4 探测'; }
+        for input in "$expected" "[$expected]"; do
+            domain=''
+            prompt_node_host domain '地址：' <<< "$input" >/dev/null
+            assert_eq "$expected" "$domain"
+            save_vless_reality_state "$domain" ipv6-node 20002 \
+                11111111-2222-4333-8444-555555555555 addons.mozilla.org \
+                AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA \
+                BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB \
+                0123456789abcdef 222222222222222222222222
+            load_state_file "$VLESS_STATE_FILE" vless-reality
+            assert_eq "$expected" "$DOMAIN"
+            generate_link_from_loaded_state > "$CONFIG_DIR/link"
+            assert_file_contains "$CONFIG_DIR/link" '^vless://[^@]+@\[2001:db8::10\]:20002\?'
+            assert_file_contains "$CONFIG_DIR/link" 'sni=addons.mozilla.org'
+        done
+        prompt_node_host domain '地址：' <<< $'2001::db8::1\n[2001:db8::10]' > "$CONFIG_DIR/invalid.out" 2>&1
+        assert_eq "$expected" "$domain"
+        assert_file_contains "$CONFIG_DIR/invalid.out" '格式不正确'
+        prompt_node_host domain '地址：' <<< '2001:db8:0:0:0:0:0:10' >/dev/null
+        assert_eq '2001:db8:0:0:0:0:0:10' "$domain"
+    )
+}
+
+test_node_templates_use_one_listener_for_each_ipv6_mode() {
+    local available bind_only
+    for available in 0 1; do
+        for bind_only in 0 1; do
+            (
+                local expected=0.0.0.0 file
+                set_node_paths "$TEST_TMP/ipv6-template-$available-$bind_only"
+                ipv6_listen_available() { [ "$available" = 1 ]; }
+                sysctl() { printf '%s\n' "$bind_only"; }
+                [ "$available" = 0 ] || expected=::
+                write_vless_reality_config 20002 11111111-2222-4333-8444-555555555555 \
+                    addons.mozilla.org AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA \
+                    0123456789abcdef 222222222222222222222222 >/dev/null
+                write_config 20001 QUFBQUFBQUFBQUFBQUFBQQ== 111111111111111111111111 >/dev/null
+                for file in "$VLESS_CONFIG_PATH" "$SS_CONFIG_PATH"; do
+                    jq -e --arg listen "$expected" \
+                        '(.inbounds | length) == 1 and .inbounds[0].listen == $listen' "$file" >/dev/null
+                done
+            )
+        done
+    done
+}
+
+test_vless_ipv6_unavailable_rejected_before_transaction() {
+    (
+        set_node_paths "$TEST_TMP/ipv6-preflight"
+        mkdir -p "$NODE_CONFIG_DIR"
+        forbid_init
+        ipv6_listen_available() { return 1; }
+        begin_node_creation_transaction() { forbid 'IPv6 不可用时不得创建事务'; }
+        prompt_reality_server() { forbid 'IPv6 不可用时不应继续目标探测'; }
+        if create_vless_reality_node <<< '[2001:db8::10]' > "$TEST_TMP/ipv6-preflight.out" 2>&1; then
+            fail 'IPv6 不可用时必须拒绝创建'
+        fi
+        assert_file_contains "$TEST_TMP/ipv6-preflight.out" '无法提供 IPv6 监听'
+        assert_no_forbidden
+        [ ! -e "$VLESS_CONFIG_PATH" ] && [ ! -e "$NODE_TRANSACTION_DIR" ]
+    )
+}
+
+setup_vless_ipv6_creation_case() {
+    set_node_paths "$TEST_TMP/$1"
+    mkdir -p "$NODE_CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR" "$NODE_CONFIG_DIR"
+    write_ss_config_fixture "$SS_CONFIG_PATH"
+    write_ss_state_fixture "$SS_STATE_FILE"
+    ipv6_test_active=0
+    ipv6_test_ready=1
+    ipv6_test_udp=1
+    OS=unknown
+    is_systemd() { return 1; }
+    service_is_running() { [ "$ipv6_test_active" = 1 ]; }
+    service_manager_is_active() { [ "$ipv6_test_active" = 1 ]; }
+    service_is_enabled() { return 1; }
+    service_disable() { return 0; }
+    service_stop() { ipv6_test_active=0; }
+    singbox_config_pids() { return 0; }
+    stop_singbox_config_processes() { return 0; }
+    install_singbox_if_missing() { return 0; }
+    ipv6_listen_available() { return 0; }
+    reality_tls_probe_supported() { return 1; }
+    choose_node_port() { printf '20002\n'; }
+    confirm_default_yes() { return 0; }
+    sleep() { return 0; }
+    sing-box() {
+        case "${1:-} ${2:-} ${3:-} ${4:-}" in
+            'generate uuid  ') printf '11111111-2222-4333-8444-555555555555\n' ;;
+            'generate rand 8 --hex') printf '0123456789abcdef\n' ;;
+            'generate rand 12 --hex') printf '222222222222222222222222\n' ;;
+            'check '*) command sing-box "$@" ;;
+            *) return 1 ;;
+        esac
+    }
+    generate_reality_keypair() {
+        printf '%s\n' AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+    }
+    firewall_prepare_port_transition() {
+        assert_eq '20002:' "$1:$2" 'VLESS 只申请 TCP 端口'
+    }
+    firewall_complete_port_transition() { return 0; }
+    firewall_runtime_enabled() { return 1; }
+    setup_service() { return 0; }
+    restart_singbox_cleanly() { ipv6_test_active=1; }
+    ss() {
+        case "$*" in
+            '-H -6 -ltn')
+                if [ "$ipv6_test_ready" = 1 ]; then printf 'LISTEN 0 4096 [::]:20002 [::]:*\n'; fi ;;
+            '-H -ltn') printf 'LISTEN 0 4096 0.0.0.0:20002 0.0.0.0:*\nLISTEN 0 4096 0.0.0.0:20001 0.0.0.0:*\n' ;;
+            '-H -lun')
+                if [ "$ipv6_test_udp" = 1 ]; then printf 'UNCONN 0 0 0.0.0.0:20001 0.0.0.0:*\n'; fi ;;
+            *) return 2 ;;
+        esac
+    }
+}
+
+test_vless_ipv6_creation_preserves_sibling_and_requires_ipv6_tcp() {
+    (
+        local before
+        setup_vless_ipv6_creation_case ipv6-create
+        before="$(sha256sum "$SS_CONFIG_PATH" "$SS_STATE_FILE")"
+        create_vless_reality_node <<< $'[2001:db8::10]\n\n' > "$TEST_TMP/ipv6-create.out" 2>&1
+        assert_eq "$before" "$(sha256sum "$SS_CONFIG_PATH" "$SS_STATE_FILE")"
+        assert_eq normal "$(protocol_node_status vless)"
+        assert_file_contains "$VLESS_URI_FILE" '^vless://[^@]+@\[2001:db8::10\]:20002\?'
+        jq -e '(.inbounds | length) == 1 and .inbounds[0].listen == "::"' "$VLESS_CONFIG_PATH" >/dev/null
+        [ ! -e "$NODE_TRANSACTION_DIR" ] || fail '成功后应提交并清理事务'
+        verify_all_node_runtime
+        self_check_node_stack > "$CONFIG_DIR/check-ready.out"
+        assert_file_contains "$CONFIG_DIR/check-ready.out" 'OK.*VLESS Reality 节点.*IPv6 TCP 监听正常'
+        ipv6_test_ready=0
+        if verify_all_node_runtime; then fail 'IPv4 监听不能代替 IPv6 VLESS 监听'; fi
+        self_check_node_stack > "$CONFIG_DIR/check-ipv4-only.out"
+        assert_file_contains "$CONFIG_DIR/check-ipv4-only.out" 'FAIL.*VLESS Reality 节点.*IPv6 TCP 未监听'
+        ipv6_test_ready=1
+        ipv6_test_udp=0
+        if verify_all_node_runtime; then fail 'IPv6 VLESS 成功不能掩盖 SS 缺少 UDP'; fi
+        # shellcheck disable=SC2034 # 生产防火墙生成函数通过 source 读取。
+        FW_ALLOWED_TCP=20002
+        firewall_write_config "$CONFIG_DIR/firewall.nft"
+        assert_file_contains "$CONFIG_DIR/firewall.nft" '^table inet vpsbox'
+        assert_file_contains "$CONFIG_DIR/firewall.nft" 'tcp dport \{ 20002 \} accept'
+        assert_file_contains "$CONFIG_DIR/firewall.nft" 'meta l4proto ipv6-icmp accept'
+    )
+}
+
+test_vless_ipv6_creation_failure_restores_original_nodes() {
+    (
+        local before
+        setup_vless_ipv6_creation_case ipv6-rollback
+        write_vless_config_fixture "$VLESS_CONFIG_PATH" 20003
+        write_vless_state_fixture "$VLESS_STATE_FILE" 20003
+        before="$(sha256sum "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$VLESS_CONFIG_PATH" "$VLESS_STATE_FILE")"
+        ipv6_test_ready=0
+        if create_vless_reality_node <<< $'y\n2001:db8::10\n\n' > "$TEST_TMP/ipv6-rollback.out" 2>&1; then
+            fail '只存在 IPv4 监听时创建必须失败'
+        fi
+        assert_file_contains "$TEST_TMP/ipv6-rollback.out" '节点端口未完整监听'
+        assert_eq "$before" "$(sha256sum "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$VLESS_CONFIG_PATH" "$VLESS_STATE_FILE")"
+        assert_eq 0 "$ipv6_test_active" '回滚应恢复原停止状态'
+        [ ! -e "$NODE_TRANSACTION_DIR" ] || fail '成功回滚应清理事务'
+    )
+}
+
+test_vless_ipv6_disabled_during_preparation_cancels_transaction() {
+    (
+        local before
+        setup_vless_ipv6_creation_case ipv6-disabled-late
+        before="$(sha256sum "$SS_CONFIG_PATH" "$SS_STATE_FILE")"
+        begin_node_creation_transaction 'VLESS Reality'
+        ipv6_listen_available() { return 1; }
+        if prepare_vless_reality_node_stage 2001:db8::10 ipv6-node 20002 addons.mozilla.org 0 >/dev/null; then
+            fail '准备过程中 IPv6 不可用必须取消'
+        fi
+        assert_eq "$before" "$(sha256sum "$SS_CONFIG_PATH" "$SS_STATE_FILE")"
+        [ ! -e "$VLESS_CONFIG_PATH" ] && [ ! -e "$NODE_TRANSACTION_DIR" ]
+    )
+}
+
+test_ipv6_tcp_listener_collection_failure_is_not_success() {
+    (
+        ss() { return 42; }
+        local status=0
+        port_listener_ready 20002 tcp ipv6 || status=$?
+        assert_eq 2 "$status"
+        ss() { printf 'LISTEN 0 4096 [::]:20003 [::]:*\n'; }
+        if port_listener_ready 20002 tcp ipv6; then fail '其他 IPv6 端口不得误报'; fi
+    )
+}
+
 test_complete_configs_merge_with_unique_tags() {
     (
         local vless_before
@@ -2768,6 +2993,14 @@ main() {
         node_summary
     )
     local -a tests=(
+        test_ipv6_detection_reads_zero_size_stream_and_rejects_unavailable
+        test_ipv6_host_state_and_uri_round_trip
+        test_node_templates_use_one_listener_for_each_ipv6_mode
+        test_vless_ipv6_unavailable_rejected_before_transaction
+        test_vless_ipv6_creation_preserves_sibling_and_requires_ipv6_tcp
+        test_vless_ipv6_creation_failure_restores_original_nodes
+        test_vless_ipv6_disabled_during_preparation_cancels_transaction
+        test_ipv6_tcp_listener_collection_failure_is_not_success
         test_fake_singbox_rejects_invalid_config_schema
         test_service_actions_validate_config_before_mutation
         test_service_config_check_uses_service_working_directory

@@ -18,6 +18,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbo
 vpsbox
 ```
 
+## 使用 IPv6 创建 VLESS Reality 节点
+
+进入“节点管理 → 创建/重建 VLESS Reality 节点”，在节点连接地址处输入 VPS 的公网 IPv6，例如 `2001:db8::10`，也可输入带方括号的 `[2001:db8::10]`（此处仅为文档示例地址）。生成的分享链接会自动使用 `[IPv6]:端口` 格式。留空仍自动检测公网 IPv4；Reality 目标和 SNI 仍使用域名。
+
+VPS 和客户端都需要可用的 IPv6 网络，云安全组和主机防火墙需要放行该节点的 TCP 端口。脚本会检查本机 IPv6 监听条件，并在创建后验证 IPv6 TCP 监听；这不能代替公网连通性验证。IPv6 已禁用或不可用时会取消创建，不会自动启用 IPv6。
+
+更新脚本不会改写已有节点。需要把旧节点改成 IPv6 地址时，可主动重建；重建会重新生成凭据，请重新导入节点链接。
+
 ## 主界面
 
 输入 `vpsbox` 打开管理面板：

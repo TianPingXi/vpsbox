@@ -4697,7 +4697,17 @@ port_conflicts_with_existing_node() {
 }
 
 port_listener_ready() {
-    local port="$1" protocols="${2:-both}"
+    local port="$1" protocols="${2:-both}" family="${3:-any}" output
+
+    if [ "$family" = ipv6 ]; then
+        [ "$protocols" = tcp ] || return 2
+        command -v ss >/dev/null 2>&1 || return 2
+        output="$(ss -H -6 -ltn 2>/dev/null)" || return 2
+        printf '%s\n' "$output" |
+            awk -v port="$port" '$4 ~ (":" port "$") { found=1 } END { exit !found }'
+        return
+    fi
+    [ "$family" = any ] || return 2
 
     case "$protocols" in
         tcp) port_in_use_tcp "$port" ;;
@@ -4708,41 +4718,41 @@ port_listener_ready() {
 }
 
 wait_for_port_listener() {
-    local port="$1" protocols="${2:-both}" i
+    local port="$1" protocols="${2:-both}" family="${3:-any}" i
     for i in 1 2 3 4 5; do
-        port_listener_ready "$port" "$protocols" && return 0
+        port_listener_ready "$port" "$protocols" "$family" && return 0
         sleep 1
     done
     return 1
 }
 
 ipv6_listen_available() {
-    [ -r /proc/net/if_inet6 ] || return 1
-    [ -s /proc/net/if_inet6 ] || return 1
+    local addresses="${1:-/proc/net/if_inet6}"
+    local disabled_file="${2:-/proc/sys/net/ipv6/conf/all/disable_ipv6}" disabled
 
-    if [ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ] &&
-        [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" = "1" ]; then
-        return 1
+    # procfs 文件的 stat 大小通常为 0，必须读取内容而不能使用 -s。
+    [ -r "$addresses" ] && grep -q '[^[:space:]]' "$addresses" || return 1
+    if [ -e "$disabled_file" ]; then
+        disabled="$(cat "$disabled_file" 2>/dev/null)" || return 1
+        [ "$disabled" = 0 ] || return 1
     fi
+    return 0
 }
 
-ipv6_bindv6only_value() {
-    local value
+require_vless_ipv6_support() {
+    local host="$1"
 
-    value="$(sysctl -n net.ipv6.bindv6only 2>/dev/null || cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo 0)"
-    case "$value" in
-        1) echo "1" ;;
-        *) echo "0" ;;
-    esac
+    [[ "$host" == *:* ]] || return 0
+    ipv6_listen_available && return 0
+    err "节点连接地址是 IPv6，但当前系统无法提供 IPv6 监听，已取消创建。"
+    return 1
 }
 
 listen_mode() {
     if ipv6_listen_available; then
-        if [ "$(ipv6_bindv6only_value)" = "1" ]; then
-            echo "dual"
-        else
-            echo "ipv6"
-        fi
+        # sing-box 的 :: 使用 Go tcp/udp 双栈 socket，并自行设置 IPV6_V6ONLY。
+        # 即使系统 bindv6only=1，也不能另建同端口 IPv4 入站，否则会重复绑定。
+        echo "ipv6"
     else
         echo "ipv4"
     fi
@@ -4977,9 +4987,6 @@ write_config() {
         ipv6)
             info "监听地址：::（IPv4/IPv6 双栈）"
             ;;
-        dual)
-            info "监听地址：0.0.0.0 + ::（系统启用了 IPv6-only 监听）"
-            ;;
         *)
             info "监听地址：0.0.0.0"
             ;;
@@ -4998,10 +5005,6 @@ EOF
     case "$mode" in
         ipv6)
             write_shadowsocks_inbound_json "vpsbox-${config_id}-ss-in" "::" "$port" "$password" >> "$tmp"
-            ;;
-        dual)
-            write_shadowsocks_inbound_json "vpsbox-${config_id}-ss-in-ipv4" "0.0.0.0" "$port" "$password" "," >> "$tmp"
-            write_shadowsocks_inbound_json "vpsbox-${config_id}-ss-in-ipv6" "::" "$port" "$password" >> "$tmp"
             ;;
         *)
             write_shadowsocks_inbound_json "vpsbox-${config_id}-ss-in" "0.0.0.0" "$port" "$password" >> "$tmp"
@@ -5077,7 +5080,6 @@ write_vless_reality_config() {
     mode="$(listen_mode)"
     case "$mode" in
         ipv6) info "监听地址：::（IPv4/IPv6 双栈）" ;;
-        dual) info "监听地址：0.0.0.0 + ::（系统启用了 IPv6-only 监听）" ;;
         *) info "监听地址：0.0.0.0" ;;
     esac
 
@@ -5093,10 +5095,6 @@ write_vless_reality_config() {
 EOF
     case "$mode" in
         ipv6) write_vless_reality_inbound_json "vpsbox-${config_id}-vless-reality-in" "::" "$port" "$uuid" "$server_name" "$private_key" "$short_id" >> "$tmp" ;;
-        dual)
-            write_vless_reality_inbound_json "vpsbox-${config_id}-vless-reality-in-ipv4" "0.0.0.0" "$port" "$uuid" "$server_name" "$private_key" "$short_id" "," >> "$tmp"
-            write_vless_reality_inbound_json "vpsbox-${config_id}-vless-reality-in-ipv6" "::" "$port" "$uuid" "$server_name" "$private_key" "$short_id" >> "$tmp"
-            ;;
         *) write_vless_reality_inbound_json "vpsbox-${config_id}-vless-reality-in" "0.0.0.0" "$port" "$uuid" "$server_name" "$private_key" "$short_id" >> "$tmp" ;;
     esac
     cat >> "$tmp" <<EOF
@@ -5533,19 +5531,21 @@ prepare_node_layout_for_write() {
 }
 
 verify_all_node_runtime() {
-    local protocol protocols
+    local protocol protocols family
 
     service_is_running || return 1
     for protocol in vless ss; do
         protocol_visible_exists "$protocol" || continue
         load_protocol_state "$protocol" || return 1
+        family=any
         if [ "$protocol" = "vless" ]; then
             [ -n "${REALITY_PRIVATE_KEY:-}" ] || return 1
             protocols=tcp
+            [[ "${DOMAIN:-}" != *:* ]] || family=ipv6
         else
             protocols=both
         fi
-        wait_for_port_listener "$PORT" "$protocols" || return 1
+        wait_for_port_listener "$PORT" "$protocols" "$family" || return 1
     done
 }
 
@@ -5685,6 +5685,10 @@ prepare_vless_reality_node_stage() {
     local check_status=0
     local -a keypair
 
+    if ! require_vless_ipv6_support "$domain"; then
+        rollback_node_files_transaction || true
+        return 1
+    fi
     if [ "$check_deferred" -eq 1 ]; then
         info "正在检查 Reality 目标的 DNS、TLS 1.3 与 H2 支持..."
         if check_reality_server "$server_name"; then
@@ -5865,10 +5869,11 @@ create_vless_reality_node() {
         return 1
     }
 
-    if ! prompt_node_host domain "请输入节点连接地址（域名或 IP，留空自动检测公网 IPv4）："; then
+    if ! prompt_node_host domain "请输入节点连接地址（域名 / IPv4 / IPv6，留空自动检测公网 IPv4）："; then
         info "输入已结束，已取消。"
         return 1
     fi
+    require_vless_ipv6_support "$domain" || return 1
     default_name="$(default_name_for_host "$domain")"
     default_name="vless-${default_name#ss-}"
     prompt_node_name "$domain" "$default_name" name || return 1
@@ -16709,7 +16714,7 @@ self_check_node_stack() {
     local node_integrity_failed="0"
     local singbox_available=0
     local config_state service_state listener_ok listener_fail
-    local detail label node_protocols protocol protocol_status uri_cache_state
+    local detail label node_protocols family protocol protocol_status uri_cache_state
 
     if node_core_artifacts_present; then
         has_node_artifacts="1"
@@ -16735,16 +16740,22 @@ self_check_node_stack() {
         load_protocol_state "$protocol" >/dev/null 2>&1 || continue
         has_node="1"
         [ "$protocol" = "vless" ] && label="VLESS Reality" || label="Shadowsocks"
+        family=any
         if [ "$protocol" = "vless" ]; then
             node_protocols=tcp
             listener_ok="TCP 监听正常"
             listener_fail="TCP 未监听"
+            if [[ "${DOMAIN:-}" == *:* ]]; then
+                family=ipv6
+                listener_ok="IPv6 TCP 监听正常"
+                listener_fail="IPv6 TCP 未监听"
+            fi
         else
             node_protocols=both
             listener_ok="TCP、UDP 监听正常"
             listener_fail="TCP、UDP 未完整监听"
         fi
-        if port_listener_ready "$PORT" "$node_protocols"; then
+        if port_listener_ready "$PORT" "$node_protocols" "$family"; then
             check_ok "$label 节点" "${DOMAIN:-未知}:${PORT:-未知} / $listener_ok"
         else
             check_fail "$label 节点" "${DOMAIN:-未知}:${PORT:-未知} / $listener_fail"
