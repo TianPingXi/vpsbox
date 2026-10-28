@@ -26,12 +26,14 @@ egress_case() {
 set -euo pipefail
 case "$1" in
  version) printf 'sing-box version %s\n' "${POLICY_TEST_VERSION:-1.14.4}" ;;
- rule-set) cp -- "$3" "$5" ;;
+ rule-set)
+  [ "${POLICY_TEST_COMPILE_FAIL:-0}:$2" != '1:compile' ] || exit 1
+  cp -- "$3" "$5" ;;
  check)
   if [ "$2" = -c ]; then files=("$3"); else files=("$3/"*.json); fi
   for file in "${files[@]}"; do
    jq -e '((.inbounds | type == "array" and length > 0) and (.outbounds | length == 1)) or
-    (.dns.servers[0].type == "local" and (.route.rules | length == 2) and .route.rules[1].action == "reject")' "$file" >/dev/null
+    (.dns.servers[0].type == "local" and (.route.rules | length == 2 or length == 5) and .route.rules[-1].action == "reject")' "$file" >/dev/null
    while IFS= read -r rule; do [ -f "$rule" ]; done < <(jq -r '.route.rule_set[]?.path' "$file")
   done ;;
  *) exit 2 ;;
@@ -44,6 +46,7 @@ EOF
     OS=unknown ACTIVE_NODE_BACKUP='' ACTIVE_NODE_TRANSACTION_MUTATED=0
     policy_active=0 policy_enabled=0 policy_restarts=0 policy_fail_restart=0
     policy_download_fail=0 policy_rule='{"version":1,"rules":[{"ip_cidr":["1.0.1.0/24","240e::/16"]}]}'
+    policy_domain_fail=0 policy_domain='{"version":1,"rules":[{"domain_suffix":["domestic.test"],"domain_regex":["^cn[0-9]+[.]test$"]}]}'
     is_systemd() { return 1; }
     listen_mode() { printf 'ipv4\n'; }
     service_is_running() { [ "$policy_active" = 1 ]; }
@@ -63,7 +66,12 @@ EOF
     firewall_refresh_if_enabled() { return 0; }
     download_egress_rules() {
         [ "$policy_download_fail" = 0 ] || return 1
-        printf '%s\n' "$policy_rule" > "$1"
+        if [ "${2:-ip}" = domain ]; then
+            [ "$policy_domain_fail" = 0 ] || return 1
+            printf '%s\n' "$policy_domain" > "$1"
+        else
+            printf '%s\n' "$policy_rule" > "$1"
+        fi
     }
 }
 
@@ -97,7 +105,7 @@ test_egress_default_and_preset_inherited_by_creation() {
         commit_node_transaction
         validate_egress_policy
         assert_eq 0 "$policy_restarts"
-        jq -e '.route.rules[0].action == "resolve" and .route.rules[1].action == "reject"' "$NODE_CONFIG_DIR/30-egress-policy.json" >/dev/null
+        jq -e '[.route.rules[].action] == ["reject","sniff","reject","resolve","reject"]' "$NODE_CONFIG_DIR/30-egress-policy.json" >/dev/null
     )
 }
 
@@ -306,6 +314,94 @@ test_egress_menu_dispatches_only_confirmed_choices() {
     )
 }
 
+egress_install_legacy_policy() {
+    local digest path
+    digest="$(printf '%s\n' "$policy_rule" | sha256sum | awk '{print $1}')"
+    path="$(egress_policy_rule_path "$digest")"
+    mkdir -p "$CONFIG_DIR/rule-set"
+    chmod 700 "$CONFIG_DIR/rule-set"
+    printf '%s\n' "$policy_rule" > "$path"
+    jq -nc --arg hash "$digest" '{version:1,enabled:true,sha256:$hash,updated_at:1700000000}' > "$CONFIG_DIR/vpsbox-egress.json"
+    render_egress_policy_config "$(egress_policy_tags "$NODE_CONFIG_DIR")" "$path" 1 > "$NODE_CONFIG_DIR/30-egress-policy.json"
+    chmod 600 "$path" "$CONFIG_DIR/vpsbox-egress.json" "$NODE_CONFIG_DIR/30-egress-policy.json"
+}
+
+test_egress_legacy_migration_is_explicit_and_recoverable() {
+    (
+        egress_case legacy
+        egress_add_ss
+        egress_install_legacy_policy
+        policy_active=1
+        local before
+        before="$(sha256sum "$CONFIG_DIR/vpsbox-egress.json" "$NODE_CONFIG_DIR/30-egress-policy.json")"
+        validate_egress_policy
+        [[ "$(egress_policy_summary)" == *旧版仅\ IP* ]]
+        apply_egress_policy on
+        begin_node_transaction
+        prepare_node_stage
+        cp -- "$SS_CONFIG_PATH" "$NODE_TRANSACTION_STAGE/configs/10-ss.json"
+        prepare_staged_egress_policy inherit
+        cmp "$NODE_TRANSACTION_STAGE/configs/30-egress-policy.json" "$NODE_CONFIG_DIR/30-egress-policy.json"
+        cancel_unmodified_node_transaction
+        assert_eq "$before" "$(sha256sum "$CONFIG_DIR/vpsbox-egress.json" "$NODE_CONFIG_DIR/30-egress-policy.json")"
+        policy_domain_fail=1
+        if apply_egress_policy update >/dev/null 2>&1; then fail '域名下载失败不得部分迁移'; fi
+        policy_domain_fail=0 policy_fail_restart=1
+        if apply_egress_policy update >/dev/null 2>&1; then fail '迁移运行验收失败必须回退旧策略'; fi
+        assert_eq "$before" "$(sha256sum "$CONFIG_DIR/vpsbox-egress.json" "$NODE_CONFIG_DIR/30-egress-policy.json")"
+        validate_egress_policy
+        apply_egress_policy update
+        jq -e '.version == 2' "$CONFIG_DIR/vpsbox-egress.json" >/dev/null
+        [[ "$(egress_policy_summary)" == *官方\ geolocation-cn* ]]
+        validate_egress_policy
+        [ ! -e "$NODE_TRANSACTION_DIR" ]
+    )
+}
+
+test_egress_domain_update_validation_and_compile_failures_are_atomic() {
+    (
+        egress_case domain-update
+        egress_add_ss
+        policy_active=1
+        apply_egress_policy on
+        local before bad rule
+        before="$(sha256sum "$CONFIG_DIR/vpsbox-egress.json" "$NODE_CONFIG_DIR/30-egress-policy.json")"
+        for bad in '{"ip_cidr":["1.0.1.0/24"]}' '{"domain_suffix":[]}' \
+            '{"domain_suffix":[""]}' '{"domain_suffix":["cn"],"invert":true}' \
+            '{"process_name":["curl"]}'; do
+            policy_domain="{\"version\":1,\"rules\":[$bad]}"
+            if apply_egress_policy update >/dev/null 2>&1; then fail '不得接受不受支持的域名规则'; fi
+            assert_eq "$before" "$(sha256sum "$CONFIG_DIR/vpsbox-egress.json" "$NODE_CONFIG_DIR/30-egress-policy.json")"
+        done
+        policy_domain='{"version":1,"rules":[{"domain_suffix":["changed.test"]}]}'
+        export POLICY_TEST_COMPILE_FAIL=1
+        if apply_egress_policy update >/dev/null 2>&1; then fail '编译失败必须保留旧策略'; fi
+        unset POLICY_TEST_COMPILE_FAIL
+        assert_eq "$before" "$(sha256sum "$CONFIG_DIR/vpsbox-egress.json" "$NODE_CONFIG_DIR/30-egress-policy.json")"
+        apply_egress_policy update
+        assert_eq 2 "$policy_restarts" '仅域名源变化也应应用新规则'
+        rule="$(jq -r '.route.rule_set[0].path' "$NODE_CONFIG_DIR/30-egress-policy.json")"
+        jq -e 'any(.rules[]; .domain_suffix == ["changed.test"]) and any(.rules[]; .ip_cidr != null)' "$rule" >/dev/null
+        validate_egress_policy
+    )
+}
+
+test_egress_legacy_disable_and_reenable_upgrades_cached_rules() {
+    (
+        egress_case legacy-toggle
+        egress_add_ss
+        egress_install_legacy_policy
+        policy_download_fail=1
+        apply_egress_policy off
+        if apply_egress_policy on >/dev/null 2>&1; then fail '重新开启不得以旧 IP 缓存冒充新策略'; fi
+        jq -e '.version == 1 and .enabled == false' "$CONFIG_DIR/vpsbox-egress.json" >/dev/null
+        policy_download_fail=0
+        apply_egress_policy on
+        jq -e '.version == 2 and .enabled == true' "$CONFIG_DIR/vpsbox-egress.json" >/dev/null
+        validate_egress_policy
+    )
+}
+
 main() {
     run_registered_test_suite "${BASH_SOURCE[0]}" 'egress policy tests' \
         test_egress_default_and_preset_inherited_by_creation \
@@ -319,6 +415,9 @@ main() {
         test_egress_first_enable_failure_restores_v1_snapshot \
         test_egress_unsafe_paths_and_corrupt_rules_are_rejected \
         test_egress_damaged_node_cleanup_keeps_healthy_policy \
+        test_egress_legacy_migration_is_explicit_and_recoverable \
+        test_egress_domain_update_validation_and_compile_failures_are_atomic \
+        test_egress_legacy_disable_and_reenable_upgrades_cached_rules \
         test_egress_menu_dispatches_only_confirmed_choices
 }
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

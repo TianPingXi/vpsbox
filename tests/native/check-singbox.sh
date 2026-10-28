@@ -31,7 +31,34 @@ if [ -n "${CN_NATIVE_RULE_FILE:-}" ]; then
     validate_egress_rule_content "$CN_NATIVE_RULE_FILE" "$work/cn-decoded.json"
     printf 'PASS upstream CN rule-set validation\n'
 fi
-printf '%s\n' '{"version":1,"rules":[{"ip_cidr":["127.0.0.2/32","::1/128"]}]}' > "$work/test-cn.json"
+if [ -n "${CN_NATIVE_DOMAIN_FILE:-}" ]; then
+    validate_egress_rule_content "$CN_NATIVE_DOMAIN_FILE" "$work/domain-decoded.json" domain
+    printf 'PASS upstream official domain rule-set validation\n'
+    if [ -n "${CN_NATIVE_RULE_FILE:-}" ]; then
+        (
+            download_egress_rules() {
+                case "$2" in
+                    ip) cp -- "$CN_NATIVE_RULE_FILE" "$1" ;;
+                    domain) cp -- "$CN_NATIVE_DOMAIN_FILE" "$1" ;;
+                    *) return 1 ;;
+                esac
+            }
+            build_egress_rules "$work/upstream-combined.srs"
+            printf 'PASS upstream combined rule-set compile and validation\n'
+            for destination in www.baidu.com www.qq.com www.bilibili.com www.taobao.com www.jd.com 223.5.5.5 2400:3200::1; do
+                result="$(sing-box rule-set match -f binary "$work/upstream-combined.srs" "$destination" 2>&1)"
+                [[ "$result" == 'match rules.['* ]] || { printf 'Missing upstream match: %s\n' "$destination" >&2; exit 1; }
+                printf 'PASS upstream match %s\n' "$destination"
+            done
+            for destination in github.com www.cloudflare.com www.google.com; do
+                result="$(sing-box rule-set match -f binary "$work/upstream-combined.srs" "$destination" 2>&1)"
+                [ -z "$result" ] || { printf 'Unexpected upstream match: %s\n' "$destination" >&2; exit 1; }
+                printf 'PASS upstream no match %s\n' "$destination"
+            done
+        )
+    fi
+fi
+printf '%s\n' '{"version":1,"rules":[{"ip_cidr":["127.0.0.2/32","::1/128"]},{"domain_suffix":["blocked-domain.native.test"],"domain_regex":["^cn[0-9]+[.]native[.]test$"]}]}' > "$work/test-cn.json"
 sing-box rule-set compile "$work/test-cn.json" -o "$work/test-cn.srs"
 for family in ipv4 ipv6; do
     listen_mode() { printf '%s\n' "$family"; }

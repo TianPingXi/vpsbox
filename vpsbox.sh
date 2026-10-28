@@ -4009,14 +4009,14 @@ write_node_transaction_validation_spec() {
 read_egress_policy_state() {
     local file="${1:-$CONFIG_DIR/vpsbox-egress.json}"
     if [ ! -e "$file" ] && [ ! -L "$file" ]; then
-        printf '%s\n' '{"version":1,"enabled":false,"sha256":"","updated_at":0}'
+        printf '%s\n' '{"version":2,"enabled":false,"sha256":"","updated_at":0}'
         return 0
     fi
     node_file_is_secure "$file" || return 1
     [ "$(stat -c %s "$file")" -le 1024 ] || return 1
     jq -cse 'select(length == 1) | .[0] |
         select(type == "object" and keys == ["enabled","sha256","updated_at","version"]) |
-        select(.version == 1 and (.enabled | type == "boolean")) |
+        select((.version == 1 or .version == 2) and (.enabled | type == "boolean")) |
         select(.sha256 | type == "string" and (. == "" or test("^[a-f0-9]{64}$"))) |
         select(.updated_at | type == "number" and floor == . and . >= 0 and . < 4102444800) |
         select((.sha256 == "" and .updated_at == 0) or (.sha256 != "" and .updated_at > 0))' "$file" 2>/dev/null
@@ -4053,13 +4053,20 @@ egress_policy_tags() {
 }
 
 render_egress_policy_config() {
-    local tags="$1" path="$2"
-    jq -nc --argjson tags "$tags" --arg path "$path" '{
+    local tags="$1" path="$2" version="${3:-2}"
+    case "$version" in 1|2) ;; *) return 2 ;; esac
+    # v1 保留原配置，脚本更新不自动改写已部署策略；显式更新规则才迁移。
+    jq -nc --argjson tags "$tags" --arg path "$path" --argjson version "$version" '
+        {inbound:$tags,rule_set:["vpsbox-cn"],action:"reject",method:"default",no_drop:true} as $reject |
+        {
         dns:{servers:[{type:"local",tag:"vpsbox-egress-dns"}]},
-        route:{rules:[
-            {inbound:$tags,action:"resolve",server:"vpsbox-egress-dns",strategy:"prefer_ipv4"},
-            {inbound:$tags,rule_set:["vpsbox-cn"],action:"reject",method:"default",no_drop:true}
-        ],rule_set:[{type:"local",tag:"vpsbox-cn",format:"binary",path:$path}]}}'
+        route:{rules:((if $version == 2 then [
+            $reject,
+            {inbound:$tags,action:"sniff",sniffer:["http","tls","quic"],timeout:"300ms"},
+            $reject
+        ] else [] end) + [
+            {inbound:$tags,action:"resolve",server:"vpsbox-egress-dns",strategy:"prefer_ipv4"},$reject
+        ]),rule_set:[{type:"local",tag:"vpsbox-cn",format:"binary",path:$path}]}}'
 }
 
 validate_egress_rule_digest() {
@@ -4069,8 +4076,9 @@ validate_egress_rule_digest() {
     [ "$(sha256sum "$file" | awk '{print $1}')" = "$digest" ]
 }
 
-validate_egress_rule_content() {
-    local file="$1" decoded="$2" status=0
+decode_egress_rule_content() {
+    local file="$1" decoded="$2" kind="${3:-ip}"
+    case "$kind" in ip|domain|combined) ;; *) return 2 ;; esac
     # 限制输入、解码时间与解码文件大小；原生解码器负责二进制和 CIDR 合法性。
     [ -f "$file" ] && [ ! -L "$file" ] && [ -s "$file" ] || return 1
     [ "$(stat -c %s "$file")" -le 8388608 ] || return 1
@@ -4078,26 +4086,60 @@ validate_egress_rule_content() {
         umask 077
         ulimit -f 32768 || exit 1
         run_bounded_command 20 sing-box rule-set decompile "$file" -o "$decoded" >/dev/null 2>&1
-    ) || status=1
-    if [ "$status" -eq 0 ]; then
-        jq -e '(.version >= 1 and .version <= 4) and
-            (.rules | type == "array" and length > 0) and
-            all(.rules[]; keys == ["ip_cidr"] and
-                (.ip_cidr | type == "array" and length > 0) and
-                all(.ip_cidr[]; type == "string" and contains("/"))) and
-            any(.rules[].ip_cidr[]; contains(":")) and
-            any(.rules[].ip_cidr[]; contains(":") | not)' "$decoded" >/dev/null 2>&1 || status=1
-    fi
+    ) || return 1
+    jq -e --arg kind "$kind" '
+        def ip_rule: keys == ["ip_cidr"] and
+            (.ip_cidr | type == "array" and length > 0) and
+            all(.ip_cidr[]; type == "string" and contains("/"));
+        def domain_rule: (keys | length > 0) and
+            ((keys - ["domain","domain_suffix","domain_keyword","domain_regex"]) == []) and
+            all(.[]; type == "array" and length > 0 and all(.[]; type == "string" and length > 0));
+        (.version >= 1 and .version <= 4) and
+        (.rules | type == "array" and length > 0) and
+        (if $kind == "ip" then all(.rules[]; ip_rule)
+         elif $kind == "domain" then all(.rules[]; domain_rule)
+         else all(.rules[]; ip_rule or domain_rule) and any(.rules[]; domain_rule) end) and
+        (if $kind == "domain" then true else
+            any(.rules[].ip_cidr[]?; contains(":")) and
+            any(.rules[].ip_cidr[]?; contains(":") | not) end)' "$decoded" >/dev/null 2>&1
+}
+
+validate_egress_rule_content() {
+    local file="$1" decoded="$2" kind="${3:-ip}" status=0
+    decode_egress_rule_content "$file" "$decoded" "$kind" || status=1
     rm -f -- "$decoded" || return 1
     return "$status"
 }
 
 download_egress_rules() {
+    local url
+    case "${2:-ip}" in
+        ip) url=https://raw.githubusercontent.com/Loyalsoldier/geoip/release/srs/cn.srs ;;
+        domain) url=https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-cn.srs ;;
+        *) return 2 ;;
+    esac
     [ "${VPSBOX_TEST_MODE:-0}" != 1 ] || return 1
     curl -fLsS --proto '=https' --proto-redir '=https' --connect-timeout 10 \
         --max-time 60 --max-filesize 8388608 \
-        https://raw.githubusercontent.com/Loyalsoldier/geoip/release/srs/cn.srs -o "$1"
+        "$url" -o "$1"
 }
+
+build_egress_rules() (
+    # 两个来源全部成功后合并为一个不可变 SRS，沿用单规则快照和原子发布边界。
+    local output="$1" work kind
+    umask 077
+    work="$(mktemp -d "${output%/*}/.egress-build.XXXXXX")" || return 1
+    trap 'rm -rf -- "$work"' EXIT
+    for kind in ip domain; do
+        download_egress_rules "$work/$kind.srs" "$kind" &&
+            decode_egress_rule_content "$work/$kind.srs" "$work/$kind.json" "$kind" || return 1
+    done
+    jq -s '{version:([.[].version] | max),rules:[.[].rules[]]}' \
+        "$work/ip.json" "$work/domain.json" > "$work/combined.json" || return 1
+    ulimit -f 32768 || return 1
+    run_bounded_command 20 sing-box rule-set compile "$work/combined.json" -o "$output" >/dev/null 2>&1 &&
+        validate_egress_rule_content "$output" "$work/check.json" combined
+)
 
 # structural 模式供关闭损坏规则时备份原状；不放宽状态/配置格式和路径安全要求。
 validate_egress_policy() {
@@ -4130,7 +4172,7 @@ validate_egress_policy() {
     fi
     rule="$(egress_policy_rule_path "$digest")" || return 1
     node_file_is_secure "$fragment" || return 1
-    expected="$(render_egress_policy_config "$tags" "$rule" | jq -Sc .)" || return 1
+    expected="$(render_egress_policy_config "$tags" "$rule" "$(jq -r .version <<< "$data")" | jq -Sc .)" || return 1
     actual="$(jq -Sce . "$fragment")" || return 1
     [ "$actual" = "$expected" ] || return 1
     if [ "$mode" != structural ]; then
@@ -4158,11 +4200,19 @@ check_node_config_directory() {
 }
 
 prepare_staged_egress_policy() {
-    local action="${1:-inherit}" stage="$NODE_TRANSACTION_STAGE" data enabled digest rule tags now
+    local action="${1:-inherit}" stage="$NODE_TRANSACTION_STAGE" data enabled digest rule tags now version
     data="$(read_egress_policy_state)" || return 1
     # 旧安装没有偏好时不落盘，不改变创建和删除的默认行为。
     if [ "$action" = inherit ] && [ ! -e "$CONFIG_DIR/vpsbox-egress.json" ]; then return 0; fi
     enabled="$(jq -r .enabled <<< "$data")"; digest="$(jq -r .sha256 <<< "$data")"
+    version="$(jq -r .version <<< "$data")"
+    if [ "$action" = update ] || { [ "$action" = on ] && [ "$enabled" = false ]; }; then
+        if [ "$version" = 1 ]; then
+            digest=""
+            data="$(jq -c '.version=2 | .sha256="" | .updated_at=0' <<< "$data")" || return 1
+            version=2
+        fi
+    fi
     case "$action" in on) enabled=true ;; off) enabled=false ;; update|inherit) ;; *) return 2 ;; esac
     tags='[]'
     if [ "$enabled" = true ]; then
@@ -4179,13 +4229,13 @@ prepare_staged_egress_policy() {
             }
             cp -- "$rule" "$stage/egress-rule.srs" || return 1
         else
-            download_egress_rules "$stage/egress-rule.srs" &&
-                validate_egress_rule_content "$stage/egress-rule.srs" "$stage/egress-decoded.json" || {
+            build_egress_rules "$stage/egress-rule.srs" || {
                 err "CN 规则下载或原生校验失败，未更改现有策略。"; return 1;
             }
             digest="$(sha256sum "$stage/egress-rule.srs" | awk '{print $1}')" || return 1
             now="$(date +%s)" || return 1
-            data="$(jq -c --arg hash "$digest" --argjson now "$now" '.sha256=$hash | .updated_at=$now' <<< "$data")" || return 1
+            version=2
+            data="$(jq -c --arg hash "$digest" --argjson now "$now" '.version=2 | .sha256=$hash | .updated_at=$now' <<< "$data")" || return 1
         fi
         chmod 600 "$stage/egress-rule.srs" || return 1
     fi
@@ -4194,7 +4244,7 @@ prepare_staged_egress_policy() {
     rm -f -- "$stage/configs/30-egress-policy.json" || return 1
     if [ "$enabled" = true ] && [ "$tags" != '[]' ]; then
         rule="$(egress_policy_rule_path "$digest")" || return 1
-        render_egress_policy_config "$tags" "$rule" > "$stage/configs/30-egress-policy.json" || return 1
+        render_egress_policy_config "$tags" "$rule" "$version" > "$stage/configs/30-egress-policy.json" || return 1
         chmod 600 "$stage/configs/30-egress-policy.json" || return 1
         validate_egress_policy "$stage/configs" "$stage/egress-state.json" "$stage/egress-rule.srs" || return 1
     fi
@@ -4293,6 +4343,11 @@ egress_policy_summary() {
     elif ! node_exists; then printf '已开启（待创建节点生效）';
     elif service_is_running; then printf '已开启';
     else printf '已开启（服务未运行）'; fi
+    if [ "$(jq -r .version <<< "$data")" = 1 ]; then
+        printf '；旧版仅 IP（更新 CN 规则后加入官方域名）'
+    else
+        printf '；官方 geolocation-cn 域名 + CN IP'
+    fi
     if [ -n "$digest" ]; then
         printf '；CN 规则 %s；更新时间 %s' "${digest:0:12}" "$(date -u -d "@$(jq -r .updated_at <<< "$data")" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || jq -r .updated_at <<< "$data")"
     fi
@@ -4303,7 +4358,7 @@ egress_policy_menu() {
     local opt action
     while true; do
         printf '\n回国流量限制：%s\n' "$(egress_policy_summary || true)"
-        printf '作用于受管 VLESS Reality / Shadowsocks 的目标 CN IPv4/IPv6。\n[1] 开启\n[2] 关闭\n[3] 更新 CN 规则\n[0] 返回\n'
+        printf '作用于受管 VLESS Reality / Shadowsocks；更新规则使用官方国内域名 + CN IPv4/IPv6。\n[1] 开启\n[2] 关闭\n[3] 更新 CN 规则\n[0] 返回\n'
         read -r -p '请选择：' opt || return 0
         case "$opt" in 1) action=on ;; 2) action=off ;; 3) action=update ;; 0) return 0 ;; *) continue ;; esac
         warn "正在运行的节点将重启以应用策略，已有连接可能中断；停止的服务保持停止。"

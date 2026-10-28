@@ -125,6 +125,9 @@ func socks(addr string, command byte, ip net.IP, port int) net.Conn {
 }
 
 func forwardTCP(host string, port int) (err error) {
+	return forwardHTTP(host, port, "native.example")
+}
+func forwardHTTP(host string, port int, httpHost string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("%v", r)
@@ -132,7 +135,7 @@ func forwardTCP(host string, port int) (err error) {
 	}()
 	c := socksHost("127.0.0.1:29103", 1, host, port)
 	defer c.Close()
-	_, err = c.Write([]byte("GET / HTTP/1.0\r\nHost: native.example\r\n\r\n"))
+	_, err = c.Write([]byte("GET / HTTP/1.0\r\nHost: " + httpHost + "\r\n\r\n"))
 	must(err)
 	data, err := io.ReadAll(c)
 	must(err)
@@ -166,7 +169,21 @@ func forwardUDP(host string, port int) (err error) {
 	return nil
 }
 
-func policyChecks(protocol, family string, tcpPort, udpPort int) {
+func forwardTLS(port int, name string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%v", r)
+		}
+	}()
+	c := socksHost("127.0.0.1:29103", 1, "127.0.0.1", port)
+	defer c.Close()
+	// Local fixture certificate; the test varies SNI to exercise server-side sniffing.
+	t := tls.Client(c, &tls.Config{ServerName: name, InsecureSkipVerify: true})
+	defer t.Close()
+	return t.Handshake()
+}
+
+func policyChecks(protocol, family string, tcpPort, udpPort, tlsPort int) {
 	for _, c := range []struct {
 		host  string
 		allow bool
@@ -174,6 +191,8 @@ func policyChecks(protocol, family string, tcpPort, udpPort int) {
 		{"127.0.0.1", true}, {"127.0.0.2", false}, {"::1", false},
 		{"allowed.native.test", true}, {"blocked4.native.test", false}, {"blocked6.native.test", false},
 		{"mixed.native.test", false}, {"missing.native.test", false},
+		{"blocked-domain.native.test", false}, {"child.blocked-domain.native.test", false},
+		{"cn123.native.test", false},
 	} {
 		err := forwardTCP(c.host, tcpPort)
 		if (err == nil) != c.allow {
@@ -186,6 +205,23 @@ func policyChecks(protocol, family string, tcpPort, udpPort int) {
 			}
 		}
 		fmt.Printf("PASS %s %s policy %s allow=%v\n", protocol, family, c.host, c.allow)
+	}
+	for _, c := range []struct {
+		name  string
+		allow bool
+	}{
+		{"allowed.native.test", true}, {"blocked-domain.native.test", false},
+		{"child.blocked-domain.native.test", false}, {"cn123.native.test", false},
+	} {
+		err := forwardHTTP("127.0.0.1", tcpPort, c.name)
+		if (err == nil) != c.allow {
+			panic(fmt.Sprintf("HTTP sniff %s allow=%v err=%v", c.name, c.allow, err))
+		}
+		err = forwardTLS(tlsPort, c.name)
+		if (err == nil) != c.allow {
+			panic(fmt.Sprintf("TLS sniff %s allow=%v err=%v", c.name, c.allow, err))
+		}
+		fmt.Printf("PASS %s %s HTTP/TLS sniff %s allow=%v\n", protocol, family, c.name, c.allow)
 	}
 }
 
@@ -240,6 +276,8 @@ func run() error {
 		config["dns"] = obj{"servers": []any{obj{"type": "hosts", "tag": "vpsbox-egress-dns", "predefined": obj{
 			"allowed.native.test": []string{"127.0.0.1"}, "blocked4.native.test": []string{"127.0.0.2"},
 			"blocked6.native.test": []string{"::1"}, "mixed.native.test": []string{"127.0.0.1", "::1"},
+			"blocked-domain.native.test": []string{"127.0.0.1"}, "child.blocked-domain.native.test": []string{"127.0.0.1"},
+			"cn123.native.test": []string{"127.0.0.1"},
 		}}}}
 		writeJSON(path, config)
 	}
@@ -272,7 +310,7 @@ func run() error {
 			defer stopClient()
 			waitTCP("127.0.0.1:29103")
 			if policy {
-				policyChecks(protocol, family, target.Addr().(*net.TCPAddr).Port, udp.LocalAddr().(*net.UDPAddr).Port)
+				policyChecks(protocol, family, target.Addr().(*net.TCPAddr).Port, udp.LocalAddr().(*net.UDPAddr).Port, reality.Addr().(*net.TCPAddr).Port)
 				return
 			}
 			c := socks("127.0.0.1:29103", 1, net.ParseIP(ip), target.Addr().(*net.TCPAddr).Port)
