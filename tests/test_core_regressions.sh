@@ -2021,7 +2021,7 @@ test_self_check_classifies_and_summarizes_results() {
             ' "$first_output"
         )"
         assert_eq \
-            $'运行用户\nvpsbox 命令\n首次安装\n运行时间\n系统时间\nNTP 同步\nsing-box\n节点\n公网 IPv4\nSSH 端口\nFail2ban\n主机防火墙\nIPv4 优先\nIPv6\nBBR\nfq\nTCP 缓冲区\n日志限制\n日志占用\n系统重启' \
+            $'运行用户\nvpsbox 命令\n首次安装\n运行时间\n系统时间\nNTP 同步\nsing-box\nsing-box 版本\n回国流量限制\n节点\n公网 IPv4\nSSH 端口\nFail2ban\n主机防火墙\nIPv4 优先\nIPv6\nBBR\nfq\nTCP 缓冲区\n日志限制\n日志占用\n系统重启' \
             "$actual_labels" \
             "基准场景的一键检测项目集合与顺序必须保持稳定"
 

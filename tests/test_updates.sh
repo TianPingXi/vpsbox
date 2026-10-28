@@ -1322,7 +1322,7 @@ test_singbox_version_noop_guards() {
     assert_empty_file "$MOCK_SINGBOX_EVENT_LOG" "相同版本不得安装依赖或二进制"
 
     reset_singbox_case higher
-    MOCK_SINGBOX_VERSION="1.14.0"
+    MOCK_SINGBOX_VERSION="1.14.5"
     update_singbox > "$TEST_TMP/singbox-higher.out" 2>&1 || fail "较高 sing-box 版本应拒绝降级并正常返回"
     assert_empty_file "$MOCK_SINGBOX_EVENT_LOG" "较高版本不得隐式降级"
     assert_file_contains "$TEST_TMP/singbox-higher.out" '已拒绝隐式降级'
@@ -1333,15 +1333,15 @@ test_singbox_lower_version_updates() {
 
     require_root_permission_semantics || return "$?"
     mkdir -p "$fake_bin"
-    printf '#!/usr/bin/env bash\nprintf \"sing-box version 1.13.13\\n\"\n' > "$fake_bin/sing-box"
+    printf '#!/usr/bin/env bash\nprintf \"sing-box version 1.13.14\\n\"\n' > "$fake_bin/sing-box"
     chmod 755 "$fake_bin/sing-box"
     PATH="$fake_bin:$PATH"
 
     reset_singbox_case lower
-    MOCK_SINGBOX_VERSION="1.13.13"
+    MOCK_SINGBOX_VERSION="1.13.14"
     update_singbox > "$TEST_TMP/singbox-lower.out" 2>&1 || fail "较低 sing-box 版本应更新"
     assert_file_contains "$MOCK_SINGBOX_EVENT_LOG" '^deps$'
-    assert_file_contains "$MOCK_SINGBOX_EVENT_LOG" '^installer:1\.13\.14$'
+    assert_file_contains "$MOCK_SINGBOX_EVENT_LOG" '^installer:1\.14\.4$'
 }
 
 test_singbox_update_continues_without_rollback_package() {
@@ -1366,7 +1366,7 @@ test_singbox_update_continues_without_rollback_package() {
         update_singbox > "$output" 2>&1 ||
             fail "旧版本回滚包不可用时，可信旧二进制已持久化后仍应继续更新"
         assert_file_contains "$MOCK_SINGBOX_EVENT_LOG" '^rollback-package-unavailable$'
-        assert_file_contains "$MOCK_SINGBOX_EVENT_LOG" '^installer:1\.13\.14$'
+        assert_file_contains "$MOCK_SINGBOX_EVENT_LOG" '^installer:1\.14\.4$'
         assert_file_contains "$output" '旧版 sing-box 回滚包.*继续更新'
         [ ! -e "$SINGBOX_UPDATE_TRANSACTION_DIR" ] ||
             fail "无旧包的成功更新也必须提交并清理事务"

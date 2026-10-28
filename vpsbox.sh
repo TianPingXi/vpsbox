@@ -28,7 +28,9 @@ APP_NAME="vpsbox"
 VPSBOX_VERSION="v1.0.64"
 # 只从当前仓库下载并识别可执行脚本。
 SCRIPT_URL="https://raw.githubusercontent.com/TianPingXi/vpsbox/main/vpsbox.sh"
-SINGBOX_RELEASE_VERSION="1.13.14"
+SINGBOX_RELEASE_VERSION="1.14.4"
+SINGBOX_VERSION_CACHE_TTL=86400
+SINGBOX_VERSION_FAILURE_TTL=600
 REALITY_POOL_PROBE_TIMEOUT=3
 REALITY_CLOUDFLARE_CHECK_TIMEOUT=3
 REALITY_CLOUDFLARE_RESPONSE_LIMIT=65536
@@ -1578,6 +1580,135 @@ download_verified_github_asset() {
         err "SHA256 校验失败：$asset"
         return 1
     fi
+}
+
+# 最新稳定版仅用于提示；安装目标始终是 SINGBOX_RELEASE_VERSION。
+fetch_singbox_latest_version() {
+    local metadata
+
+    # 测试必须替换本函数，不因菜单或自检意外访问真实网络。
+    [ "${VPSBOX_TEST_MODE:-0}" != 1 ] || return 1
+    command -v curl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 1
+    metadata="$(curl -fsS --proto '=https' --connect-timeout 2 --max-time 5 \
+        --max-filesize 1048576 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null)" || return 1
+    printf '%s' "$metadata" | jq -esr '
+        select(length == 1) | .[0] |
+        select(.draft == false and .prerelease == false) | .tag_name |
+        select(type == "string" and test("^v[0-9]{1,6}\\.[0-9]{1,6}\\.[0-9]{1,6}$")) | ltrimstr("v")'
+}
+
+read_singbox_version_cache() {
+    local cache="$VPSBOX_STATE_DIR/singbox-latest.json"
+
+    [ "${VPSBOX_TEST_MODE:-0}:$VPSBOX_STATE_DIR" != '1:/etc/vpsbox' ] || return 1
+    node_dir_is_secure "$VPSBOX_STATE_DIR" && node_file_is_secure "$cache" || return 1
+    [ "$(stat -c '%s' "$cache")" -le 1024 ] || return 1
+    jq -cse '
+        select(length == 1) | .[0] |
+        select(type == "object" and (keys == ["attempted_at", "checked_at", "success", "version"])) |
+        select(.attempted_at | type == "number" and floor == . and . > 0 and . < 4102444800) |
+        select(.checked_at | type == "number" and floor == . and . >= 0 and . < 4102444800) |
+        select(.success | type == "boolean") |
+        select(.version | type == "string" and (. == "" or test("^[0-9]{1,6}\\.[0-9]{1,6}\\.[0-9]{1,6}$"))) |
+        select(.checked_at <= .attempted_at and
+            ((.version == "" and .checked_at == 0 and .success == false) or
+             (.version != "" and .checked_at > 0)))' "$cache" 2>/dev/null
+}
+
+save_singbox_version_cache() {
+    local data="$1" cache="$VPSBOX_STATE_DIR/singbox-latest.json" tmp
+
+    [ "${VPSBOX_TEST_MODE:-0}:$VPSBOX_STATE_DIR" != '1:/etc/vpsbox' ] || return 1
+    [ ! -L "$VPSBOX_STATE_DIR" ] || return 1
+    if [ ! -e "$VPSBOX_STATE_DIR" ]; then
+        install -d -o root -g root -m 700 "$VPSBOX_STATE_DIR" || return 1
+    fi
+    node_dir_is_secure "$VPSBOX_STATE_DIR" || return 1
+    if [ -e "$cache" ] || [ -L "$cache" ]; then
+        node_file_is_secure "$cache" || return 1
+    fi
+    tmp="$(mktemp "$VPSBOX_STATE_DIR/.singbox-latest.XXXXXX")" || return 1
+    if ! printf '%s\n' "$data" > "$tmp" || ! chown root:root "$tmp" ||
+        ! chmod 600 "$tmp" || ! mv -f -- "$tmp" "$cache"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+}
+
+check_singbox_latest_version() {
+    local force="${1:-0}" now data="" attempted=0 checked=0 success=false version="" ttl
+
+    SINGBOX_LATEST_VERSION=""
+    SINGBOX_LATEST_CHECKED=0
+    SINGBOX_LATEST_STATUS=unknown
+    command -v jq >/dev/null 2>&1 || return 0
+    now="$(date +%s)" || return 0
+    [[ "$now" =~ ^[0-9]{1,10}$ ]] || return 0
+    if data="$(read_singbox_version_cache)"; then
+        attempted="$(jq -r .attempted_at <<< "$data")"
+        checked="$(jq -r .checked_at <<< "$data")"
+        success="$(jq -r .success <<< "$data")"
+        version="$(jq -r .version <<< "$data")"
+    fi
+    ttl="$SINGBOX_VERSION_FAILURE_TTL"
+    [ "$success" != true ] || ttl="$SINGBOX_VERSION_CACHE_TTL"
+    if [ "$force" = 1 ] || [ "$attempted" -gt "$now" ] ||
+        [ $((now - attempted)) -ge "$ttl" ]; then
+        local latest=""
+        success=false
+        if latest="$(fetch_singbox_latest_version)" &&
+            [[ "$latest" =~ ^[0-9]{1,6}([.][0-9]{1,6}){2}$ ]]; then
+            version="$latest" checked="$now" success=true
+        fi
+        # 时钟回拨时旧时间不可作为可信的新鲜缓存。
+        if [ "$checked" -gt "$now" ]; then version=""; checked=0; fi
+        data="$(jq -nc --arg version "$version" --argjson checked "$checked" \
+            --argjson now "$now" --argjson success "$success" \
+            '{version:$version,checked_at:$checked,attempted_at:$now,success:$success}')" || return 0
+        # 缓存只是派生数据，保存失败不掩盖本次查询结果。
+        save_singbox_version_cache "$data" 2>/dev/null || true
+    fi
+    SINGBOX_LATEST_VERSION="$version"
+    SINGBOX_LATEST_CHECKED="$checked"
+    if [ "$success" = true ]; then
+        SINGBOX_LATEST_STATUS=current
+    elif [ -n "$version" ]; then
+        SINGBOX_LATEST_STATUS=stale
+    fi
+    return 0
+}
+
+singbox_version_advice() {
+    local force="${1:-0}" installed relation stamp
+
+    check_singbox_latest_version "$force"
+    SINGBOX_NOTICE_LEVEL=INFO
+    SINGBOX_NOTICE="受管：v$SINGBOX_RELEASE_VERSION"
+    installed="$(singbox_version 2>/dev/null || true)"
+    if relation="$(version_relation "$SINGBOX_RELEASE_VERSION" "$installed")" && [ "$relation" = newer ]; then
+        SINGBOX_NOTICE_LEVEL=WARN
+        SINGBOX_NOTICE+="；可通过菜单更新至受管版本"
+    fi
+    case "$SINGBOX_LATEST_STATUS" in
+        current|stale)
+            stamp="$(date -u -d "@$SINGBOX_LATEST_CHECKED" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || printf '%s' "$SINGBOX_LATEST_CHECKED")"
+            SINGBOX_NOTICE+="；上游稳定版：v$SINGBOX_LATEST_VERSION（检查时间：$stamp）"
+            if version_is_newer "$SINGBOX_LATEST_VERSION" "$SINGBOX_RELEASE_VERSION"; then
+                SINGBOX_NOTICE_LEVEL=WARN
+                SINGBOX_NOTICE+="；尚未纳入本版受管范围"
+            fi
+            if [ "$SINGBOX_LATEST_STATUS" = stale ]; then
+                SINGBOX_NOTICE_LEVEL=WARN
+                SINGBOX_NOTICE+="；最近一次查询失败，以上为旧缓存"
+            fi
+            ;;
+        *) SINGBOX_NOTICE_LEVEL=WARN; SINGBOX_NOTICE+="；上游稳定版：无法确认（查询失败或缺少工具）" ;;
+    esac
+}
+
+show_singbox_version_advice() {
+    singbox_version_advice "${1:-0}"
+    printf '%s\n' "$SINGBOX_NOTICE"
 }
 
 singbox_release_package_arch() {
@@ -3207,7 +3338,7 @@ node_config_dir_contents_valid() {
     while IFS= read -r path; do
         [ -n "$path" ] || continue
         case "$path" in
-            "$SS_CONFIG_PATH"|"$VLESS_CONFIG_PATH") ;;
+            "$SS_CONFIG_PATH"|"$VLESS_CONFIG_PATH"|"$NODE_CONFIG_DIR/30-egress-policy.json") ;;
             *) return 1 ;;
         esac
         node_file_is_secure "$path" || return 1
@@ -3225,7 +3356,7 @@ node_config_dir_layout_valid() {
     while IFS= read -r path; do
         [ -n "$path" ] || continue
         case "$path" in
-            "$SS_CONFIG_PATH"|"$VLESS_CONFIG_PATH") ;;
+            "$SS_CONFIG_PATH"|"$VLESS_CONFIG_PATH"|"$NODE_CONFIG_DIR/30-egress-policy.json") ;;
             *) return 1 ;;
         esac
     done <<< "$entries"
@@ -3313,6 +3444,10 @@ require_valid_node_state_if_present() {
             }
         fi
     done
+    validate_egress_policy "$NODE_CONFIG_DIR" "$CONFIG_DIR/vpsbox-egress.json" "" "${1:-full}" || {
+        err "回国限制的状态、配置或规则不一致；请检查或从节点菜单关闭限制。"
+        return 1
+    }
 }
 
 commit_node_state_file() {
@@ -3870,11 +4005,319 @@ write_node_transaction_validation_spec() {
     chown root:root "$spec_file" && chmod 600 "$spec_file"
 }
 
+# 回国限制的数据位于 CONFIG_DIR，完整卸载节点时一并清理；规则不放入 -C 扫描目录。
+read_egress_policy_state() {
+    local file="${1:-$CONFIG_DIR/vpsbox-egress.json}"
+    if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+        printf '%s\n' '{"version":1,"enabled":false,"sha256":"","updated_at":0}'
+        return 0
+    fi
+    node_file_is_secure "$file" || return 1
+    [ "$(stat -c %s "$file")" -le 1024 ] || return 1
+    jq -cse 'select(length == 1) | .[0] |
+        select(type == "object" and keys == ["enabled","sha256","updated_at","version"]) |
+        select(.version == 1 and (.enabled | type == "boolean")) |
+        select(.sha256 | type == "string" and (. == "" or test("^[a-f0-9]{64}$"))) |
+        select(.updated_at | type == "number" and floor == . and . >= 0 and . < 4102444800) |
+        select((.sha256 == "" and .updated_at == 0) or (.sha256 != "" and .updated_at > 0))' "$file" 2>/dev/null
+}
+
+egress_policy_rule_path() {
+    [[ "$1" =~ ^[a-f0-9]{64}$ ]] || return 1
+    printf '%s/rule-set/cn-%s.srs\n' "$CONFIG_DIR" "$1"
+}
+
+egress_policy_kernel_supported() {
+    local version relation
+    version="$(singbox_version 2>/dev/null)" || return 1
+    relation="$(version_relation 1.14.4 "$version")" || return 1
+    [ "$relation" = same ] || [ "$relation" = older ]
+}
+
+egress_policy_tags() {
+    local dir="$1" excluded="${2:-}" file
+    local -a files=()
+    for file in "$dir/${SS_CONFIG_PATH##*/}" "$dir/${VLESS_CONFIG_PATH##*/}"; do
+        [ "$excluded:${file##*/}" != "ss:${SS_CONFIG_PATH##*/}" ] || continue
+        [ "$excluded:${file##*/}" != "vless:${VLESS_CONFIG_PATH##*/}" ] || continue
+        [ ! -e "$file" ] || files+=("$file")
+    done
+    if [ "${#files[@]}" -eq 0 ]; then printf '[]\n'; return 0; fi
+    # 不合并用户的 DNS/route；禁止非受管入站被意外纳入策略。
+    jq -cse '
+        if all(.[]; (.dns == null and .route == null) and
+            (.inbounds | type == "array" and length > 0) and
+            all(.inbounds[]; (.type == "shadowsocks" or .type == "vless") and
+                (.tag | type == "string" and test("^vpsbox-[a-f0-9]{24}-(ss|vless-reality)-in(-[a-zA-Z0-9-]+)?$"))))
+        then [.[].inbounds[].tag] | unique else error("custom route/dns/inbound") end' "${files[@]}"
+}
+
+render_egress_policy_config() {
+    local tags="$1" path="$2"
+    jq -nc --argjson tags "$tags" --arg path "$path" '{
+        dns:{servers:[{type:"local",tag:"vpsbox-egress-dns"}]},
+        route:{rules:[
+            {inbound:$tags,action:"resolve",server:"vpsbox-egress-dns",strategy:"prefer_ipv4"},
+            {inbound:$tags,rule_set:["vpsbox-cn"],action:"reject",method:"default",no_drop:true}
+        ],rule_set:[{type:"local",tag:"vpsbox-cn",format:"binary",path:$path}]}}'
+}
+
+validate_egress_rule_digest() {
+    local file="$1" digest="$2"
+    node_file_is_secure "$file" || return 1
+    [ "$(stat -c %s "$file")" -gt 0 ] && [ "$(stat -c %s "$file")" -le 8388608 ] || return 1
+    [ "$(sha256sum "$file" | awk '{print $1}')" = "$digest" ]
+}
+
+validate_egress_rule_content() {
+    local file="$1" decoded="$2" status=0
+    # 限制输入、解码时间与解码文件大小；原生解码器负责二进制和 CIDR 合法性。
+    [ -f "$file" ] && [ ! -L "$file" ] && [ -s "$file" ] || return 1
+    [ "$(stat -c %s "$file")" -le 8388608 ] || return 1
+    (
+        umask 077
+        ulimit -f 32768 || exit 1
+        run_bounded_command 20 sing-box rule-set decompile "$file" -o "$decoded" >/dev/null 2>&1
+    ) || status=1
+    if [ "$status" -eq 0 ]; then
+        jq -e '(.version >= 1 and .version <= 4) and
+            (.rules | type == "array" and length > 0) and
+            all(.rules[]; keys == ["ip_cidr"] and
+                (.ip_cidr | type == "array" and length > 0) and
+                all(.ip_cidr[]; type == "string" and contains("/"))) and
+            any(.rules[].ip_cidr[]; contains(":")) and
+            any(.rules[].ip_cidr[]; contains(":") | not)' "$decoded" >/dev/null 2>&1 || status=1
+    fi
+    rm -f -- "$decoded" || return 1
+    return "$status"
+}
+
+download_egress_rules() {
+    [ "${VPSBOX_TEST_MODE:-0}" != 1 ] || return 1
+    curl -fLsS --proto '=https' --proto-redir '=https' --connect-timeout 10 \
+        --max-time 60 --max-filesize 8388608 \
+        https://raw.githubusercontent.com/Loyalsoldier/geoip/release/srs/cn.srs -o "$1"
+}
+
+# structural 模式供关闭损坏规则时备份原状；不放宽状态/配置格式和路径安全要求。
+validate_egress_policy() {
+    local dir="${1:-$NODE_CONFIG_DIR}" state_file="${2:-$CONFIG_DIR/vpsbox-egress.json}"
+    local rule_override="${3:-}" mode="${4:-full}" data enabled digest rule tags expected actual
+    local fragment="$dir/30-egress-policy.json"
+    if [ ! -e "$state_file" ] && [ ! -L "$state_file" ] &&
+        [ ! -e "$fragment" ] && [ ! -L "$fragment" ]; then return 0; fi
+    data="$(read_egress_policy_state "$state_file")" || return 1
+    enabled="$(jq -r .enabled <<< "$data")"; digest="$(jq -r .sha256 <<< "$data")"
+    if [ "$enabled" = false ]; then
+        [ ! -e "$fragment" ] && [ ! -L "$fragment" ]
+        return $?
+    fi
+    if [[ "$mode" == cleanup:* ]]; then
+        # 删除损坏节点时只从健康协议推导标签；目标协议原标签由已校验快照保留。
+        local healthy
+        healthy="$(egress_policy_tags "$dir" "${mode#cleanup:}")" || return 1
+        node_file_is_secure "$fragment" || return 1
+        tags="$(jq -ce --argjson healthy "$healthy" '.route.rules[0].inbound |
+            select(type == "array" and length > 0 and . == (unique)) |
+            select(all(.[]; type == "string" and test("^vpsbox-[a-f0-9]{24}-(ss|vless-reality)-in(-[a-zA-Z0-9-]+)?$"))) |
+            select(($healthy - .) == [])' "$fragment")" || return 1
+    else
+        tags="$(egress_policy_tags "$dir")" || return 1
+    fi
+    if [ "$tags" = '[]' ]; then
+        [ ! -e "$fragment" ] && [ ! -L "$fragment" ]
+        return $?
+    fi
+    rule="$(egress_policy_rule_path "$digest")" || return 1
+    node_file_is_secure "$fragment" || return 1
+    expected="$(render_egress_policy_config "$tags" "$rule" | jq -Sc .)" || return 1
+    actual="$(jq -Sce . "$fragment")" || return 1
+    [ "$actual" = "$expected" ] || return 1
+    if [ "$mode" != structural ]; then
+        if [ -z "$rule_override" ]; then node_dir_is_secure "$CONFIG_DIR/rule-set" || return 1; fi
+        validate_egress_rule_digest "${rule_override:-$rule}" "$digest" || return 1
+    fi
+}
+
+check_node_config_directory() {
+    local dir="$1" rule_override="${2:-}" working_dir=/ check_dir="$1" tmp="" status=0
+    if is_systemd; then working_dir="$CONFIG_DIR"; fi
+    if [ -f "$dir/30-egress-policy.json" ] && [ -n "$rule_override" ]; then
+        tmp="$(mktemp -d "${TMPDIR:-/tmp}/vpsbox-egress-check.XXXXXX")" || return 1
+        chmod 700 "$tmp" || { rm -rf -- "$tmp"; return 1; }
+        if ! cp -- "$dir/"*.json "$tmp/" ||
+            ! jq --arg path "$rule_override" '.route.rule_set[0].path=$path' \
+                "$dir/30-egress-policy.json" > "$tmp/30-egress-policy.json"; then
+            rm -rf -- "$tmp"; return 1
+        fi
+        check_dir="$tmp"
+    fi
+    (cd -- "$working_dir" && sing-box check -C "$check_dir" >/dev/null) || status=1
+    [ -z "$tmp" ] || rm -rf -- "$tmp" || status=1
+    return "$status"
+}
+
+prepare_staged_egress_policy() {
+    local action="${1:-inherit}" stage="$NODE_TRANSACTION_STAGE" data enabled digest rule tags now
+    data="$(read_egress_policy_state)" || return 1
+    # 旧安装没有偏好时不落盘，不改变创建和删除的默认行为。
+    if [ "$action" = inherit ] && [ ! -e "$CONFIG_DIR/vpsbox-egress.json" ]; then return 0; fi
+    enabled="$(jq -r .enabled <<< "$data")"; digest="$(jq -r .sha256 <<< "$data")"
+    case "$action" in on) enabled=true ;; off) enabled=false ;; update|inherit) ;; *) return 2 ;; esac
+    tags='[]'
+    if [ "$enabled" = true ]; then
+        tags="$(egress_policy_tags "$stage/configs")" || {
+            err "现有节点包含自定义 DNS、路由或非受管入站，无法自动应用回国限制。"; return 1;
+        }
+    fi
+    if [ "$action" = update ] || { [ "$enabled" = true ] && [ "$tags" != '[]' ]; }; then
+        egress_policy_kernel_supported || { err "请先通过 sing-box 管理更新至 1.14.4 或更高版本。"; return 1; }
+        if [ -n "$digest" ] && [ "$action" != update ]; then
+            rule="$(egress_policy_rule_path "$digest")" || return 1
+            node_dir_is_secure "$CONFIG_DIR/rule-set" && validate_egress_rule_digest "$rule" "$digest" || {
+                err "CN 规则缺失或损坏，请先更新规则或关闭限制。"; return 1;
+            }
+            cp -- "$rule" "$stage/egress-rule.srs" || return 1
+        else
+            download_egress_rules "$stage/egress-rule.srs" &&
+                validate_egress_rule_content "$stage/egress-rule.srs" "$stage/egress-decoded.json" || {
+                err "CN 规则下载或原生校验失败，未更改现有策略。"; return 1;
+            }
+            digest="$(sha256sum "$stage/egress-rule.srs" | awk '{print $1}')" || return 1
+            now="$(date +%s)" || return 1
+            data="$(jq -c --arg hash "$digest" --argjson now "$now" '.sha256=$hash | .updated_at=$now' <<< "$data")" || return 1
+        fi
+        chmod 600 "$stage/egress-rule.srs" || return 1
+    fi
+    jq -c --argjson enabled "$enabled" '.enabled=$enabled' <<< "$data" > "$stage/egress-state.json" || return 1
+    chmod 600 "$stage/egress-state.json" || return 1
+    rm -f -- "$stage/configs/30-egress-policy.json" || return 1
+    if [ "$enabled" = true ] && [ "$tags" != '[]' ]; then
+        rule="$(egress_policy_rule_path "$digest")" || return 1
+        render_egress_policy_config "$tags" "$rule" > "$stage/configs/30-egress-policy.json" || return 1
+        chmod 600 "$stage/configs/30-egress-policy.json" || return 1
+        validate_egress_policy "$stage/configs" "$stage/egress-state.json" "$stage/egress-rule.srs" || return 1
+    fi
+}
+
+publish_staged_egress_policy() {
+    local stage="$NODE_TRANSACTION_STAGE" data digest target
+    [ -f "$stage/egress-state.json" ] || return 0
+    data="$(read_egress_policy_state "$stage/egress-state.json")" || return 1
+    digest="$(jq -r .sha256 <<< "$data")"
+    if [ -f "$stage/egress-rule.srs" ]; then
+        target="$(egress_policy_rule_path "$digest")" || return 1
+        if [ ! -e "$CONFIG_DIR/rule-set" ] && [ ! -L "$CONFIG_DIR/rule-set" ]; then
+            install -d -o root -g root -m 700 "$CONFIG_DIR/rule-set" || return 1
+        fi
+        node_dir_is_secure "$CONFIG_DIR/rule-set" || return 1
+        if [ -e "$target" ] || [ -L "$target" ]; then
+            if ! validate_egress_rule_digest "$target" "$digest"; then
+                # 不覆盖正在被策略引用的文件，避免内核自动重载早于事务提交。
+                if [ -e "$NODE_CONFIG_DIR/30-egress-policy.json" ] || [ -L "$target" ]; then
+                    err "现有规则内容损坏；请先关闭限制，再更新规则。"; return 1
+                fi
+                node_file_is_secure "$target" && publish_staged_node_file "$stage/egress-rule.srs" "$target" || return 1
+            fi
+        else
+            publish_staged_node_file "$stage/egress-rule.srs" "$target" || return 1
+        fi
+    fi
+    publish_staged_node_file "$stage/egress-state.json" "$CONFIG_DIR/vpsbox-egress.json" || return 1
+    if [ -f "$stage/configs/30-egress-policy.json" ]; then
+        publish_staged_node_file "$stage/configs/30-egress-policy.json" "$NODE_CONFIG_DIR/30-egress-policy.json"
+    else
+        remove_snapshot_target_file "$NODE_CONFIG_DIR/30-egress-policy.json"
+    fi
+}
+
+apply_egress_policy() {
+    local action="$1" file spec=full active=0 data desired reload=1
+    case "$action" in on|off|update) ;; *) return 2 ;; esac
+    command -v jq >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1 || {
+        err "缺少 jq 或 sha256sum，无法管理回国流量限制。"; return 1
+    }
+    recover_pending_node_transaction || return 1
+    require_valid_node_state_if_present structural || return 1
+    data="$(read_egress_policy_state)" || return 1
+    if [ "$action" != update ]; then
+        desired=false; [ "$action" != on ] || desired=true
+        if [ "$(jq -r .enabled <<< "$data")" = "$desired" ] && validate_egress_policy; then
+            info "回国流量限制已经是目标状态，无需更改。"; return 0
+        fi
+    fi
+    if node_exists && ! service_manager_is_active && [ -n "$(singbox_config_pids)" ]; then
+        err "服务管理器与 sing-box 进程状态不一致，请先处理残留进程。"; return 1
+    fi
+    [ "$action" = on ] && node_exists || spec=static
+    begin_node_transaction "$spec" || return 1
+    if ! prepare_node_stage || ! secure_config_dir; then cancel_unmodified_node_transaction; return 1; fi
+    for file in "$SS_CONFIG_PATH" "$VLESS_CONFIG_PATH"; do
+        if [ -f "$file" ]; then
+            cp -- "$file" "$NODE_TRANSACTION_STAGE/configs/${file##*/}" || { cancel_unmodified_node_transaction; return 1; }
+        fi
+    done
+    if ! prepare_staged_egress_policy "$action"; then cancel_unmodified_node_transaction; return 1; fi
+    if node_exists && ! check_node_config_directory "$NODE_TRANSACTION_STAGE/configs" "$NODE_TRANSACTION_STAGE/egress-rule.srs"; then
+        cancel_unmodified_node_transaction; return 1
+    fi
+    active="$(cat "$NODE_TRANSACTION_BACKUP/service-running")"
+    if { cmp -s "$NODE_CONFIG_DIR/30-egress-policy.json" "$NODE_TRANSACTION_STAGE/configs/30-egress-policy.json" && validate_egress_policy; } ||
+        { [ ! -e "$NODE_CONFIG_DIR/30-egress-policy.json" ] && [ ! -e "$NODE_TRANSACTION_STAGE/configs/30-egress-policy.json" ]; }; then reload=0; fi
+    if ! mark_node_transaction_mutated || ! publish_staged_egress_policy ||
+        ! require_valid_node_state_if_present; then
+        fail_after_node_rollback "回国限制发布失败" "操作前"; return 1
+    fi
+    if [ "$reload" = 1 ] && [ "$active" = 1 ] && node_exists; then
+        if ! restart_singbox_cleanly || ! verify_all_node_runtime; then
+            fail_after_node_rollback "回国限制运行验收失败" "操作前"; return 1
+        fi
+    fi
+    if ! commit_node_transaction; then
+        fail_after_node_rollback "回国限制提交失败" "操作前"; return 1
+    fi
+    info "回国流量限制设置已保存。"
+}
+
+egress_policy_summary() {
+    local data digest enabled
+    if [ ! -e "$CONFIG_DIR/vpsbox-egress.json" ] && [ ! -L "$CONFIG_DIR/vpsbox-egress.json" ] &&
+        [ ! -e "$NODE_CONFIG_DIR/30-egress-policy.json" ] && [ ! -L "$NODE_CONFIG_DIR/30-egress-policy.json" ]; then
+        printf '已关闭（默认）\n'; return 0
+    fi
+    if ! data="$(read_egress_policy_state)" || ! validate_egress_policy; then
+        printf '异常（状态、配置或规则缺失/损坏）\n'; return 1
+    fi
+    enabled="$(jq -r .enabled <<< "$data")"; digest="$(jq -r .sha256 <<< "$data")"
+    if [ "$enabled" = false ]; then printf '已关闭';
+    elif ! node_exists; then printf '已开启（待创建节点生效）';
+    elif service_is_running; then printf '已开启';
+    else printf '已开启（服务未运行）'; fi
+    if [ -n "$digest" ]; then
+        printf '；CN 规则 %s；更新时间 %s' "${digest:0:12}" "$(date -u -d "@$(jq -r .updated_at <<< "$data")" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || jq -r .updated_at <<< "$data")"
+    fi
+    printf '\n'
+}
+
+egress_policy_menu() {
+    local opt action
+    while true; do
+        printf '\n回国流量限制：%s\n' "$(egress_policy_summary || true)"
+        printf '作用于受管 VLESS Reality / Shadowsocks 的目标 CN IPv4/IPv6。\n[1] 开启\n[2] 关闭\n[3] 更新 CN 规则\n[0] 返回\n'
+        read -r -p '请选择：' opt || return 0
+        case "$opt" in 1) action=on ;; 2) action=off ;; 3) action=update ;; 0) return 0 ;; *) continue ;; esac
+        warn "正在运行的节点将重启以应用策略，已有连接可能中断；停止的服务保持停止。"
+        confirm_default_yes '确认应用？' || continue
+        run_menu_action apply_egress_policy "$action"
+        pause
+    done
+}
+
 backup_node_files() {
     local backup_dir="$1"
     local validation_spec="${2:-full}"
     local manifest="$backup_dir/manifest"
-    local cleanup_protocol="" normalize_ss=0 normalize_vless=0 path
+    local cleanup_protocol="" normalize_ss=0 normalize_vless=0 path policy_version=1 data digest
 
     case "$validation_spec" in
         full|static) ;;
@@ -3897,7 +4340,8 @@ backup_node_files() {
     fi
     mkdir -p "$backup_dir" || return 1
     : > "$manifest" || return 1
-    printf 'version|1\n' >> "$manifest" || return 1
+    if [ -e "$CONFIG_DIR/vpsbox-egress.json" ] || [ -e "$NODE_CONFIG_DIR/30-egress-policy.json" ]; then policy_version=2; fi
+    printf 'version|%s\n' "$policy_version" >> "$manifest" || return 1
 
     # URI 是可由配置与状态重建的派生缓存，不作为事务恢复的权威材料。
     # 保留旧清单字段，兼容 v1.0.43 起已经落盘的 version|1 事务格式。
@@ -3951,6 +4395,19 @@ backup_node_files() {
         service-running "$manifest" || return 1
     backup_node_copied_file_with_manifest "$backup_dir/service-enabled" \
         service-enabled "$manifest" || return 1
+    if [ "$policy_version" = 2 ]; then
+        backup_node_file_with_manifest "$CONFIG_DIR/vpsbox-egress.json" "$backup_dir/egress-state.json" egress-state.json "$manifest" || return 1
+        backup_node_copied_file_with_manifest "$backup_dir/vpsbox.d/30-egress-policy.json" vpsbox.d/30-egress-policy.json "$manifest" || return 1
+        data="$(read_egress_policy_state)" || return 1
+        digest="$(jq -r .sha256 <<< "$data")"
+        if [ -n "$digest" ]; then
+            path="$(egress_policy_rule_path "$digest")" || return 1
+            if [ -e "$path" ] || [ -L "$path" ]; then node_dir_is_secure "$CONFIG_DIR/rule-set" || return 1; fi
+            backup_node_file_with_manifest "$path" "$backup_dir/egress-rule.srs" egress-rule.srs "$manifest" || return 1
+        else
+            printf 'file|egress-rule.srs|absent|-\n' >> "$manifest" || return 1
+        fi
+    fi
 }
 
 normalize_cleanup_backup_file() {
@@ -4084,7 +4541,7 @@ validate_node_transaction_backup() {
     local vless_config="$config_dir/${VLESS_CONFIG_PATH##*/}"
     local line kind name state digest path protocol config state_path
     local config_dir_present=0 config_count=0 entry_status
-    local cleanup_protocol="" config_present state_present
+    local cleanup_protocol="" config_present state_present policy_version policy_mode=full
     local -a entries=(
         node-uri.txt vpsbox.d "vpsbox.d/${SS_CONFIG_PATH##*/}"
         "vpsbox.d/${VLESS_CONFIG_PATH##*/}" ss-state.env vless-state.env
@@ -4101,8 +4558,15 @@ validate_node_transaction_backup() {
     command -v sha256sum >/dev/null 2>&1 || return 1
     [ -d "$backup_dir" ] && [ ! -L "$backup_dir" ] || return 1
     node_backup_file_is_safe "$manifest" || return 1
-    [ "$(sed -n '1p' "$manifest")" = "version|1" ] || return 1
-    [ "$(wc -l < "$manifest")" -eq 13 ] || return 1
+    policy_version="$(sed -n '1p' "$manifest")"
+    case "$policy_version" in
+        'version|1') [ "$(wc -l < "$manifest")" -eq 13 ] || return 1 ;;
+        'version|2')
+            [ "$(wc -l < "$manifest")" -eq 16 ] || return 1
+            entries+=(egress-state.json egress-rule.srs vpsbox.d/30-egress-policy.json)
+            ;;
+        *) return 1 ;;
+    esac
     for name in "${entries[@]}"; do
         node_backup_manifest_entry "$manifest" "$name" >/dev/null || return 1
     done
@@ -4134,6 +4598,13 @@ validate_node_transaction_backup() {
     validate_node_backup_file_entry "$manifest" openrc-sing-box "$backup_dir/openrc-sing-box" || return 1
     validate_node_backup_file_entry "$manifest" service-running "$backup_dir/service-running" || return 1
     validate_node_backup_file_entry "$manifest" service-enabled "$backup_dir/service-enabled" || return 1
+    if [ "$policy_version" = 'version|2' ]; then
+        for name in egress-state.json egress-rule.srs vpsbox.d/30-egress-policy.json; do
+            validate_node_backup_file_entry "$manifest" "$name" "$backup_dir/$name" || return 1
+        done
+        case "$validation_spec" in static) policy_mode=structural ;; cleanup:*) policy_mode="$validation_spec" ;; esac
+        validate_egress_policy "$config_dir" "$backup_dir/egress-state.json" "$backup_dir/egress-rule.srs" "$policy_mode" || return 1
+    fi
 
     grep -Eq '^[01]$' "$backup_dir/service-running" || return 1
     grep -Eq '^[01]$' "$backup_dir/service-enabled" || return 1
@@ -4180,6 +4651,7 @@ validate_node_transaction_backup() {
             [ -n "$path" ] || continue
             case "$path" in
                 "$ss_config"|"$vless_config") ;;
+                "$config_dir/30-egress-policy.json") [ "$policy_version" = 'version|2' ] || return 1 ;;
                 *) return 1 ;;
             esac
         done < <(find "$config_dir" -mindepth 1 -maxdepth 1 -print 2>/dev/null)
@@ -4274,7 +4746,7 @@ begin_node_transaction() {
         { [ -f "$NODE_TRANSACTION_BACKUP/vpsbox.d/${SS_CONFIG_PATH##*/}" ] ||
             [ -f "$NODE_TRANSACTION_BACKUP/vpsbox.d/${VLESS_CONFIG_PATH##*/}" ]; }; then
         if ! command -v sing-box >/dev/null 2>&1 ||
-            ! sing-box check -C "$NODE_TRANSACTION_BACKUP/vpsbox.d" >/dev/null; then
+            ! check_node_config_directory "$NODE_TRANSACTION_BACKUP/vpsbox.d" "$NODE_TRANSACTION_BACKUP/egress-rule.srs"; then
             remove_node_transaction_dir || true
             err "节点事务备份未通过 sing-box 配置检查。"
             return 1
@@ -4387,6 +4859,7 @@ restore_node_config_dir_from_backup() {
             "$backup_dir/vpsbox.d/${SS_CONFIG_PATH##*/}" "$SS_CONFIG_PATH" || return 1
         restore_node_file_from_backup "$backup_dir" "vpsbox.d/${VLESS_CONFIG_PATH##*/}" \
             "$backup_dir/vpsbox.d/${VLESS_CONFIG_PATH##*/}" "$VLESS_CONFIG_PATH" || return 1
+        restore_egress_fragment_from_backup "$backup_dir" || return 1
         node_config_dir_contents_valid
         return $?
     else
@@ -4397,6 +4870,7 @@ restore_node_config_dir_from_backup() {
         "$backup_dir/vpsbox.d/${SS_CONFIG_PATH##*/}" "$SS_CONFIG_PATH" || return 1
     restore_node_file_from_backup "$backup_dir" "vpsbox.d/${VLESS_CONFIG_PATH##*/}" \
         "$backup_dir/vpsbox.d/${VLESS_CONFIG_PATH##*/}" "$VLESS_CONFIG_PATH" || return 1
+    restore_egress_fragment_from_backup "$backup_dir" || return 1
     if [ -L "$NODE_CONFIG_DIR" ]; then
         rm -f -- "$NODE_CONFIG_DIR"
     elif [ -e "$NODE_CONFIG_DIR" ]; then
@@ -4423,7 +4897,7 @@ node_config_dir_restore_target_safe() {
     while IFS= read -r path; do
         [ -n "$path" ] || continue
         case "$path" in
-            "$SS_CONFIG_PATH"|"$VLESS_CONFIG_PATH") ;;
+            "$SS_CONFIG_PATH"|"$VLESS_CONFIG_PATH"|"$NODE_CONFIG_DIR/30-egress-policy.json") ;;
             *) return 1 ;;
         esac
         if [ "$path" = "$cleanup_target" ]; then
@@ -4432,6 +4906,35 @@ node_config_dir_restore_target_safe() {
             node_file_is_secure "$path" || return 1
         fi
     done <<< "$entries"
+}
+
+restore_egress_fragment_from_backup() {
+    local backup="$1"
+    if [ "$(head -1 "$backup/manifest")" = 'version|2' ]; then
+        restore_node_file_from_backup "$backup" vpsbox.d/30-egress-policy.json \
+            "$backup/vpsbox.d/30-egress-policy.json" "$NODE_CONFIG_DIR/30-egress-policy.json"
+    else
+        remove_snapshot_target_file "$NODE_CONFIG_DIR/30-egress-policy.json"
+    fi
+}
+
+restore_egress_data_from_backup() {
+    local backup="$1" data digest target
+    if [ "$(head -1 "$backup/manifest")" = 'version|1' ]; then
+        remove_snapshot_target_file "$CONFIG_DIR/vpsbox-egress.json"
+        return $?
+    fi
+    data="$(read_egress_policy_state "$backup/egress-state.json")" || return 1
+    digest="$(jq -r .sha256 <<< "$data")"
+    if [ -n "$digest" ]; then
+        target="$(egress_policy_rule_path "$digest")" || return 1
+        if [ ! -e "$CONFIG_DIR/rule-set" ] && [ ! -L "$CONFIG_DIR/rule-set" ]; then
+            install -d -o root -g root -m 700 "$CONFIG_DIR/rule-set" || return 1
+        fi
+        node_dir_is_secure "$CONFIG_DIR/rule-set" || return 1
+        restore_node_file_from_backup "$backup" egress-rule.srs "$backup/egress-rule.srs" "$target" || return 1
+    fi
+    restore_node_file_from_backup "$backup" egress-state.json "$backup/egress-state.json" "$CONFIG_DIR/vpsbox-egress.json"
 }
 
 restore_node_files() {
@@ -4467,6 +4970,7 @@ restore_node_files() {
         err "节点配置目录异常，已拒绝恢复：$NODE_CONFIG_DIR"
         return 1
     }
+    restore_egress_data_from_backup "$backup_dir" || failed=1
     restore_node_config_dir_from_backup "$backup_dir" "$validation_spec" || failed=1
     restore_node_file_from_backup "$backup_dir" ss-state.env "$backup_dir/ss-state.env" "$SS_STATE_FILE" || failed=1
     restore_node_file_from_backup "$backup_dir" vless-state.env "$backup_dir/vless-state.env" "$VLESS_STATE_FILE" || failed=1
@@ -5177,7 +5681,8 @@ validate_staged_node() {
         validate_protocol_node_core \
             "$protocol" "$config" "$state" || return 1
     done
-    sing-box check -C "$NODE_TRANSACTION_STAGE/configs" >/dev/null
+    prepare_staged_egress_policy || return 1
+    check_node_config_directory "$NODE_TRANSACTION_STAGE/configs" "$NODE_TRANSACTION_STAGE/egress-rule.srs"
 }
 
 publish_staged_node_file() {
@@ -5211,23 +5716,17 @@ publish_staged_node() {
         "$NODE_TRANSACTION_STAGE/configs/${config##*/}" "$config" || return 1
     publish_staged_node_file \
         "$NODE_TRANSACTION_STAGE/states/${state##*/}" "$state" || return 1
+    publish_staged_egress_policy || return 1
     require_valid_node_state_if_present
 }
 
 check_node_config_set() {
-    local working_dir=/
-
     [ -d "$NODE_CONFIG_DIR" ] && [ ! -L "$NODE_CONFIG_DIR" ] || return 1
     { [ -f "$SS_CONFIG_PATH" ] || [ -f "$VLESS_CONFIG_PATH" ]; } || return 1
     node_config_dir_contents_valid || return 1
     # 与受管服务模板一致：systemd 指定 CONFIG_DIR，OpenRC 系统服务默认从 / 启动。
-    if is_systemd; then
-        working_dir="$CONFIG_DIR"
-    fi
-    (
-        cd -- "$working_dir" || return 1
-        sing-box check -C "$NODE_CONFIG_DIR" >/dev/null
-    )
+    validate_egress_policy || return 1
+    check_node_config_directory "$NODE_CONFIG_DIR"
 }
 
 check_active_node_config() {
@@ -6060,7 +6559,22 @@ publish_node_deletion() {
         fail_after_node_rollback "$label 节点文件删除失败" "删除前" || true
         return 1
     }
+    if [ -e "$CONFIG_DIR/vpsbox-egress.json" ]; then
+        if ! refresh_egress_after_node_deletion; then
+            fail_after_node_rollback "删除后的回国限制配置更新失败" "删除前" || true
+            return 1
+        fi
+    fi
     repair_node_uri_cache_best_effort "删除节点后"
+}
+
+refresh_egress_after_node_deletion() {
+    local file
+    prepare_node_stage || return 1
+    for file in "$SS_CONFIG_PATH" "$VLESS_CONFIG_PATH"; do
+        [ ! -f "$file" ] || cp -- "$file" "$NODE_TRANSACTION_STAGE/configs/${file##*/}" || return 1
+    done
+    prepare_staged_egress_policy && publish_staged_egress_policy
 }
 
 accept_node_deletion_result() {
@@ -16731,6 +17245,14 @@ self_check_node_stack() {
     else
         check_info "sing-box" "未安装"
     fi
+    singbox_version_advice
+    check_row "$SINGBOX_NOTICE_LEVEL" "sing-box 版本" "$SINGBOX_NOTICE"
+    local policy_summary
+    if policy_summary="$(egress_policy_summary)"; then
+        check_info "回国流量限制" "$policy_summary"
+    else
+        check_fail "回国流量限制" "$policy_summary"
+    fi
     for protocol in vless ss; do
         protocol_status="$(protocol_node_status "$protocol" 2>/dev/null || true)"
         case "$protocol_status" in
@@ -18278,6 +18800,7 @@ $(node_summary)
  [3] 查看节点链接
  [4] 删除 VLESS Reality 节点
  [5] 删除 Shadowsocks 节点
+ [6] 回国流量限制
 ----------------------------------------
  [0] 返回主菜单
 ========================================
@@ -18291,6 +18814,7 @@ EOF
             3) run_menu_action view_node_link; pause ;;
             4) run_menu_action delete_vless_reality_node; pause ;;
             5) run_menu_action delete_node; pause ;;
+            6) egress_policy_menu ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
@@ -18307,11 +18831,13 @@ singbox_menu() {
  sing-box 管理
 ========================================
 $(singbox_summary_line)
+$(show_singbox_version_advice)
 ----------------------------------------
  [1] 启动服务
  [2] 停止服务
  [3] 重启服务
  [4] 更新 sing-box
+ [5] 检查上游最新稳定版
 ----------------------------------------
  [0] 返回主菜单
 ========================================
@@ -18324,6 +18850,7 @@ EOF
             2) run_menu_action stop_service_action; pause ;;
             3) run_menu_action restart_service_action; pause ;;
             4) run_menu_action update_singbox; pause ;;
+            5) run_menu_action show_singbox_version_advice 1; pause ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
