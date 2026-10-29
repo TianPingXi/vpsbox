@@ -1355,19 +1355,6 @@ test_tcp_buffer_cancel_invalid_default_and_healthy_noop_are_read_only() {
 
 test_pending_system_change_blocks_fast_return_paths() {
     (
-        local output="$TEST_TMP/ipv6-pending-fast-return.out"
-
-        reset_change_store ipv6-pending-fast-return
-        manifest_set PENDING_IPV6_CONF 1
-        global_ipv6_addresses() { forbid "IPv6 pending 应在地址检测前被拦截"; }
-        forbid_init
-        if disable_ipv6 > "$output" 2>&1; then
-            fail "IPv6 存在未完成事务时不得按无地址路径返回成功"
-        fi
-        assert_file_contains "$output" '尚未处理的 IPv6 修改事务'
-        assert_no_forbidden "IPv6 pending 检查顺序错误"
-    )
-    (
         local output="$TEST_TMP/tcp-pending-fast-return.out"
 
         reset_change_store tcp-pending-fast-return
@@ -1524,401 +1511,6 @@ test_tcp_buffer_restore_rejects_invalid_metadata_before_mutation() {
             fail "TCP 缓冲区恢复元数据异常时必须失败"
         fi
         assert_no_forbidden "TCP 恢复必须先完整校验元数据"
-    )
-}
-
-setup_ipv6_disable_case() {
-    local name="$1"
-
-    IPV6_TEST_DIR="$TEST_TMP/ipv6-$name"
-    IPV6_DISABLE_CONF="$IPV6_TEST_DIR/99-vpsbox-disable-ipv6.conf"
-    VPSBOX_STATE_DIR="$IPV6_TEST_DIR/state"
-    CHANGE_MANIFEST="$VPSBOX_STATE_DIR/changes.env"
-    CHANGE_BACKUP_DIR="$VPSBOX_STATE_DIR/backups"
-    IPV6_TEST_ALL=0
-    IPV6_TEST_DEFAULT=0
-    IPV6_TEST_LO=0
-    IPV6_TEST_IP_FAIL=0
-    IPV6_TEST_APPLY_FAIL=0
-    IPV6_TEST_KEEP_ADDRESSES=0
-    IPV6_TEST_RESTORE_FAIL_KEY=""
-    IPV6_TEST_WRITE_FAIL_ONCE_KEY=""
-    IPV6_TEST_ADDRESSES=$'2: ens17 inet6 2001:db8:100::7f/64 scope global\n2: ens17 inet6 2001:db8:100::80/64 scope global'
-    IPV6_TEST_SYSCTL_LOG="$IPV6_TEST_DIR/sysctl.log"
-    mkdir -p "$IPV6_TEST_DIR"
-    : > "$IPV6_TEST_SYSCTL_LOG"
-    unset SSH_CONNECTION
-
-    ip() {
-        [ "$*" = "-6 -o addr show scope global" ] || return 2
-        [ "$IPV6_TEST_IP_FAIL" -eq 0 ] || return 42
-        if [ "$IPV6_TEST_ALL" -eq 1 ] && [ "$IPV6_TEST_KEEP_ADDRESSES" -eq 0 ]; then
-            return 0
-        fi
-        [ -z "$IPV6_TEST_ADDRESSES" ] || printf '%s\n' "$IPV6_TEST_ADDRESSES"
-    }
-    sysctl() {
-        local key value
-
-        case "$1" in
-            -n)
-                case "$2" in
-                    net.ipv6.conf.all.disable_ipv6) printf '%s\n' "$IPV6_TEST_ALL" ;;
-                    net.ipv6.conf.default.disable_ipv6) printf '%s\n' "$IPV6_TEST_DEFAULT" ;;
-                    net.ipv6.conf.lo.disable_ipv6) printf '%s\n' "$IPV6_TEST_LO" ;;
-                    *) return 2 ;;
-                esac
-                ;;
-            -p)
-                printf 'p:%s\n' "$2" >> "$IPV6_TEST_SYSCTL_LOG"
-                IPV6_TEST_ALL=1
-                if [ "$IPV6_TEST_APPLY_FAIL" -eq 1 ]; then
-                    return 41
-                fi
-                IPV6_TEST_DEFAULT=1
-                IPV6_TEST_LO=1
-                ;;
-            -w)
-                printf 'w:%s\n' "$2" >> "$IPV6_TEST_SYSCTL_LOG"
-                key="${2%%=*}"
-                value="${2#*=}"
-                if [ "$key" = "$IPV6_TEST_WRITE_FAIL_ONCE_KEY" ]; then
-                    IPV6_TEST_WRITE_FAIL_ONCE_KEY=""
-                    return 42
-                fi
-                [ "$key" != "$IPV6_TEST_RESTORE_FAIL_KEY" ] || return 43
-                case "$key" in
-                    net.ipv6.conf.all.disable_ipv6) IPV6_TEST_ALL="$value" ;;
-                    net.ipv6.conf.default.disable_ipv6) IPV6_TEST_DEFAULT="$value" ;;
-                    net.ipv6.conf.lo.disable_ipv6) IPV6_TEST_LO="$value" ;;
-                    *) return 2 ;;
-                esac
-                ;;
-            *) return 2 ;;
-        esac
-    }
-}
-
-test_ipv6_no_global_address_is_noop_and_detection_failure_is_fatal() {
-    (
-        local output="$TEST_TMP/ipv6-none.out"
-
-        setup_ipv6_disable_case none
-        IPV6_TEST_ADDRESSES=""
-        forbid_init
-        read() { forbid "无全局 IPv6 时不得询问"; }
-        sysctl() { forbid "无全局 IPv6 时不得读取或修改 sysctl"; }
-
-        disable_ipv6 > "$output"
-
-        assert_file_contains "$output" '未检测到全局 IPv6 地址，无需禁用'
-        [ ! -e "$IPV6_DISABLE_CONF" ] || fail "无全局 IPv6 时不得创建配置"
-        assert_no_forbidden "无全局 IPv6 时必须零副作用"
-    )
-    (
-        local output="$TEST_TMP/ipv6-detect-failure.out"
-
-        setup_ipv6_disable_case detection-failure
-        IPV6_TEST_IP_FAIL=1
-        forbid_init
-        read() { forbid "IPv6 检测失败时不得询问"; }
-        sysctl() { forbid "IPv6 检测失败时不得读取或修改 sysctl"; }
-
-        if disable_ipv6 > "$output" 2>&1; then
-            fail "ip 命令失败时不得误报无 IPv6"
-        fi
-        assert_file_contains "$output" '无法读取全局 IPv6 地址'
-        assert_no_forbidden "IPv6 检测失败必须在修改前停止"
-    )
-}
-
-test_ipv6_addresses_are_displayed_and_cancel_is_read_only() {
-    (
-        local output="$TEST_TMP/ipv6-cancel.out"
-
-        setup_ipv6_disable_case cancel
-        unset SSH_CONNECTION
-
-        disable_ipv6 <<< "n" > "$output"
-
-        assert_file_contains "$output" 'ens17：2001:db8:100::7f/64'
-        assert_file_contains "$output" 'ens17：2001:db8:100::80/64'
-        assert_file_contains "$output" '已取消禁用 IPv6'
-        assert_empty_file "$IPV6_TEST_SYSCTL_LOG" "取消时不得调用 sysctl"
-        [ ! -e "$IPV6_DISABLE_CONF" ] || fail "取消时不得创建持久配置"
-        [ ! -e "$CHANGE_MANIFEST" ] || fail "IPv6 禁用不应创建通用恢复记录"
-    )
-}
-
-test_ipv6_ssh_session_is_rejected_before_confirmation() {
-    (
-        local output="$TEST_TMP/ipv6-ssh.out"
-
-        setup_ipv6_disable_case ssh-ipv6
-        SSH_CONNECTION="2001:db8:200::20 52341 2001:db8:100::7f 22"
-
-        disable_ipv6 </dev/null > "$output" 2>&1
-
-        assert_file_contains "$output" '当前 SSH 会话正在通过 IPv6 连接'
-        assert_file_contains "$output" '请改用 IPv4 SSH 或 VPS 控制台后重试'
-        assert_empty_file "$IPV6_TEST_SYSCTL_LOG" "IPv6 SSH 拦截后不得调用 sysctl"
-        [ ! -e "$IPV6_DISABLE_CONF" ] || fail "IPv6 SSH 拦截后不得创建配置"
-    )
-}
-
-test_ipv6_default_confirmation_applies_and_repeated_run_is_noop() {
-    (
-        local output="$TEST_TMP/ipv6-success.out" before_count after_count
-
-        setup_ipv6_disable_case success
-        # shellcheck disable=SC2034 # 被测 IPv6 会话检测通过动态作用域读取。
-        SSH_CONNECTION="198.51.100.20 52341 192.0.2.10 22"
-        forbid_init
-        systemctl() { forbid "禁用 IPv6 不得调用 systemd"; }
-        rc-service() { forbid "禁用 IPv6 不得调用 OpenRC"; }
-
-        disable_ipv6 <<< "" > "$output"
-
-        [ -f "$IPV6_DISABLE_CONF" ] && [ ! -L "$IPV6_DISABLE_CONF" ] ||
-            fail "默认确认后必须发布 IPv6 配置"
-        assert_eq "$(render_ipv6_disable_config)" "$(cat "$IPV6_DISABLE_CONF")" \
-            "IPv6 持久配置内容不正确"
-        assert_eq "1 1 1" "$IPV6_TEST_ALL $IPV6_TEST_DEFAULT $IPV6_TEST_LO" \
-            "默认确认后必须禁用 all/default/lo"
-        assert_file_contains "$output" 'IPv6 已禁用，重启后仍会保持禁用'
-        assert_file_contains "$CHANGE_MANIFEST" '^BACKUP_IPV6_CONF=absent$'
-        assert_file_contains "$CHANGE_MANIFEST" '^IPV6_ALL=0$'
-        assert_file_contains "$CHANGE_MANIFEST" '^IPV6_DEFAULT=0$'
-        assert_file_contains "$CHANGE_MANIFEST" '^IPV6_LO=0$'
-        assert_file_contains "$CHANGE_MANIFEST" '^APPLIED_IPV6_CONF=1$'
-        assert_file_contains "$output" '可通过 vpsbox 系统改动恢复菜单恢复禁用前状态'
-        assert_no_forbidden "禁用 IPv6 不得重启服务"
-
-        IPV6_TEST_ALL=0
-        IPV6_TEST_DEFAULT=0
-        IPV6_TEST_LO=0
-        disable_ipv6 <<< "" > "$TEST_TMP/ipv6-repair.out"
-        assert_eq "1 1 1" "$IPV6_TEST_ALL $IPV6_TEST_DEFAULT $IPV6_TEST_LO" \
-            "持久配置已存在时应只修复运行参数"
-        assert_eq "$(render_ipv6_disable_config)" "$(cat "$IPV6_DISABLE_CONF")" \
-            "运行参数修复不得改写持久配置内容"
-
-        before_count="$(grep -c '^p:' "$IPV6_TEST_SYSCTL_LOG")"
-        forbid_init
-        read() { forbid "已无全局 IPv6 时重复执行不得询问"; }
-        disable_ipv6 > "$TEST_TMP/ipv6-repeat.out"
-        after_count="$(grep -c '^p:' "$IPV6_TEST_SYSCTL_LOG")"
-        assert_eq "$before_count" "$after_count" "重复执行不得再次应用 sysctl"
-        assert_no_forbidden "重复执行必须在确认前返回"
-    )
-}
-
-test_ipv6_existing_unmanaged_config_is_rejected() {
-    (
-        local output="$TEST_TMP/ipv6-existing.out"
-
-        setup_ipv6_disable_case existing
-        printf '%s\n' 'net.ipv6.conf.all.disable_ipv6 = 0' > "$IPV6_DISABLE_CONF"
-
-        if disable_ipv6 <<< "" > "$output" 2>&1; then
-            fail "已有不同内容的 IPv6 配置不得被覆盖"
-        fi
-
-        assert_file_contains "$IPV6_DISABLE_CONF" '^net.ipv6.conf.all.disable_ipv6 = 0$'
-        assert_file_contains "$output" '已存在且内容不属于当前配置，已拒绝覆盖'
-        assert_empty_file "$IPV6_TEST_SYSCTL_LOG" "拒绝现有配置后不得调用 sysctl"
-    )
-}
-
-test_ipv6_runtime_apply_or_verification_failure_restores_values() {
-    local mode
-
-    for mode in apply verify; do
-        (
-            local output="$TEST_TMP/ipv6-${mode}-failure.out"
-
-            setup_ipv6_disable_case "$mode-failure"
-            if [ "$mode" = "apply" ]; then
-                IPV6_TEST_APPLY_FAIL=1
-            else
-                IPV6_TEST_KEEP_ADDRESSES=1
-            fi
-
-            if disable_ipv6 <<< "" > "$output" 2>&1; then
-                fail "IPv6 ${mode} 失败时不得报告成功"
-            fi
-
-            assert_eq "0 0 0" "$IPV6_TEST_ALL $IPV6_TEST_DEFAULT $IPV6_TEST_LO" \
-                "IPv6 ${mode} 失败后应恢复记录的运行参数"
-            [ ! -e "$IPV6_DISABLE_CONF" ] || fail "IPv6 ${mode} 失败不得发布持久配置"
-            assert_file_contains "$output" '已恢复记录的运行参数，持久配置未改动'
-            assert_eq 3 "$(grep -c '^w:' "$IPV6_TEST_SYSCTL_LOG")" \
-                "IPv6 ${mode} 失败后应回退三个运行参数"
-            assert_file_not_contains "$CHANGE_MANIFEST" \
-                '^(BACKUP_IPV6_CONF|PENDING_IPV6_CONF|APPLIED_IPV6_CONF|IPV6_ALL|IPV6_DEFAULT|IPV6_LO)='
-        )
-    done
-}
-
-test_ipv6_publish_failure_restores_runtime_and_preserves_target() {
-    (
-        local output="$TEST_TMP/ipv6-publish-failure.out"
-
-        setup_ipv6_disable_case publish-failure
-        mv() {
-            local last="${!#}"
-            [ "$last" != "$IPV6_DISABLE_CONF" ] || return 42
-            command mv "$@"
-        }
-
-        if disable_ipv6 <<< "" > "$output" 2>&1; then
-            fail "IPv6 配置发布失败时不得报告成功"
-        fi
-
-        assert_eq "0 0 0" "$IPV6_TEST_ALL $IPV6_TEST_DEFAULT $IPV6_TEST_LO" \
-            "发布失败后应恢复记录的运行参数"
-        [ ! -e "$IPV6_DISABLE_CONF" ] || fail "发布失败不得留下正式配置"
-        assert_file_contains "$output" '保存 IPv6 配置失败；已恢复记录的运行参数'
-        assert_file_not_contains "$CHANGE_MANIFEST" \
-            '^(BACKUP_IPV6_CONF|PENDING_IPV6_CONF|APPLIED_IPV6_CONF|IPV6_ALL|IPV6_DEFAULT|IPV6_LO)='
-        if find "$IPV6_TEST_DIR" -maxdepth 1 -name '.vpsbox-disable-ipv6.*' -print -quit | grep -q .; then
-            fail "发布失败后不得残留 IPv6 临时配置"
-        fi
-    )
-}
-
-test_ipv6_failed_runtime_restore_reports_manual_recovery() {
-    (
-        local output="$TEST_TMP/ipv6-restore-failure.out"
-
-        setup_ipv6_disable_case restore-failure
-        IPV6_TEST_APPLY_FAIL=1
-        IPV6_TEST_RESTORE_FAIL_KEY="net.ipv6.conf.all.disable_ipv6"
-
-        if disable_ipv6 <<< "" > "$output" 2>&1; then
-            fail "IPv6 运行参数回退失败时不得报告成功"
-        fi
-
-        assert_eq 1 "$IPV6_TEST_ALL" "夹具必须保留未恢复的 all.disable_ipv6"
-        assert_file_contains "$output" '记录的运行参数未能确认完整恢复'
-        assert_file_contains "$output" '已保留事务记录'
-        assert_file_contains "$CHANGE_MANIFEST" '^PENDING_IPV6_CONF=1$'
-        assert_file_contains "$CHANGE_MANIFEST" '^BACKUP_IPV6_CONF=absent$'
-        assert_file_contains "$CHANGE_MANIFEST" '^IPV6_ALL=0$'
-        [ ! -e "$IPV6_DISABLE_CONF" ] || fail "回退失败也不得发布持久配置"
-    )
-}
-
-test_ipv6_recorded_restore_recovers_file_and_runtime() {
-    (
-        local output="$TEST_TMP/ipv6-recorded-restore.out"
-
-        setup_ipv6_disable_case recorded-restore
-        disable_ipv6 <<< "" >/dev/null
-
-        restore_vpsbox_system_change ipv6 > "$output"
-
-        [ ! -e "$IPV6_DISABLE_CONF" ] || fail "恢复后应移除首次创建的 IPv6 禁用配置"
-        assert_eq "0 0 0" "$IPV6_TEST_ALL $IPV6_TEST_DEFAULT $IPV6_TEST_LO" \
-            "IPv6 恢复必须还原禁用前的三个运行参数"
-        assert_file_not_contains "$CHANGE_MANIFEST" \
-            '^(BACKUP_IPV6_CONF|PENDING_IPV6_CONF|APPLIED_IPV6_CONF|IPV6_ALL|IPV6_DEFAULT|IPV6_LO)='
-        assert_file_contains "$output" '已重新检测到全局 IPv6 地址'
-        assert_file_contains "$output" 'IPv6 禁用 已恢复'
-    )
-}
-
-test_ipv6_untracked_config_uses_explicit_reenable_path() {
-    (
-        local output="$TEST_TMP/ipv6-untracked-reenable.out"
-        local disable_output="$TEST_TMP/ipv6-untracked-disable.out"
-
-        setup_ipv6_disable_case untracked-reenable
-        render_ipv6_disable_config > "$IPV6_DISABLE_CONF"
-        if disable_ipv6 <<< "" > "$disable_output" 2>&1; then
-            fail "无原始记录的旧版 IPv6 配置不得建立错误恢复基线"
-        fi
-        assert_file_contains "$disable_output" '请先在系统改动菜单中重新启用 IPv6'
-        assert_empty_file "$IPV6_TEST_SYSCTL_LOG" \
-            "拒绝旧版 IPv6 配置时不得重新应用运行参数"
-        IPV6_TEST_ALL=1
-        IPV6_TEST_DEFAULT=1
-        IPV6_TEST_LO=1
-
-        assert_eq legacy "$(system_change_state ipv6)" \
-            "无原始记录的 vpsbox IPv6 配置应显示单独重新启用状态"
-        if recorded_system_changes_present; then
-            fail "无原始记录的 IPv6 配置不得进入恢复全部"
-        fi
-        restore_vpsbox_system_change_interactive ipv6 <<< "YES" > "$output"
-
-        [ ! -e "$IPV6_DISABLE_CONF" ] || fail "重新启用后应移除无记录的 vpsbox 禁用配置"
-        assert_eq "0 0 0" "$IPV6_TEST_ALL $IPV6_TEST_DEFAULT $IPV6_TEST_LO"
-        assert_file_contains "$output" '不属于精确还原'
-        assert_file_contains "$output" 'all/default/lo 已设置为 0'
-        assert_file_contains "$output" '已重新检测到全局 IPv6 地址'
-        assert_eq "" "${ACTIVE_IPV6_REENABLE_SNAPSHOT:-}" \
-            "IPv6 重新启用成功后必须清除活动回滚句柄"
-        if find "$IPV6_TEST_DIR" -maxdepth 1 -name '.vpsbox-enable-ipv6.*' -print -quit |
-            grep -q .; then
-            fail "IPv6 重新启用成功后不得残留临时快照"
-        fi
-    )
-}
-
-test_ipv6_untracked_reenable_failure_restores_original_state() {
-    (
-        local output="$TEST_TMP/ipv6-untracked-reenable-failure.out"
-
-        setup_ipv6_disable_case untracked-reenable-failure
-        render_ipv6_disable_config > "$IPV6_DISABLE_CONF"
-        IPV6_TEST_ALL=1
-        IPV6_TEST_DEFAULT=1
-        IPV6_TEST_LO=1
-        IPV6_TEST_WRITE_FAIL_ONCE_KEY=net.ipv6.conf.default.disable_ipv6
-
-        if reenable_untracked_ipv6 > "$output" 2>&1; then
-            fail "IPv6 运行参数部分写入失败时不得报告重新启用成功"
-        fi
-        ipv6_disable_config_is_current || fail "IPv6 重新启用失败后必须保留禁用配置"
-        assert_eq "1 1 1" "$IPV6_TEST_ALL $IPV6_TEST_DEFAULT $IPV6_TEST_LO" \
-            "IPv6 重新启用失败后必须恢复原运行参数"
-        assert_eq "" "${ACTIVE_IPV6_REENABLE_SNAPSHOT:-}" \
-            "IPv6 回滚成功后必须清除活动句柄"
-        assert_file_contains "$output" '已恢复原禁用配置和运行参数'
-        if find "$IPV6_TEST_DIR" -maxdepth 1 -name '.vpsbox-enable-ipv6.*' -print -quit |
-            grep -q .; then
-            fail "IPv6 回滚成功后不得残留临时快照"
-        fi
-    )
-}
-
-test_runtime_cleanup_rolls_back_active_untracked_ipv6_reenable() {
-    (
-        local snapshot
-
-        setup_ipv6_disable_case untracked-reenable-cleanup
-        render_ipv6_disable_config > "$IPV6_DISABLE_CONF"
-        IPV6_TEST_ALL=1
-        IPV6_TEST_DEFAULT=1
-        IPV6_TEST_LO=1
-        snapshot="$(mktemp "$IPV6_TEST_DIR/.vpsbox-enable-ipv6.XXXXXX")"
-        cp -a -- "$IPV6_DISABLE_CONF" "$snapshot"
-        arm_untracked_ipv6_reenable_rollback "$snapshot" 1 1 1
-        IPV6_TEST_ALL=0
-        IPV6_TEST_DEFAULT=1
-        IPV6_TEST_LO=0
-        rm -f -- "$IPV6_DISABLE_CONF"
-        cleanup_vpsbox_lock() { return 0; }
-
-        cleanup_vpsbox_runtime
-
-        ipv6_disable_config_is_current || fail "统一退出清理必须恢复 IPv6 禁用配置"
-        assert_eq "1 1 1" "$IPV6_TEST_ALL $IPV6_TEST_DEFAULT $IPV6_TEST_LO" \
-            "统一退出清理必须恢复 IPv6 原运行参数"
-        assert_eq "" "${ACTIVE_IPV6_REENABLE_SNAPSHOT:-}" \
-            "统一退出清理成功后必须清除 IPv6 活动句柄"
-        [ ! -e "$snapshot" ] || fail "统一退出回滚成功后必须清理 IPv6 临时快照"
     )
 }
 
@@ -3758,7 +3350,7 @@ test_hostname_change_does_not_create_restore_record() {
         [ ! -e "$CHANGE_BACKUP_DIR/HOSTNAME_FILE" ] &&
             [ ! -e "$CHANGE_BACKUP_DIR/HOSTS_FILE" ] ||
             fail "主机名修改不应创建持久备份"
-        assert_eq 'dns bbr ipv4_priority fail2ban journald ntp ipv6 tcp_buffer' \
+        assert_eq 'dns bbr fail2ban journald ntp tcp_buffer' \
             "$(system_change_items | paste -sd ' ' -)" \
             "系统恢复项目不应再包含主机名"
     )
@@ -4009,7 +3601,7 @@ test_fail2ban_restore_accepts_complete_service_metadata() {
 test_restore_system_changes_clears_success_and_preserves_failed_group() {
     (
         local case_dir="$TEST_TMP/restore-groups"
-        local dns_target="$case_dir/resolv.conf" gai_target="$case_dir/gai.conf"
+        local dns_target="$case_dir/resolv.conf" journal_target="$case_dir/journal.conf"
         local output="$case_dir/restore.out" status_output="$case_dir/status.out"
 
         forbid_init
@@ -4018,22 +3610,23 @@ test_restore_system_changes_clears_success_and_preserves_failed_group() {
         # shellcheck disable=SC2034 # 被测系统恢复入口动态读取。
         RESOLV_CONF="$dns_target"
         # shellcheck disable=SC2034 # 被测系统恢复入口动态读取。
-        GAI_CONF="$gai_target"
+        JOURNALD_VPSBOX_CONF="$journal_target"
         printf '%s\n' dns-original > "$dns_target"
-        printf '%s\n' gai-original > "$gai_target"
+        printf '%s\n' journal-original > "$journal_target"
         backup_change_file_once DNS_RESOLV "$dns_target"
         mark_change_applied DNS_RESOLV
         begin_change_transaction DNS_RESOLVED
-        backup_change_file_once GAI_CONF "$gai_target"
-        mark_change_applied GAI_CONF
+        backup_change_file_once JOURNALD_CONF "$journal_target"
+        mark_change_applied JOURNALD_CONF
         printf '%s\n' dns-modified > "$dns_target"
-        printf '%s\n' gai-modified > "$gai_target"
-        systemctl() { forbid "DNS 组预检失败时不得修改服务"; }
+        printf '%s\n' journal-modified > "$journal_target"
+        is_systemd() { return 0; }
+        systemctl() { case "$*" in "restart systemd-journald"|"is-active --quiet systemd-journald") return 0 ;; *) forbid "DNS 组预检失败时不得修改服务" ;; esac; }
 
         show_vpsbox_changes > "$status_output"
         assert_file_contains "$status_output" 'IPv4 DNS：未完成，可恢复'
-        assert_file_contains "$status_output" 'IPv4 优先：可恢复'
-        assert_file_not_contains "$status_output" 'DNS_RESOLV|GAI_CONF' \
+        assert_file_contains "$status_output" 'journald 日志限制：可恢复'
+        assert_file_not_contains "$status_output" 'DNS_RESOLV|JOURNALD_CONF' \
             "系统改动状态不得暴露内部清单键"
 
         if restore_vpsbox_system_changes 1 > "$output" 2>&1; then
@@ -4047,15 +3640,15 @@ test_restore_system_changes_clears_success_and_preserves_failed_group() {
         [ -f "$CHANGE_BACKUP_DIR/DNS_RESOLV" ] ||
             fail "失败的 DNS 组必须保留原始备份"
 
-        assert_file_contains "$gai_target" '^gai-original$' \
+        assert_file_contains "$journal_target" '^journal-original$' \
             "前一项目失败后仍必须继续恢复后续项目"
         assert_file_not_contains "$CHANGE_MANIFEST" \
-            '^(BACKUP_GAI_CONF|APPLIED_GAI_CONF|PENDING_GAI_CONF)='
-        [ ! -e "$CHANGE_BACKUP_DIR/GAI_CONF" ] ||
+            '^(BACKUP_JOURNALD_CONF|APPLIED_JOURNALD_CONF|PENDING_JOURNALD_CONF)='
+        [ ! -e "$CHANGE_BACKUP_DIR/JOURNALD_CONF" ] ||
             fail "成功项目必须立即清理自己的备份"
         assert_file_contains "$output" '恢复成功：1 项'
         assert_file_contains "$output" '恢复失败：1 项'
-        assert_file_contains "$output" '无记录：6 项'
+        assert_file_contains "$output" '无记录：4 项'
         assert_no_forbidden "失败组预检后仍执行了系统服务修改"
     )
 }
@@ -4063,29 +3656,31 @@ test_restore_system_changes_clears_success_and_preserves_failed_group() {
 test_single_system_change_restore_is_isolated() {
     (
         local case_dir="$TEST_TMP/restore-single"
-        local dns_target="$case_dir/resolv.conf" gai_target="$case_dir/gai.conf"
+        local dns_target="$case_dir/resolv.conf" journal_target="$case_dir/journal.conf"
 
         reset_change_store restore-single
         mkdir -p "$case_dir"
         # shellcheck disable=SC2034 # 被测单项恢复函数动态读取。
         RESOLV_CONF="$dns_target"
         # shellcheck disable=SC2034 # 被测单项恢复函数动态读取。
-        GAI_CONF="$gai_target"
+        JOURNALD_VPSBOX_CONF="$journal_target"
         printf '%s\n' dns-original > "$dns_target"
-        printf '%s\n' gai-original > "$gai_target"
+        printf '%s\n' journal-original > "$journal_target"
         backup_change_file_once DNS_RESOLV "$dns_target"
         mark_change_applied DNS_RESOLV
-        backup_change_file_once GAI_CONF "$gai_target"
-        mark_change_applied GAI_CONF
+        backup_change_file_once JOURNALD_CONF "$journal_target"
+        mark_change_applied JOURNALD_CONF
         printf '%s\n' dns-modified > "$dns_target"
-        printf '%s\n' gai-modified > "$gai_target"
+        printf '%s\n' journal-modified > "$journal_target"
 
-        restore_vpsbox_system_change_interactive ipv4_priority <<< "YES" >/dev/null
+        is_systemd() { return 0; }
+        systemctl() { case "$*" in "restart systemd-journald"|"is-active --quiet systemd-journald") return 0 ;; *) return 1 ;; esac; }
+        restore_vpsbox_system_change_interactive journald <<< "YES" >/dev/null
 
-        assert_file_contains "$gai_target" '^gai-original$'
+        assert_file_contains "$journal_target" '^journal-original$'
         assert_file_not_contains "$CHANGE_MANIFEST" \
-            '^(BACKUP_GAI_CONF|APPLIED_GAI_CONF|PENDING_GAI_CONF)='
-        [ ! -e "$CHANGE_BACKUP_DIR/GAI_CONF" ] ||
+            '^(BACKUP_JOURNALD_CONF|APPLIED_JOURNALD_CONF|PENDING_JOURNALD_CONF)='
+        [ ! -e "$CHANGE_BACKUP_DIR/JOURNALD_CONF" ] ||
             fail "单项恢复成功后必须清理目标项目备份"
         assert_file_contains "$dns_target" '^dns-modified$' \
             "单项恢复不得修改其他项目"
@@ -4162,15 +3757,12 @@ main() {
         chrony_main_uses_source_dir
         chrony_sources_are_current
         chrony_vpsbox_markers_valid
-        disable_ipv6
-        rollback_active_untracked_ipv6_reenable
         resolv_conf_line_is_ipv4_nameserver
         apply_tcp_buffer_tier
         enable_bbr_fq
         ensure_public_config_dir
         set_main_ssh_port_directives
         apply_ssh_port_change
-        enable_ipv4_priority
         enable_ntp_sync
         ntp_unit_state_matches
         repair_ntp_service_state
@@ -4180,7 +3772,6 @@ main() {
         restore_vpsbox_system_change
         restore_vpsbox_system_change_interactive
         restore_vpsbox_system_changes
-        restore_ipv6_system_change
         restore_tcp_buffer_system_change
         restore_dns_operation_snapshot
         show_vpsbox_changes
@@ -4226,18 +3817,6 @@ main() {
         test_ntp_pre_mutation_snapshot_failures_clear_new_tracking
         test_ntp_pre_mutation_tracking_is_covered_by_runtime_cleanup
         test_cancel_unmodified_ntp_tracking_preserves_existing_baseline
-        test_ipv6_no_global_address_is_noop_and_detection_failure_is_fatal
-        test_ipv6_addresses_are_displayed_and_cancel_is_read_only
-        test_ipv6_ssh_session_is_rejected_before_confirmation
-        test_ipv6_default_confirmation_applies_and_repeated_run_is_noop
-        test_ipv6_existing_unmanaged_config_is_rejected
-        test_ipv6_runtime_apply_or_verification_failure_restores_values
-        test_ipv6_publish_failure_restores_runtime_and_preserves_target
-        test_ipv6_failed_runtime_restore_reports_manual_recovery
-        test_ipv6_recorded_restore_recovers_file_and_runtime
-        test_ipv6_untracked_config_uses_explicit_reenable_path
-        test_ipv6_untracked_reenable_failure_restores_original_state
-        test_runtime_cleanup_rolls_back_active_untracked_ipv6_reenable
         test_bbr_fq_healthy_is_noop
         test_bbr_fq_runtime_drift_uses_light_repair
         test_unsupported_kernel_leaves_no_phantom_pending_change

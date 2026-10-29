@@ -33,7 +33,7 @@ case "$1" in
   if [ "$2" = -c ]; then files=("$3"); else files=("$3/"*.json); fi
   for file in "${files[@]}"; do
    jq -e '((.inbounds | type == "array" and length > 0) and (.outbounds | length == 1)) or
-    (.dns.servers[0].type == "local" and (.route.rules | length == 2 or length == 5) and .route.rules[-1].action == "reject")' "$file" >/dev/null
+    (.dns.servers[0].type == "local" and (.route.rules | length > 0) and all(.route.rules[]; (.action == "resolve" or .action == "reject" or .action == "sniff")))' "$file" >/dev/null
    while IFS= read -r rule; do [ -f "$rule" ]; done < <(jq -r '.route.rule_set[]?.path' "$file")
   done ;;
  *) exit 2 ;;
@@ -402,6 +402,169 @@ test_egress_legacy_disable_and_reenable_upgrades_cached_rules() {
     )
 }
 
+test_ip_policy_modes_preserve_nodes_and_cn_state() {
+    local enabled strategy running
+    for enabled in off on; do
+        for running in 0 1; do
+            (
+                egress_case "ip-$enabled-$running"
+                egress_add_ss; egress_add_vless
+                policy_active="$running" policy_enabled="$running"
+                apply_egress_policy "$enabled"
+                local before cn rule_before=''
+                before="$(sha256sum "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$VLESS_CONFIG_PATH" "$VLESS_STATE_FILE")"
+                cn="$(read_egress_policy_state | jq -c 'del(.ip_strategy)')"
+                [ "$enabled" != on ] || rule_before="$(sha256sum "$CONFIG_DIR/"rule-set/*)"
+                policy_download_fail=1
+                for strategy in prefer_ipv4 prefer_ipv6 ipv4_only default; do
+                    apply_egress_policy "ip:$strategy"
+                    validate_egress_policy
+                    assert_eq "$cn" "$(read_egress_policy_state | jq -c 'del(.ip_strategy)')"
+                    assert_eq "$before" "$(sha256sum "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$VLESS_CONFIG_PATH" "$VLESS_STATE_FILE")"
+                    assert_eq "$running" "$policy_active"; assert_eq "$running" "$policy_enabled"
+                    assert_eq "$(ip_outbound_strategy_label "$strategy")" "$(ip_outbound_policy_summary)"
+                    local restarts="$policy_restarts"
+                    apply_egress_policy "ip:$strategy"
+                    assert_eq "$restarts" "$policy_restarts" '重复选择不得重启'
+                    [ "$enabled" != on ] || assert_eq "$rule_before" "$(sha256sum "$CONFIG_DIR/"rule-set/*)"
+                done
+                if [ "$enabled" = off ]; then [ ! -e "$NODE_CONFIG_DIR/30-egress-policy.json" ]; fi
+            )
+        done
+    done
+}
+
+test_ip_policy_only_v4_keeps_full_cn_check_before_filtering() {
+    (
+        egress_case only4
+        egress_add_ss
+        apply_egress_policy ip:ipv4_only
+        jq -e '.route.rules[0].ip_version == 6 and .route.rules[1].strategy == "ipv4_only" and .route.rule_set == null' "$NODE_CONFIG_DIR/30-egress-policy.json" >/dev/null
+        apply_egress_policy on
+        jq -e '[.route.rules[].action] == ["reject","reject","sniff","reject","resolve","reject","resolve","reject"] and
+            .route.rules[0].ip_version == 6 and .route.rules[4].strategy == "prefer_ipv4" and
+            .route.rules[6].strategy == "ipv4_only"' "$NODE_CONFIG_DIR/30-egress-policy.json" >/dev/null
+        apply_egress_policy off
+        assert_eq 仅IPV4 "$(ip_outbound_policy_summary)"
+        validate_egress_policy
+    )
+}
+
+test_ip_policy_preset_inherits_and_last_deletion_keeps_preference() {
+    (
+        egress_case ip-preset
+        apply_egress_policy ip:prefer_ipv6
+        [ ! -e "$NODE_CONFIG_DIR" ]
+        begin_node_transaction
+        prepare_node_stage
+        egress_add_ss "$NODE_TRANSACTION_STAGE/configs/10-ss.json" "$NODE_TRANSACTION_STAGE/states/vpsbox-ss.env"
+        validate_staged_node ss
+        mark_node_transaction_mutated
+        publish_staged_node ss
+        commit_node_transaction
+        validate_egress_policy
+        jq -e '.route.rules[0].strategy == "prefer_ipv6"' "$NODE_CONFIG_DIR/30-egress-policy.json" >/dev/null
+        begin_node_transaction
+        mark_node_transaction_mutated
+        publish_node_deletion ss SS
+        commit_node_transaction
+        [ ! -e "$NODE_CONFIG_DIR/30-egress-policy.json" ]
+        assert_eq IPV6优先 "$(ip_outbound_policy_summary)"
+    )
+}
+
+test_ip_policy_failures_and_interruption_restore_snapshot() {
+    (
+        egress_case ip-rollback
+        egress_add_ss
+        policy_active=1 policy_enabled=1
+        apply_egress_policy ip:prefer_ipv6
+        local before
+        before="$(sha256sum "$CONFIG_DIR/vpsbox-egress.json" "$NODE_CONFIG_DIR/30-egress-policy.json")"
+        policy_fail_restart=1
+        if apply_egress_policy ip:ipv4_only >/dev/null 2>&1; then fail '失败必须回滚'; fi
+        assert_eq "$before" "$(sha256sum "$CONFIG_DIR/vpsbox-egress.json" "$NODE_CONFIG_DIR/30-egress-policy.json")"
+        begin_node_transaction
+        prepare_node_stage
+        cp "$SS_CONFIG_PATH" "$NODE_TRANSACTION_STAGE/configs/10-ss.json"
+        prepare_staged_egress_policy ip:prefer_ipv4
+        mark_node_transaction_mutated
+        publish_staged_egress_policy
+        # shellcheck disable=SC2034 # 模拟下一进程恢复未完成事务。
+        ACTIVE_NODE_BACKUP='' ACTIVE_NODE_TRANSACTION_MUTATED=0
+        recover_pending_node_transaction
+        assert_eq "$before" "$(sha256sum "$CONFIG_DIR/vpsbox-egress.json" "$NODE_CONFIG_DIR/30-egress-policy.json")"
+        validate_egress_policy
+        assert_eq 1 "$policy_active"
+        assert_eq 1 "$policy_enabled"
+    )
+}
+
+test_ip_policy_legacy_cn_and_corrupt_cache_recovery() {
+    (
+        egress_case ip-legacy
+        egress_add_ss
+        egress_install_legacy_policy
+        assert_eq IPV4优先 "$(ip_outbound_policy_summary)"
+        policy_download_fail=1
+        apply_egress_policy ip:prefer_ipv6
+        jq -e '.version == 1 and .ip_strategy == "prefer_ipv6"' "$CONFIG_DIR/vpsbox-egress.json" >/dev/null
+        jq -e '[.route.rules[].action] == ["resolve","reject"] and .route.rules[0].strategy == "prefer_ipv6"' "$NODE_CONFIG_DIR/30-egress-policy.json" >/dev/null
+        local rule
+        rule="$(jq -r '.route.rule_set[0].path' "$NODE_CONFIG_DIR/30-egress-policy.json")"
+        printf damaged > "$rule"
+        apply_egress_policy off
+        validate_egress_policy
+        assert_eq IPV6优先 "$(ip_outbound_policy_summary)"
+        policy_download_fail=0
+        apply_egress_policy update
+        apply_egress_policy on
+        validate_egress_policy
+        assert_eq IPV6优先 "$(ip_outbound_policy_summary)"
+    )
+}
+
+test_ip_policy_rejects_bad_state_custom_routes_and_old_kernel() {
+    (
+        egress_case ip-invalid
+        egress_add_ss
+        export POLICY_TEST_VERSION=1.13.14
+        if apply_egress_policy ip:prefer_ipv6 >/dev/null 2>&1; then fail '旧内核不得启用 IP 策略'; fi
+        unset POLICY_TEST_VERSION
+        jq '.dns={servers:[]}' "$SS_CONFIG_PATH" > "$CONFIG_DIR/custom"
+        cat "$CONFIG_DIR/custom" > "$SS_CONFIG_PATH"
+        if apply_egress_policy ip:ipv4_only >/dev/null 2>&1; then fail '不得覆盖自定义 DNS'; fi
+        egress_add_ss
+        apply_egress_policy ip:prefer_ipv4
+        jq '.ip_strategy="ipv6_only"' "$CONFIG_DIR/vpsbox-egress.json" > "$CONFIG_DIR/bad"
+        cat "$CONFIG_DIR/bad" > "$CONFIG_DIR/vpsbox-egress.json"
+        if read_egress_policy_state >/dev/null; then fail '非法策略必须拒绝'; fi
+        if ip_outbound_policy_summary >/dev/null; then fail '异常不得显示默认'; fi
+    )
+}
+
+test_ip_policy_menu_and_node_status_labels() {
+    (
+        egress_case ip-menu
+        local calls="$CONFIG_DIR/calls" output="$CONFIG_DIR/menu"
+        : > "$calls"
+        apply_egress_policy() { printf '%s\n' "$1" >> "$calls"; }
+        pause() { :; }; clear() { :; }
+        ip_outbound_policy_menu <<< $'1\ny\n2\nn\n3\ny\n4\ny\n0' > "$output"
+        assert_eq $'ip:default\nip:prefer_ipv6\nip:ipv4_only' "$(cat "$calls")"
+        assert_file_contains "$output" '作用范围：所有 sing-box 节点'
+        assert_file_not_contains "$output" '允许使用|控制节点|无需修改'
+        singbox_summary_line() { :; }; node_summary() { :; }
+        node_menu <<< '0' > "$output"
+        assert_file_contains "$output" '[[]6[]] 回国流量限制（已关闭）'
+        assert_file_contains "$output" '[[]7[]] IP 出站策略（默认）'
+        egress_policy_menu <<< '0' > "$output"
+        assert_file_contains "$output" '当前状态：已关闭'
+        assert_file_contains "$output" '作用范围：所有 sing-box 节点'
+        assert_file_not_contains "$output" 'geolocation|摘要|更新时间|VLESS'
+    )
+}
+
 main() {
     run_registered_test_suite "${BASH_SOURCE[0]}" 'egress policy tests' \
         test_egress_default_and_preset_inherited_by_creation \
@@ -418,6 +581,13 @@ main() {
         test_egress_legacy_migration_is_explicit_and_recoverable \
         test_egress_domain_update_validation_and_compile_failures_are_atomic \
         test_egress_legacy_disable_and_reenable_upgrades_cached_rules \
-        test_egress_menu_dispatches_only_confirmed_choices
+        test_egress_menu_dispatches_only_confirmed_choices \
+        test_ip_policy_modes_preserve_nodes_and_cn_state \
+        test_ip_policy_only_v4_keeps_full_cn_check_before_filtering \
+        test_ip_policy_preset_inherits_and_last_deletion_keeps_preference \
+        test_ip_policy_failures_and_interruption_restore_snapshot \
+        test_ip_policy_legacy_cn_and_corrupt_cache_recovery \
+        test_ip_policy_rejects_bad_state_custom_routes_and_old_kernel \
+        test_ip_policy_menu_and_node_status_labels
 }
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

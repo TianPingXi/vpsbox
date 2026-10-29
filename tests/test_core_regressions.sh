@@ -1829,9 +1829,7 @@ test_ipv6_summary_states() {
     (
         local mock_runtime="0 0 0"
         local mock_addresses=""
-        local mock_config_current=0
 
-        IPV6_DISABLE_CONF="$TEST_TMP/ipv6-summary.conf"
         ipv6_disable_runtime_values() {
             [ "$mock_runtime" != "__FAIL__" ] || return 1
             printf '%s\n' "$mock_runtime"
@@ -1839,9 +1837,6 @@ test_ipv6_summary_states() {
         global_ipv6_addresses() {
             [ "$mock_addresses" != "__FAIL__" ] || return 1
             [ -z "$mock_addresses" ] || printf '%s\n' "$mock_addresses"
-        }
-        ipv6_disable_config_is_current() {
-            [ "$mock_config_current" -eq 1 ]
         }
 
         assert_eq "未检测到全局 IPv6" "$(ipv6_summary_state)" \
@@ -1853,23 +1848,9 @@ test_ipv6_summary_states() {
 
         mock_runtime="1 1 1"
         mock_addresses=""
-        assert_eq "已禁用（非 vpsbox 配置）" "$(ipv6_summary_state)" \
-            "无受管配置的运行时禁用必须与 vpsbox 禁用区分"
-
-        : > "$IPV6_DISABLE_CONF"
-        mock_config_current=1
         assert_eq "已禁用" "$(ipv6_summary_state)" \
-            "受管配置和运行状态一致时必须显示已禁用"
+            "运行参数禁用时必须显示已禁用"
 
-        mock_runtime="0 0 0"
-        assert_eq "禁用配置存在但未生效" "$(ipv6_summary_state)" \
-            "受管禁用配置未生效时必须明确提示"
-
-        mock_config_current=0
-        assert_eq "配置异常" "$(ipv6_summary_state)" \
-            "受管 IPv6 配置内容异常时必须拒绝误报"
-
-        rm -f -- "$IPV6_DISABLE_CONF"
         mock_runtime="__FAIL__"
         assert_eq "无法检测" "$(ipv6_summary_state)" \
             "IPv6 运行参数无法读取时必须显示无法检测"
@@ -1892,7 +1873,6 @@ test_self_check_classifies_and_summarizes_results() {
         local scan_fail_output="$TEST_TMP/self-check-scan-fail.out"
         local ipv6_ok_output="$TEST_TMP/self-check-ipv6-ok.out"
         local ipv6_external_output="$TEST_TMP/self-check-ipv6-external.out"
-        local ipv6_fail_output="$TEST_TMP/self-check-ipv6-fail.out"
         local ipv6_warn_output="$TEST_TMP/self-check-ipv6-warn.out"
         local status count actual_labels
         local mock_ntp_state=未安装 mock_journald_state=不支持
@@ -1908,7 +1888,6 @@ test_self_check_classifies_and_summarizes_results() {
         ntp_sync_state() { printf '%s\n' "$mock_ntp_state"; }
         bbr_state() { printf '%s\n' 未启用; }
         fq_state() { printf '%s\n' 未启用; }
-        ipv4_priority_state() { printf '%s\n' 未启用; }
         ipv6_summary_state() { printf '%s\n' "$mock_ipv6_state"; }
         ssh_effective_ports_listening() { return 0; }
         ssh_port_state() { printf '%s\n' 22; }
@@ -2003,7 +1982,6 @@ test_self_check_classifies_and_summarizes_results() {
 
         assert_file_contains "$first_output" 'INFO[[:space:]]+[|] BBR[[:space:]]+[|] 未启用'
         assert_file_contains "$first_output" 'INFO[[:space:]]+[|] fq[[:space:]]+[|] 未启用'
-        assert_file_contains "$first_output" 'INFO[[:space:]]+[|] IPv4 优先[[:space:]]+[|] 未启用'
         assert_file_contains "$first_output" 'INFO[[:space:]]+[|] IPv6[[:space:]]+[|] 未检测到全局 IPv6'
         assert_file_not_contains "$first_output" 'SSH 基础加固' \
             "一键检测不得继续显示已删除的 SSH 基础加固项目"
@@ -2021,7 +1999,7 @@ test_self_check_classifies_and_summarizes_results() {
             ' "$first_output"
         )"
         assert_eq \
-            $'运行用户\nvpsbox 命令\n首次安装\n运行时间\n系统时间\nNTP 同步\nsing-box\nsing-box 版本\n回国流量限制\n节点\n公网 IPv4\nSSH 端口\nFail2ban\n主机防火墙\nIPv4 优先\nIPv6\nBBR\nfq\nTCP 缓冲区\n日志限制\n日志占用\n系统重启' \
+            $'运行用户\nvpsbox 命令\n首次安装\n运行时间\n系统时间\nNTP 同步\nsing-box\nsing-box 版本\n回国流量限制\nIP 出站策略\n节点\n公网 IPv4\nSSH 端口\nFail2ban\n主机防火墙\nIPv6\nBBR\nfq\nTCP 缓冲区\n日志限制\n日志占用\n系统重启' \
             "$actual_labels" \
             "基准场景的一键检测项目集合与顺序必须保持稳定"
 
@@ -2029,13 +2007,9 @@ test_self_check_classifies_and_summarizes_results() {
         run_self_check > "$ipv6_ok_output" 2>&1 || fail "已启用 IPv6 的一键检测应正常完成"
         assert_file_contains "$ipv6_ok_output" 'OK[[:space:]]+[|] IPv6[[:space:]]+[|] 已启用（3 个全局地址）'
 
-        mock_ipv6_state="已禁用（非 vpsbox 配置）"
+        mock_ipv6_state="已禁用"
         run_self_check > "$ipv6_external_output" 2>&1 || fail "外部禁用 IPv6 的一键检测应正常完成"
-        assert_file_contains "$ipv6_external_output" 'INFO[[:space:]]+[|] IPv6[[:space:]]+[|] 已禁用（非 vpsbox 配置）'
-
-        mock_ipv6_state="禁用配置存在但未生效"
-        run_self_check > "$ipv6_fail_output" 2>&1 || fail "IPv6 配置未生效时一键检测仍应完成状态报告"
-        assert_file_contains "$ipv6_fail_output" 'FAIL[[:space:]]+[|] IPv6[[:space:]]+[|] 禁用配置存在但未生效'
+        assert_file_contains "$ipv6_external_output" 'OK[[:space:]]+[|] IPv6[[:space:]]+[|] 已禁用'
 
         mock_ipv6_state="无法检测"
         run_self_check > "$ipv6_warn_output" 2>&1 || fail "IPv6 无法检测时一键检测仍应完成状态报告"
@@ -2096,7 +2070,6 @@ test_self_check_classifies_and_summarizes_results() {
         ntp_sync_state() { printf '%s\n' 未运行; }
         bbr_state() { printf '%s\n' 未启用; }
         fq_state() { printf '%s\n' 未启用; }
-        ipv4_priority_state() { printf '%s\n' 未启用; }
         ssh_effective_ports_listening() { return 1; }
         ssh_port_state() { printf '%s\n' 22; }
         fail2ban_installed() { return 0; }
@@ -2116,7 +2089,7 @@ test_self_check_classifies_and_summarizes_results() {
         BBR_CONF="$TEST_TMP/damaged-bbr.conf"
         VPSBOX_STATE_DIR="$TEST_TMP/self-check-damaged-state"
         INSTALL_METADATA_FILE="$VPSBOX_STATE_DIR/install.env"
-        change_applied_recorded_readonly() { [ "$1" = GAI_CONF ]; }
+        change_applied_recorded_readonly() { return 1; }
         printf '%s\n' broken > "$JOURNALD_VPSBOX_CONF"
         printf '%s\n' broken > "$BBR_CONF"
         chmod 644 "$JOURNALD_VPSBOX_CONF"
@@ -2137,7 +2110,6 @@ test_self_check_classifies_and_summarizes_results() {
         assert_file_contains "$output" 'FAIL[[:space:]]+[|] 日志限制[[:space:]]+[|] 配置存在但未按预期生效或不安全'
         assert_file_contains "$output" 'FAIL[[:space:]]+[|] BBR[[:space:]]+[|] 配置存在但未生效'
         assert_file_contains "$output" 'FAIL[[:space:]]+[|] fq[[:space:]]+[|] 配置存在但未生效'
-        assert_file_contains "$output" 'FAIL[[:space:]]+[|] IPv4 优先[[:space:]]+[|] 配置记录存在但未生效'
         assert_file_not_contains "$output" '日志最大占用|单个日志最大' \
             "journald 配置损坏时不得继续显示派生值"
         assert_eq 1 "$(grep -c '^检测结果：' "$output")" \
@@ -2214,7 +2186,6 @@ test_self_check_classifies_and_summarizes_results() {
         ntp_sync_state() { printf '%s\n' 已同步; }
         bbr_state() { printf '%s\n' 已启用; }
         fq_state() { printf '%s\n' 已启用; }
-        ipv4_priority_state() { printf '%s\n' 已启用; }
         ssh_effective_ports_listening() { return 0; }
         ssh_port_state() { printf '%s\n' 22; }
         fail2ban_installed() { return 1; }
@@ -2496,7 +2467,6 @@ test_menu_dispatch_and_system_status_wiring() {
         detect_os() { OS=debian; }
         bbr_fq_summary_state() { :; }
         tcp_buffer_summary_state() { :; }
-        ipv4_priority_state() { :; }
         ipv6_summary_state() { :; }
         ssh_port_state() { :; }
         fail2ban_service_state() { :; }
@@ -2510,9 +2480,9 @@ test_menu_dispatch_and_system_status_wiring() {
         tcp_buffer_menu() { printf '%s\n' tcp_buffer_menu >> "$submenu_log"; }
         system_changes_menu() { printf '%s\n' system_changes_menu >> "$submenu_log"; }
 
-        system_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n0' >/dev/null
+        system_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n0' >/dev/null
     )
-    assert_eq $'update_system_packages\ncleanup_system_garbage\nchange_system_hostname\nenable_ntp_sync\nssh_port_change_menu\ninstall_fail2ban\nchange_ipv4_dns\nenable_ipv4_priority\ndisable_ipv6\nenable_bbr_fq\ntcp_buffer_menu\nlimit_systemd_journal\nsystem_changes_menu' \
+    assert_eq $'update_system_packages\ncleanup_system_garbage\nchange_system_hostname\nenable_ntp_sync\nssh_port_change_menu\ninstall_fail2ban\nchange_ipv4_dns\nenable_bbr_fq\ntcp_buffer_menu\nlimit_systemd_journal\nsystem_changes_menu' \
         "$(cat "$submenu_log")" "系统菜单全部编号必须分发到对应操作"
 
     : > "$submenu_log"
@@ -2522,10 +2492,10 @@ test_menu_dispatch_and_system_status_wiring() {
         system_change_state_text() { printf '%s\n' "无记录"; }
         run_menu_action() { printf '%s\n' "$*" >> "$submenu_log"; }
 
-        system_changes_menu <<< $'1\n2\n3\n4\n5\n6\n7\n8\n9\n0' >/dev/null
+        system_changes_menu <<< $'1\n2\n3\n4\n5\n6\n7\n0' >/dev/null
     )
-    assert_eq $'restore_vpsbox_system_changes\nrestore_vpsbox_system_change_interactive dns\nrestore_vpsbox_system_change_interactive bbr\nrestore_vpsbox_system_change_interactive ipv4_priority\nrestore_vpsbox_system_change_interactive fail2ban\nrestore_vpsbox_system_change_interactive journald\nrestore_vpsbox_system_change_interactive ntp\nrestore_vpsbox_system_change_interactive ipv6\nrestore_vpsbox_system_change_interactive tcp_buffer' \
-        "$(cat "$submenu_log")" "系统改动菜单必须把恢复全部和八个单项分发到对应操作"
+    assert_eq $'restore_vpsbox_system_changes\nrestore_vpsbox_system_change_interactive dns\nrestore_vpsbox_system_change_interactive bbr\nrestore_vpsbox_system_change_interactive fail2ban\nrestore_vpsbox_system_change_interactive journald\nrestore_vpsbox_system_change_interactive ntp\nrestore_vpsbox_system_change_interactive tcp_buffer' \
+        "$(cat "$submenu_log")" "系统改动菜单必须把恢复全部和六个单项分发到对应操作"
 
     for entry in "${third_party_cases[@]}"; do
         read -r choice action <<< "$entry"
@@ -2554,7 +2524,6 @@ test_menu_dispatch_and_system_status_wiring() {
         }
         bbr_fq_summary_state() { printf '已开启\n'; }
         tcp_buffer_summary_state() { printf '第一档（100–300 Mbps / 最大 8 MiB）\n'; }
-        ipv4_priority_state() { printf '已启用\n'; }
         ipv6_summary_state() { printf '已启用（3 个全局地址）\n'; }
         ssh_port_state() { printf '23333\n'; }
         fail2ban_service_state() { printf '运行中\n'; }
@@ -2566,7 +2535,7 @@ test_menu_dispatch_and_system_status_wiring() {
         system_menu <<< "0" > "$system_output"
         assert_file_contains "$system_output" 'BBR.*已开启'
         assert_file_contains "$system_output" 'TCP 缓冲区.*第一档.*8 MiB'
-        assert_file_contains "$system_output" 'IPv4.*已启用'
+        assert_file_not_contains "$system_output" 'IPv4 优先|禁用 IPv6'
         assert_file_contains "$system_output" 'IPv6.*已启用.*3 个全局地址'
         assert_file_contains "$system_output" '^ SSH：端口 23333$'
         assert_file_contains "$system_output" 'Fail2ban.*运行中.*已启用'
@@ -2576,18 +2545,16 @@ test_menu_dispatch_and_system_status_wiring() {
         assert_file_contains "$system_output" '^ [[]5[]] 修改 SSH 端口$'
         assert_file_contains "$system_output" '^ [[]6[]] 安装 Fail2ban$'
         assert_file_contains "$system_output" '^ [[]7[]] 修改 IPv4 DNS$'
-        assert_file_contains "$system_output" '^ [[]9[]] 禁用 IPv6$'
-        assert_file_contains "$system_output" '^ [[]10[]] 开启 BBR [+] fq$'
-        assert_file_contains "$system_output" '^ [[]11[]] TCP 缓冲区调优$'
-        assert_file_contains "$system_output" '^ [[]12[]] 限制 journald 日志大小$'
-        assert_file_contains "$system_output" '^ [[]13[]] 查看/恢复 vpsbox 系统改动$'
+        assert_file_contains "$system_output" '^ [[]8[]] 开启 BBR [+] fq$'
+        assert_file_contains "$system_output" '^ [[]9[]] TCP 缓冲区调优$'
+        assert_file_contains "$system_output" '^ [[]10[]] 限制 journald 日志大小$'
+        assert_file_contains "$system_output" '^ [[]11[]] 查看/恢复 vpsbox 系统改动$'
         assert_file_not_contains "$system_output" 'SSH 基础加固|查看 SSH 生效配置' \
             "系统优化菜单不得继续显示已删除的 SSH 功能"
         awk '
             /^ NTP：/ { ntp = NR }
             /^ SSH：/ { ssh = NR }
             /^ Fail2ban：/ { fail2ban = NR }
-            /^ IPv4 优先：/ { ipv4 = NR }
             /^ IPv6：/ { ipv6 = NR }
             /^ BBR [+] fq：/ { bbr = NR }
             /^ TCP 缓冲区：/ { tcp = NR }
@@ -2596,8 +2563,7 @@ test_menu_dispatch_and_system_status_wiring() {
             /^ SSH 安全$/ { ssh_menu = NR }
             /^ 网络$/ { network_menu = NR }
             END {
-                exit !(ntp < ssh && ssh < fail2ban && fail2ban < ipv4 &&
-                    ipv4 < ipv6 && ipv6 < bbr && bbr < tcp && tcp < journald &&
+                exit !(ntp < ssh && ssh < fail2ban && fail2ban < ipv6 && ipv6 < bbr && bbr < tcp && tcp < journald &&
                     journald < reboot && ssh_menu < network_menu)
             }
         ' "$system_output" || fail "系统优化状态和功能分组顺序必须保持一致"

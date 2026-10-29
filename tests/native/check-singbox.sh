@@ -60,6 +60,8 @@ if [ -n "${CN_NATIVE_DOMAIN_FILE:-}" ]; then
 fi
 printf '%s\n' '{"version":1,"rules":[{"ip_cidr":["127.0.0.2/32","::1/128"]},{"domain_suffix":["blocked-domain.native.test"],"domain_regex":["^cn[0-9]+[.]native[.]test$"]}]}' > "$work/test-cn.json"
 sing-box rule-set compile "$work/test-cn.json" -o "$work/test-cn.srs"
+printf '%s\n' '{"version":1,"rules":[{"ip_cidr":["127.0.0.2/32","2001:db8:dead::1/128"]},{"domain_suffix":["blocked-domain.native.test"]}]}' > "$work/ip-test-cn.json"
+sing-box rule-set compile "$work/ip-test-cn.json" -o "$work/ip-test-cn.srs"
 for family in ipv4 ipv6; do
     listen_mode() { printf '%s\n' "$family"; }
     write_config 29101 "$password" "$id"
@@ -70,4 +72,17 @@ for family in ipv4 ipv6; do
     sing-box check -C "$NODE_CONFIG_DIR"
     "$VPSBOX_NATIVE_PROBE" "$SINGBOX_NATIVE_BINARY" "$NODE_CONFIG_DIR" "$family" policy
     rm -- "$NODE_CONFIG_DIR/30-egress-policy.json"
+    for cn in false true; do
+        for strategy in default prefer_ipv4 prefer_ipv6 ipv4_only; do
+            write_config 29101 "$password" "$id"
+            write_vless_reality_config 29102 "$uuid" native.example "$private_key" "$short_id" "$id"
+            if [ "$cn" = true ] || [ "$strategy" != default ]; then
+                render_egress_policy_config "$(egress_policy_tags "$NODE_CONFIG_DIR")" "$work/ip-test-cn.srs" 2 "$strategy" "$cn" > "$NODE_CONFIG_DIR/30-egress-policy.json"
+            fi
+            sing-box check -C "$NODE_CONFIG_DIR"
+            mode=ip; [ "$cn" != true ] || mode=policy
+            "$VPSBOX_NATIVE_PROBE" "$SINGBOX_NATIVE_BINARY" "$NODE_CONFIG_DIR" "$family" "$mode" "$strategy"
+            rm -- "$NODE_CONFIG_DIR/30-egress-policy.json"
+        done
+    done
 done

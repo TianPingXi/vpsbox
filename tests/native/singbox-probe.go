@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -142,7 +143,7 @@ func forwardHTTP(host string, port int, httpHost string) (err error) {
 	if !bytes.Contains(data, []byte("vpsbox-native-ok")) {
 		return fmt.Errorf("no TCP echo")
 	}
-	return nil
+	return checkEgressFamily(data)
 }
 func forwardUDP(host string, port int) (err error) {
 	defer func() {
@@ -166,7 +167,65 @@ func forwardUDP(host string, port int) (err error) {
 	if !bytes.HasSuffix(b[:n], []byte("udp-native-ok")) {
 		return fmt.Errorf("no UDP echo")
 	}
+	return checkEgressFamily(b[:n])
+}
+
+var expectedEgressFamily string
+
+func checkEgressFamily(data []byte) error {
+	if expectedEgressFamily != "" && !bytes.Contains(data, []byte("|"+expectedEgressFamily+"|")) {
+		return fmt.Errorf("unexpected egress family, want %s", expectedEgressFamily)
+	}
 	return nil
+}
+
+func ipPolicyChecks(protocol, family, strategy string, cn bool, tcpPort, udpPort, tcp4Port, tcp6Port int) {
+	preferred := ""
+	if strategy == "prefer_ipv4" || strategy == "ipv4_only" {
+		preferred = "ipv4"
+	}
+	if strategy == "prefer_ipv6" {
+		preferred = "ipv6"
+	}
+	for _, c := range []struct {
+		host   string
+		allow  bool
+		family string
+	}{
+		{"127.0.0.1", true, "ipv4"}, {"::1", strategy != "ipv4_only", "ipv6"},
+		{"allowed.native.test", true, "ipv4"}, {"aaaa.native.test", strategy != "ipv4_only", "ipv6"},
+		{"dual.native.test", true, preferred}, {"missing.native.test", false, ""},
+		{"127.0.0.2", !cn, "ipv4"}, {"blocked-domain.native.test", !cn, "ipv4"},
+		{"mixed.native.test", !cn, preferred},
+	} {
+		expectedEgressFamily = c.family
+		if !c.allow {
+			expectedEgressFamily = ""
+		}
+		for _, network := range []string{"tcp", "udp"} {
+			var err error
+			if network == "tcp" {
+				err = forwardTCP(c.host, tcpPort)
+			} else {
+				err = forwardUDP(c.host, udpPort)
+			}
+			if (err == nil) != c.allow {
+				panic(fmt.Sprintf("%s %s %s cn=%v %s %s allow=%v: %v", protocol, family, strategy, cn, network, c.host, c.allow, err))
+			}
+		}
+		fmt.Printf("PASS %s %s %s cn=%v TCP/UDP %s allow=%v\n", protocol, family, strategy, cn, c.host, c.allow)
+	}
+	if strategy == "prefer_ipv4" || strategy == "prefer_ipv6" {
+		port := tcp6Port
+		expectedEgressFamily = "ipv6"
+		if strategy == "prefer_ipv6" {
+			port = tcp4Port
+			expectedEgressFamily = "ipv4"
+		}
+		must(forwardTCP("dual.native.test", port))
+		fmt.Printf("PASS %s %s %s TCP fallback\n", protocol, family, strategy)
+	}
+	expectedEgressFamily = ""
 }
 
 func forwardTLS(port int, name string) (err error) {
@@ -231,6 +290,10 @@ func main() { must(run()) }
 func run() error {
 	bin, dir, family := os.Args[1], os.Args[2], os.Args[3]
 	policy := len(os.Args) > 4 && os.Args[4] == "policy"
+	strategy := ""
+	if len(os.Args) > 5 {
+		strategy = os.Args[5]
+	}
 	ip := "127.0.0.1"
 	if family == "ipv6" {
 		ip = "::1"
@@ -239,7 +302,23 @@ func run() error {
 	target, e := net.Listen("tcp", "[::]:0")
 	must(e)
 	defer target.Close()
-	go http.Serve(target, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "vpsbox-native-ok") }))
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		address := r.Context().Value(http.LocalAddrContextKey).(net.Addr).String()
+		family := "ipv4"
+		if strings.HasPrefix(address, "[") {
+			family = "ipv6"
+		}
+		fmt.Fprint(w, "vpsbox-native-ok|"+family+"|")
+	})
+	go http.Serve(target, handler)
+	target4, e := net.Listen("tcp4", "127.0.0.1:0")
+	must(e)
+	defer target4.Close()
+	target6, e := net.Listen("tcp6", "[::1]:0")
+	must(e)
+	defer target6.Close()
+	go http.Serve(target4, handler)
+	go http.Serve(target6, handler)
 	udp, e := net.ListenPacket("udp", "[::]:0")
 	must(e)
 	defer udp.Close()
@@ -250,7 +329,11 @@ func run() error {
 			if e != nil {
 				return
 			}
-			_, _ = udp.WriteTo(b[:n], a)
+			family := "ipv4"
+			if a.(*net.UDPAddr).IP.To4() == nil {
+				family = "ipv6"
+			}
+			_, _ = udp.WriteTo(append([]byte("|"+family+"|"), b[:n]...), a)
 		}
 	}()
 	key, e := rsa.GenerateKey(rand.Reader, 2048)
@@ -270,12 +353,23 @@ func run() error {
 	vr := vi["tls"].(map[string]any)["reality"].(map[string]any)
 	vr["handshake"] = obj{"server": "127.0.0.1", "server_port": reality.Addr().(*net.TCPAddr).Port}
 	writeJSON(vlessPath, vless)
-	if policy {
+	if policy || strategy != "" {
 		path := filepath.Join(dir, "30-egress-policy.json")
-		config := readJSON(path)
+		config := obj{}
+		if _, err := os.Stat(path); err == nil {
+			config = readJSON(path)
+		}
+		if _, ok := config["route"]; !ok {
+			config["route"] = obj{"default_domain_resolver": "vpsbox-egress-dns"}
+		}
+		blocked6 := "::1"
+		if strategy != "" && policy {
+			blocked6 = "2001:db8:dead::1"
+		}
 		config["dns"] = obj{"servers": []any{obj{"type": "hosts", "tag": "vpsbox-egress-dns", "predefined": obj{
 			"allowed.native.test": []string{"127.0.0.1"}, "blocked4.native.test": []string{"127.0.0.2"},
-			"blocked6.native.test": []string{"::1"}, "mixed.native.test": []string{"127.0.0.1", "::1"},
+			"blocked6.native.test": []string{blocked6}, "mixed.native.test": []string{"127.0.0.1", blocked6},
+			"aaaa.native.test": []string{"::1"}, "dual.native.test": []string{"127.0.0.1", "::1"},
 			"blocked-domain.native.test": []string{"127.0.0.1"}, "child.blocked-domain.native.test": []string{"127.0.0.1"},
 			"cn123.native.test": []string{"127.0.0.1"},
 		}}}}
@@ -309,6 +403,11 @@ func run() error {
 			stopClient := start(bin, "run", "-c", client)
 			defer stopClient()
 			waitTCP("127.0.0.1:29103")
+			if strategy != "" {
+				ipPolicyChecks(protocol, family, strategy, policy, target.Addr().(*net.TCPAddr).Port, udp.LocalAddr().(*net.UDPAddr).Port,
+					target4.Addr().(*net.TCPAddr).Port, target6.Addr().(*net.TCPAddr).Port)
+				return
+			}
 			if policy {
 				policyChecks(protocol, family, target.Addr().(*net.TCPAddr).Port, udp.LocalAddr().(*net.UDPAddr).Port, reality.Addr().(*net.TCPAddr).Port)
 				return

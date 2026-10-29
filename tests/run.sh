@@ -17,7 +17,6 @@ declare -a SUITES=(
     test_egress_policy.sh
     test_fail2ban.sh
     test_package_timeouts.sh
-    test_ipv4_priority.sh
     test_firewall_watchdog.sh
     test_core_regressions.sh
     test_dual_nodes.sh

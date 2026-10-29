@@ -58,7 +58,6 @@ VLESS_STATE_FILE="$CONFIG_DIR/vpsbox-vless.env"
 SS_URI_FILE="$CONFIG_DIR/vpsbox-ss-uri.txt"
 VLESS_URI_FILE="$CONFIG_DIR/vpsbox-vless-uri.txt"
 BBR_CONF="/etc/sysctl.d/99-vpsbox-bbr.conf"
-IPV6_DISABLE_CONF="/etc/sysctl.d/99-vpsbox-disable-ipv6.conf"
 TCP_BUFFER_CONF="/etc/sysctl.d/99-vpsbox-tcp-buffer.conf"
 TCP_BUFFER_TIER_1_MAX=8388608
 TCP_BUFFER_TIER_2_MAX=16777216
@@ -74,7 +73,6 @@ NODE_TRANSACTION_BACKUP="$NODE_TRANSACTION_DIR/backup"
 NODE_TRANSACTION_STAGE="$NODE_TRANSACTION_DIR/stage"
 SINGBOX_UPDATE_TRANSACTION_DIR="$VPSBOX_STATE_DIR/singbox-update"
 SINGBOX_UPDATE_TRANSACTION_STATE="$SINGBOX_UPDATE_TRANSACTION_DIR/state"
-GAI_CONF="/etc/gai.conf"
 RESOLV_CONF="/etc/resolv.conf"
 RESOLVED_VPSBOX_CONF="/etc/systemd/resolved.conf.d/vpsbox.conf"
 NTP_SOURCES_BEGIN="# BEGIN VPSBOX NTP SOURCES"
@@ -156,8 +154,6 @@ ACTIVE_NTP_ROLLBACK_ARGS=()
 ACTIVE_NTP_SERVICE_ROLLBACK=0
 ACTIVE_NTP_SERVICE_ROLLBACK_ARGS=()
 ACTIVE_NTP_TRACKING_CANCEL=0
-ACTIVE_IPV6_REENABLE_SNAPSHOT=""
-ACTIVE_IPV6_REENABLE_OLD_VALUES=""
 ACTIVE_SINGBOX_UPDATE_BINARY=""
 ACTIVE_SINGBOX_UPDATE_BACKUP=""
 ACTIVE_SINGBOX_UPDATE_DIR=""
@@ -722,11 +718,6 @@ cleanup_vpsbox_runtime_host_transactions() {
         declare -F rollback_active_ntp_operation >/dev/null 2>&1; then
         rollback_active_ntp_operation ||
             warn "NTP 操作被中断，首次恢复记录清理或原状态恢复未能完整完成。"
-    fi
-    if [ -n "${ACTIVE_IPV6_REENABLE_SNAPSHOT:-}" ] &&
-        declare -F rollback_active_untracked_ipv6_reenable >/dev/null 2>&1; then
-        rollback_active_untracked_ipv6_reenable ||
-            warn "IPv6 重新启用被中断，配置或运行参数未能完整恢复；临时快照已保留。"
     fi
     if declare -F rollback_active_singbox_update >/dev/null 2>&1; then
         rollback_active_singbox_update ||
@@ -4009,13 +4000,18 @@ write_node_transaction_validation_spec() {
 read_egress_policy_state() {
     local file="${1:-$CONFIG_DIR/vpsbox-egress.json}"
     if [ ! -e "$file" ] && [ ! -L "$file" ]; then
-        printf '%s\n' '{"version":2,"enabled":false,"sha256":"","updated_at":0}'
+        printf '%s\n' '{"version":2,"enabled":false,"sha256":"","updated_at":0,"ip_strategy":"default"}'
         return 0
     fi
     node_file_is_secure "$file" || return 1
     [ "$(stat -c %s "$file")" -le 1024 ] || return 1
     jq -cse 'select(length == 1) | .[0] |
-        select(type == "object" and keys == ["enabled","sha256","updated_at","version"]) |
+        select(type == "object" and
+            (keys == ["enabled","sha256","updated_at","version"] or
+             keys == ["enabled","ip_strategy","sha256","updated_at","version"])) |
+        select((has("ip_strategy") | not) or
+            (.ip_strategy == "default" or .ip_strategy == "prefer_ipv4" or
+             .ip_strategy == "prefer_ipv6" or .ip_strategy == "ipv4_only")) |
         select((.version == 1 or .version == 2) and (.enabled | type == "boolean")) |
         select(.sha256 | type == "string" and (. == "" or test("^[a-f0-9]{64}$"))) |
         select(.updated_at | type == "number" and floor == . and . >= 0 and . < 4102444800) |
@@ -4053,20 +4049,29 @@ egress_policy_tags() {
 }
 
 render_egress_policy_config() {
-    local tags="$1" path="$2" version="${3:-2}"
+    local tags="$1" path="$2" version="${3:-2}" strategy="${4:-legacy}" enabled="${5:-true}"
     case "$version" in 1|2) ;; *) return 2 ;; esac
-    # v1 保留原配置，脚本更新不自动改写已部署策略；显式更新规则才迁移。
-    jq -nc --argjson tags "$tags" --arg path "$path" --argjson version "$version" '
+    case "$strategy" in legacy|default|prefer_ipv4|prefer_ipv6|ipv4_only) ;; *) return 2 ;; esac
+    case "$enabled" in true|false) ;; *) return 2 ;; esac
+    # 未设置 IP 策略的旧状态保留原配置，显式设置后才改变地址族选择。
+    jq -nc --argjson tags "$tags" --arg path "$path" --argjson version "$version" \
+        --arg strategy "$strategy" --argjson enabled "$enabled" '
+        def resolve($s): {inbound:$tags,action:"resolve",server:"vpsbox-egress-dns"} +
+            (if $s == "default" then {} else {strategy:$s} end);
         {inbound:$tags,rule_set:["vpsbox-cn"],action:"reject",method:"default",no_drop:true} as $reject |
         {
         dns:{servers:[{type:"local",tag:"vpsbox-egress-dns"}]},
-        route:{rules:((if $version == 2 then [
+        route:({rules:((if $strategy == "ipv4_only" then [
+            {inbound:$tags,ip_version:6,action:"reject",method:"default",no_drop:true}
+        ] else [] end) + (if $enabled then (if $version == 2 then [
             $reject,
             {inbound:$tags,action:"sniff",sniffer:["http","tls","quic"],timeout:"300ms"},
             $reject
         ] else [] end) + [
-            {inbound:$tags,action:"resolve",server:"vpsbox-egress-dns",strategy:"prefer_ipv4"},$reject
-        ]),rule_set:[{type:"local",tag:"vpsbox-cn",format:"binary",path:$path}]}}'
+            resolve(if $strategy == "legacy" or $strategy == "ipv4_only" then "prefer_ipv4" else $strategy end),$reject
+        ] + (if $strategy == "ipv4_only" then [resolve("ipv4_only"),$reject] else [] end)
+        else [resolve(if $strategy == "legacy" then "default" else $strategy end)] end))} +
+        (if $enabled then {rule_set:[{type:"local",tag:"vpsbox-cn",format:"binary",path:$path}]} else {} end))}'
 }
 
 validate_egress_rule_digest() {
@@ -4144,13 +4149,14 @@ build_egress_rules() (
 # structural 模式供关闭损坏规则时备份原状；不放宽状态/配置格式和路径安全要求。
 validate_egress_policy() {
     local dir="${1:-$NODE_CONFIG_DIR}" state_file="${2:-$CONFIG_DIR/vpsbox-egress.json}"
-    local rule_override="${3:-}" mode="${4:-full}" data enabled digest rule tags expected actual
+    local rule_override="${3:-}" mode="${4:-full}" data enabled digest rule="" tags expected actual strategy
     local fragment="$dir/30-egress-policy.json"
     if [ ! -e "$state_file" ] && [ ! -L "$state_file" ] &&
         [ ! -e "$fragment" ] && [ ! -L "$fragment" ]; then return 0; fi
     data="$(read_egress_policy_state "$state_file")" || return 1
     enabled="$(jq -r .enabled <<< "$data")"; digest="$(jq -r .sha256 <<< "$data")"
-    if [ "$enabled" = false ]; then
+    strategy="$(jq -r '.ip_strategy // "legacy"' <<< "$data")"
+    if [ "$enabled" = false ] && { [ "$strategy" = legacy ] || [ "$strategy" = default ]; }; then
         [ ! -e "$fragment" ] && [ ! -L "$fragment" ]
         return $?
     fi
@@ -4170,12 +4176,12 @@ validate_egress_policy() {
         [ ! -e "$fragment" ] && [ ! -L "$fragment" ]
         return $?
     fi
-    rule="$(egress_policy_rule_path "$digest")" || return 1
+    if [ "$enabled" = true ]; then rule="$(egress_policy_rule_path "$digest")" || return 1; fi
     node_file_is_secure "$fragment" || return 1
-    expected="$(render_egress_policy_config "$tags" "$rule" "$(jq -r .version <<< "$data")" | jq -Sc .)" || return 1
+    expected="$(render_egress_policy_config "$tags" "$rule" "$(jq -r .version <<< "$data")" "$strategy" "$enabled" | jq -Sc .)" || return 1
     actual="$(jq -Sce . "$fragment")" || return 1
     [ "$actual" = "$expected" ] || return 1
-    if [ "$mode" != structural ]; then
+    if [ "$enabled" = true ] && [ "$mode" != structural ]; then
         if [ -z "$rule_override" ]; then node_dir_is_secure "$CONFIG_DIR/rule-set" || return 1; fi
         validate_egress_rule_digest "${rule_override:-$rule}" "$digest" || return 1
     fi
@@ -4184,7 +4190,8 @@ validate_egress_policy() {
 check_node_config_directory() {
     local dir="$1" rule_override="${2:-}" working_dir=/ check_dir="$1" tmp="" status=0
     if is_systemd; then working_dir="$CONFIG_DIR"; fi
-    if [ -f "$dir/30-egress-policy.json" ] && [ -n "$rule_override" ]; then
+    if [ -f "$dir/30-egress-policy.json" ] && [ -n "$rule_override" ] &&
+        jq -e '(.route.rule_set // []) | length > 0' "$dir/30-egress-policy.json" >/dev/null; then
         tmp="$(mktemp -d "${TMPDIR:-/tmp}/vpsbox-egress-check.XXXXXX")" || return 1
         chmod 700 "$tmp" || { rm -rf -- "$tmp"; return 1; }
         if ! cp -- "$dir/"*.json "$tmp/" ||
@@ -4200,7 +4207,7 @@ check_node_config_directory() {
 }
 
 prepare_staged_egress_policy() {
-    local action="${1:-inherit}" stage="$NODE_TRANSACTION_STAGE" data enabled digest rule tags now version
+    local action="${1:-inherit}" stage="$NODE_TRANSACTION_STAGE" data enabled digest rule="" tags now version strategy
     data="$(read_egress_policy_state)" || return 1
     # 旧安装没有偏好时不落盘，不改变创建和删除的默认行为。
     if [ "$action" = inherit ] && [ ! -e "$CONFIG_DIR/vpsbox-egress.json" ]; then return 0; fi
@@ -4213,12 +4220,23 @@ prepare_staged_egress_policy() {
             version=2
         fi
     fi
-    case "$action" in on) enabled=true ;; off) enabled=false ;; update|inherit) ;; *) return 2 ;; esac
+    case "$action" in
+        on) enabled=true ;;
+        off) enabled=false ;;
+        update|inherit) ;;
+        ip:default|ip:prefer_ipv4|ip:prefer_ipv6|ip:ipv4_only)
+            data="$(jq -c --arg strategy "${action#ip:}" '.ip_strategy=$strategy' <<< "$data")" || return 1 ;;
+        *) return 2 ;;
+    esac
+    strategy="$(jq -r '.ip_strategy // "legacy"' <<< "$data")"
     tags='[]'
-    if [ "$enabled" = true ]; then
+    if [ "$enabled" = true ] || { [ "$strategy" != default ] && [ "$strategy" != legacy ]; }; then
         tags="$(egress_policy_tags "$stage/configs")" || {
-            err "现有节点包含自定义 DNS、路由或非受管入站，无法自动应用回国限制。"; return 1;
+            err "现有节点包含自定义 DNS、路由或非受管入站，无法自动应用出站策略。"; return 1;
         }
+    fi
+    if [ "$tags" != '[]' ]; then
+        egress_policy_kernel_supported || { err "请先通过 sing-box 管理更新至 1.14.4 或更高版本。"; return 1; }
     fi
     if [ "$action" = update ] || { [ "$enabled" = true ] && [ "$tags" != '[]' ]; }; then
         egress_policy_kernel_supported || { err "请先通过 sing-box 管理更新至 1.14.4 或更高版本。"; return 1; }
@@ -4242,9 +4260,9 @@ prepare_staged_egress_policy() {
     jq -c --argjson enabled "$enabled" '.enabled=$enabled' <<< "$data" > "$stage/egress-state.json" || return 1
     chmod 600 "$stage/egress-state.json" || return 1
     rm -f -- "$stage/configs/30-egress-policy.json" || return 1
-    if [ "$enabled" = true ] && [ "$tags" != '[]' ]; then
-        rule="$(egress_policy_rule_path "$digest")" || return 1
-        render_egress_policy_config "$tags" "$rule" "$version" > "$stage/configs/30-egress-policy.json" || return 1
+    if [ "$tags" != '[]' ]; then
+        if [ "$enabled" = true ]; then rule="$(egress_policy_rule_path "$digest")" || return 1; fi
+        render_egress_policy_config "$tags" "$rule" "$version" "$strategy" "$enabled" > "$stage/configs/30-egress-policy.json" || return 1
         chmod 600 "$stage/configs/30-egress-policy.json" || return 1
         validate_egress_policy "$stage/configs" "$stage/egress-state.json" "$stage/egress-rule.srs" || return 1
     fi
@@ -4264,7 +4282,8 @@ publish_staged_egress_policy() {
         if [ -e "$target" ] || [ -L "$target" ]; then
             if ! validate_egress_rule_digest "$target" "$digest"; then
                 # 不覆盖正在被策略引用的文件，避免内核自动重载早于事务提交。
-                if [ -e "$NODE_CONFIG_DIR/30-egress-policy.json" ] || [ -L "$target" ]; then
+                if { [ -f "$NODE_CONFIG_DIR/30-egress-policy.json" ] &&
+                    jq -e --arg path "$target" 'any(.route.rule_set[]?; .path == $path)' "$NODE_CONFIG_DIR/30-egress-policy.json" >/dev/null; } || [ -L "$target" ]; then
                     err "现有规则内容损坏；请先关闭限制，再更新规则。"; return 1
                 fi
                 node_file_is_secure "$target" && publish_staged_node_file "$stage/egress-rule.srs" "$target" || return 1
@@ -4283,14 +4302,18 @@ publish_staged_egress_policy() {
 
 apply_egress_policy() {
     local action="$1" file spec=full active=0 data desired reload=1
-    case "$action" in on|off|update) ;; *) return 2 ;; esac
+    case "$action" in on|off|update|ip:default|ip:prefer_ipv4|ip:prefer_ipv6|ip:ipv4_only) ;; *) return 2 ;; esac
     command -v jq >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1 || {
-        err "缺少 jq 或 sha256sum，无法管理回国流量限制。"; return 1
+        err "缺少 jq 或 sha256sum，无法管理节点出站策略。"; return 1
     }
     recover_pending_node_transaction || return 1
     require_valid_node_state_if_present structural || return 1
     data="$(read_egress_policy_state)" || return 1
-    if [ "$action" != update ]; then
+    if [[ "$action" == ip:* ]]; then
+        if [ "$(jq -r '.ip_strategy // "unset"' <<< "$data")" = "${action#ip:}" ] && validate_egress_policy; then
+            info "IP 出站策略已经是目标状态，无需更改。"; return 0
+        fi
+    elif [ "$action" != update ]; then
         desired=false; [ "$action" != on ] || desired=true
         if [ "$(jq -r .enabled <<< "$data")" = "$desired" ] && validate_egress_policy; then
             info "回国流量限制已经是目标状态，无需更改。"; return 0
@@ -4299,7 +4322,7 @@ apply_egress_policy() {
     if node_exists && ! service_manager_is_active && [ -n "$(singbox_config_pids)" ]; then
         err "服务管理器与 sing-box 进程状态不一致，请先处理残留进程。"; return 1
     fi
-    [ "$action" = on ] && node_exists || spec=static
+    if node_exists && { [ "$action" = on ] || [[ "$action" == ip:* ]]; }; then spec=full; else spec=static; fi
     begin_node_transaction "$spec" || return 1
     if ! prepare_node_stage || ! secure_config_dir; then cancel_unmodified_node_transaction; return 1; fi
     for file in "$SS_CONFIG_PATH" "$VLESS_CONFIG_PATH"; do
@@ -4316,17 +4339,18 @@ apply_egress_policy() {
         { [ ! -e "$NODE_CONFIG_DIR/30-egress-policy.json" ] && [ ! -e "$NODE_TRANSACTION_STAGE/configs/30-egress-policy.json" ]; }; then reload=0; fi
     if ! mark_node_transaction_mutated || ! publish_staged_egress_policy ||
         ! require_valid_node_state_if_present; then
-        fail_after_node_rollback "回国限制发布失败" "操作前"; return 1
+        fail_after_node_rollback "节点出站策略发布失败" "操作前"; return 1
     fi
     if [ "$reload" = 1 ] && [ "$active" = 1 ] && node_exists; then
         if ! restart_singbox_cleanly || ! verify_all_node_runtime; then
-            fail_after_node_rollback "回国限制运行验收失败" "操作前"; return 1
+            fail_after_node_rollback "节点出站策略运行验收失败" "操作前"; return 1
         fi
     fi
     if ! commit_node_transaction; then
-        fail_after_node_rollback "回国限制提交失败" "操作前"; return 1
+        fail_after_node_rollback "节点出站策略提交失败" "操作前"; return 1
     fi
-    info "回国流量限制设置已保存。"
+    if [[ "$action" == ip:* ]]; then info "IP 出站策略已切换为：$(ip_outbound_strategy_label "${action#ip:}")";
+    else info "回国流量限制设置已保存。"; fi
 }
 
 egress_policy_summary() {
@@ -4354,12 +4378,94 @@ egress_policy_summary() {
     printf '\n'
 }
 
+egress_policy_status_label() {
+    local summary
+    summary="$(egress_policy_summary)" || { printf '异常\n'; return 1; }
+    case "$summary" in
+        已开启*) printf '已开启\n' ;;
+        已关闭*) printf '已关闭\n' ;;
+        *) printf '异常\n'; return 1 ;;
+    esac
+}
+
+ip_outbound_strategy_label() {
+    case "$1" in
+        default) printf '默认\n' ;;
+        prefer_ipv4) printf 'IPV4优先\n' ;;
+        prefer_ipv6) printf 'IPV6优先\n' ;;
+        ipv4_only) printf '仅IPV4\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+ip_outbound_policy_summary() {
+    local data strategy
+    if [ ! -e "$CONFIG_DIR/vpsbox-egress.json" ] && [ ! -L "$CONFIG_DIR/vpsbox-egress.json" ] &&
+        [ ! -e "$NODE_CONFIG_DIR/30-egress-policy.json" ] && [ ! -L "$NODE_CONFIG_DIR/30-egress-policy.json" ]; then
+        ip_outbound_strategy_label default; return 0
+    fi
+    if ! data="$(read_egress_policy_state)" || ! validate_egress_policy; then
+        printf '异常\n'; return 1
+    fi
+    # 旧 CN 策略固定 prefer_ipv4，显示其实际行为，显式选择默认后解除。
+    strategy="$(jq -r '.ip_strategy // (if .enabled then "prefer_ipv4" else "default" end)' <<< "$data")"
+    ip_outbound_strategy_label "$strategy"
+}
+
+ip_outbound_policy_menu() {
+    local opt strategy
+    while true; do
+        clear 2>/dev/null || true
+        cat <<EOF
+========================================
+ IP 出站策略
+========================================
+ 当前策略：$(ip_outbound_policy_summary || true)
+ 作用范围：所有 sing-box 节点
+
+ [1] 默认
+ [2] IPV4优先
+ [3] IPV6优先
+ [4] 仅IPV4
+
+ [0] 返回上级
+========================================
+EOF
+        read -r -p '请选择 [0-4]：' opt || return 0
+        case "$opt" in
+            1) strategy=default ;;
+            2) strategy=prefer_ipv4 ;;
+            3) strategy=prefer_ipv6 ;;
+            4) strategy=ipv4_only ;;
+            0) return 0 ;;
+            *) continue ;;
+        esac
+        warn "正在运行的节点将重启以应用策略，已有连接可能中断；停止的服务保持停止。"
+        confirm_default_yes '确认应用？' || continue
+        run_menu_action apply_egress_policy "ip:$strategy"
+        pause
+    done
+}
+
 egress_policy_menu() {
     local opt action
     while true; do
-        printf '\n回国流量限制：%s\n' "$(egress_policy_summary || true)"
-        printf '作用于受管 VLESS Reality / Shadowsocks；更新规则使用官方国内域名 + CN IPv4/IPv6。\n[1] 开启\n[2] 关闭\n[3] 更新 CN 规则\n[0] 返回\n'
-        read -r -p '请选择：' opt || return 0
+        clear 2>/dev/null || true
+        cat <<EOF
+========================================
+ 回国流量限制
+========================================
+ 当前状态：$(egress_policy_status_label || true)
+ 作用范围：所有 sing-box 节点
+
+ [1] 开启
+ [2] 关闭
+ [3] 更新 CN 规则
+
+ [0] 返回上级
+========================================
+EOF
+        read -r -p '请选择 [0-3]：' opt || return 0
         case "$opt" in 1) action=on ;; 2) action=off ;; 3) action=update ;; 0) return 0 ;; *) continue ;; esac
         warn "正在运行的节点将重启以应用策略，已有连接可能中断；停止的服务保持停止。"
         confirm_default_yes '确认应用？' || continue
@@ -8070,15 +8176,6 @@ bbr_fq_summary_state() {
     fi
 }
 
-ipv4_priority_state() {
-    if [ -f "$GAI_CONF" ] &&
-        grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100([[:space:]]|$)' "$GAI_CONF"; then
-        echo "已启用"
-    else
-        echo "未启用"
-    fi
-}
-
 fail2ban_installed() {
     command -v fail2ban-client >/dev/null 2>&1
 }
@@ -10199,93 +10296,6 @@ EOF
     ipv4_dns_lines
 }
 
-cancel_unpublished_ipv4_priority_change() {
-    local prior_state="$1"
-
-    [ "$prior_state" = "pending" ] && return 0
-    if ! cancel_unmodified_change_transaction GAI_CONF; then
-        warn "IPv4 优先尚未修改，但本次恢复记录未能完整清理。"
-    fi
-    return 0
-}
-
-enable_ipv4_priority() {
-    local parent tmp prior_state
-
-    prior_state="$(change_restore_state_readonly GAI_CONF)" || return 1
-    if [ "$prior_state" = "pending" ]; then
-        err "检测到尚未处理的 IPv4 优先修改事务，请先在恢复菜单中检查或恢复。"
-        return 1
-    fi
-
-    info "正在开启 IPv4 优先，不会禁用 IPv6。"
-    if [ "$(ipv4_priority_state)" = "已启用" ]; then
-        info "IPv4 优先已开启，无需重复修改。"
-        return 0
-    fi
-    [ ! -L "$GAI_CONF" ] || { err "$GAI_CONF 是符号链接，已拒绝修改。"; return 1; }
-    prior_state="$(change_restore_state GAI_CONF)" || return 1
-    if [ "$prior_state" = "pending" ]; then
-        err "检测到尚未处理的 IPv4 优先修改事务，请先在恢复菜单中检查或恢复。"
-        return 1
-    fi
-    backup_change_file_once GAI_CONF "$GAI_CONF" || { err "记录 IPv4 优先原配置失败，已取消修改。"; return 1; }
-    begin_change_transaction GAI_CONF || {
-        cancel_unpublished_ipv4_priority_change "$prior_state"
-        err "记录 IPv4 优先事务失败，已取消修改。"
-        return 1
-    }
-
-    parent="$(dirname "$GAI_CONF")"
-    [ -d "$parent" ] && [ ! -L "$parent" ] || {
-        cancel_unpublished_ipv4_priority_change "$prior_state"
-        err "IPv4 优先配置目录无效或为符号链接：$parent"
-        return 1
-    }
-    tmp="$(mktemp "$parent/.gai.conf.vpsbox.XXXXXX")" || {
-        cancel_unpublished_ipv4_priority_change "$prior_state"
-        return 1
-    }
-    if [ -f "$GAI_CONF" ]; then
-        cp -a -- "$GAI_CONF" "$tmp" || {
-            rm -f -- "$tmp"
-            cancel_unpublished_ipv4_priority_change "$prior_state"
-            return 1
-        }
-    else
-        chmod 644 "$tmp" || {
-            rm -f -- "$tmp"
-            cancel_unpublished_ipv4_priority_change "$prior_state"
-            return 1
-        }
-    fi
-
-    if ! sed -i '/^[#[:space:]]*precedence[[:space:]]\+::ffff:0:0\/96[[:space:]]\+/d' "$tmp"; then
-        rm -f -- "$tmp"
-        cancel_unpublished_ipv4_priority_change "$prior_state"
-        err "清理旧 IPv4 优先配置失败。"
-        return 1
-    fi
-
-    if ! printf '%s\n' 'precedence ::ffff:0:0/96 100' >> "$tmp"; then
-        rm -f -- "$tmp"
-        cancel_unpublished_ipv4_priority_change "$prior_state"
-        err "写入 IPv4 优先配置失败。"
-        return 1
-    fi
-    if ! chown root:root "$tmp" || ! mv -f -- "$tmp" "$GAI_CONF"; then
-        rm -f -- "$tmp"
-        cancel_unpublished_ipv4_priority_change "$prior_state"
-        err "原子替换 IPv4 优先配置失败。"
-        return 1
-    fi
-
-    info "已写入：precedence ::ffff:0:0/96 100"
-    mark_change_applied GAI_CONF || return 1
-    info "当前 IPv4 优先：$(ipv4_priority_state)"
-    info "可用 curl ip.sb 或 curl -v ip.sb 验证默认出口。"
-}
-
 sshd_binary() {
     local bin
 
@@ -11848,34 +11858,6 @@ global_ipv6_addresses() {
         awk '$3 == "inet6" && $4 != "" { print $2, $4 }'
 }
 
-current_ssh_connection_uses_ipv6() {
-    local client_ip client_port server_ip server_port extra
-
-    [ -n "${SSH_CONNECTION:-}" ] || return 1
-    read -r client_ip client_port server_ip server_port extra <<< "$SSH_CONNECTION"
-    [ -n "$client_ip" ] &&
-        [[ "$client_port" =~ ^[0-9]+$ ]] &&
-        [ -n "$server_ip" ] &&
-        [[ "$server_port" =~ ^[0-9]+$ ]] &&
-        [ -z "${extra:-}" ] &&
-        [[ "$server_ip" == *:* ]]
-}
-
-render_ipv6_disable_config() {
-    # --- BEGIN GENERATED TEMPLATE: disable IPv6 sysctl drop-in ---
-    cat <<'EOF'
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
-EOF
-    # --- END GENERATED TEMPLATE: disable IPv6 sysctl drop-in ---
-}
-
-ipv6_disable_config_is_current() {
-    [ -f "$IPV6_DISABLE_CONF" ] && [ ! -L "$IPV6_DISABLE_CONF" ] || return 1
-    render_ipv6_disable_config | cmp -s - "$IPV6_DISABLE_CONF"
-}
-
 ipv6_disable_runtime_values() {
     local all default lo
 
@@ -11884,22 +11866,6 @@ ipv6_disable_runtime_values() {
     lo="$(sysctl -n net.ipv6.conf.lo.disable_ipv6 2>/dev/null)" || return 1
     [[ "$all" =~ ^[01]$ ]] && [[ "$default" =~ ^[01]$ ]] && [[ "$lo" =~ ^[01]$ ]] || return 1
     printf '%s %s %s\n' "$all" "$default" "$lo"
-}
-
-ipv6_runtime_matches_values() {
-    local expected_all="$1" expected_default="$2" expected_lo="$3"
-    local actual
-
-    actual="$(ipv6_disable_runtime_values)" || return 1
-    [ "$actual" = "$expected_all $expected_default $expected_lo" ]
-}
-
-ipv6_disabled_runtime_is_current() {
-    local addresses
-
-    ipv6_runtime_matches_values 1 1 1 || return 1
-    addresses="$(global_ipv6_addresses)" || return 1
-    [ -z "$addresses" ]
 }
 
 ipv6_summary_state() {
@@ -11914,20 +11880,9 @@ ipv6_summary_state() {
         return 0
     }
 
-    if [ -e "$IPV6_DISABLE_CONF" ] || [ -L "$IPV6_DISABLE_CONF" ]; then
-        if ! ipv6_disable_config_is_current; then
-            printf '%s\n' "配置异常"
-        elif [ "$runtime" = "1 1 1" ] && [ -z "$addresses" ]; then
-            printf '%s\n' "已禁用"
-        else
-            printf '%s\n' "禁用配置存在但未生效"
-        fi
-        return 0
-    fi
-
     if [ "$runtime" = "1 1 1" ]; then
         if [ -z "$addresses" ]; then
-            printf '%s\n' "已禁用（非 vpsbox 配置）"
+            printf '%s\n' "已禁用"
         else
             printf '%s\n' "无法检测"
         fi
@@ -11937,310 +11892,6 @@ ipv6_summary_state() {
     else
         printf '%s\n' "未检测到全局 IPv6"
     fi
-}
-
-restore_ipv6_runtime_values() {
-    local old_all="$1" old_default="$2" old_lo="$3" failed=0
-
-    sysctl -w "net.ipv6.conf.all.disable_ipv6=$old_all" >/dev/null 2>&1 || failed=1
-    sysctl -w "net.ipv6.conf.default.disable_ipv6=$old_default" >/dev/null 2>&1 || failed=1
-    sysctl -w "net.ipv6.conf.lo.disable_ipv6=$old_lo" >/dev/null 2>&1 || failed=1
-    [ "$failed" -eq 0 ] && ipv6_runtime_matches_values "$old_all" "$old_default" "$old_lo"
-}
-
-cancel_unmodified_ipv6_change() {
-    if ! cancel_unmodified_change_transaction \
-        IPV6_CONF IPV6_ALL IPV6_DEFAULT IPV6_LO; then
-        err "清理尚未应用的 IPv6 修改记录失败，请先使用恢复菜单检查系统改动。"
-        return 1
-    fi
-}
-
-prepare_ipv6_disable_change() {
-    local old_all="$1" old_default="$2" old_lo="$3" parent="$4" output_var="$5"
-    local staged_file
-
-    if ! backup_change_file_once IPV6_CONF "$IPV6_DISABLE_CONF" ||
-        ! manifest_set_once IPV6_ALL "$old_all" ||
-        ! manifest_set_once IPV6_DEFAULT "$old_default" ||
-        ! manifest_set_once IPV6_LO "$old_lo"; then
-        cancel_unmodified_ipv6_change || true
-        err "记录 IPv6 原配置失败，已取消修改。"
-        return 1
-    fi
-    if ! begin_change_transaction IPV6_CONF; then
-        cancel_unmodified_ipv6_change || true
-        err "记录 IPv6 修改事务失败，已取消修改。"
-        return 1
-    fi
-
-    staged_file="$(mktemp "$parent/.vpsbox-disable-ipv6.XXXXXX")" || {
-        cancel_unmodified_ipv6_change || true
-        return 1
-    }
-    if ! render_ipv6_disable_config > "$staged_file" ||
-        ! chown root:root "$staged_file" ||
-        ! chmod 644 "$staged_file"; then
-        rm -f -- "$staged_file" || warn "清理 IPv6 临时配置失败：$staged_file"
-        cancel_unmodified_ipv6_change || true
-        err "生成 IPv6 配置失败，未修改系统。"
-        return 1
-    fi
-    printf -v "$output_var" '%s' "$staged_file"
-}
-
-rollback_failed_ipv6_disable() {
-    local old_all="$1" old_default="$2" old_lo="$3" failure_stage="$4"
-    local failure_text
-
-    case "$failure_stage" in
-        runtime) failure_text="禁用 IPv6 失败" ;;
-        publish) failure_text="保存 IPv6 配置失败" ;;
-        *) return 2 ;;
-    esac
-
-    if restore_ipv6_runtime_values "$old_all" "$old_default" "$old_lo"; then
-        if cancel_unmodified_ipv6_change; then
-            err "$failure_text；已恢复记录的运行参数，持久配置未改动。"
-        else
-            err "$failure_text；运行参数已恢复，但事务记录清理失败。"
-        fi
-    else
-        err "$failure_text，且记录的运行参数未能确认完整恢复。"
-        err "已保留事务记录，请通过恢复菜单或 IPv4/VPS 控制台处理。"
-    fi
-}
-
-disable_ipv6() {
-    local addresses runtime_values old_all old_default old_lo
-    local parent tmp interface address tracking_state
-
-    tracking_state="$(change_restore_state_readonly IPV6_CONF)" || return 1
-    if [ "$tracking_state" = "pending" ]; then
-        err "检测到尚未处理的 IPv6 修改事务，请先在恢复菜单中检查或恢复。"
-        return 1
-    fi
-
-    if ! addresses="$(global_ipv6_addresses)"; then
-        err "无法读取全局 IPv6 地址，已取消禁用。"
-        return 1
-    fi
-    if [ -z "$addresses" ]; then
-        info "未检测到全局 IPv6 地址，无需禁用。"
-        return 0
-    fi
-
-    echo "检测到以下全局 IPv6 地址："
-    while read -r interface address; do
-        [ -n "$interface" ] && [ -n "$address" ] || continue
-        printf ' - %s：%s\n' "$interface" "$address"
-    done <<< "$addresses"
-
-    if current_ssh_connection_uses_ipv6; then
-        warn "当前 SSH 会话正在通过 IPv6 连接，禁用后会立即断开。"
-        warn "请改用 IPv4 SSH 或 VPS 控制台后重试。"
-        return 0
-    fi
-
-    warn "禁用后，IPv6 地址、路由和现有 IPv6 连接会立即失效。"
-    warn "现有节点配置不会自动改写；请先确认节点和其他服务可通过 IPv4 访问。"
-    if ! confirm_default_yes "是否禁用 IPv6？"; then
-        info "已取消禁用 IPv6。"
-        return 0
-    fi
-
-    parent="$(dirname "$IPV6_DISABLE_CONF")"
-    [ -d "$parent" ] && [ ! -L "$parent" ] || {
-        err "IPv6 配置目录不存在或不安全：$parent"
-        return 1
-    }
-    if [ -e "$IPV6_DISABLE_CONF" ] || [ -L "$IPV6_DISABLE_CONF" ]; then
-        [ -f "$IPV6_DISABLE_CONF" ] && [ ! -L "$IPV6_DISABLE_CONF" ] || {
-            err "$IPV6_DISABLE_CONF 不是安全的普通文件，已拒绝覆盖。"
-            return 1
-        }
-        if ! ipv6_disable_config_is_current; then
-            err "$IPV6_DISABLE_CONF 已存在且内容不属于当前配置，已拒绝覆盖。"
-            return 1
-        fi
-    fi
-
-    tracking_state="$(change_restore_state IPV6_CONF)" || return 1
-    if [ "$tracking_state" = "pending" ]; then
-        err "检测到尚未处理的 IPv6 修改事务，请先在恢复菜单中检查或恢复。"
-        return 1
-    fi
-    if [ "$tracking_state" = "none" ] && ipv6_disable_config_is_current; then
-        err "检测到没有原始恢复记录的 vpsbox IPv6 禁用配置。"
-        err "请先在系统改动菜单中重新启用 IPv6，再重新执行禁用以建立恢复基线。"
-        return 1
-    fi
-    if [ "$tracking_state" = "none" ] && {
-        [ -n "$(manifest_value BACKUP_IPV6_CONF 2>/dev/null || true)" ] ||
-            [ -n "$(manifest_value IPV6_ALL 2>/dev/null || true)" ] ||
-            [ -n "$(manifest_value IPV6_DEFAULT 2>/dev/null || true)" ] ||
-            [ -n "$(manifest_value IPV6_LO 2>/dev/null || true)" ];
-    }; then
-        cancel_unmodified_ipv6_change || return 1
-    fi
-
-    runtime_values="$(ipv6_disable_runtime_values)" || {
-        err "无法读取 IPv6 内核运行参数，未修改系统。"
-        return 1
-    }
-    read -r old_all old_default old_lo <<< "$runtime_values"
-
-    prepare_ipv6_disable_change "$old_all" "$old_default" "$old_lo" "$parent" tmp ||
-        return 1
-
-    if ! sysctl -p "$tmp" >/dev/null 2>&1 || ! ipv6_disabled_runtime_is_current; then
-        rm -f -- "$tmp" || warn "清理 IPv6 临时配置失败：$tmp"
-        rollback_failed_ipv6_disable "$old_all" "$old_default" "$old_lo" runtime
-        return 1
-    fi
-
-    if ! mv -f -- "$tmp" "$IPV6_DISABLE_CONF"; then
-        rm -f -- "$tmp" || warn "清理 IPv6 临时配置失败：$tmp"
-        rollback_failed_ipv6_disable "$old_all" "$old_default" "$old_lo" publish
-        return 1
-    fi
-
-    if ! mark_change_applied IPV6_CONF; then
-        err "IPv6 已禁用，但恢复记录提交失败；已保留待恢复记录。"
-        return 1
-    fi
-
-    info "IPv6 已禁用，重启后仍会保持禁用。"
-    info "可通过 vpsbox 系统改动恢复菜单恢复禁用前状态。"
-}
-
-report_ipv6_reenable_address_state() {
-    local addresses
-
-    if ! addresses="$(global_ipv6_addresses)"; then
-        warn "IPv6 开关已恢复，但无法读取全局 IPv6 地址；请通过 IPv4 或 VPS 控制台检查。"
-    elif [ -z "$addresses" ]; then
-        warn "IPv6 开关已恢复，但全局 IPv6 地址尚未重新出现。"
-        warn "请保持 IPv4 或控制台连接，并在方便时重启 VPS。"
-    else
-        info "已重新检测到全局 IPv6 地址。"
-    fi
-}
-
-ipv6_reenable_snapshot_path_allowed() {
-    local snapshot="$1" parent expected_parent base
-
-    [ -n "$snapshot" ] || return 1
-    parent="$(dirname -- "$snapshot")" || return 1
-    expected_parent="$(dirname -- "$IPV6_DISABLE_CONF")" || return 1
-    base="${snapshot##*/}"
-    [ "$parent" = "$expected_parent" ] && [[ "$base" == .vpsbox-enable-ipv6.* ]]
-}
-
-arm_untracked_ipv6_reenable_rollback() {
-    local snapshot="$1" old_all="$2" old_default="$3" old_lo="$4"
-
-    [ -z "${ACTIVE_IPV6_REENABLE_SNAPSHOT:-}" ] || return 1
-    ipv6_reenable_snapshot_path_allowed "$snapshot" &&
-        [ -f "$snapshot" ] && [ ! -L "$snapshot" ] || return 1
-    [[ "$old_all" =~ ^[01]$ ]] && [[ "$old_default" =~ ^[01]$ ]] &&
-        [[ "$old_lo" =~ ^[01]$ ]] || return 1
-    ACTIVE_IPV6_REENABLE_OLD_VALUES="$old_all $old_default $old_lo"
-    # 最后登记快照作为活动标记；在此之前尚未修改配置或运行参数。
-    ACTIVE_IPV6_REENABLE_SNAPSHOT="$snapshot"
-}
-
-clear_active_untracked_ipv6_reenable() {
-    ACTIVE_IPV6_REENABLE_SNAPSHOT=""
-    ACTIVE_IPV6_REENABLE_OLD_VALUES=""
-}
-
-rollback_active_untracked_ipv6_reenable() {
-    local snapshot="${ACTIVE_IPV6_REENABLE_SNAPSHOT:-}"
-    local old_values="${ACTIVE_IPV6_REENABLE_OLD_VALUES:-}"
-    local old_all old_default old_lo failed=0
-
-    [ -n "$snapshot" ] || return 0
-    ipv6_reenable_snapshot_path_allowed "$snapshot" &&
-        [ -f "$snapshot" ] && [ ! -L "$snapshot" ] || return 1
-    read -r old_all old_default old_lo <<< "$old_values"
-    [[ "$old_all" =~ ^[01]$ ]] && [[ "$old_default" =~ ^[01]$ ]] &&
-        [[ "$old_lo" =~ ^[01]$ ]] || return 1
-
-    if [ -e "$IPV6_DISABLE_CONF" ] || [ -L "$IPV6_DISABLE_CONF" ]; then
-        ipv6_disable_config_is_current || failed=1
-    else
-        restore_file_atomically_from_snapshot "$snapshot" "$IPV6_DISABLE_CONF" || failed=1
-    fi
-    restore_ipv6_runtime_values "$old_all" "$old_default" "$old_lo" || failed=1
-    [ "$failed" -eq 0 ] || return 1
-
-    clear_active_untracked_ipv6_reenable
-    rm -f -- "$snapshot" || warn "IPv6 原状态已恢复，但临时快照清理失败：$snapshot"
-}
-
-reenable_untracked_ipv6() {
-    local runtime_values old_all old_default old_lo parent snapshot failed=0
-
-    ipv6_disable_config_is_current || {
-        err "未找到可安全识别的 vpsbox IPv6 禁用配置，已拒绝自动处理。"
-        return 1
-    }
-    [ "$(change_restore_state IPV6_CONF)" = "none" ] || {
-        err "检测到 IPv6 恢复记录，请使用正常恢复流程。"
-        return 1
-    }
-    runtime_values="$(ipv6_disable_runtime_values)" || {
-        err "无法读取 IPv6 内核运行参数，未修改系统。"
-        return 1
-    }
-    read -r old_all old_default old_lo <<< "$runtime_values"
-    parent="$(dirname "$IPV6_DISABLE_CONF")"
-    [ -d "$parent" ] && [ ! -L "$parent" ] || {
-        err "IPv6 配置目录不存在或不安全：$parent"
-        return 1
-    }
-    snapshot="$(mktemp "$parent/.vpsbox-enable-ipv6.XXXXXX")" || return 1
-    if ! cp -a -- "$IPV6_DISABLE_CONF" "$snapshot"; then
-        rm -f -- "$snapshot"
-        err "创建 IPv6 重新启用快照失败，未修改系统。"
-        return 1
-    fi
-    if ! arm_untracked_ipv6_reenable_rollback "$snapshot" \
-        "$old_all" "$old_default" "$old_lo"; then
-        rm -f -- "$snapshot"
-        err "登记 IPv6 中断回滚状态失败，未修改系统。"
-        return 1
-    fi
-
-    sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || failed=1
-    sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || failed=1
-    sysctl -w net.ipv6.conf.lo.disable_ipv6=0 >/dev/null 2>&1 || failed=1
-    if [ "$failed" -ne 0 ] || ! ipv6_runtime_matches_values 0 0 0; then
-        if ! rollback_active_untracked_ipv6_reenable; then
-            err "重新启用 IPv6 失败，且禁用配置或原运行参数未能完整恢复。"
-            err "请通过 IPv4 或 VPS 控制台检查 IPv6 配置。"
-        else
-            err "重新启用 IPv6 失败，已恢复原禁用配置和运行参数。"
-        fi
-        return 1
-    fi
-
-    if ! rm -f -- "$IPV6_DISABLE_CONF"; then
-        if ! rollback_active_untracked_ipv6_reenable; then
-            err "移除 IPv6 禁用配置失败，且原配置或运行参数未能完整恢复。"
-            err "请通过 IPv4 或 VPS 控制台检查 IPv6 配置。"
-        else
-            err "移除 IPv6 禁用配置失败，已恢复原禁用配置和运行参数。"
-        fi
-        return 1
-    fi
-
-    # 文件移除且运行参数已验收即提交；此后中断不应回滚成功状态。
-    clear_active_untracked_ipv6_reenable
-    rm -f -- "$snapshot" || warn "IPv6 已重新启用，但临时快照清理失败：$snapshot"
-    info "vpsbox IPv6 禁用配置已移除，all/default/lo 已设置为 0。"
-    report_ipv6_reenable_address_state
 }
 
 tcp_buffer_tier_max() {
@@ -17308,6 +16959,11 @@ self_check_node_stack() {
     else
         check_fail "回国流量限制" "$policy_summary"
     fi
+    if policy_summary="$(ip_outbound_policy_summary)"; then
+        check_info "IP 出站策略" "$policy_summary"
+    else
+        check_fail "IP 出站策略" "$policy_summary"
+    fi
     for protocol in vless ss; do
         protocol_status="$(protocol_node_status "$protocol" 2>/dev/null || true)"
         case "$protocol_status" in
@@ -17451,25 +17107,12 @@ self_check_access_security() {
 }
 
 self_check_network_tuning() {
-    local bbr_config_expected=0 ipv4_priority_expected=0 state
-
-    if change_applied_recorded_readonly GAI_CONF; then
-        ipv4_priority_expected=1
-    fi
-    state="$(ipv4_priority_state)"
-    if [ "$state" = "已启用" ]; then
-        check_ok "IPv4 优先" "$state"
-    elif [ "$ipv4_priority_expected" -eq 1 ]; then
-        check_fail "IPv4 优先" "配置记录存在但未生效"
-    else
-        check_info "IPv4 优先" "$state"
-    fi
+    local bbr_config_expected=0 state
 
     state="$(ipv6_summary_state)"
     case "$state" in
         已禁用|已启用（*个全局地址）) check_ok "IPv6" "$state" ;;
-        "已禁用（非 vpsbox 配置）"|"未检测到全局 IPv6") check_info "IPv6" "$state" ;;
-        "禁用配置存在但未生效"|配置异常) check_fail "IPv6" "$state" ;;
+        "未检测到全局 IPv6") check_info "IPv6" "$state" ;;
         *) check_warn "IPv6" "$state" ;;
     esac
 
@@ -18054,18 +17697,16 @@ cleanup_system_garbage() {
 }
 
 system_change_items() {
-    printf '%s\n' dns bbr ipv4_priority fail2ban journald ntp ipv6 tcp_buffer
+    printf '%s\n' dns bbr fail2ban journald ntp tcp_buffer
 }
 
 system_change_label() {
     case "$1" in
         dns) printf '%s\n' "IPv4 DNS" ;;
         bbr) printf '%s\n' "BBR + fq" ;;
-        ipv4_priority) printf '%s\n' "IPv4 优先" ;;
         fail2ban) printf '%s\n' "Fail2ban" ;;
         journald) printf '%s\n' "journald 日志限制" ;;
         ntp) printf '%s\n' "NTP 时间同步" ;;
-        ipv6) printf '%s\n' "IPv6 禁用" ;;
         tcp_buffer) printf '%s\n' "TCP 缓冲区" ;;
         *) return 2 ;;
     esac
@@ -18075,11 +17716,9 @@ system_change_members() {
     case "$1" in
         dns) printf '%s\n' DNS_RESOLV DNS_RESOLVED ;;
         bbr) printf '%s\n' BBR_CONF ;;
-        ipv4_priority) printf '%s\n' GAI_CONF ;;
         fail2ban) printf '%s\n' FAIL2BAN_SSHD ;;
         journald) printf '%s\n' JOURNALD_CONF ;;
         ntp) printf '%s\n' NTP_CONF ;;
-        ipv6) printf '%s\n' IPV6_CONF ;;
         tcp_buffer) printf '%s\n' TCP_BUFFER_CONF ;;
         *) return 2 ;;
     esac
@@ -18100,19 +17739,13 @@ system_change_state() {
             applied) result=applied ;;
         esac
     done <<< "$members"
-    if [ "$result" = "none" ] && [ "$item" = "ipv6" ] &&
-        ipv6_disable_config_is_current; then
-        printf '%s\n' legacy
-    else
-        printf '%s\n' "$result"
-    fi
+    printf '%s\n' "$result"
 }
 
 system_change_state_text() {
     case "$(system_change_state "$1")" in
         pending) printf '%s\n' "未完成，可恢复" ;;
         applied) printf '%s\n' "可恢复" ;;
-        legacy) printf '%s\n' "可重新启用（无原始记录）" ;;
         none) printf '%s\n' "无记录" ;;
         *) return 1 ;;
     esac
@@ -18205,30 +17838,6 @@ restore_bbr_system_change() {
     return "$failed"
 }
 
-restore_ipv6_system_change() {
-    local all default lo failed=0
-
-    all="$(manifest_value IPV6_ALL 2>/dev/null || true)"
-    default="$(manifest_value IPV6_DEFAULT 2>/dev/null || true)"
-    lo="$(manifest_value IPV6_LO 2>/dev/null || true)"
-    change_backup_record_is_valid IPV6_CONF &&
-        [[ "$all" =~ ^[01]$ ]] &&
-        [[ "$default" =~ ^[01]$ ]] &&
-        [[ "$lo" =~ ^[01]$ ]] || {
-        err "IPv6 禁用恢复记录不完整，已拒绝修改系统。"
-        return 1
-    }
-    restore_change_file IPV6_CONF "$IPV6_DISABLE_CONF" || return 1
-    restore_ipv6_runtime_values "$all" "$default" "$lo" || return 1
-
-    clear_change_tracking IPV6_CONF || failed=1
-    manifest_remove IPV6_ALL || failed=1
-    manifest_remove IPV6_DEFAULT || failed=1
-    manifest_remove IPV6_LO || failed=1
-    [ "$failed" -eq 0 ] || return 1
-    report_ipv6_reenable_address_state
-}
-
 restore_tcp_buffer_system_change() {
     local core_rmem core_wmem tcp_rmem tcp_wmem values failed=0
 
@@ -18254,15 +17863,6 @@ restore_tcp_buffer_system_change() {
     manifest_remove TCP_BUFFER_TCP_RMEM || failed=1
     manifest_remove TCP_BUFFER_TCP_WMEM || failed=1
     return "$failed"
-}
-
-restore_ipv4_priority_system_change() {
-    change_backup_record_is_valid GAI_CONF || {
-        err "IPv4 优先恢复记录不完整，已拒绝修改系统。"
-        return 1
-    }
-    restore_change_file GAI_CONF "$GAI_CONF" || return 1
-    clear_change_tracking GAI_CONF
 }
 
 restore_fail2ban_system_change() {
@@ -18351,11 +17951,9 @@ restore_vpsbox_system_change() {
     case "$item" in
         dns) restore_dns_system_change ;;
         bbr) restore_bbr_system_change ;;
-        ipv4_priority) restore_ipv4_priority_system_change ;;
         fail2ban) restore_fail2ban_system_change ;;
         journald) restore_journald_system_change ;;
         ntp) restore_ntp_system_change ;;
-        ipv6) restore_ipv6_system_change ;;
         tcp_buffer) restore_tcp_buffer_system_change ;;
         *) return 2 ;;
     esac || {
@@ -18373,17 +17971,6 @@ restore_vpsbox_system_change_interactive() {
     if [ "$state" = none ]; then
         info "$label 没有可恢复记录。"
         return 0
-    fi
-    if [ "$item" = "ipv6" ] && [ "$state" = "legacy" ]; then
-        warn "未找到禁用前的原始记录，只能移除 vpsbox 配置并将 all/default/lo 设置为 0。"
-        warn "这会重新启用 IPv6，但不属于精确还原。"
-        if ! read -r -p "重新启用 IPv6？请输入 YES：" confirm; then
-            info "输入已结束，已取消重新启用 IPv6。"
-            return 0
-        fi
-        [ "$confirm" = "YES" ] || { info "已取消重新启用 IPv6。"; return 0; }
-        reenable_untracked_ipv6
-        return
     fi
     if ! read -r -p "恢复 $label？请输入 YES：" confirm; then
         info "输入已结束，已取消恢复。"
@@ -18416,10 +18003,6 @@ restore_vpsbox_system_changes() {
             continue
         }
         if [ "$state" = none ]; then
-            absent=$((absent + 1))
-            continue
-        fi
-        if [ "$state" = legacy ]; then
             absent=$((absent + 1))
             continue
         fi
@@ -18471,12 +18054,10 @@ system_changes_menu() {
  [1] 恢复全部已记录项目
  [2] IPv4 DNS：$(system_change_state_text dns)
  [3] BBR + fq：$(system_change_state_text bbr)
- [4] IPv4 优先：$(system_change_state_text ipv4_priority)
- [5] Fail2ban：$(system_change_state_text fail2ban)
- [6] journald 日志限制：$(system_change_state_text journald)
- [7] NTP 时间同步：$(system_change_state_text ntp)
- [8] IPv6 禁用：$(system_change_state_text ipv6)
- [9] TCP 缓冲区：$(system_change_state_text tcp_buffer)
+ [4] Fail2ban：$(system_change_state_text fail2ban)
+ [5] journald 日志限制：$(system_change_state_text journald)
+ [6] NTP 时间同步：$(system_change_state_text ntp)
+ [7] TCP 缓冲区：$(system_change_state_text tcp_buffer)
 ----------------------------------------
  [0] 返回系统优化菜单
 ========================================
@@ -18488,12 +18069,10 @@ EOF
             1) run_menu_action restore_vpsbox_system_changes; pause ;;
             2) run_menu_action restore_vpsbox_system_change_interactive dns; pause ;;
             3) run_menu_action restore_vpsbox_system_change_interactive bbr; pause ;;
-            4) run_menu_action restore_vpsbox_system_change_interactive ipv4_priority; pause ;;
-            5) run_menu_action restore_vpsbox_system_change_interactive fail2ban; pause ;;
-            6) run_menu_action restore_vpsbox_system_change_interactive journald; pause ;;
-            7) run_menu_action restore_vpsbox_system_change_interactive ntp; pause ;;
-            8) run_menu_action restore_vpsbox_system_change_interactive ipv6; pause ;;
-            9) run_menu_action restore_vpsbox_system_change_interactive tcp_buffer; pause ;;
+            4) run_menu_action restore_vpsbox_system_change_interactive fail2ban; pause ;;
+            5) run_menu_action restore_vpsbox_system_change_interactive journald; pause ;;
+            6) run_menu_action restore_vpsbox_system_change_interactive ntp; pause ;;
+            7) run_menu_action restore_vpsbox_system_change_interactive tcp_buffer; pause ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
@@ -18855,7 +18434,8 @@ $(node_summary)
  [3] 查看节点链接
  [4] 删除 VLESS Reality 节点
  [5] 删除 Shadowsocks 节点
- [6] 回国流量限制
+ [6] 回国流量限制（$(egress_policy_status_label || true)）
+ [7] IP 出站策略（$(ip_outbound_policy_summary || true)）
 ----------------------------------------
  [0] 返回主菜单
 ========================================
@@ -18870,6 +18450,7 @@ EOF
             4) run_menu_action delete_vless_reality_node; pause ;;
             5) run_menu_action delete_node; pause ;;
             6) egress_policy_menu ;;
+            7) ip_outbound_policy_menu ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
@@ -18931,7 +18512,6 @@ system_menu() {
  NTP：$(ntp_sync_state)
  SSH：端口 $(ssh_port_state)
  Fail2ban：$(fail2ban_service_state) / SSH 防护$(fail2ban_sshd_state)
- IPv4 优先：$(ipv4_priority_state)
  IPv6：$(ipv6_summary_state)
  BBR + fq：$(bbr_fq_summary_state)
  TCP 缓冲区：$(tcp_buffer_summary_state)
@@ -18950,14 +18530,12 @@ system_menu() {
 
  网络
  [7] 修改 IPv4 DNS
- [8] 开启 IPv4 优先
- [9] 禁用 IPv6
- [10] 开启 BBR + fq
- [11] TCP 缓冲区调优
+ [8] 开启 BBR + fq
+ [9] TCP 缓冲区调优
 
  维护
- [12] $journal_label
- [13] 查看/恢复 vpsbox 系统改动
+ [10] $journal_label
+ [11] 查看/恢复 vpsbox 系统改动
 ----------------------------------------
  [0] 返回主菜单
 ========================================
@@ -18973,12 +18551,10 @@ EOF
             5) ssh_port_change_menu ;;
             6) run_menu_action install_fail2ban; pause ;;
             7) run_menu_action change_ipv4_dns; pause ;;
-            8) run_menu_action enable_ipv4_priority; pause ;;
-            9) run_menu_action disable_ipv6; pause ;;
-            10) run_menu_action enable_bbr_fq; pause ;;
-            11) tcp_buffer_menu ;;
-            12) run_menu_action limit_systemd_journal; pause ;;
-            13) system_changes_menu ;;
+            8) run_menu_action enable_bbr_fq; pause ;;
+            9) tcp_buffer_menu ;;
+            10) run_menu_action limit_systemd_journal; pause ;;
+            11) system_changes_menu ;;
             0) return 0 ;;
             *) warn "无效选项：$opt"; pause ;;
         esac
