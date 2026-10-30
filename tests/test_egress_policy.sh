@@ -500,6 +500,119 @@ test_ip_policy_failures_and_interruption_restore_snapshot() {
     )
 }
 
+inject_egress_commit_fault() {
+    chown() {
+        if [ "$commit_fault" = chown ] && [[ "${*: -1}" == "$NODE_TRANSACTION_DIR"/.committed.* || "${*: -1}" == "$NODE_TRANSACTION_DIR/committed" ]]; then
+            commit_fault_seen=1; return 42
+        fi
+        command chown "$@"
+    }
+    chmod() {
+        if [ "$commit_fault" = chmod ] && [[ "${*: -1}" == "$NODE_TRANSACTION_DIR"/.committed.* || "${*: -1}" == "$NODE_TRANSACTION_DIR/committed" ]]; then
+            commit_fault_seen=1; return 42
+        fi
+        command chmod "$@"
+    }
+    sync_node_transaction_store() {
+        if [ "$commit_fault" = sync ] &&
+            { [ -f "$NODE_TRANSACTION_DIR/committed" ] || compgen -G "$NODE_TRANSACTION_DIR/.committed.*" >/dev/null; }; then
+            commit_fault_seen=1; return 42
+        fi
+        return 0
+    }
+    mv() {
+        if [ "$commit_fault" = publish ] && [ "${*: -1}" = "$NODE_TRANSACTION_DIR/committed" ]; then
+            commit_fault_seen=1; return 42
+        fi
+        if [ "$block_rollback" = 1 ] && [ "$commit_fault_seen" = 1 ] &&
+            [ "${*: -1}" = "$NODE_CONFIG_DIR/30-egress-policy.json" ]; then return 42; fi
+        command mv "$@"
+    }
+}
+
+recover_egress_case_in_fresh_process() {
+    local case_name="$1" expected_failure="$2"
+    bash -s -- "$REPO_DIR" "$TEST_TMP" "$case_name" "$expected_failure" <<'CHILD'
+set -euo pipefail
+source "$1/tests/test_egress_policy.sh"
+child_tmp="$TEST_TMP"
+TEST_TMP="$2"
+egress_case "$3"
+TEST_TMP="$child_tmp"
+if [ "$4" = 1 ]; then
+    mv() {
+        [ "${*: -1}" != "$NODE_CONFIG_DIR/30-egress-policy.json" ] || return 42
+        command mv "$@"
+    }
+    if recover_pending_node_transaction; then fail '恢复文件仍不可写时必须失败'; fi
+    [ -d "$NODE_TRANSACTION_BACKUP" ] && [ -f "$NODE_TRANSACTION_DIR/pending" ] || fail '恢复失败必须保留备份及 pending'
+    [ ! -e "$NODE_TRANSACTION_DIR/committed" ] || fail '恢复失败不能升级为已提交'
+else
+    recover_pending_node_transaction
+    validate_egress_policy
+    assert_eq prefer_ipv4 "$(read_egress_policy_state | jq -r .ip_strategy)"
+    assert_eq 1 "$policy_active"
+    assert_eq 1 "$policy_enabled"
+    [ ! -e "$NODE_TRANSACTION_DIR" ] || fail '完整恢复后应清理事务'
+fi
+CHILD
+}
+
+test_ip_policy_commit_preparation_failure_rolls_back_complete_state() {
+    local commit_fault
+    for commit_fault in chown chmod sync publish; do
+        (
+            egress_case "commit-full-$commit_fault"
+            egress_add_ss; egress_add_vless
+            policy_active=1 policy_enabled=1
+            apply_egress_policy ip:prefer_ipv4
+            apply_egress_policy on
+            local before commit_fault_seen=0 block_rollback=0
+            before="$(sha256sum "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$VLESS_CONFIG_PATH" "$VLESS_STATE_FILE" "$CONFIG_DIR/vpsbox-egress.json" "$NODE_CONFIG_DIR/30-egress-policy.json")"
+            inject_egress_commit_fault
+            if apply_egress_policy ip:prefer_ipv6 > "$CONFIG_DIR/failed-commit" 2>&1; then fail '提交准备失败必须返回非零'; fi
+            assert_eq 1 "$commit_fault_seen" '必须实际触发指定提交故障'
+            assert_eq "$before" "$(sha256sum "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$VLESS_CONFIG_PATH" "$VLESS_STATE_FILE" "$CONFIG_DIR/vpsbox-egress.json" "$NODE_CONFIG_DIR/30-egress-policy.json")"
+            validate_egress_policy
+            assert_eq 1 "$policy_active"
+            assert_eq 1 "$policy_enabled"
+            [ ! -e "$NODE_TRANSACTION_DIR" ] || fail '完整回滚后应清理事务'
+        )
+    done
+}
+
+test_ip_policy_partial_rollback_recovers_in_fresh_process() {
+    local commit_fault enabled
+    for commit_fault in chown chmod sync publish; do
+        for enabled in off on; do
+            (
+                local case_name="commit-partial-$commit_fault-$enabled"
+                egress_case "$case_name"
+                egress_add_ss; egress_add_vless
+                policy_active=1 policy_enabled=1
+                apply_egress_policy ip:prefer_ipv4
+                apply_egress_policy "$enabled"
+                local before commit_fault_seen=0 block_rollback=1
+                before="$(sha256sum "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$VLESS_CONFIG_PATH" "$VLESS_STATE_FILE" "$CONFIG_DIR/vpsbox-egress.json" "$NODE_CONFIG_DIR/30-egress-policy.json")"
+                inject_egress_commit_fault
+                if apply_egress_policy ip:prefer_ipv6 > "$CONFIG_DIR/failed-commit" 2>&1; then fail '提交与回滚不完整时必须失败'; fi
+                assert_eq 1 "$commit_fault_seen"
+                [ -d "$NODE_TRANSACTION_BACKUP" ] && [ -f "$NODE_TRANSACTION_DIR/pending" ] || fail '必须留下可恢复事务'
+                [ ! -e "$NODE_TRANSACTION_DIR/committed" ] || fail '未提交事务不能留下正式标记'
+                assert_eq prefer_ipv4 "$(read_egress_policy_state | jq -r .ip_strategy)"
+                assert_eq prefer_ipv6 "$(jq -r '.route.rules[] | select(.action == "resolve") | .strategy' "$NODE_CONFIG_DIR/30-egress-policy.json")"
+                if validate_egress_policy; then fail '本例必须确实留下部分恢复造成的不一致'; fi
+                recover_egress_case_in_fresh_process "$case_name" 1 > "$CONFIG_DIR/failed-recovery" 2>&1
+                [ -d "$NODE_TRANSACTION_BACKUP" ] || fail '新进程恢复失败不能清理备份'
+                recover_egress_case_in_fresh_process "$case_name" 0 > "$CONFIG_DIR/successful-recovery" 2>&1
+                assert_eq "$before" "$(sha256sum "$SS_CONFIG_PATH" "$SS_STATE_FILE" "$VLESS_CONFIG_PATH" "$VLESS_STATE_FILE" "$CONFIG_DIR/vpsbox-egress.json" "$NODE_CONFIG_DIR/30-egress-policy.json")"
+                validate_egress_policy
+                [ ! -e "$NODE_TRANSACTION_DIR" ] || fail '后续新进程完整恢复后才能清理备份'
+            )
+        done
+    done
+}
+
 test_ip_policy_legacy_cn_and_corrupt_cache_recovery() {
     (
         egress_case ip-legacy
@@ -586,6 +699,8 @@ main() {
         test_ip_policy_only_v4_keeps_full_cn_check_before_filtering \
         test_ip_policy_preset_inherits_and_last_deletion_keeps_preference \
         test_ip_policy_failures_and_interruption_restore_snapshot \
+        test_ip_policy_commit_preparation_failure_rolls_back_complete_state \
+        test_ip_policy_partial_rollback_recovers_in_fresh_process \
         test_ip_policy_legacy_cn_and_corrupt_cache_recovery \
         test_ip_policy_rejects_bad_state_custom_routes_and_old_kernel \
         test_ip_policy_menu_and_node_status_labels

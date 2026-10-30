@@ -4868,11 +4868,8 @@ begin_node_transaction() {
         err "检测到尚未恢复的节点事务，已拒绝开始新操作：$NODE_TRANSACTION_DIR"
         return 1
     fi
-    if [ -e "$NODE_TRANSACTION_DIR/committed" ]; then
-        node_file_is_secure "$NODE_TRANSACTION_DIR/committed" || {
-            err "节点事务 committed 标记不安全，已拒绝开始新操作。"
-            return 1
-        }
+    if [ -e "$NODE_TRANSACTION_DIR/committed" ] || [ -L "$NODE_TRANSACTION_DIR/committed" ]; then
+        node_transaction_commit_state || return 1
         remove_node_transaction_dir || return 1
     elif [ -e "$NODE_TRANSACTION_DIR" ]; then
         # pending 标记只会在完整备份后写入；没有标记说明尚未修改节点文件。
@@ -4958,29 +4955,77 @@ cancel_unmodified_node_transaction() {
     remove_node_transaction_dir "$transaction_dir"
 }
 
-commit_node_transaction() {
-    [ "${ACTIVE_NODE_BACKUP:-}" = "$NODE_TRANSACTION_DIR" ] || return 1
-    [ -f "$NODE_TRANSACTION_DIR/pending" ] && [ ! -L "$NODE_TRANSACTION_DIR/pending" ] || return 1
-    : > "$NODE_TRANSACTION_DIR/committed" || return 1
-    chown root:root "$NODE_TRANSACTION_DIR/committed" &&
-        chmod 600 "$NODE_TRANSACTION_DIR/committed" || return 1
-    sync_node_transaction_store || return 1
-    # committed 标记完成持久化后即越过核心提交点。后续只清理事务痕迹，
-    # 即使失败也必须保留新节点状态，并交由下次启动按 committed 语义清理。
+node_transaction_commit_state() {
+    local transaction_dir="${1:-$NODE_TRANSACTION_DIR}"
+
+    # 0：已提交；1：尚未提交；2：路径或标记不安全，禁止猜测并覆盖现场。
+    node_transaction_dir_valid "$transaction_dir" && node_dir_is_secure "$transaction_dir" || {
+        err "节点事务目录不安全，已拒绝判断提交状态：$transaction_dir"
+        return 2
+    }
+    if [ -e "$transaction_dir/committed" ] || [ -L "$transaction_dir/committed" ]; then
+        node_file_is_secure "$transaction_dir/committed" || {
+            err "节点事务 committed 标记不安全，已保留事务材料。"
+            return 2
+        }
+        return 0
+    fi
+    return 1
+}
+
+finish_committed_node_transaction() {
+    local transaction_dir="${1:-$NODE_TRANSACTION_DIR}"
+
+    node_transaction_commit_state "$transaction_dir" || return 1
     ACTIVE_NODE_BACKUP=""
     ACTIVE_NODE_TRANSACTION_MUTATED=0
-    if ! rm -f -- "$NODE_TRANSACTION_DIR/pending"; then
-        warn "节点事务已提交，但 pending 标记未能清理：$NODE_TRANSACTION_DIR/pending"
+    # 先同步已发布的标记，再移除 pending 和备份。提交点后的失败不能触发回滚。
+    if ! sync_node_transaction_store; then
+        warn "节点事务已提交，但提交标记尚未确认同步；事务材料已保留：$transaction_dir"
+        return 0
+    fi
+    if ! rm -f -- "$transaction_dir/pending"; then
+        warn "节点事务已提交，但 pending 标记未能清理：$transaction_dir/pending"
         return 0
     fi
     if ! sync_node_transaction_store; then
-        warn "节点事务已提交，但清理状态未能持久化：$NODE_TRANSACTION_DIR"
+        warn "节点事务已提交，但清理状态未能持久化：$transaction_dir"
         return 0
     fi
-    remove_node_transaction_dir || {
-        warn "节点事务已提交，但临时目录未能清理：$NODE_TRANSACTION_DIR"
+    remove_node_transaction_dir "$transaction_dir" || {
+        warn "节点事务已提交，但临时目录未能清理：$transaction_dir"
         return 0
     }
+}
+
+commit_node_transaction() {
+    local prepared publish_status=0 status
+
+    [ "${ACTIVE_NODE_BACKUP:-}" = "$NODE_TRANSACTION_DIR" ] || return 1
+    if node_transaction_commit_state; then
+        finish_committed_node_transaction
+        return $?
+    else
+        status=$?
+        [ "$status" -eq 1 ] || return 1
+    fi
+    node_file_is_secure "$NODE_TRANSACTION_DIR/pending" || return 1
+    prepared="$(mktemp "$NODE_TRANSACTION_DIR/.committed.XXXXXX")" || return 1
+    # 权限及新节点状态的同步均在正式标记出现前完成，失败残留不能冒充已提交。
+    if ! chown root:root "$prepared" || ! chmod 600 "$prepared" ||
+        ! sync_node_transaction_store; then
+        rm -f -- "$prepared" || warn "节点事务提交准备文件未能清理：$prepared"
+        return 1
+    fi
+    mv -fT -- "$prepared" "$NODE_TRANSACTION_DIR/committed" || publish_status=$?
+    # rename 已成功但命令被信号打断时，以正式标记为准，不能再回滚到旧状态。
+    if node_transaction_commit_state; then
+        [ "$publish_status" -eq 0 ] || warn "提交命令返回异常，但节点事务提交标记已发布。"
+        finish_committed_node_transaction
+        return $?
+    fi
+    rm -f -- "$prepared" || warn "节点事务提交准备文件未能清理：$prepared"
+    return 1
 }
 
 restore_node_file_from_backup() {
@@ -5177,6 +5222,12 @@ rollback_node_files_transaction() {
 
     [ -n "$transaction_dir" ] || return 0
     node_transaction_dir_valid "$transaction_dir" || return 1
+    if node_transaction_commit_state "$transaction_dir"; then
+        finish_committed_node_transaction "$transaction_dir"
+        return $?
+    else
+        [ "$?" -eq 1 ] || return 1
+    fi
     [ -f "$transaction_dir/pending" ] || return 1
     if [ "${ACTIVE_NODE_TRANSACTION_MUTATED:-0}" = "0" ] &&
         [ ! -e "$transaction_dir/mutated" ]; then
@@ -5194,6 +5245,12 @@ rollback_node_files_transaction() {
 fail_after_node_rollback() {
     local reason="$1" previous_state="$2"
 
+    if [ -n "${ACTIVE_NODE_BACKUP:-}" ] &&
+        node_transaction_commit_state "$ACTIVE_NODE_BACKUP"; then
+        finish_committed_node_transaction "$ACTIVE_NODE_BACKUP" || return 1
+        err "$reason；节点事务已提交，已保留提交后的状态。"
+        return 1
+    fi
     if rollback_active_node_transaction; then
         err "$reason；节点配置与 sing-box 已恢复到${previous_state}状态。"
     else
@@ -5208,6 +5265,12 @@ rollback_active_node_transaction() {
 
     [ -n "$transaction_dir" ] || return 0
     node_transaction_dir_valid "$transaction_dir" || return 1
+    if node_transaction_commit_state "$transaction_dir"; then
+        finish_committed_node_transaction "$transaction_dir"
+        return $?
+    else
+        [ "$?" -eq 1 ] || return 1
+    fi
     if [ "${ACTIVE_NODE_TRANSACTION_MUTATED:-0}" = "0" ] &&
         [ ! -e "$transaction_dir/mutated" ]; then
         cancel_unmodified_node_transaction
@@ -5247,13 +5310,13 @@ recover_pending_node_transaction() {
         err "节点事务目录不安全，已拒绝启动：$NODE_TRANSACTION_DIR"
         return 1
     }
-    if [ -f "$NODE_TRANSACTION_DIR/committed" ]; then
-        node_file_is_secure "$NODE_TRANSACTION_DIR/committed" || {
-            err "节点事务 committed 标记不安全，已拒绝自动处理。"
-            return 1
-        }
+    if node_transaction_commit_state; then
+        ACTIVE_NODE_BACKUP=""
+        ACTIVE_NODE_TRANSACTION_MUTATED=0
         remove_node_transaction_dir
         return
+    else
+        [ "$?" -eq 1 ] || return 1
     fi
     if [ -f "$NODE_TRANSACTION_DIR/pending" ]; then
         node_file_is_secure "$NODE_TRANSACTION_DIR/pending" || {

@@ -2400,7 +2400,7 @@ test_node_commit_cleanup_sync_failure_keeps_committed_state() {
         printf 'committed-new-state\n' > "$SS_CONFIG_PATH"
         sync_node_transaction_store() {
             sync_calls=$((sync_calls + 1))
-            [ "$sync_calls" -eq 1 ]
+            [ "$sync_calls" -ne 3 ]
         }
         service_stop() { forbid "committed 后的清理同步失败不得触发节点回滚"; }
 
@@ -2476,7 +2476,252 @@ test_node_commit_marker_sync_failure_keeps_active_transaction() {
         assert_eq "$NODE_TRANSACTION_DIR" "$ACTIVE_NODE_BACKUP" \
             "越过提交点前失败必须保留活动事务供调用者回滚"
         [ -f "$NODE_TRANSACTION_DIR/pending" ] || fail "提交点前失败必须保留 pending 标记"
+        [ ! -e "$NODE_TRANSACTION_DIR/committed" ] || fail "准备同步失败不得留下正式提交标记"
     )
+}
+
+setup_node_commit_case() {
+    set_node_paths "$TEST_TMP/$1"
+    mkdir -p "$NODE_CONFIG_DIR"
+    write_ss_config_fixture "$SS_CONFIG_PATH"
+    write_ss_state_fixture "$SS_STATE_FILE"
+    service_manager_is_active() { return 1; }
+    service_is_enabled() { return 1; }
+    begin_node_transaction
+    mark_node_transaction_mutated
+    write_ss_config_fixture "$SS_CONFIG_PATH" 20099
+    write_ss_state_fixture "$SS_STATE_FILE" 20099
+}
+
+test_node_commit_preparation_failures_do_not_publish_marker() {
+    local fault
+    for fault in mktemp chown chmod sync publish cleanup; do
+        (
+            setup_node_commit_case "commit-prepare-$fault"
+            mktemp() {
+                if [ "$fault" = mktemp ] && [[ "${1:-}" == "$NODE_TRANSACTION_DIR"/.committed.* ]]; then return 42; fi
+                command mktemp "$@"
+            }
+            chown() {
+                if [[ "${*: -1}" == "$NODE_TRANSACTION_DIR"/.committed.* ]] &&
+                    { [ "$fault" = chown ] || [ "$fault" = cleanup ]; }; then return 42; fi
+                command chown "$@"
+            }
+            chmod() {
+                if [ "$fault" = chmod ] && [[ "${*: -1}" == "$NODE_TRANSACTION_DIR"/.committed.* ]]; then return 42; fi
+                command chmod "$@"
+            }
+            sync_node_transaction_store() { [ "$fault" != sync ]; }
+            mv() {
+                if [ "$fault" = publish ] && [ "${*: -1}" = "$NODE_TRANSACTION_DIR/committed" ]; then return 42; fi
+                command mv "$@"
+            }
+            rm() {
+                if [ "$fault" = cleanup ] && [[ "${*: -1}" == "$NODE_TRANSACTION_DIR"/.committed.* ]]; then return 42; fi
+                command rm "$@"
+            }
+            if commit_node_transaction > "$CONFIG_DIR/commit-output" 2>&1; then fail "提交准备 $fault 失败不得成功"; fi
+            [ ! -e "$NODE_TRANSACTION_DIR/committed" ] && [ ! -L "$NODE_TRANSACTION_DIR/committed" ] ||
+                fail "提交准备 $fault 失败留下了正式提交标记"
+            assert_eq "$NODE_TRANSACTION_DIR" "$ACTIVE_NODE_BACKUP"
+            [ -f "$NODE_TRANSACTION_DIR/pending" ] && [ -d "$NODE_TRANSACTION_BACKUP" ] || fail '必须保留恢复材料'
+            if [ "$fault" = cleanup ]; then
+                [ -n "$(find "$NODE_TRANSACTION_DIR" -maxdepth 1 -name '.committed.*' -print)" ] || fail '本例必须留下未发布准备文件'
+            fi
+        )
+    done
+}
+
+test_node_commit_uses_publication_postcondition() {
+    local result
+    for result in error-after-publish success-without-publish; do
+        (
+            setup_node_commit_case "commit-result-$result"
+            mv() {
+                if [ "${*: -1}" = "$NODE_TRANSACTION_DIR/committed" ]; then
+                    [ "$result" != success-without-publish ] || return 0
+                    command mv "$@" || return "$?"
+                    return 42
+                fi
+                command mv "$@"
+            }
+            local status=0
+            commit_node_transaction > "$CONFIG_DIR/commit-output" 2>&1 || status=$?
+            if [ "$result" = error-after-publish ]; then
+                assert_eq 0 "$status" '正式标记已发布时不得误触发回滚'
+                assert_eq '' "$ACTIVE_NODE_BACKUP"
+                [ ! -e "$NODE_TRANSACTION_DIR" ] || fail '已提交事务应完成清理'
+            else
+                [ "$status" -ne 0 ] || fail '没有发布标记时不得把命令成功当成提交成功'
+                assert_eq "$NODE_TRANSACTION_DIR" "$ACTIVE_NODE_BACKUP"
+                [ -f "$NODE_TRANSACTION_DIR/pending" ] && [ ! -e "$NODE_TRANSACTION_DIR/committed" ] || fail '未发布时应保持待恢复'
+            fi
+        )
+    done
+}
+
+test_node_commit_marker_flush_failure_retains_committed_material() {
+    (
+        setup_node_commit_case commit-published-sync-failure
+        forbid_init
+        local sync_calls=0
+        sync_node_transaction_store() {
+            sync_calls=$((sync_calls + 1))
+            [ "$sync_calls" -eq 1 ]
+        }
+        restore_node_files() { forbid '已发布标记后的同步失败不得回滚'; }
+        commit_node_transaction > "$CONFIG_DIR/commit-output" 2>&1 || fail '提交点后同步失败不能反转提交'
+        assert_eq '' "$ACTIVE_NODE_BACKUP"
+        [ -f "$NODE_TRANSACTION_DIR/committed" ] && [ -f "$NODE_TRANSACTION_DIR/pending" ] &&
+            [ -d "$NODE_TRANSACTION_BACKUP" ] || fail '标记同步未确认时必须保留全部事务材料'
+        recover_pending_node_transaction
+        load_protocol_state ss
+        assert_eq 20099 "$PORT"
+        [ ! -e "$NODE_TRANSACTION_DIR" ] || fail '后续恢复只应清理已提交材料'
+        assert_no_forbidden
+    )
+}
+
+test_node_commit_directory_cleanup_failure_is_retryable() {
+    (
+        setup_node_commit_case commit-directory-cleanup
+        rm() {
+            if [ "$*" = "-rf -- $NODE_TRANSACTION_DIR" ]; then return 42; fi
+            command rm "$@"
+        }
+        commit_node_transaction > "$CONFIG_DIR/commit-output" 2>&1 || fail '目录清理失败不能反转提交'
+        assert_eq '' "$ACTIVE_NODE_BACKUP"
+        [ -f "$NODE_TRANSACTION_DIR/committed" ] && [ -d "$NODE_TRANSACTION_BACKUP" ] || fail '清理失败应留下材料'
+        if recover_pending_node_transaction; then fail '仍无法清理时不得谎报恢复完成'; fi
+        [ -d "$NODE_TRANSACTION_BACKUP" ] || fail '清理失败不得丢失备份'
+        unset -f rm
+        recover_pending_node_transaction
+        load_protocol_state ss
+        assert_eq 20099 "$PORT"
+        [ ! -e "$NODE_TRANSACTION_DIR" ] || fail '恢复清理应可重试'
+    )
+}
+
+test_node_rollback_entrypoints_preserve_published_state() {
+    local entry
+    for entry in rollback_active_node_transaction rollback_node_files_transaction cleanup_vpsbox_runtime_host_transactions fail_after_node_rollback; do
+        (
+            setup_node_commit_case "commit-rollback-guard-$entry"
+            forbid_init
+            : > "$NODE_TRANSACTION_DIR/committed"
+            chmod 600 "$NODE_TRANSACTION_DIR/committed"
+            restore_node_files() { forbid '已发布事务不得恢复旧文件'; }
+            service_stop() { forbid '已发布事务不得停止服务'; }
+            cleanup_active_bounded_command() { :; }
+            rollback_active_singbox_update() { :; }
+            firewall_abort_port_transition() { :; }
+            if [ "$entry" = fail_after_node_rollback ]; then
+                if fail_after_node_rollback '测试异常' '操作前' > "$CONFIG_DIR/output" 2>&1; then fail '失败处理必须返回非零'; fi
+                assert_file_contains "$CONFIG_DIR/output" '已提交'
+                assert_file_not_contains "$CONFIG_DIR/output" '已恢复到'
+            else
+                "$entry" "$NODE_TRANSACTION_DIR"
+            fi
+            assert_eq '' "$ACTIVE_NODE_BACKUP"
+            load_protocol_state ss
+            assert_eq 20099 "$PORT"
+            assert_no_forbidden
+        )
+    done
+}
+
+test_node_commit_unsafe_marker_preserves_backup() {
+    require_root_permission_semantics || return "$?"
+    local kind entry
+    for kind in directory symlink dangling writable; do
+        (
+            setup_node_commit_case "commit-unsafe-$kind"
+            forbid_init
+            case "$kind" in
+                directory) mkdir "$NODE_TRANSACTION_DIR/committed" ;;
+                symlink|dangling)
+                    require_real_symlink file || return "$?"
+                    [ "$kind" != symlink ] || : > "$CONFIG_DIR/marker-target"
+                    ln -s "$CONFIG_DIR/marker-target" "$NODE_TRANSACTION_DIR/committed"
+                    ;;
+                writable) : > "$NODE_TRANSACTION_DIR/committed"; chmod 666 "$NODE_TRANSACTION_DIR/committed" ;;
+            esac
+            restore_node_files() { forbid '标记不安全时不得覆盖节点'; }
+            for entry in commit_node_transaction rollback_active_node_transaction rollback_node_files_transaction recover_pending_node_transaction; do
+                if "$entry" > "$CONFIG_DIR/output" 2>&1; then fail "$kind 标记不得被 $entry 当作安全事务"; fi
+                [ -d "$NODE_TRANSACTION_BACKUP" ] || fail '异常标记必须保留备份'
+            done
+            load_protocol_state ss
+            assert_eq 20099 "$PORT"
+            assert_no_forbidden
+        )
+    done
+}
+
+test_node_commit_interruptions_respect_publication_boundary() {
+    require_linux_proc || return "$?"
+    local boundary signal case_root status
+    local child="$TEST_TMP/commit-boundary-child.sh"
+    cat > "$child" <<'CHILD'
+set -euo pipefail
+repo="$1" case_root="$2" phase="$3" boundary="$4" signal="$5"
+export TMPDIR="$case_root/child-tmp"
+source "$repo/tests/test_dual_nodes.sh"
+set_node_paths "$case_root/config"
+OS=unknown
+is_systemd() { return 1; }
+service_manager_is_active() { return 1; }
+service_is_enabled() { return 1; }
+service_disable() { :; }
+service_stop() { :; }
+stop_singbox_config_processes() { :; }
+singbox_config_pids() { :; }
+repair_node_uri_cache_best_effort() { :; }
+firewall_refresh_if_enabled() { :; }
+if [ "$phase" = recover ]; then
+    recover_pending_node_transaction
+    cleanup
+    exit 0
+fi
+mkdir -p "$NODE_CONFIG_DIR"
+write_ss_config_fixture "$SS_CONFIG_PATH"
+write_ss_state_fixture "$SS_STATE_FILE"
+begin_node_transaction
+mark_node_transaction_mutated
+write_ss_config_fixture "$SS_CONFIG_PATH" 20099
+write_ss_state_fixture "$SS_STATE_FILE" 20099
+trap 'cleanup_vpsbox_runtime; cleanup' EXIT
+trap 'exit 143' TERM
+mv() {
+    if [ "${*: -1}" = "$NODE_TRANSACTION_DIR/committed" ]; then
+        [ "$boundary" != before ] || kill -s "$signal" "$BASHPID"
+        command mv "$@" || return "$?"
+        kill -s "$signal" "$BASHPID"
+    else
+        command mv "$@"
+    fi
+}
+commit_node_transaction
+exit 99
+CHILD
+    for boundary in before after; do
+        for signal in TERM KILL; do
+            case_root="$TEST_TMP/commit-boundary-$boundary-$signal"
+            mkdir -p "$case_root/child-tmp"
+            status=0
+            bash "$child" "$REPO_DIR" "$case_root" publish "$boundary" "$signal" > "$case_root/output" 2>&1 || status=$?
+            if [ "$signal" = TERM ]; then assert_eq 143 "$status"; else assert_eq 137 "$status"; fi
+            set_node_paths "$case_root/config"
+            if [ "$signal" = KILL ]; then
+                [ -d "$NODE_TRANSACTION_BACKUP" ] || fail '硬中断应留下事务材料'
+                bash "$child" "$REPO_DIR" "$case_root" recover "$boundary" "$signal" > "$case_root/recovery-output" 2>&1
+            fi
+            validate_protocol_node_core ss "$SS_CONFIG_PATH" "$SS_STATE_FILE"
+            load_protocol_state ss
+            if [ "$boundary" = before ]; then assert_eq 20001 "$PORT"; else assert_eq 20099 "$PORT"; fi
+            [ ! -e "$NODE_TRANSACTION_DIR" ] || fail '恢复或退出清理后应完成事务处理'
+        done
+    done
 }
 
 test_config_state_identity_and_credentials_must_match() {
@@ -3053,6 +3298,13 @@ main() {
         test_node_commit_cleanup_sync_failure_keeps_committed_state
         test_node_commit_pending_cleanup_failure_keeps_committed_state
         test_node_commit_marker_sync_failure_keeps_active_transaction
+        test_node_commit_preparation_failures_do_not_publish_marker
+        test_node_commit_uses_publication_postcondition
+        test_node_commit_marker_flush_failure_retains_committed_material
+        test_node_commit_directory_cleanup_failure_is_retryable
+        test_node_rollback_entrypoints_preserve_published_state
+        test_node_commit_unsafe_marker_preserves_backup
+        test_node_commit_interruptions_respect_publication_boundary
         test_config_state_identity_and_credentials_must_match
         test_protocol_status_distinguishes_template_drift_from_damage
         test_self_check_warns_for_template_drift_without_integrity_failure
